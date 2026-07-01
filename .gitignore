@@ -1,0 +1,51 @@
+# Python
+
+__pycache__/
+
+*.pyc
+
+.venv/
+
+.pytest_cache/
+
+.mypy_cache/
+
+.ruff_cache/
+
+.coverage
+
+htmlcov/
+
+# IDE
+
+.idea/
+
+.vscode/
+
+# Environment
+
+.env
+
+.env.*
+
+# Logs
+
+*.log
+
+# macOS
+
+.DS_Store
+
+# Database
+
+*.sqlite3
+
+# Build
+
+dist/
+
+build/
+
+# uv
+
+uv.lock.bak
