@@ -28,6 +28,8 @@ htmlcov/
 
 .env.*
 
+!.env.example
+
 # Logs
 
 *.log

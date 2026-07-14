@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
+      - name: Prepare .env
+        run: cp .env.example .env
       - name: Start full stack
         run: docker compose up -d --build
       - name: Wait for services
