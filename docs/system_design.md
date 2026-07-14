@@ -1,8 +1,8 @@
-# AlphaMind v2.2 Enterprise
+# AlphaMind v2.3 Enterprise
 
 # SYSTEM_DESIGN_INTERVIEW.md
 
-Version: 2.2
+Version: 2.3
 
 ---
 

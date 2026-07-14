@@ -1,0 +1,35 @@
+name: ai-service CI
+
+on:
+  pull_request:
+    path:
+      - "service/ai-service/**"
+      - "shared/**"
+      - "pyproject.toml"
+      - "uv.lock"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - run: make test-ai
+      - run: uv run ruff check services/ai-service shared
+      - name: Build image
+        run: docker build -f services/ai-service/Dockerfile -t ai-service:ci .

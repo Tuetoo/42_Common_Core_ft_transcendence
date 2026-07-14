@@ -1,26 +1,28 @@
 repos:
-
+  # Ruff (Lint + Format)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.12.4
     hooks:
       - id: ruff
+        args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/psf/black
-    rev: 25.1.0
-    hooks:
-      - id: black
-
+  # Common Git Hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
-
       - id: end-of-file-fixer
-
       - id: trailing-whitespace
-
       - id: check-yaml
-
       - id: check-json
-
       - id: check-added-large-files
+      - id: check-merge-conflict
+
+  # MyPy
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false

@@ -255,6 +255,27 @@ class AgentResult(BaseModel):
 
     sources: list[str]
 ```
+
+
+```text
+Concrete locations (see PROJECT_STRUCTURE.md):
+
+    BaseAgent        -> ai/agents/base.py
+    AnalysisState     -> ai/graph/state.py (the LangGraph shared state
+                          object every node reads/writes)
+    AgentResult        -> ai/schemas/outputs.py
+    Final analysis     -> ai/schemas/analysis.py (AnalysisRead) — the
+      entity/status                run/status entity; distinct from AgentResult,
+                                    which is one agent's individual output
+    Recommendation      -> ai/schemas/recommendation.py
+    What other domains  -> ai/schemas/refs.py (AnalysisRef,
+      may reference          RecommendationRef) — domains/notification and
+                              domains/portfolio embed these; they never
+                              import ai/graph/state.py or ai/schemas/outputs.py
+                              directly (see ALIGNMENT_README.md §5 rule 5:
+                              dependencies only point downward).
+```
+
 ---
 
 # 6. Supervisor Agent

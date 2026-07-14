@@ -45,9 +45,19 @@ All APIs return:
 
 ```json
 {
-  "success": true,
-  "data": {},
-  "message": null
+  "data": { },
+  "request_id": "a1b2c3d4-..."
+}
+```
+
+(`shared.schemas.base.PaginatedResponse`):
+
+```json
+{
+  "items": [ ],
+  "total": 42,
+  "page": 1,
+  "page_size": 20
 }
 ```
 
@@ -57,10 +67,10 @@ All APIs return:
 
 ```json
 {
-  "success": false,
   "error": {
-    "code": "INVALID_CREDENTIALS",
-    "message": "Email or password incorrect"
+    "code": "invalid_credentials",
+    "message": "Email or password incorrect",
+    "request_id": "a1b2c3d4-..."
   }
 }
 ```
@@ -1816,36 +1826,6 @@ ws://host/api/v1/ws
 {
   "event":"AGENT_FINISHED",
   "agent":"News Agent"
-}
-```
-
----
-
-## Workflow Paused
-
-```json
-{
-  "event":"WORKFLOW_PAUSED"
-}
-```
-
----
-
-## Workflow Resumed
-
-```json
-{
-  "event":"WORKFLOW_RESUMED"
-}
-```
-
----
-
-## Workflow Cancelled
-
-```json
-{
-  "event":"WORKFLOW_CANCELLED"
 }
 ```
 

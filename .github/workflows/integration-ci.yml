@@ -1,0 +1,25 @@
+name: intergration CI
+
+on:
+  push: 
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Start full stack
+        run: docker compose up -d --build
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health/auth && curl -sf http://localhost:8000/health/core && curl -sf http://localhost:8000/health/ai && break
+            sleep 2
+          done
+      - run: uv sync
+      - run: make test-integration
+      - if: always()
+        run: docker compose down
+      
