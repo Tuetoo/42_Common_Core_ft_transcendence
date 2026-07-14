@@ -1,14 +1,14 @@
 services:
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    env_file: .env
-    ports:
-      - "3000:3000"
-    depends_on:
-      - gateway
-    restart: unless-stopped
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   env_file: .env
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - gateway
+  #   restart: unless-stopped
 
   gateway:
     image: nginx:1.27-alpine
