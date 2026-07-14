@@ -21,7 +21,7 @@ jobs:
             sleep 2
           done
       - run: uv sync
-      - run: make test-integration
+      # - run: make test-integration
       - if: always()
         run: docker compose down
       

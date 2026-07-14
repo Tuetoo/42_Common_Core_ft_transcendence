@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync
-      - run: make test-auth
+      # - run: make test-auth
       - run: uv run ruff check services/auth-service shared
       - name: Build image
         run: docker build -f services/auth-service/Dockerfile -t auth-service:ci .

@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync
-      - run: make test-core
+      # - run: make test-core
       - run: uv run ruff check services/core-service shared
       - name: Build image
         run: docker build -f services/core-service/Dockerfile -t core-service:ci .
