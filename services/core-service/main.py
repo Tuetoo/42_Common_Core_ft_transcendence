@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await close_redis_connections()
 
 
-app = FastAPI(title="AlphaMind Core Service", version="4.0.0",
+app = FastAPI(title="AlphaMind Core Service", version="1.0.0",
               docs_url="/api/docs", openapi_url="/api/openapi.json",
               lifespan=lifespan)
 

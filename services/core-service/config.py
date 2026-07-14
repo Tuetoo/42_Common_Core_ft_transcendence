@@ -1,6 +1,7 @@
 from functools import lru_cache
-from shared.config import BaseServiceSettings
 from typing import ClassVar
+
+from shared.config import BaseServiceSettings
 
 
 class CoreServiceSettings(BaseServiceSettings):

@@ -1,4 +1,4 @@
-from sqlalchemy.ext.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from domains.market.repository import InstrumentRepository, PriceBarRepository
 from domains.market.schema import InstrumentRead, PriceBarRead
 

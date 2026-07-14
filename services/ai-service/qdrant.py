@@ -16,9 +16,7 @@ async def ensure_collection(
         collection_name: str = settings.QDRANT_COLLECTION_RESEARCH,
         vector_size: int = settings.QDRANT_VECTOR_SIZE) -> None:
     client = get_qdrant_client()
-    try:
-        await client.get_collections(collection_name)
-    except Exception:
+    if not await client.collection_exists(collection_name=collection_name):
         await client.create_collection(
             collection_name=collection_name,
             vectors_config=qmodels.VectorParams(

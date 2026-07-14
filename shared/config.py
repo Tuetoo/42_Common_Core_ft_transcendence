@@ -1,6 +1,5 @@
 from functools import lru_cache
 from typing import Literal
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,37 +56,28 @@ class BaseServiceSettings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
 
-    @field_validator("DATABASE_URL", mode="before")
-    @classmethod
-    def assemble_database_url(cls, v: str | None, info) -> str:
-        if v:
-            return v
-        data = info.data
+    def assemble_database_url(self) -> str:
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
         return (
-            f"postgresql+asyncpg://{data.get('POSTGRES_USER')}:"
-            f"{data.get('POSTGRES_PASSWORD')}@{data.get('POSTGRES_HOST')}:"
-            f"{data.get('POSTGRES_PORT')}/{data.get('POSTGRES_DB')}"
+            f"postgresql+asyncpg://{self.POSTGRES_USER}:"
+            f"{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:"
+            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
 
-    @field_validator("SYNC_DATABASE_URL", mode="before")
-    @classmethod
-    def assemble_sync_database_url(cls, v: str | None, info) -> str:
-        if v:
-            return v
-        data = info.data
+    def assemble_sync_database_url(self) -> str:
+        if self.SYNC_DATABASE_URL:
+            return self.SYNC_DATABASE_URL
         return (
-            f"postgresql+psycopg://{data.get('POSTGRES_USER')}:"
-            f"{data.get('POSTGRES_PASSWORD')}@{data.get('POSTGRES_HOST')}:"
-            f"{data.get('POSTGRES_PORT')}/{data.get('POSTGRES_DB')}"
+            f"postgresql+psycopg://{self.POSTGRES_USER}:"
+            f"{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:"
+            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
 
-    @field_validator("REDIS_URL", mode="before")
-    @classmethod
-    def assemble_redis_url(cls, v: str | None, info) -> str:
-        if v:
-            return v
-        data = info.data
-        return f"redis://{data.get('REDIS_HOST')}:{data.get('REDIS_PORT')}"
+    def assemble_redis_url(self) -> str:
+        if self.REDIS_URL:
+            return self.REDIS_URL
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}"
 
     # @property
     # def is_production(self) -> bool:
