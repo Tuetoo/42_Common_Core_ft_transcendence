@@ -77,6 +77,11 @@ select = [
     "RUF",    # Ruff rules
 ]
 
+ignore = [
+    "B008",
+    "UP046",
+]
+
 [tool.black]
 
 line-length = 88

@@ -21,8 +21,26 @@ repos:
   # MyPy
   - repo: local
     hooks:
-      - id: mypy
-        name: mypy
-        entry: uv run mypy
+      - id: mypy-ai
+        name: mypy ai-service
+        entry: uv run mypy services/ai-service
+        language: system
+        pass_filenames: false
+
+      - id: mypy-auth
+        name: mypy auth-service
+        entry: uv run mypy services/auth-service
+        language: system
+        pass_filenames: false
+
+      - id: mypy-core
+        name: mypy core-service
+        entry: uv run mypy services/core-service
+        language: system
+        pass_filenames: false
+
+      - id: mypy-shared
+        name: mypy shared
+        entry: uv run mypy shared
         language: system
         pass_filenames: false
