@@ -1,199 +1,194 @@
-# AlphaMind v3.0
+# AlphaMind v4.1
 # MODULE_MAPPING.md
 
-Version: 3.0 
+Version: 4.1
 
 ---
 
-## 1. Team & Ownership (3 developers)
+## 1. Team & Ownership (3 developers, 3 services)
 
-| Role | Owns | Primary domains (see ERD.md) |
+| Role | Owns service(s) | Domains inside |
 |---|---|---|
-| **Backend Lead** | Auth, Social (connections), Organizations, Portfolio (CRUD), Research (notes/tags/upload orchestration), Notifications, Public API + rate limiting, RBAC, OAuth, 2FA, Docker/infra, Monitoring, System/Audit | AUTH, SOCIAL, ORGANIZATION, PORTFOLIO, RESEARCH, DOCUMENT (ingest orchestration), NOTIFICATION, SYSTEM, AUDIT |
-| **AI Lead** | RAG pipeline, LangGraph agent orchestration, multi-LLM router, debate/reflection engine, decision tracking, backtesting/benchmarking, market data ingestion, AI-specific analytics dashboards, and everything under `backend/app/workers/` | RAG, AI ANALYSIS, AGENT, AI MEMORY, PROMPT MANAGEMENT, DEBATE, DECISION TRACKING, BACKTEST, BENCHMARK, MODEL ROUTING, MARKET, ANALYTICS |
-| **Frontend Lead** | Next.js app end-to-end: dashboard, portfolio UI, research UI, AI workflow visualization, analytics dashboards, org/settings UI, WebSocket client | Consumes all backend domains through the REST + WebSocket API |
+| **Backend Lead** | `auth-service`, `core-service` | auth, organization, social (connections/presence) — in auth-service; portfolio, research, notification — in core-service |
+| **AI Lead** | `ai-service` | the entire multi-agent/RAG/LLM engine, market data, AI-driven analytics |
+| **Frontend Lead** | `frontend/` | consumes all 3 services through the Nginx gateway |
 
-Every table migration is reviewed by at least one other developer before
-merge (see official requirement: "code reviews" + "how each member
-contributed").
-
----
-
-## 2. Point Strategy
-
-| Tier | Points | Meaning |
-|---|---|---|
-| Mandatory minimum | 14 | Required to pass at all |
-| Our baseline plan (Section 4) | **31** | Everything we are actually building, mapped honestly |
-| Officially countable bonus | +5 max | Per the subject: bonus only unlocks once the 14-point baseline is fully validated, and is capped at 5 extra points regardless of how much more you build |
-
-**Why build ~31 points of functionality if only ~19 are "countable"?**
-Because (a) modules occasionally fail validation at demo time due to a bug or
-a missed requirement — building real headroom protects the 14-point pass
-line, (b) the AI stack is the actual product, not a school exercise (see
-`Proposal.md`), and (c) the evaluator explicitly rewards depth and coherence,
-not just a checklist.
+Backend Lead additionally owns: `gateway/nginx.conf`,
+`docker-compose.yaml`, `infra/`, CI/CD pipelines for all 3 services
+(see 4.5), Prometheus/Grafana setup.
 
 ---
 
-## 3. Architecture Overview (simplified, corrected)
+## 2. Point Strategy (unchanged targets, updated composition)
+
+| Tier | Points |
+|---|---|
+| Official minimum | 14 |
+| Safe pass | 20 |
+| AlphaMind baseline (v4.0) | **33** |
+| Officially countable bonus above 14 | capped at +5 per the subject |
+
+---
+
+## 3. Architecture Overview
 
 ```
-Frontend (Next.js, 1 container)
-        │  REST (JSON) + WebSocket
-        ▼
-Backend (FastAPI, 1 container — modular monolith)
-    ├── domains/auth
-    ├── domains/organization
-    ├── domains/portfolio
-    ├── domains/research
-    ├── domains/notification
-    ├── domains/analytics
-    └── ai/  (LangGraph engine: agents, RAG, debate, reflection, router)
+Frontend (Next.js)
         │
-   ┌────┼────────────┐
-   ▼    ▼             ▼
-Postgres  Redis     Qdrant
-(system   (cache,   (vector
- of        sessions, store for
- record)   rate     RAG)
-           limit,
-           pub/sub)
+        ▼
+   Nginx Gateway (path-based routing + WebSocket upgrade; no custom
+                   gateway service to build/maintain)
+        │
+   ┌────┼────────────────┬─────────────────┐
+   ▼                      ▼                  ▼
+auth-service         core-service        ai-service
+(Backend Lead)       (Backend Lead)      (AI Lead)
+auth, organization,  portfolio,          agents, LangGraph,
+social/connections   research,           RAG, LLM router,
+                      notification,       recommendation,
+                      WebSocket           backtesting,
+                      connections          market, analytics
+   │                      │                  │
+   └──────────┬───────────┴─────────┬────────┘
+              ▼                     ▼
+      One Postgres instance      Redis (cache, rate
+      (schemas: auth/core/ai)    limit, cross-service
+                                  Pub/Sub events)
+                                     │
+                                     ▼
+                              Qdrant (ai-service only)
 
-Prometheus + Grafana (observability, separate containers)
+shared/ — shared Python source (no packaging step), containing:
+config base, DB/Redis factories, JWT verification, exceptions,
+logging, event bus, ORM mixins, enums, Pydantic base schemas + refs
 ```
 
-This is **one deployable backend**, not seven fake microservices. All
-`docker-compose.yaml` service definitions that pointed at non-existent
-`backend/services/*` directories are removed. The compose file now defines
-exactly what is built: `frontend`, `backend`, `postgres`, `redis`, `qdrant`,
-`prometheus`, `grafana` — and starts with a single `docker compose up`.
-
-If, after the core plan is done and fully working, the team has spare time
-and wants the extra 2 "Microservices" points, `domains/research` + the AI
-engine (the most independent, most CPU/IO-heavy part) is the best candidate
-to split into a second container communicating over REST/Redis — but this is
-an explicit **stretch item**, not part of the baseline plan, and must not be
-started before the 14-point baseline is fully working end to end.
+Services never import each other's code. They talk over:
+1. **REST** — synchronous, via `app/clients/*.py` (typed, cached,
+   raise `UpstreamServiceError` on failure).
+2. **Redis Pub/Sub** — asynchronous, via `alphamind_common.events`,
+   for events listed in `alphamind_common.events_registry.EventName`.
 
 ---
 
-## 4. Scored Modules (mapped against the official subject)
+## 4. Scored Modules
 
 ### 4.1 Web (`IV.1`)
 
 | # | Module | Type | Pts | What we build | Owner |
 |---|---|---|---|---|---|
-| W1 | Use a framework for both frontend and backend | Major | 2 | Next.js (frontend) + FastAPI (backend) | Frontend + Backend |
-| W2 | Use an ORM for the database | Minor | 1 | SQLAlchemy 2.0 (async) + Alembic migrations | Backend |
-| W3 | Real-time features via WebSocket | Major | 2 | Live workflow progress, notifications, org presence ("who's online") | Backend + Frontend |
-| W4 | Public API: secured API key + rate limiting + docs + ≥5 endpoints (GET/POST/PUT/DELETE) | Major | 2 | `/api/v1/public/*` namespace, `X-API-Key` header, Redis-backed sliding-window limiter, OpenAPI/Swagger docs | Backend |
-| W5 | Complete notification system for all create/update/delete actions | Minor | 1 | `notifications` domain fires on portfolio/research/org/analysis events | Backend |
-| W6 | File upload and management system | Minor | 1 | Research document upload (PDF/TXT/MD), client+server validation, secure storage, preview, progress bar, delete | Backend + Frontend |
-| W7 | Advanced search (filters, sorting, pagination) | Minor | 1 | Search across research notes/documents/holdings with filters + pagination | Backend + Frontend |
+| W1 | Framework for both frontend and backend | Major | 2 | Next.js + FastAPI (×3 services) | All |
+| W2 | ORM | Minor | 1 | SQLAlchemy 2.0 async, `alphamind_common.database.Base` | Backend |
+| W3 | Real-time features (WebSocket) | Major | 2 | core-service holds connections; ai-service/auth-service push via Redis Pub/Sub → core-service rebroadcasts | Backend + AI |
+| W4 | Public API: API key + rate limiting + docs + ≥5 endpoints | Major | 2 | `/api/v1/public/*`, hosted by core-service, `X-API-Key`, Redis sliding window | Backend |
+| W5 | Notification system | Minor | 1 | core-service `domains/notification`, triggered by local + cross-service events | Backend |
+| W6 | File upload | Minor | 1 | core-service `domains/research`: PDF/TXT/MD upload, validation, storage, preview, progress, delete | Backend |
+| W7 | Advanced search | Minor | 1 | Postgres full-text (notes) + Qdrant semantic (documents, via ai-service) | Backend + AI |
 | **Subtotal** | | | **10** | | |
-
-Not claimed (explicit decision, can be added later as stretch): "Allow users
-to interact with other users" Major (would require a full chat system — see
-4.2 for the lighter connections/presence feature we build instead),
-Real-time collaborative editing, SSR, PWA, custom design system.
 
 ### 4.2 User Management (`IV.3`)
 
 | # | Module | Type | Pts | What we build | Owner |
 |---|---|---|---|---|---|
-| U1 | Standard user management (profile update, avatar w/ default, connections + online status, profile page) | Major | 2 | Profile CRUD, avatar upload, a lightweight **connections** feature (add/remove, see online status via WebSocket presence) — not a full chat system | Backend + Frontend |
-| U2 | OAuth 2.0 | Minor | 1 | Google + GitHub login | Backend |
-| U3 | 2FA | Minor | 1 | TOTP (Google Authenticator / Authy compatible) | Backend |
-| U4 | Advanced permissions system (CRUD users, roles, role-based views) | Major | 2 | `SystemRole` (admin/user) + `OrganizationRole` (owner/admin/member/viewer) RBAC, admin console | Backend + Frontend |
-| U5 | Organization system (CRUD org, add/remove members, scoped actions) | Major | 2 | Organizations own shared portfolios and shared research | Backend + Frontend |
+| U1 | Standard user management (profile, avatar, connections + online status) | Major | 2 | auth-service | Backend |
+| U2 | OAuth 2.0 | Minor | 1 | Google + GitHub, auth-service | Backend |
+| U3 | 2FA | Minor | 1 | TOTP, auth-service | Backend |
+| U4 | Advanced permissions system | Major | 2 | RBAC, auth-service | Backend |
+| U5 | Organization system | Major | 2 | auth-service | Backend |
 | **Subtotal** | | | **8** | | |
-
-Not claimed: Game statistics (no game in this project), 2FA already counted
-above. User activity analytics dashboard (Minor, 1pt) is a good stretch item
-once the baseline works — the `episodic_memories`/audit data already
-supports it.
 
 ### 4.3 Artificial Intelligence (`IV.4`)
 
 | # | Module | Type | Pts | What we build | Owner |
 |---|---|---|---|---|---|
-| A1 | Complete RAG system | Major | 2 | Upload → chunk → embed → Qdrant → retrieve → cite, used by the Filing/News/Research agents | AI |
-| A2 | Complete LLM system interface | Major | 2 | Multi-provider router (OpenAI / Anthropic / Gemini / Mistral), streaming responses, error handling + rate limiting | AI |
-| A3 | Sentiment analysis for user-generated content | Minor | 1 | Sentiment Agent scores news headlines and user research notes | AI |
+| A1 | Complete RAG system | Major | 2 | ai-service: chunk → embed → Qdrant → retrieve → cite | AI |
+| A2 | Complete LLM system interface | Major | 2 | ai-service: multi-provider router (OpenAI/Anthropic/Gemini/Mistral), streaming, rate limiting | AI |
+| A3 | Sentiment analysis | Minor | 1 | ai-service Sentiment Agent | AI |
 | **Subtotal** | | | **5** | | |
 
-Not claimed: "AI Opponent" (requires a game — out of scope here),
-"Recommendation system using machine learning" (see 4.5 below — we do not
-claim this exact module because our recommendation logic is agent/LLM-driven
-reasoning, not a collaborative/content-based filtering model that improves
-from behavioral data; claiming it as such would not survive evaluator
-questioning). Voice/speech and image recognition are not built.
-
-### 4.4 Devops (`IV.7`)
+### 4.4 Devops (`IV.7`) — corrected: Microservices is now real
 
 | # | Module | Type | Pts | What we build | Owner |
 |---|---|---|---|---|---|
-| D1 | Monitoring with Prometheus + Grafana | Major | 2 | Latency, error rate, AI token cost, agent runtime dashboards + alert rules | Backend |
-| D2 | Health check / status page | Minor | 1 | `/health` endpoint aggregating Postgres/Redis/Qdrant liveness, simple status page in the frontend | Backend + Frontend |
-| **Subtotal** | | | **3** | | |
+| D1 | Monitoring (Prometheus + Grafana) | Major | 2 | All 3 services expose `/metrics` (`prometheus-fastapi-instrumentator`); Grafana dashboards per service | Backend |
+| D2 | **Backend as microservices** | Major | 2 | 3 real services, own Dockerfiles, own schemas, REST + Redis Pub/Sub communication, single responsibility each — see PROJECT_STRUCTURE.md v4.0 | Backend + AI |
+| D3 | Health check / status page | Minor | 1 | Each service's `/health`; Nginx exposes `/health/auth`, `/health/core`, `/health/ai` | Backend |
+| **Subtotal** | | | **5** | | |
 
-Explicitly **not claimed**: ELK log management Major (we use Loki for logs,
-which is not Elasticsearch+Logstash+Kibana — if the team wants this module,
-swap Loki for a real ELK stack; otherwise do not claim it). Microservices
-Major (architecture simplified to a monolith — see Section 3; revisit only
-as a stretch item after the baseline is done).
+Still **not claimed**: ELK log management Major — the team runs
+structured JSON logs (`alphamind_common.logging`) but not a real
+Elasticsearch+Logstash+Kibana stack. Claim it only if that stack is
+actually stood up.
 
-### 4.5 Modules of Choice (`IV.10`) — where AlphaMind's real engineering lives
+### 4.5 CI/CD — Modules of Choice (`IV.10`)
 
-> Per the subject, each custom module requires README justification
-> covering: why we chose it, what technical challenge it solves, how it adds
-> value, and why it deserves its point value. Draft justification below —
-> finalize it in `README.md`, not just here.
+CI/CD is not a listed module in categories I–IX, so it's claimed here,
+with the justification the subject requires:
 
 | # | Module | Type | Pts | What we build |
 |---|---|---|---|---|
-| C1 | Multi-Agent Investment Debate & Reflection Engine | Major | 2 | A Supervisor agent orchestrates 8 specialist agents (Market, News, Sentiment, Filing, Technical, Fundamental, Risk, Macro) via LangGraph; a Bull agent and a Bear agent independently build opposing cases; a Judge agent weighs both; a Reflection agent checks source quality, evidence sufficiency, and confidence calibration before a recommendation is released. |
-| C2 | Decision Tracking & Backtesting Evaluation Engine | Minor | 1 | Every recommendation is persisted; outcomes are graded against real market data after N days; a backtest engine computes Sharpe/Sortino ratio, max drawdown, and win rate against a benchmark (SPY/QQQ/DIA/VT). |
-| **Subtotal** | | | **3** | |
+| C1 | Multi-Agent Investment Debate & Reflection Engine | Major | 2 | v4.1: dynamic, task-aware agent selection + every data/analysis agent as an autonomous ReAct loop (Thought→Action→Observation→...→Finish) with its own tools + multi-round Bull/Bear/Judge debate with Judge-decided convergence + Reflection that can send specific agents back for more evidence — see `Agents.md v4.1` |
+| C2 | Decision Tracking & Backtesting Evaluation Engine | Minor | 1 | (unchanged — see below) |
+| C3 | **Per-service CI/CD pipeline** | Minor | 1 | GitHub Actions: on every PR, lint + test + build a Docker image independently for whichever of the 3 services changed (path-filtered triggers); on merge to main, push images to a registry. |
 
-**Draft justification for C1 (Major, 2 pts):**
-- *Why we chose it*: single-LLM-call answers ("should I buy X?") are
-  unverifiable and non-transparent. Structuring the reasoning as parallel
-  specialist analysis → adversarial debate → independent judging →
-  self-critique produces an explainable, auditable decision trail instead of
-  a black-box answer.
-- *Technical challenge*: coordinating 12 agents with partial-failure
-  handling, bounded latency (parallel fan-out where possible), and a shared,
-  strongly-typed state object (LangGraph `state.py`) that every node reads
-  and writes without race conditions.
-- *Value added*: the debate/reflection output is the core UX of the product
-  and the main reason a user would return to it (see `Proposal.md`).
+**Draft justification for C1 (Major, 2 pts) — strengthened in v4.1:**
+- *Why we chose it*: a single LLM call producing a recommendation is
+  unverifiable and non-transparent, and treats every agent as a
+  one-shot prompt rather than something responsible for its own
+  result. Structuring the reasoning as dynamically-selected, autonomous
+  specialist agents (each gathering and validating its own evidence via
+  a ReAct loop, not answering blind on the first pass) → adversarial
+  multi-round debate → Judge-assessed convergence → self-critique
+  produces an explainable, auditable decision trail, and each agent is
+  genuinely responsible for its own evidence quality rather than just
+  executing a single prompt.
+- *Technical challenge*: coordinating up to 9 autonomous agents (8 data/
+  analysis + conditionally Portfolio), each running its own bounded
+  Thought/Action/Observation loop with tool-calling; a LangGraph with
+  real cycles (not a linear pipeline) for multi-round debate and
+  Reflection-triggered agent retries, each dynamically decided by an
+  LLM but bounded by an explicit hard cap as a safety net; a shared,
+  strongly-typed state object every node reads/writes without race
+  conditions; per-agent business-specific retrievers over one shared
+  knowledge base.
+- *Value added*: the debate/reflection output — including exactly which
+  agents participated, which didn't and why, and whether the debate
+  actually converged or just ran out of rounds — is the core UX of the
+  product and the main reason a user would trust, and return to, a
+  recommendation (see `Proposal.md`).
 - *Why Major (2 pts)*: comparable in scope/complexity to the official
-  "Recommendation system using ML" Major, but implemented as a
-  multi-agent reasoning pipeline rather than a trained model.
+  "Recommendation system using ML" Major, implemented as autonomous
+  multi-agent reasoning with tool use rather than a trained model —
+  arguably a harder and more novel engineering problem than fitting a
+  standard recommender model.
 
-**Draft justification for C2 (Minor, 1 pt):**
-- *Why we chose it*: without measuring whether past recommendations were
-  actually good, an "AI recommendation" feature is just an opinion generator.
-- *Technical challenge*: correctly time-windowing "outcome" evaluation
-  (waiting N days, pulling the real price, computing alpha vs benchmark)
-  without look-ahead bias.
-- *Value added*: closes the feedback loop described in `Proposal.md`
-  ("Recommendation → User Action → Market Outcome").
-- *Why Minor (1 pt)*: smaller in scope than C1 — a metrics/reporting layer
-  on top of data already produced by the recommendation engine.
+**Draft justification for C2 (Minor, 1 pt) — unchanged from v3.0:**
+Closes the feedback loop (recommendation → decision → real outcome);
+technical challenge is correct time-windowed evaluation without
+look-ahead bias; smaller in scope than C1.
+
+**Draft justification for C3 (Minor, 1 pt) — new in v4.0:**
+- *Why we chose it*: with 3 independently deployable services, manual
+  testing/building doesn't scale — a change to `ai-service` shouldn't
+  require manually rebuilding and retesting `auth-service`.
+- *Technical challenge*: path-filtered pipeline triggers (only build/test
+  the service(s) that actually changed, plus `libs/alphamind_common`
+  changes triggering all 3, since every service depends on it), and
+  running integration tests that spin up more than one service against
+  a shared Postgres+Redis in CI.
+- *Value added*: catches a broken inter-service contract (e.g.
+  `core-service`'s `auth_client.py` expecting a `UserRef` field
+  `auth-service` no longer returns) before it reaches the demo.
+- *Why Minor, not Major*: the pipeline itself (lint/test/build/push) is
+  standard practice, not a novel technical contribution — it doesn't
+  carry the same weight as C1's actual system design work.
 
 ### 4.6 Data & Analytics (`IV.8`)
 
 | # | Module | Type | Pts | What we build | Owner |
 |---|---|---|---|---|---|
-| N1 | Advanced analytics dashboard with data visualization | Major | 2 | Interactive charts (portfolio performance, recommendation accuracy, agent performance, workflow timeline), real-time updates over WebSocket, CSV/PDF export, date-range filters | AI (data) + Frontend |
+| N1 | Advanced analytics dashboard | Major | 2 | ai-service `domains/analytics`, charts, real-time via WebSocket relay through core-service, CSV export | AI |
 | **Subtotal** | | | **2** | | |
-
-Not claimed as separately scored (kept as engineering quality, not points):
-data export/import (Minor) and GDPR features (Minor) are reasonable stretch
-adds once the baseline is stable, but are not required to hit our target.
 
 ---
 
@@ -204,79 +199,62 @@ adds once the baseline is stable, but are not required to hit our target.
 | Web | 10 |
 | User Management | 8 |
 | Artificial Intelligence | 5 |
-| Devops | 3 |
-| Modules of Choice | 3 |
+| Devops | 5 |
+| Modules of Choice | 4 |
 | Data & Analytics | 2 |
-| **Total** | **31** |
+| **Total** | **34** |
 
-Mandatory minimum: 14 ✅ (cleared with a 17-point safety margin)
-Officially countable bonus is capped at +5 beyond the 14 baseline per the
-subject's Bonus chapter — build everything above for quality, redundancy,
-and product value, but do not assume the grade scales linearly past that cap.
+(Corrected arithmetic note: Devops 2+2+1=5, Modules of Choice 2+1+1=4;
+total = 10+8+5+5+4+2 = **34**.)
 
----
-
-## 6. Modules explicitly excluded (do not present these at evaluation)
-
-| Claimed in v2.3 | Why it's invalid | What to do instead |
-|---|---|---|
-| "Web Framework" (2pt) + "Frontend Framework" (2pt) as two separate majors | The subject has exactly ONE major for "framework for both frontend and backend" (2 pts total) | Counted once as W1 above |
-| "Database" (2pt) | Not a module in the subject — a schema with clear relations is a mandatory baseline requirement, not a scored module | Removed from the point count entirely |
-| "Docker" (1pt) | Containerized single-command deployment is a mandatory general requirement, not a scored module | Removed from the point count entirely |
-| "CI/CD" (1pt) | Not a listed module anywhere in the subject | Either drop it, or move it into `Modules of choice` with full justification if the team wants to claim it |
-| "ELK log management" (2pt) using Loki | The official module requires Elasticsearch + Logstash + Kibana specifically; Loki is not ELK | Either stand up real ELK, or don't claim this module |
-| "Microservices" (2pt) | `docker-compose.yaml` pointed at services that don't exist in the codebase; the actual code is one FastAPI app | Architecture simplified to a monolith (Section 3); revisit only as a stretch item |
-| "Recommendation system using ML" (2pt) | Our engine is multi-agent/LLM reasoning, not a trained collaborative/content-based filtering model that improves from usage data — an evaluator can and will ask to see the model | Reframed as Modules of Choice C1 (Section 4.5), which honestly describes what we built |
+Mandatory minimum: 14 ✅. Officially countable bonus above 14 is capped
+at +5 per the subject's Bonus chapter — build everything above for
+resilience against demo-day validation failures and because the AI
+stack is the actual product, not to inflate the formal score past the
+cap.
 
 ---
 
-## 7. Evaluation Demo Checklist
+## 6. What NOT to claim (carried over from v3.0, still applies)
 
-- [ ] Register, login, OAuth login, 2FA setup and login
-- [ ] Update profile, upload avatar, add a connection, see their online status
-- [ ] RBAC: show admin vs regular user views
-- [ ] Create an organization, invite a member, show scoped portfolio/research
-- [ ] Create a portfolio, add holdings, record a transaction
-- [ ] Upload a research document (PDF), show it get chunked/embedded, ask a
-      question and get a cited answer (RAG)
-- [ ] Run a full analysis: watch the agent workflow execute live over
-      WebSocket, see the Bull/Bear debate, see the Judge verdict, see the
-      Reflection self-check, receive the final BUY/HOLD/SELL recommendation
-- [ ] Show a past decision being graded against real market outcome
-      (Decision Tracking) and a backtest report (Sharpe/Sortino/drawdown vs
-      SPY)
-- [ ] Show the analytics dashboard (recommendation accuracy, agent
-      performance) with live updates and a CSV export
-- [ ] Call the public API with `X-API-Key`, show a 429 once the rate limit
-      is hit, show the Swagger docs
-- [ ] Show Grafana dashboards and the `/health` status page
-- [ ] `docker compose up` from a clean clone, single command, no manual steps
+| Do not claim | Why |
+|---|---|
+| "Database" as a standalone module | Mandatory baseline requirement, not a module |
+| "Docker" as a standalone module | Mandatory baseline requirement, not a module |
+| ELK log management | Only claim if real Elasticsearch+Logstash+Kibana is running, not just structured JSON logs |
+| "Recommendation system using ML" (official module) | Our engine is multi-agent/LLM reasoning, not a trained collaborative/content-based filtering model — claimed instead as Modules of Choice C1, which is honest about what was built |
+| CI/CD as a standalone Devops/Web module | Not in the official list — claimed via Modules of Choice (C3) with justification instead |
 
 ---
 
-## 8. Change Log vs v2.3
+## 7. Evaluation Demo Checklist (updated for 3 services)
 
-1. Removed double-counted Web framework claim (was 4pts, now 2pts, correctly
-   as one Major).
-2. Removed "Database," "Docker," and "CI/CD" as scored modules — none exist
-   in the official module list; they are mandatory baseline requirements.
-3. Removed the ELK claim (Loki ≠ ELK); documented as a stretch item requiring
-   a real ELK stack.
-4. Removed the "Microservices" claim; simplified architecture to a working
-   modular monolith with an honest `docker-compose.yaml`.
-5. Added the AI stack (RAG, LLM interface, sentiment) as properly scored
-   `IV.4 Artificial Intelligence` modules — previously excluded from the
-   point count entirely.
-6. Reframed the debate/reflection engine and decision-tracking/backtesting
-   as justified `Modules of Choice` (Major + Minor) instead of an
-   unscored "AlphaMind Core AI Modules" appendix.
-7. Added a small "connections + online status" feature to satisfy the
-   `User Management` Major's own requirement (independent of, and lighter
-   than, the Web category's full chat system, which we do not build).
-8. Corrected baseline total from an inflated 22–24 down to an honestly
-   mapped **31**, with an explicit note on the official +5 bonus cap.
+- [ ] `docker compose up` from a clean clone starts all 9 containers
+      (frontend, gateway, 3 services, postgres, redis, qdrant,
+      prometheus, grafana) with one command
+- [ ] Register/login/OAuth/2FA against auth-service through the gateway
+- [ ] Create an organization, invite a member (auth-service)
+- [ ] Create a portfolio, add holdings (core-service) — show the
+      owner's username was resolved via a live call to auth-service
+      (open Grafana/logs to show the actual inter-service HTTP call)
+- [ ] Upload a research document (core-service) → show it get
+      chunked/embedded (ai-service reacted to a Redis Pub/Sub event, not
+      a direct call) → ask a question, get a cited answer
+- [ ] Run a full analysis (ai-service) → show the live workflow
+      timeline over WebSocket (core-service relaying ai-service's
+      Redis-published events)
+- [ ] Show a recommendation on the portfolio page (core-service calling
+      ai-service's `/internal/recommendations/latest`)
+- [ ] Show a backtest report and decision-tracking outcome
+- [ ] Show the analytics dashboard
+- [ ] Call the public API with `X-API-Key`, trigger a 429
+- [ ] Show 3 separate Grafana dashboards (one per service) and each
+      service's independent `/health`
+- [ ] Show the GitHub Actions run: a PR touching only `ai-service`
+      building/testing only `ai-service` (plus `alphamind_common`)
+
 
 ---
 
 # END OF MODULE_MAPPING.md
-# Version 3.0
+# Version 4.1

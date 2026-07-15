@@ -1,114 +1,59 @@
-# AlphaMind v3.0
+# AlphaMind v4.0
 # Entity Relationship Design (ERD)
 
-Version: 3.0 (supersedes 2.3 — see "Change Log vs v2.3" at the end)
+Version: 4.0 
 
 ---
 
-## 1. What changed vs v2.3
+## 2. Database Strategy
 
-- **No table was removed.** All product functionality from v2.3 is still
-  here — this update only fixes gaps and mislabeling, it does not cut scope.
-- Two tables were **added** because they were required by modules the team
-  already committed to but the old ERD never actually modeled:
-  - `api_keys` — the Web module "Public API" (secured API key + rate
-    limiting) cannot be demoed without a real API key table.
-  - `connections` — the User Management "Standard user management" Major
-    explicitly requires "users can add other users as friends and see their
-    online status"; a `last_seen_at` column was added to `users` to support
-    the online-status half of that requirement.
-- The 18 "domains" are now grouped to match `MODULE_MAPPING.md v3.0`
-  exactly, and each domain header states which module(s) it exists to
-  support, plus its **owner** (Backend / AI / Frontend-consumed).
-- `service_health` is repurposed for a single backend process + its 3
-  infra dependencies (Postgres/Redis/Qdrant), matching the simplified
-  monolith architecture instead of the old fake microservices list.
-- "Architecture Compatibility" (Section 24) no longer claims
-  "Microservices."
+**One Postgres instance, one schema per service** (`auth`, `core`,
+`ai`), not three separate Postgres instances. This is a deliberate,
+documented tradeoff for a 3-person, 6-week project:
 
----
-
-## 2. Design Goals
-
-The schema supports, end to end:
-
-- Authentication, OAuth, 2FA, RBAC, Organizations
-- Portfolio management (holdings, transactions, watchlists, snapshots)
-- Research workspace + document upload/RAG ingestion
-- Multi-agent AI analysis (LangGraph), debate, reflection
-- Decision tracking and backtesting against real benchmarks
-- Analytics dashboards (portfolio, agent, recommendation, retrieval)
-- Real-time notifications and WebSocket presence
-- Auditability and basic system observability
+- Each service's `shared`-based engine sets its own
+  `search_path` to its own schema on every connection (see
+  `shared/database.py`) — from
+  application code's point of view, it's indistinguishable from having
+  its own database.
+- No service can query another service's schema (enforced by
+  convention + code review, not by Postgres role permissions in the
+  baseline — see the stretch hardening note in
+  `infra/postgres/init-schemas.sql`).
+- Running 3 separate Postgres instances would triple backup/monitoring/
+  connection-pooling work for no functional benefit at this scale — a
+  real justification is needed to pay that cost, and "more standard"
+  isn't one for a 6-week student project. If the project continues past
+  graduation and a service needs genuinely independent scaling of its
+  data tier, splitting a schema into its own instance is a contained
+  migration (`pg_dump --schema=ai` + restore elsewhere), not a rewrite.
 
 ---
 
-## 3. Database Domains (regrouped, mapped to MODULE_MAPPING.md v3.0)
+## 3. Cross-Service Reference Rule
 
-| Domain | Supports (module code) | Owner |
-|---|---|---|
-| AUTH | Mandatory user management + U2 (OAuth) + U3 (2FA) | Backend |
-| SOCIAL (new, small) | U1 (connections + online status) | Backend |
-| ORGANIZATION | U4 (advanced permissions) + U5 (organization system) | Backend |
-| PORTFOLIO | Mandatory + core product | Backend |
-| RESEARCH | Mandatory + W6 (file upload) | Backend |
-| DOCUMENT | W6 (file upload) + A1 (RAG) | Backend / AI |
-| RAG | A1 (RAG major) | AI |
-| AI ANALYSIS | A1/A2 (RAG, LLM interface) + C1 (debate/reflection) | AI |
-| AGENT | C1 (multi-agent engine) | AI |
-| AI MEMORY | Supports C1 (agent long-term context) — engineering quality, not separately scored | AI |
-| PROMPT MANAGEMENT | Supports A2 (LLM interface) — engineering quality, not separately scored | AI |
-| DEBATE | C1 (debate/reflection Major) | AI |
-| DECISION TRACKING | C2 (decision tracking Minor) | AI |
-| BACKTEST | C2 (backtesting Minor) | AI |
-| BENCHMARK | C2 (backtesting Minor) | AI |
-| MODEL ROUTING | Supports A2 (LLM interface: cost/usage per provider) | AI |
-| ANALYTICS | N1 (analytics dashboard Major) | AI (data) |
-| NOTIFICATION | W5 (notification system) + W3 (real-time) | Backend |
-| SYSTEM | D2 (health check) | Backend |
-| AUDIT | Supports U4/U5 accountability — engineering quality, not separately scored | Backend |
-| MARKET | Supports A1/A2/C1 (agents' data source) — engineering quality, not separately scored (see §24.5 addendum) | AI |
+No table in one service's schema may declare a `FOREIGN KEY` into
+another service's schema. Where one service's data conceptually
+references another's (e.g. a `core.portfolios` row has an owner, who is
+a `auth.users` row), the column is a plain `UUID`, and:
+
+- **Reads** that need more than the ID (e.g. displaying the owner's
+  username) go through that service's REST client
+  (`app/clients/auth_client.py`) and a shared
+  `shared.schemas.refs` model — see
+  `services/*/app/clients/*.py`.
+- **Referential integrity** (not letting a user be deleted while they
+  still own portfolios) is enforced at the application layer, not the
+  database layer — auth-service would need to check with core-service
+  (or accept eventual-consistency cleanup via an event) before allowing
+  a hard delete. This is a real, known tradeoff of microservices,
+  not an oversight.
 
 ---
 
-## 4. High-Level Domain Relationship
+## PART 1 — `auth` schema (auth-service, Backend Lead)
 
-```
-User
- ├── Connections (friends + online status)
- ├── Portfolio
- │      ├── Holdings
- │      ├── Transactions
- │      ├── Watchlists
- │      └── Portfolio Metrics / Evaluations
- ├── Research
- │      ├── Documents -> Chunks -> Qdrant (RAG)
- │      ├── Notes / Comments / Tags
- │      └── Analyses
- ├── AI Analysis
- │      ├── Agent Runs -> Agent Results / Steps
- │      ├── Debate Sessions -> Arguments
- │      ├── Reflections
- │      └── Recommendations -> Decision Tracking -> Outcomes
- ├── Backtests -> Positions / Trades / Metrics -> Benchmark Results
- └── Notifications
-
-Organization
- ├── Members (role-scoped)
- ├── Shared Portfolios
- ├── Shared Research
- └── Shared Analyses
-
-API Key (belongs to a User or an Organization)
- └── used by the Public API module (rate-limited, logged)
-```
-
----
-
-## 5. AUTH DOMAIN
-*(Backend — mandatory user management, U2 OAuth, U3 2FA)*
-
-### users
+### auth.users
 ```sql
 id                UUID PK
 email             VARCHAR UNIQUE NOT NULL
@@ -117,37 +62,37 @@ password_hash     TEXT NOT NULL
 system_role       VARCHAR NOT NULL DEFAULT 'user'   -- admin | user (U4 RBAC)
 is_active         BOOLEAN NOT NULL DEFAULT TRUE
 is_verified       BOOLEAN NOT NULL DEFAULT FALSE
-last_seen_at      TIMESTAMPTZ                        -- NEW: online-status (U1)
+last_seen_at      TIMESTAMPTZ                        -- online-status (U1)
 created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### user_profiles
+### auth.user_profiles
 ```sql
 id            UUID PK
-user_id       UUID FK -> users.id UNIQUE
+user_id       UUID FK -> auth.users.id UNIQUE        -- same-service FK, OK
 first_name    VARCHAR
 last_name     VARCHAR
-avatar_url    TEXT                -- default avatar applied at service layer if NULL
+avatar_url    TEXT
 bio           TEXT
 timezone      VARCHAR
 country       VARCHAR
 ```
 
-### user_settings
+### auth.user_settings
 ```sql
 id                          UUID PK
-user_id                     UUID FK -> users.id UNIQUE
+user_id                     UUID FK -> auth.users.id UNIQUE
 preferred_currency          VARCHAR DEFAULT 'USD'
 theme                       VARCHAR DEFAULT 'system'
-default_model               VARCHAR                -- default LLM provider preference
+default_model               VARCHAR
 notification_preferences    JSONB
 ```
 
-### user_sessions
+### auth.user_sessions
 ```sql
 id             UUID PK
-user_id        UUID FK -> users.id
+user_id        UUID FK -> auth.users.id
 refresh_token  TEXT NOT NULL
 expires_at     TIMESTAMPTZ NOT NULL
 ip_address     VARCHAR
@@ -155,131 +100,107 @@ device_info    TEXT
 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### oauth_accounts
+### auth.oauth_accounts
 ```sql
 id                 UUID PK
-user_id            UUID FK -> users.id
+user_id            UUID FK -> auth.users.id
 provider           VARCHAR NOT NULL   -- google | github
 provider_user_id   VARCHAR NOT NULL
 UNIQUE (provider, provider_user_id)
 ```
 
-### two_factor_secrets
+### auth.two_factor_secrets
 ```sql
 id         UUID PK
-user_id    UUID FK -> users.id UNIQUE
+user_id    UUID FK -> auth.users.id UNIQUE
 secret     TEXT NOT NULL
 enabled    BOOLEAN NOT NULL DEFAULT FALSE
 ```
 
-### api_keys  — **NEW, required by Web module W4 (Public API)**
+### auth.connections
 ```sql
 id               UUID PK
-owner_user_id    UUID FK -> users.id NULL
-owner_org_id     UUID FK -> organizations.id NULL
-name             VARCHAR NOT NULL
-key_hash         TEXT NOT NULL UNIQUE      -- store a hash, never the raw key
-scopes           JSONB                     -- e.g. ["portfolio:read", "research:read"]
-rate_limit_per_minute  INTEGER NOT NULL DEFAULT 60
-last_used_at     TIMESTAMPTZ
-revoked_at       TIMESTAMPTZ
-created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-CHECK (owner_user_id IS NOT NULL OR owner_org_id IS NOT NULL)
-```
-
----
-
-## 6. SOCIAL DOMAIN — **NEW, required by User Management Major U1**
-*(Backend — lightweight "friends" feature; not the Web category's full chat)*
-
-### connections
-```sql
-id               UUID PK
-requester_id     UUID FK -> users.id
-addressee_id     UUID FK -> users.id
+requester_id     UUID FK -> auth.users.id
+addressee_id     UUID FK -> auth.users.id
 status           VARCHAR NOT NULL DEFAULT 'pending'  -- pending | accepted | blocked
 created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 responded_at     TIMESTAMPTZ
 UNIQUE (requester_id, addressee_id)
 ```
 
-Online status itself does not need its own table: it is derived from
-`users.last_seen_at` (updated on every authenticated request/WS heartbeat)
-plus the live `websocket_connections` table (Section 16).
-
----
-
-## 7. ORGANIZATION DOMAIN
-*(Backend — U4 advanced permissions, U5 organization system)*
-
-### organizations
+### auth.organizations
 ```sql
 id            UUID PK
 name          VARCHAR NOT NULL
 description   TEXT
-owner_id      UUID FK -> users.id
+owner_id      UUID FK -> auth.users.id
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### organization_members
+### auth.organization_members
 ```sql
 id                 UUID PK
-organization_id    UUID FK -> organizations.id
-user_id            UUID FK -> users.id
+organization_id    UUID FK -> auth.organizations.id
+user_id            UUID FK -> auth.users.id
 role               VARCHAR NOT NULL DEFAULT 'member'  -- owner|admin|member|viewer
 joined_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 UNIQUE (organization_id, user_id)
 ```
 
-### organization_roles
+### auth.organization_roles
 ```sql
 id                 UUID PK
-organization_id    UUID FK -> organizations.id
+organization_id    UUID FK -> auth.organizations.id
 role_name          VARCHAR NOT NULL
-permissions        JSONB NOT NULL   -- e.g. {"portfolio.create": true, "research.delete": false}
+permissions        JSONB NOT NULL
 ```
 
-### organization_invitations
+### auth.organization_invitations
 ```sql
 id                 UUID PK
-organization_id    UUID FK -> organizations.id
+organization_id    UUID FK -> auth.organizations.id
 email              VARCHAR NOT NULL
 role               VARCHAR NOT NULL DEFAULT 'member'
-invited_by         UUID FK -> users.id
+invited_by         UUID FK -> auth.users.id
 expires_at         TIMESTAMPTZ NOT NULL
 accepted_at        TIMESTAMPTZ
 ```
 
+*(All foreign keys above are same-service — `auth-service` is the only
+service that ever writes to this schema, so ordinary FKs are correct
+and safe here.)*
+
 ---
 
-## 8. PORTFOLIO DOMAIN
-*(Backend — core product, mandatory multi-user data)*
+## PART 2 — `core` schema (core-service, Backend Lead)
 
-### portfolios
+### core.portfolios
 ```sql
 id                UUID PK
-owner_id          UUID FK -> users.id
-organization_id   UUID FK -> organizations.id NULL   -- NULL = personal portfolio
+owner_id          UUID NOT NULL          -- plain UUID: references auth.users.id,
+                                          --   resolved via app/clients/auth_client.py
+organization_id   UUID                    -- plain UUID: references auth.organizations.id,
+                                          --   NULL = personal portfolio
 name              VARCHAR NOT NULL
 currency          VARCHAR NOT NULL DEFAULT 'USD'
-visibility        VARCHAR NOT NULL DEFAULT 'private'  -- private|organization
+visibility        VARCHAR NOT NULL DEFAULT 'private'
 created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### holdings
+### core.holdings
 ```sql
 id              UUID PK
-portfolio_id    UUID FK -> portfolios.id
+portfolio_id    UUID FK -> core.portfolios.id   -- same-service FK, OK
 ticker          VARCHAR NOT NULL
 quantity        NUMERIC NOT NULL
 average_cost    NUMERIC NOT NULL
 UNIQUE (portfolio_id, ticker)
 ```
 
-### transactions
+### core.transactions
 ```sql
 id                  UUID PK
-portfolio_id        UUID FK -> portfolios.id
+portfolio_id        UUID FK -> core.portfolios.id
 ticker              VARCHAR NOT NULL
 transaction_type    VARCHAR NOT NULL   -- buy|sell|dividend|deposit|withdrawal
 quantity            NUMERIC
@@ -287,110 +208,182 @@ price               NUMERIC
 transaction_date    TIMESTAMPTZ NOT NULL
 ```
 
-### portfolio_snapshots
+### core.portfolio_snapshots
 ```sql
 id              UUID PK
-portfolio_id    UUID FK -> portfolios.id
+portfolio_id    UUID FK -> core.portfolios.id
 snapshot_date   DATE NOT NULL
 total_value     NUMERIC NOT NULL
 cash_balance    NUMERIC NOT NULL
 UNIQUE (portfolio_id, snapshot_date)
 ```
 
-### watchlists
+### core.watchlists
 ```sql
 id          UUID PK
-owner_id    UUID FK -> users.id
+owner_id    UUID NOT NULL   -- plain UUID: references auth.users.id
 name        VARCHAR NOT NULL
 ```
 
-### watchlist_items
+### core.watchlist_items
 ```sql
 id             UUID PK
-watchlist_id   UUID FK -> watchlists.id
+watchlist_id   UUID FK -> core.watchlists.id
 ticker         VARCHAR NOT NULL
 UNIQUE (watchlist_id, ticker)
 ```
 
----
-
-## 9. RESEARCH DOMAIN
-*(Backend — mandatory + supports W6/W7)*
-
-### research_notes
+### core.research_notes
 ```sql
 id                 UUID PK
-author_id          UUID FK -> users.id
-organization_id    UUID FK -> organizations.id NULL
+author_id          UUID NOT NULL   -- plain UUID: references auth.users.id
+organization_id    UUID            -- plain UUID: references auth.organizations.id
 title              VARCHAR NOT NULL
 content            TEXT
 created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### research_comments
+### core.research_comments
 ```sql
 id           UUID PK
-note_id      UUID FK -> research_notes.id
-author_id    UUID FK -> users.id
+note_id      UUID FK -> core.research_notes.id
+author_id    UUID NOT NULL   -- plain UUID: references auth.users.id
 content      TEXT NOT NULL
 created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### research_tags
+### core.research_tags
 ```sql
 id     UUID PK
 name   VARCHAR UNIQUE NOT NULL
 ```
 
-### note_tags
+### core.note_tags
 ```sql
-note_id   UUID FK -> research_notes.id
-tag_id    UUID FK -> research_tags.id
+note_id   UUID FK -> core.research_notes.id
+tag_id    UUID FK -> core.research_tags.id
 PRIMARY KEY (note_id, tag_id)
 ```
 
----
-
-## 10. DOCUMENT DOMAIN
-*(Backend ingest orchestration + AI processing — W6, A1)*
-
-### documents
+### core.documents
 ```sql
 id                 UUID PK
-owner_id           UUID FK -> users.id
-organization_id    UUID FK -> organizations.id NULL
+owner_id           UUID NOT NULL   -- plain UUID: references auth.users.id
+organization_id    UUID            -- plain UUID: references auth.organizations.id
 filename           VARCHAR NOT NULL
 document_type      VARCHAR NOT NULL      -- pdf|txt|md
 storage_url        TEXT NOT NULL
-status             VARCHAR NOT NULL DEFAULT 'uploaded'  -- uploaded|parsing|chunking|embedding|ready|failed
+status             VARCHAR NOT NULL DEFAULT 'uploaded'
+                     -- uploaded|parsing|chunking|embedding|ready|failed
+                     -- core-service OWNS this field but only ever
+                     -- writes 'uploaded' itself; every later transition
+                     -- is written here in response to ai-service's
+                     -- `document.status_changed` event, never by a
+                     -- direct cross-service write to this table.
 uploaded_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### document_chunks
+### core.notifications
 ```sql
-id                 UUID PK
-document_id        UUID FK -> documents.id
-chunk_index        INTEGER NOT NULL
-token_count        INTEGER NOT NULL
-qdrant_point_id    VARCHAR NOT NULL UNIQUE
+id         UUID PK
+user_id    UUID NOT NULL   -- plain UUID: references auth.users.id
+type       VARCHAR NOT NULL
+title      VARCHAR NOT NULL
+content    TEXT
+read_at    TIMESTAMPTZ
+created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### document_processing_jobs
+### core.websocket_connections
 ```sql
 id               UUID PK
-document_id      UUID FK -> documents.id
-status           VARCHAR NOT NULL
-started_at       TIMESTAMPTZ
-completed_at     TIMESTAMPTZ
-error_message    TEXT
+user_id          UUID NOT NULL   -- plain UUID: references auth.users.id
+connection_id    VARCHAR NOT NULL
+connected_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
+
+### core.api_keys — Public API module (W4)
+```sql
+id                     UUID PK
+owner_user_id          UUID          -- plain UUID: references auth.users.id
+owner_org_id           UUID          -- plain UUID: references auth.organizations.id
+name                   VARCHAR NOT NULL
+key_hash               TEXT NOT NULL UNIQUE
+scopes                 JSONB
+rate_limit_per_minute  INTEGER NOT NULL DEFAULT 60
+last_used_at           TIMESTAMPTZ
+revoked_at             TIMESTAMPTZ
+created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+CHECK (owner_user_id IS NOT NULL OR owner_org_id IS NOT NULL)
+```
+*(Deliberately stored in `core`, not `auth`, even though it represents
+an identity/credential concern — core-service is what actually
+validates it on every public API request, and an extra network hop to
+auth-service on every request would defeat the point of the rate
+limiter being fast. A short-lived cache of the key's validity is enough
+protection against staleness for a 6-week project.)*
+
+### core.audit_logs
+```sql
+id             UUID PK
+actor_id       UUID NOT NULL   -- plain UUID: references auth.users.id
+action         VARCHAR NOT NULL
+entity_type    VARCHAR NOT NULL
+entity_id      UUID
+metadata       JSONB
+created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+```
+
+### core.service_health
+```sql
+id               UUID PK
+component_name   VARCHAR NOT NULL   -- core-service | postgres | redis
+status           VARCHAR NOT NULL   -- healthy | degraded | down
+last_check       TIMESTAMPTZ NOT NULL DEFAULT now()
+```
+*(Each service tracks only its own dependency health — ai-service and
+auth-service have their own equivalent rows in their own schemas, not
+shared here.)*
 
 ---
 
-## 11. RAG DOMAIN
-*(AI — A1)*
+## PART 3 — `ai` schema (ai-service, AI Lead)
 
-### rag_collections
+### ai.instruments
+```sql
+id             UUID PK
+ticker         VARCHAR UNIQUE NOT NULL
+name           VARCHAR
+asset_type     VARCHAR NOT NULL
+currency       VARCHAR NOT NULL DEFAULT 'USD'
+sector         VARCHAR
+exchange       VARCHAR
+```
+
+### ai.price_bars
+```sql
+id               UUID PK
+instrument_id    UUID FK -> ai.instruments.id
+interval         VARCHAR NOT NULL   -- 1d | 1h | 5m
+timestamp        TIMESTAMPTZ NOT NULL
+open             NUMERIC NOT NULL
+high             NUMERIC NOT NULL
+low              NUMERIC NOT NULL
+close            NUMERIC NOT NULL
+volume           NUMERIC NOT NULL
+UNIQUE (instrument_id, interval, timestamp)
+```
+
+### ai.technical_indicator_cache
+```sql
+id               UUID PK
+instrument_id    UUID FK -> ai.instruments.id
+indicator        VARCHAR NOT NULL
+computed_at      TIMESTAMPTZ NOT NULL
+value            JSONB NOT NULL
+```
+
+### ai.rag_collections
 ```sql
 id            UUID PK
 name          VARCHAR NOT NULL
@@ -398,170 +391,154 @@ description   TEXT
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### rag_documents
-```sql
-id              UUID PK
-collection_id   UUID FK -> rag_collections.id
-document_id     UUID FK -> documents.id
-```
-
-### embedding_jobs
+### ai.document_chunks
 ```sql
 id                 UUID PK
-document_id        UUID FK -> documents.id
+document_id        UUID NOT NULL   -- plain UUID: references core.documents.id
+                                    -- (cross-service — see PART 2 note on
+                                    -- core.documents.status for the event
+                                    -- flow this depends on)
+chunk_index        INTEGER NOT NULL
+token_count        INTEGER NOT NULL
+qdrant_point_id    VARCHAR NOT NULL UNIQUE
+```
+
+### ai.embedding_jobs
+```sql
+id                 UUID PK
+document_id        UUID NOT NULL   -- plain UUID: references core.documents.id
 embedding_model    VARCHAR NOT NULL
 status             VARCHAR NOT NULL
 created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### retrieval_logs
+### ai.retrieval_logs
 ```sql
 id                UUID PK
-analysis_id       UUID FK -> analyses.id
+analysis_id       UUID FK -> ai.analyses.id
 query             TEXT NOT NULL
 top_k             INTEGER NOT NULL
 retrieved_count   INTEGER NOT NULL
 created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
----
-
-## 12. AI ANALYSIS DOMAIN
-*(AI — A1, A2, C1)*
-
-### analyses
+### ai.analyses
 ```sql
 id            UUID PK
-user_id       UUID FK -> users.id
+user_id       UUID NOT NULL   -- plain UUID: references auth.users.id
+portfolio_id  UUID            -- plain UUID: references core.portfolios.id, nullable
 ticker        VARCHAR NOT NULL
-status        VARCHAR NOT NULL DEFAULT 'pending'  -- pending|running|completed|failed|cancelled
+status        VARCHAR NOT NULL DEFAULT 'pending'
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### analysis_sources
+### ai.analysis_sources
 ```sql
 id                  UUID PK
-analysis_id         UUID FK -> analyses.id
+analysis_id         UUID FK -> ai.analyses.id
 source_type         VARCHAR NOT NULL
 source_reference    TEXT NOT NULL
 ```
 
-### analysis_citations
+### ai.analysis_citations
 ```sql
 id              UUID PK
-analysis_id     UUID FK -> analyses.id
-document_id     UUID FK -> documents.id
-chunk_id        UUID FK -> document_chunks.id
+analysis_id     UUID FK -> ai.analyses.id
+document_id     UUID NOT NULL   -- plain UUID: references core.documents.id
+chunk_id        UUID FK -> ai.document_chunks.id
 citation_text   TEXT NOT NULL
 ```
 
-### recommendations
+### ai.recommendations
 ```sql
 id               UUID PK
-analysis_id      UUID FK -> analyses.id
+analysis_id      UUID FK -> ai.analyses.id
 recommendation   VARCHAR NOT NULL   -- buy|hold|sell
-confidence       NUMERIC NOT NULL   -- 0..1
+confidence       NUMERIC NOT NULL
 reasoning        TEXT NOT NULL
 created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### reflections
+### ai.reflections
 ```sql
 id            UUID PK
-analysis_id   UUID FK -> analyses.id
+analysis_id   UUID FK -> ai.analyses.id
 verified      BOOLEAN NOT NULL
 issues        JSONB
 ```
 
----
-
-## 13. AGENT DOMAIN
-*(AI — C1)*
-
-### agents
+### ai.agents
 ```sql
 id            UUID PK
-name          VARCHAR NOT NULL     -- Market, News, Sentiment, Filing, Technical,
-                                    -- Fundamental, Risk, Macro, Bull, Bear, Judge,
-                                    -- Reflection, Supervisor
+name          VARCHAR NOT NULL
 description   TEXT
 version       VARCHAR NOT NULL
 active        BOOLEAN NOT NULL DEFAULT TRUE
 ```
 
-### agent_runs
+### ai.agent_runs
 ```sql
 id               UUID PK
-analysis_id      UUID FK -> analyses.id
-agent_id         UUID FK -> agents.id
-status           VARCHAR NOT NULL   -- pending|running|completed|failed|skipped
+analysis_id      UUID FK -> ai.analyses.id
+agent_id         UUID FK -> ai.agents.id
+status           VARCHAR NOT NULL
 started_at       TIMESTAMPTZ
 completed_at     TIMESTAMPTZ
 duration_ms      INTEGER
 ```
 
-### agent_results
+### ai.agent_results
 ```sql
 id             UUID PK
-agent_run_id   UUID FK -> agent_runs.id
+agent_run_id   UUID FK -> ai.agent_runs.id
 score          NUMERIC
 summary        TEXT
 output         JSONB
 ```
 
-### agent_steps
+### ai.agent_steps
 ```sql
 id             UUID PK
-agent_run_id   UUID FK -> agent_runs.id
+agent_run_id   UUID FK -> ai.agent_runs.id
 step_name      VARCHAR NOT NULL
 input_data     JSONB
 output_data    JSONB
 duration_ms    INTEGER
 ```
 
-### agent_dependencies
+### ai.agent_dependencies
 ```sql
-parent_agent_id   UUID FK -> agents.id
-child_agent_id    UUID FK -> agents.id
+parent_agent_id   UUID FK -> ai.agents.id
+child_agent_id    UUID FK -> ai.agents.id
 PRIMARY KEY (parent_agent_id, child_agent_id)
 ```
 
----
-
-## 14. AI MEMORY DOMAIN
-*(AI — supports C1, not separately scored)*
-
-### agent_memories
+### ai.agent_memories
 ```sql
 id            UUID PK
-agent_id      UUID FK -> agents.id
+agent_id      UUID FK -> ai.agents.id
 memory_type   VARCHAR NOT NULL
 content       TEXT NOT NULL
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### memory_references
+### ai.memory_references
 ```sql
 id            UUID PK
-memory_id     UUID FK -> agent_memories.id
-analysis_id   UUID FK -> analyses.id
+memory_id     UUID FK -> ai.agent_memories.id
+analysis_id   UUID FK -> ai.analyses.id
 ```
 
-### episodic_memories
+### ai.episodic_memories
 ```sql
 id            UUID PK
-user_id       UUID FK -> users.id
+user_id       UUID NOT NULL   -- plain UUID: references auth.users.id
 event_type    VARCHAR NOT NULL
 content       TEXT
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
----
-
-## 15. PROMPT MANAGEMENT DOMAIN
-*(AI — supports A2, not separately scored)*
-
-### prompt_templates
+### ai.prompt_templates
 ```sql
 id            UUID PK
 name          VARCHAR NOT NULL
@@ -570,61 +547,51 @@ prompt        TEXT NOT NULL
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### prompt_executions
+### ai.prompt_executions
 ```sql
 id             UUID PK
-prompt_id      UUID FK -> prompt_templates.id
-analysis_id    UUID FK -> analyses.id
+prompt_id      UUID FK -> ai.prompt_templates.id
+analysis_id    UUID FK -> ai.analyses.id
 model_used     VARCHAR NOT NULL
 token_count    INTEGER
 ```
 
-### prompt_versions
+### ai.prompt_versions
 ```sql
 id            UUID PK
-prompt_id     UUID FK -> prompt_templates.id
+prompt_id     UUID FK -> ai.prompt_templates.id
 version       VARCHAR NOT NULL
 content       TEXT NOT NULL
 ```
 
----
-
-## 16. DEBATE DOMAIN
-*(AI — C1)*
-
-### debate_sessions
+### ai.debate_sessions
 ```sql
 id             UUID PK
-analysis_id    UUID FK -> analyses.id
+analysis_id    UUID FK -> ai.analyses.id
 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### debate_arguments
+### ai.debate_arguments
 ```sql
 id                   UUID PK
-debate_session_id    UUID FK -> debate_sessions.id
+debate_session_id    UUID FK -> ai.debate_sessions.id
 side                 VARCHAR NOT NULL   -- bull|bear
 content              TEXT NOT NULL
 ```
 
----
-
-## 17. DECISION TRACKING DOMAIN
-*(AI — C2)*
-
-### investment_decisions
+### ai.investment_decisions
 ```sql
 id                   UUID PK
-user_id              UUID FK -> users.id
-recommendation_id    UUID FK -> recommendations.id
+user_id              UUID NOT NULL   -- plain UUID: references auth.users.id
+recommendation_id    UUID FK -> ai.recommendations.id
 action_taken         VARCHAR NOT NULL   -- followed|ignored|partial
 created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### decision_outcomes
+### ai.decision_outcomes
 ```sql
 id                 UUID PK
-decision_id        UUID FK -> investment_decisions.id
+decision_id        UUID FK -> ai.investment_decisions.id
 evaluation_days    INTEGER NOT NULL
 strategy_return    NUMERIC
 benchmark_return   NUMERIC
@@ -633,23 +600,18 @@ outperformed       BOOLEAN
 evaluated_at       TIMESTAMPTZ
 ```
 
-### decision_reviews
+### ai.decision_reviews
 ```sql
 id                UUID PK
-decision_id       UUID FK -> investment_decisions.id
+decision_id       UUID FK -> ai.investment_decisions.id
 review_text       TEXT
 lessons_learned   TEXT
 ```
 
----
-
-## 18. BACKTEST DOMAIN
-*(AI — C2)*
-
-### backtests
+### ai.backtests
 ```sql
 id                  UUID PK
-user_id             UUID FK -> users.id
+user_id             UUID NOT NULL   -- plain UUID: references auth.users.id
 strategy_name       VARCHAR NOT NULL
 benchmark_symbol    VARCHAR NOT NULL
 start_date          DATE NOT NULL
@@ -661,45 +623,40 @@ benchmark_return    NUMERIC
 created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### backtest_positions
+### ai.backtest_positions
 ```sql
 id             UUID PK
-backtest_id    UUID FK -> backtests.id
+backtest_id    UUID FK -> ai.backtests.id
 ticker         VARCHAR NOT NULL
 quantity       NUMERIC NOT NULL
 entry_price    NUMERIC NOT NULL
 ```
 
-### backtest_trades
+### ai.backtest_trades
 ```sql
 id             UUID PK
-backtest_id    UUID FK -> backtests.id
+backtest_id    UUID FK -> ai.backtests.id
 ticker         VARCHAR NOT NULL
-side           VARCHAR NOT NULL   -- buy|sell
+side           VARCHAR NOT NULL
 quantity       NUMERIC NOT NULL
 price          NUMERIC NOT NULL
 trade_date     TIMESTAMPTZ NOT NULL
 ```
 
-### backtest_metrics
+### ai.backtest_metrics
 ```sql
 id              UUID PK
-backtest_id     UUID FK -> backtests.id
+backtest_id     UUID FK -> ai.backtests.id
 sharpe_ratio    NUMERIC
 sortino_ratio   NUMERIC
 drawdown        NUMERIC
 win_rate        NUMERIC
 ```
 
----
-
-## 19. BENCHMARK DOMAIN
-*(AI — C2)*
-
-### benchmarks
+### ai.benchmarks
 ```sql
 id            UUID PK
-symbol        VARCHAR UNIQUE NOT NULL   -- SPY, QQQ, DIA, VT
+symbol        VARCHAR UNIQUE NOT NULL
 name          VARCHAR NOT NULL
 asset_type    VARCHAR NOT NULL
 currency      VARCHAR NOT NULL
@@ -707,11 +664,11 @@ description   TEXT
 created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### benchmark_results
+### ai.benchmark_results
 ```sql
 id                    UUID PK
-backtest_id           UUID FK -> backtests.id
-benchmark_id          UUID FK -> benchmarks.id
+backtest_id           UUID FK -> ai.backtests.id
+benchmark_id          UUID FK -> ai.benchmarks.id
 strategy_return       NUMERIC
 benchmark_return      NUMERIC
 alpha                 NUMERIC
@@ -722,47 +679,42 @@ outperformed          BOOLEAN
 created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
----
-
-## 20. ANALYTICS DOMAIN
-*(AI/data — N1)*
-
-### portfolio_metrics
+### ai.portfolio_metrics
 ```sql
 id              UUID PK
-portfolio_id    UUID FK -> portfolios.id
+portfolio_id    UUID NOT NULL   -- plain UUID: references core.portfolios.id
 sharpe_ratio    NUMERIC
 sortino_ratio   NUMERIC
 drawdown        NUMERIC
 ```
 
-### recommendation_metrics
+### ai.recommendation_metrics
 ```sql
 id                   UUID PK
-recommendation_id    UUID FK -> recommendations.id
+recommendation_id    UUID FK -> ai.recommendations.id
 accuracy_score       NUMERIC
 ```
 
-### agent_metrics
+### ai.agent_metrics
 ```sql
 id             UUID PK
-agent_id       UUID FK -> agents.id
+agent_id       UUID FK -> ai.agents.id
 avg_score      NUMERIC
 success_rate   NUMERIC
 ```
 
-### retrieval_metrics
+### ai.retrieval_metrics
 ```sql
 id                UUID PK
-analysis_id       UUID FK -> analyses.id
+analysis_id       UUID FK -> ai.analyses.id
 precision_score   NUMERIC
 recall_score      NUMERIC
 ```
 
-### portfolio_evaluations
+### ai.portfolio_evaluations
 ```sql
 id                  UUID PK
-portfolio_id        UUID FK -> portfolios.id
+portfolio_id        UUID NOT NULL   -- plain UUID: references core.portfolios.id
 benchmark_symbol    VARCHAR NOT NULL
 portfolio_return    NUMERIC
 benchmark_return    NUMERIC
@@ -774,12 +726,7 @@ maximum_drawdown    NUMERIC
 created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
----
-
-## 21. MODEL ROUTING DOMAIN
-*(AI — supports A2, not separately scored)*
-
-### model_providers
+### ai.model_providers
 ```sql
 id                    UUID PK
 name                  VARCHAR NOT NULL
@@ -788,191 +735,58 @@ cost_per_1k_tokens    NUMERIC
 active                BOOLEAN NOT NULL DEFAULT TRUE
 ```
 
-### model_usage_logs
+### ai.model_usage_logs
 ```sql
 id             UUID PK
-provider_id    UUID FK -> model_providers.id
-analysis_id    UUID FK -> analyses.id
+provider_id    UUID FK -> ai.model_providers.id
+analysis_id    UUID FK -> ai.analyses.id
 tokens_used    INTEGER NOT NULL
 cost           NUMERIC NOT NULL
 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### cost_tracking
+### ai.cost_tracking
 ```sql
 id             UUID PK
-provider_id    UUID FK -> model_providers.id
+provider_id    UUID FK -> ai.model_providers.id
 daily_cost     NUMERIC NOT NULL DEFAULT 0
 monthly_cost   NUMERIC NOT NULL DEFAULT 0
 ```
 
----
-
-## 22. NOTIFICATION DOMAIN
-*(Backend — W5, W3)*
-
-### notifications
-```sql
-id         UUID PK
-user_id    UUID FK -> users.id
-type       VARCHAR NOT NULL   -- see shared.enums.notification.NotificationType
-title      VARCHAR NOT NULL
-content    TEXT
-read_at    TIMESTAMPTZ
-created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
-### websocket_connections
+### ai.service_health
 ```sql
 id               UUID PK
-user_id          UUID FK -> users.id
-connection_id    VARCHAR NOT NULL
-connected_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
----
-
-## 23. SYSTEM DOMAIN
-*(Backend — D2, simplified for the monolith)*
-
-### system_events
-```sql
-id            UUID PK
-event_type    VARCHAR NOT NULL
-payload       JSONB
-created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
-### feature_flags
-```sql
-id           UUID PK
-flag_name    VARCHAR UNIQUE NOT NULL
-enabled      BOOLEAN NOT NULL DEFAULT FALSE
-```
-
-### service_health — repurposed for the monolith + its infra dependencies
-```sql
-id               UUID PK
-component_name   VARCHAR NOT NULL   -- backend | postgres | redis | qdrant
-status           VARCHAR NOT NULL   -- healthy | degraded | down
+component_name   VARCHAR NOT NULL   -- ai-service | postgres | redis | qdrant
+status           VARCHAR NOT NULL
 last_check       TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
 ---
 
-## 24. AUDIT DOMAIN
-*(Backend — supports U4/U5 accountability, not separately scored)*
+## 4. Database Statistics
 
-### audit_logs
-```sql
-id             UUID PK
-actor_id       UUID FK -> users.id
-action         VARCHAR NOT NULL
-entity_type    VARCHAR NOT NULL
-entity_id      UUID
-metadata       JSONB
-created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
----
-
-## 24.5 MARKET DOMAIN — **ADDENDUM, added in this review**
-*(AI Lead — see ROADMAP.md v3.0 §3. Gap found during the team-ownership
-review: `backend/app/domains/market/` already existed in the codebase
-and is referenced throughout `MODULE_MAPPING.md`/`PROJECT_STRUCTURE.md`,
-but no tables were ever defined for it. Numbered 24.5, not 25, to avoid
-renumbering every section after it.)*
-
-### instruments
-```sql
-id             UUID PK
-ticker         VARCHAR UNIQUE NOT NULL
-name           VARCHAR
-asset_type     VARCHAR NOT NULL   -- see shared.enums.market.AssetType
-currency       VARCHAR NOT NULL DEFAULT 'USD'
-sector         VARCHAR
-exchange       VARCHAR
-```
-
-### price_bars
-```sql
-id               UUID PK
-instrument_id    UUID FK -> instruments.id
-interval         VARCHAR NOT NULL   -- 1d | 1h | 5m
-timestamp        TIMESTAMPTZ NOT NULL
-open             NUMERIC NOT NULL
-high             NUMERIC NOT NULL
-low              NUMERIC NOT NULL
-close            NUMERIC NOT NULL
-volume           NUMERIC NOT NULL
-UNIQUE (instrument_id, interval, timestamp)
-```
-
-### technical_indicator_cache
-```sql
-id               UUID PK
-instrument_id    UUID FK -> instruments.id
-indicator        VARCHAR NOT NULL   -- RSI | MACD | EMA | SMA | BOLLINGER | ATR
-computed_at      TIMESTAMPTZ NOT NULL
-value            JSONB NOT NULL
-```
-
-Note: `price_bars` and `technical_indicator_cache` are read-heavy,
-short-lived data — real-time quotes are additionally cached in Redis
-(`core/redis.py`'s cache DB, 30s TTL) rather than round-tripping to
-Postgres on every request; Postgres holds the durable historical record
-these caches are refreshed from.
-
----
-
-## 25. Database Statistics
-
-
-| Metric | v2.3 | v3.0 |
+| Metric | v3.0 | v4.0 |
 |---|---|---|
-| Tables | 57 | 62 (`api_keys`, `connections` added in v3.0; `instruments`, `price_bars`, `technical_indicator_cache` added in this review's MARKET addendum) |
-| Domains | 18 | 21 (`SOCIAL` added; `BENCHMARK` promoted to its own numbered section; `MARKET` added as §24.5 addendum) |
-| Estimated relationships | 120+ | 120+ |
+| Tables | 62 | 62 (unchanged — regrouped, not resized) |
+| Schemas | 1 (implicit `public`) | 3 (`auth`, `core`, `ai`) |
+| Services | 0 (monolith) | 3 |
+| Cross-schema references converted from FK to plain UUID | 0 | 19 |
 
 ---
 
-## 26. Architecture Compatibility
+## 5. Architecture Compatibility
 
-This schema supports:
-
-- ✅ FastAPI + SQLAlchemy 2.0 (async) + PostgreSQL
-- ✅ Redis (cache / rate limiting / pub-sub)
-- ✅ Qdrant (RAG vector search)
-- ✅ LangGraph multi-agent workflows
-- ✅ RAG pipeline with citation tracking
-- ✅ WebSocket real-time updates + presence
-- ✅ OAuth 2.0 + 2FA (TOTP)
-- ✅ RBAC + Organizations
-- ✅ Public API with API-key rate limiting
-- ✅ Decision tracking + backtesting vs benchmark
-- ✅ Modular monolith deployment (single backend container)
-- ⏸ Microservices — **not currently targeted**; the schema does not block a
-  future split (no cross-domain foreign keys were removed to make this
-  possible), but the baseline plan deploys as one backend service.
-
----
-
-## 27. Change Log vs v2.3
-
-1. Added `api_keys` (required by Web module W4, previously undefined).
-2. Added `connections` + `users.last_seen_at` (required by User Management
-   Major U1, previously undefined).
-3. Regrouped all 20 domains explicitly against `MODULE_MAPPING.md v3.0`
-   module codes, with an owner (Backend/AI) per domain.
-4. Repurposed `service_health` from a multi-microservice registry to a
-   single-backend + 3-infra-dependency health table, matching the
-   simplified monolith architecture.
-5. Removed the "✅ Microservices" claim from Architecture Compatibility;
-   replaced with an explicit "not currently targeted" note.
-6. Promoted the former "16.5 Benchmark Domain" to a first-class numbered
-   section (19) for clarity — no structural change to its tables.
+- ✅ 3 independent FastAPI services + Nginx gateway
+- ✅ One Postgres instance, one schema per service, no cross-schema FKs
+- ✅ Redis (cache / rate limiting / cross-service Pub/Sub)
+- ✅ Qdrant (ai-service only)
+- ✅ REST + Redis Pub/Sub inter-service communication
+- ✅ `shared/` — shared Python source, no packaging step
+- ✅ LangGraph multi-agent workflows, RAG, OAuth 2.0, 2FA, RBAC,
+  Organizations, Public API with key-based rate limiting, Decision
+  tracking + backtesting
 
 ---
 
 # END OF ERD.md
-# Version 3.0
+# Version 4.0

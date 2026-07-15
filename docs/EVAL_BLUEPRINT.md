@@ -1,1335 +1,285 @@
-# AlphaMind v2.3 Enterprise
+# AlphaMind v4.0
+# EVAL_BLUEPRINT.md
 
-# 42_EVALUATION_BLUEPRINT.md
-
-Version: 2.3
+Version: 4.0
 
 ---
 
 # 1. Objective
 
-This document defines the evaluation strategy for AlphaMind.
-
-Purpose:
-
 ```text
 Maximize evaluator perception
-
 Maximize module coverage
-
-Reduce evaluation risks
-
-Achieve 28~31 Points
+Reduce evaluation risk
+Clear the 14-point mandatory minimum with a wide safety margin, toward
+the honestly-scored 34-point baseline in MODULE_MAPPING.md v4.0
+Demonstrate the microservices architecture as a genuine strength, not
+just a checkbox — the demo script below deliberately shows
+inter-service behavior, not just end-user features.
 ```
 
 ---
 
-# 2. Fundamental Principle
-
-Most teams build:
+# 2. Evaluator Mental Model
 
 ```text
-Features
-```
+An evaluator forms an impression in the first 2 minutes. Priorities,
+in order:
 
-AlphaMind builds:
-
-```text
-Evidence
-```
-
-Every feature must answer:
-
-```text
-How will an evaluator verify it?
-```
-
-If it cannot be demonstrated in less than 30 seconds:
-
-```text
-It does not exist.
+1. Does it run? (docker compose up, one command, all 9 containers)
+2. Can the team explain what they built?
+3. Do the claimed modules actually work when demoed?
+4. Is there something genuinely interesting beyond the checklist?
+   (AlphaMind's answer: the debate/reflection engine, and the fact
+   that killing one service doesn't take down the other two.)
 ```
 
 ---
 
 # 3. Target Score Strategy
 
-## Safe Pass
-
-```text
-22 Points
-```
-
----
-
-## Strong Project
-
-```text
-26 Points
-```
-
----
-
-## AlphaMind Goal
-
-```text
-28~31 Points
-```
-
----
-
-# 4. Evaluation Philosophy
-
-Evaluator sees:
-
-```text
-Architecture
-
-Code Quality
-
-Security
-
-Real Features
-
-Deployment
-
-Documentation
-```
-
-Evaluator does NOT see:
-
-```text
-How many hours were spent
-
-How difficult something was
-```
-
-Therefore:
-
-```text
-Visibility > Complexity
-```
-
----
-
-# 5. Evaluator Journey
-
-AlphaMind demo should follow a strict order.
-
-Never randomly click through pages.
-
----
-
-## Demo Flow
-
-```text
-1 Login
-
-↓
-
-2 Security
-
-↓
-
-3 Portfolio
-
-↓
-
-4 Research
-
-↓
-
-5 AI Workflow
-
-↓
-
-6 Multi-Agent Debate
-
-↓
-
-7 Recommendation
-
-↓
-
-8 Benchmark Evaluation
-
-↓
-
-9 Analytics
-
-↓
-
-10 Infrastructure
-```
-
----
-
-Duration:
-
-```text
-15~20 Minutes
-```
-
----
-
-# 6. Demo Script
-
-## Stage 1
-
-Authentication
-
-Show:
-
-```text
-Register
-
-Login
-
-JWT
-
-Role System
-```
-
-Expected Evaluator Reaction:
-
-```text
-Standard Professional Feature
-```
-
----
-
-## Stage 2
-
-OAuth
-
-Show:
-
-```text
-Google Login
-
-GitHub Login
-```
-
----
-
-Then show:
-
-```text
-User Account Created Automatically
-```
-
----
-
-## Stage 3
-
-2FA
-
-Show:
-
-```text
-QR Code
-
-Google Authenticator
-
-Verification
-```
-
----
-
-Evaluator Perception:
-
-```text
-Production Grade Security
-```
-
----
-
-# 7. Portfolio Demonstration
-
-Create Portfolio:
-
-```text
-Alpha Portfolio
-```
-
----
-
-Add:
-
-```text
-NVDA
-
-MSFT
-
-GOOGL
-
-AMZN
-```
-
----
-
-Show:
-
-```text
-Portfolio Value
-
-Allocation
-
-Risk
-```
-
----
-
-Expected Effect:
-
-```text
-Real Product Feeling
-```
-
----
-
-# 8. Research Demonstration
-
-Upload:
-
-```text
-10-K
-
-10-Q
-
-PDF Report
-```
-
----
-
-Demonstrate:
-
-```text
-Document Upload
-
-Chunking
-
-Embedding
-
-Indexing
-```
-
----
-
-Show:
-
-```text
-Document Status
-
-Indexed
-```
-
----
-
-Evaluator Understands:
-
-```text
-File Upload
-
-Search
-
-RAG Pipeline
-```
-
----
-
-# 9. Semantic Search Demonstration
-
-Query:
-
-```text
-What are NVIDIA's biggest risks?
-```
-
----
-
-Show:
-
-```text
-Retrieved Chunks
-
-Citations
-
-Sources
-```
-
----
-
-Expected Effect:
-
-```text
-Advanced Search
-```
-
----
-
-# 10. AI Workflow Demonstration
-
-Run:
-
-```text
-Start AI Workflow
-
-Analyze NVDA
-```
-
----
-
-Workflow Timeline
-
-```text
-Workflow Created
-
-↓
-
-Market Agent
-
-↓
-
-News Agent
-
-↓
-
-Sentiment Agent
-
-↓
-
-Technical Agent
-
-↓
-
-Judge Agent
-
-↓
-
-Reflection Agent
-
-↓
-
-Recommendation
-```
-
----
-
-WebSocket Updates
-
-```text
-Workflow Started
-
-Market Agent Running
-
-News Agent Running
-
-Reflection Completed
-
-Workflow Completed
-```
-
----
-
-Show Progress
-
-```text
-0%
-
-25%
-
-50%
-
-75%
-
-100%
-```
-
----
-
-Evaluator Immediately Sees
-
-```text
-Workflow Engine
-
-Real-Time AI
-
-Parallel Execution
-```
----
-
-Workflow Visualization
-
-Display the live workflow execution graph.
-
-```text
-Supervisor
-
-├── Market Agent ✔
-
-├── News Agent ✔
-
-├── Sentiment Agent ✔
-
-├── Filing Agent ✔
-
-↓
-
-Judge Agent ✔
-
-↓
-
-Reflection Agent ✔
-
-↓
-
-Recommendation ✔
-```
-
-The graph updates in real time through WebSocket events.
-
-Expected Evaluator Reaction
-
-```text
-The execution flow is transparent, observable and easy to understand.
-```
-
----
-
-
-# 11. Multi-Agent Demonstration
-
-Show Agent Outputs.
-
----
-
-Market Agent:
-
-```text
-Bullish
-```
-
----
-
-News Agent:
-
-```text
-Positive Sentiment
-```
-
----
-
-Risk Agent:
-
-```text
-Moderate Risk
-```
-
----
-
-Fundamental Agent:
-
-```text
-Strong Growth
-```
-
----
-
-Expected Effect:
-
-```text
-Advanced AI Architecture
-```
-
----
-
-# 12. Debate Demonstration
-
-Show:
-
-```text
-Bull Agent
-```
-
-Argument:
-
-```text
-AI demand remains strong
-```
-
----
-
-Show:
-
-```text
-Bear Agent
-```
-
-Argument:
-
-```text
-Valuation is excessive
-```
-
----
-
-Then:
-
-```text
-Judge Agent
-```
-
-Result:
-
-```text
-Bull Wins
-```
-
----
-
-This is one of the strongest demo moments.
-
----
-
-# 13. Reflection Demonstration
-
-Show:
-
-```text
-Verification Checks
-```
-
----
-
-Example:
-
-```text
-Source Freshness
-
-Evidence Count
-
-Risk Coverage
-```
-
----
-
-Evaluator Sees:
-
-```text
-Hallucination Prevention
-```
-
----
-
-# 14. Recommendation Demonstration
-
-Final Result:
-
-```text
-BUY
-
-Confidence 82%
-```
-
----
-
-Show:
-
-```text
-Why
-
-Evidence
-
-Sources
-```
-
----
-
-Avoid:
-
-```text
-Black Box AI
-```
-
----
-
-# 15. Decision Tracking Demonstration
-
-Create:
-
-```text
-Investment Decision
-```
-
----
-
-Example:
-
-```text
-AI Recommendation
-
-↓
-
-User Action
-
-↓
-
-Outcome
-```
-
----
-
-Show:
-
-```text
-Decision History
-```
-
----
-
-This feels extremely professional.
-
----
-
-# 16. Backtesting Demonstration
-
-Run:
-
-```text
-2020-2025
-
-NVDA Strategy
-```
-
----
-
-Show
-
-```text
-Strategy Return
-
-Benchmark Return (SPY)
-
-Alpha
-
-Sharpe Ratio
-
-Maximum Drawdown
-
-Win Rate
-```
-
----
-
-Then show
-
-```text
-Strategy
-
-18.4%
-
-SPY
-
-13.2%
-
-Alpha
-
-+5.2%
-```
-
----
-
-Expected Reaction
-
-```text
-This AI can be objectively evaluated.
-```
-
----
-
-Expected Reaction:
-
-```text
-This is a serious system
-```
-
----
-
-# 17. Analytics Demonstration
-
-Dashboard
-
-```text
-Workflow Dashboard
-
-Benchmark Dashboard
-
-AI Accuracy
-
-Agent Accuracy
-
-Portfolio Metrics
-```
----
-
-Charts
-
-```text
-Workflow Timeline
-
-Benchmark Comparison
-
-Portfolio Growth
-
-Risk Trend
-
-Accuracy Trend
-```
-
----
-
-# 18. Infrastructure Demonstration
-
-Open:
-
-```text
-Grafana
-```
-
----
-
-Show:
-
 ```text
-CPU
-
-Memory
-
-API Latency
-
-AI Runtime
-```
-
----
-
-Then:
-
-```text
-Prometheus
-```
-
----
-
-Then:
-
-```text
-Docker Containers
-```
-
----
-
-Expected Reaction:
-
-```text
-Production Engineering
-```
-
----
-
-# 19. Swagger Demonstration
-
-Open:
-
-```text
-/api/docs
-```
-
----
-
-Show
-
-```text
-120+ REST APIs
-
-Workflow APIs
-
-OpenAPI Documentation
-
-Pydantic Schemas
-```
-
----
-
-Run
-
-```text
-Login
-
-Portfolio
-
-Start Workflow
-
-Workflow Timeline
-```
-
-directly from Swagger.
-
----
-
-Evaluator Confidence:
-
-```text
-High
-```
-
----
-
-# 20. Docker Demonstration
-
-Run:
-
-```bash
-docker compose up
-```
-
----
-
-Show:
-
-```text
-Frontend
-
-Gateway
-
-Auth
-
-AI
-
-Postgres
-
-Redis
-
-Qdrant
-```
-
-all starting.
-
----
-
-Huge evaluation value.
-
----
-
-# 21. Security Checklist
-
-Must Demonstrate:
-
-```text
-JWT
-
-Password Hashing
-
-OAuth
-
-2FA
-
-Role Permissions
-```
-
----
-
-Bonus:
-
-```text
-Rate Limiting
-```
-
----
-
-# 22. Architecture Questions
-
-Evaluator May Ask:
-
----
-
-## Why FastAPI?
-
-Answer:
-
-```text
-Async-first
-
-Strong typing
-
-Excellent OpenAPI support
-
-High performance
-```
-
----
-
-## Why PostgreSQL?
-
-Answer:
-
-```text
-Reliability
-
-Transactions
-
-Complex relationships
-```
-
----
-
-## Why Qdrant?
-
-Answer:
-
-```text
-Vector Search
-
-RAG
-
-Semantic Retrieval
-```
-
----
-
-## Why LangGraph?
-
-Answer:
-
-```text
-State Management
-
-Multi-Agent Orchestration
-
-Traceability
-```
----
-
-## Why Workflow API?
-
-Answer:
-
-```text
-Long-running AI analysis
-
-Asynchronous execution
-
-Workflow monitoring
-
-Clear separation from business APIs
-```
-
----
-
-## Why Pydantic?
-
-Answer:
-
-```text
-End-to-end type safety
-
-Consistent validation
-
-Shared models across services
-
-Reliable API contracts
-```
-
----
-
-## Why Multi-Agent?
-
-Answer:
-
-```text
-Specialized reasoning
-
-Reduced hallucination
-
-Explainability
-```
-
----
-
-# 23. High-Value Modules
-
-These produce the strongest evaluator impression.
-
----
-
-Tier S
-
-```text
-OAuth
-
-2FA
-
-WebSocket
-
-Microservices
-
-Docker
-
-Monitoring
-
-Multi-Agent AI
+Official minimum: 14
+Safe pass: 20
+AlphaMind baseline (fully built): 34
+  (bonus above 14 is capped at +5 per the official subject — build
+  past 14 for demo-day resilience and product quality, not because the
+  formal score scales linearly past the cap)
 ```
 
 ---
 
-Tier A
+# 4. Pre-Demo Setup Checklist
 
 ```text
-Search
-
-RAG
-
-Backtesting
-
-Analytics
+[ ] Fresh clone, docker compose up — confirm all 9 containers healthy
+[ ] Seed data: at least one user, one organization, one portfolio with
+    holdings, one uploaded (already-processed) document, one completed
+    analysis with a recommendation, one backtest report
+[ ] Grafana dashboards open in 3 tabs (one per service)
+[ ] A terminal ready to `docker compose stop auth-service` for the
+    resilience demo (Section 15)
+[ ] GitHub Actions tab open, showing 3 green pipelines
 ```
 
 ---
 
-Tier B
+# 5. Demo Script — Identity (auth-service)
 
 ```text
-Watchlists
-
-Notifications
-
-Profile Pages
+1. Register a new user -> show email/password validation
+2. Log in -> show JWT issued (decode it live, point out `sub`, `role`)
+3. Enable 2FA -> scan QR -> verify code -> log out -> log back in with
+   2FA challenge
+4. OAuth login with Google/GitHub
+5. Create an organization -> invite the seed user -> show role-based
+   view differences (owner vs member)
+6. Add a connection -> show the other user's online status update live
 ```
-
----
 
-# 24. Common Reasons Teams Lose Points
+# 6. Demo Script — Portfolio & Research (core-service)
 
----
-
-Problem:
-
 ```text
-Feature Exists
-
-Cannot Be Demonstrated
+1. Create a portfolio, add 3 holdings
+2. Point out: PortfolioRead.owner.username is NOT a local database
+   column — open core-service's logs live and show the actual HTTP
+   call to auth-service's /internal/users/{id} happening, then show it
+   NOT happening on a second identical request (cache hit)
+3. Upload a 10-K PDF -> show status: uploaded -> (wait a few seconds,
+   or show ai-service's logs reacting to the Redis event) -> ready
+4. Ask a question about the document -> get a cited answer
+5. Advanced search: filter/sort/paginate research notes
 ```
 
----
-
-Problem:
+# 7. Demo Script — Multi-Agent AI (ai-service)
 
 ```text
-Poor Documentation
+1. Request a full analysis on a real ticker
+2. Watch the live workflow timeline over WebSocket — explicitly narrate:
+   "ai-service is doing this work; core-service, a completely different
+   process, is what's actually holding this browser connection open —
+   it's relaying what ai-service published to Redis"
+3. Show the 8 data/analysis agents completing (parallel where possible)
+4. Show the Bull case, the Bear case, the Judge's verdict
+5. Show the Reflection agent's self-check
+6. Show the final recommendation: action, confidence, reasoning,
+   citations back to the uploaded document
 ```
-
----
 
-Problem:
+# 8. Demo Script — Decision Tracking & Backtesting (ai-service)
 
 ```text
-No Architecture Explanation
+1. Mark a past recommendation as "followed"
+2. Show its outcome evaluation against real market data
+3. Run a backtest against SPY -> show Sharpe/Sortino/drawdown/win-rate
+4. Show the analytics dashboard: recommendation accuracy over time,
+   agent performance breakdown, CSV export
 ```
 
----
-
-Problem:
+# 9. Demo Script — Public API (core-service, Module W4)
 
 ```text
-No Monitoring
+1. curl the public API without X-API-Key -> 401
+2. curl with a valid key -> 200, show the Swagger docs for these
+   endpoints (auto-generated from Pydantic models)
+3. Hit it >60 times in under a minute -> 429, show the Redis key
+   backing the counter
 ```
-
----
 
-Problem:
+# 10. Demo Script — Real-Time Resilience
 
 ```text
-Broken Docker Setup
+Already covered inline in Sections 6–7 (cache hit/miss, cross-service
+WebSocket relay). This is the connective tissue of the whole demo —
+don't save it for one isolated "and here's our architecture" slide;
+show it live, at the exact moment it's happening, throughout.
 ```
 
----
-
-Problem:
+# 11. Demo Script — Infrastructure
 
 ```text
-Frontend Incomplete
+1. docker compose up from a clean clone — narrate the 9 containers as
+   they come up
+2. Open all 3 Grafana dashboards — show live request metrics as you
+   perform the demo actions above
+3. Open each service's /health
+4. Show 3 separate Swagger UIs (/docs/auth, /docs/core, /docs/ai) —
+   point out they're independently generated from each service's own
+   Pydantic schemas
+5. Show GitHub Actions: point at a merged PR that touched only
+   ai-service and show only ai-service's + the shared-library
+   pipelines ran, not auth-service's/core-service's
 ```
-
----
 
-# 25. Evaluator Questions Preparation
+# 12. Demo Script — Service Independence (the signature moment)
 
-Prepare answers for:
-
 ```text
-Authentication Flow
-
-OAuth Flow
-
-2FA Flow
-
-Database Design
-
-RAG Pipeline
-
-Vector Search
-
-Agent Architecture
-
-WebSocket Events
-
-Docker Networking
-
-Monitoring Stack
-
-Workflow Architecture
-
-REST vs Workflow APIs
-
-Pydantic Models
-
-Benchmark Evaluation
-
-Portfolio Attribution
+1. docker compose stop auth-service
+2. Show that an ALREADY-LOGGED-IN user can still use core-service and
+   ai-service (JWT verification is stateless — no call to auth-service
+   needed for an existing session)
+3. Show that a NEW login attempt correctly fails (auth-service is the
+   identity source of truth — this SHOULD fail)
+4. Show that a request needing a UserRef (e.g. viewing a portfolio)
+   degrades gracefully (cached value, or an explicit placeholder) 
+   instead of 500ing the whole request
+5. docker compose start auth-service -> show everything recovers
+   without restarting the other two services
 ```
-
----
-
-# 26. Evaluation Day Checklist
 
-Before Evaluation:
+This is the single highest-value 90 seconds of the demo — it's the
+concrete, undeniable proof the "microservices" claim (Devops D2, 2 pts)
+is real, not just a diagram.
 
 ---
 
-Verify:
+# 13. High-Value Modules (build/rehearse these first)
 
 ```text
-All Containers Running
-```
-
----
+Tier S:
+    OAuth, 2FA, WebSocket (cross-service relay), Public API,
+    Backend as microservices (D2 — see Section 12),
+    Monitoring (3 services), Multi-Agent AI (RAG + LLM interface +
+    Modules of Choice C1)
 
-Verify:
+Tier A:
+    Advanced Search, Backtesting/Decision Tracking, Analytics Dashboard,
+    CI/CD (C3)
 
-```text
-Database Seeded
+Tier B:
+    Watchlists, Notifications, Profile/Connections (U1)
 ```
 
 ---
 
-Verify:
+# 14. Common Reasons Teams Lose Points
 
 ```text
-Demo Accounts Ready
-```
+Claiming a module not in the official list (e.g. "Database", "Docker",
+  "CI/CD" as standalone modules — CI/CD here is correctly claimed
+  through Modules of Choice with justification, not as a standalone item)
 
----
+Claiming a specific stack for a module while running something else
+  (e.g. claiming ELK while running only structured JSON logs with no
+  real Elasticsearch/Logstash/Kibana — not claimed in this project)
 
-Verify:
+Claiming "microservices" without being able to show independent
+  deployability — mitigated here by Section 12's live demo
 
-```text
-Example PDFs Uploaded
+A service crashing during the demo because a cross-service call wasn't
+  cached/error-handled — mitigated by the mandatory 4-step client
+  pattern in every app/clients/*.py (see COMMON_LIBRARY_README.md)
 ```
 
 ---
 
-Verify:
+# 15. Likely Evaluator Questions & Answers
 
 ```text
-AI Providers Working
-```
-
----
+Q: Why 3 services and not more/fewer?
+A: See system_design.md v4.0 Q20 — maps cleanly onto genuinely
+   different dependency needs (identity vs CRUD vs AI/LLM), and more
+   services wasn't going to score differently under the official rules.
 
-Verify:
+Q: What happens if a service goes down?
+A: Live demo — see Section 12.
 
-```text
-Swagger Accessible
-```
+Q: How do services find each other?
+A: Docker Compose service names as hostnames on the shared network
+   (see BaseServiceSettings.AUTH_SERVICE_URL etc.) — no separate
+   service registry needed at this scale.
 
----
+Q: Why one Postgres instance instead of three?
+A: See ERD.md v4.0 §2 and system_design.md v4.0 Q8 — schema-per-service
+   gives the same application-level isolation without tripling
+   operational overhead for a 6-week project.
 
-Verify:
+Q: How do you keep the shared library from becoming a bottleneck?
+A: It's intentionally small — wire contracts and infra glue only, never
+   business logic — so it changes rarely; every service still owns its
+   real logic independently.
 
-```text
-Grafana Accessible
+Q: Why doesn't the AI engine talk to the database that stores
+   portfolios?
+A: It doesn't need to, and shouldn't — cross-service data needs go
+   through a typed, cached REST call (ai_client.py /
+   core_client.py), never a database join across schemas.
 ```
 
 ---
 
-# 27. Expected Point Outcome
+# 16. Final Point Outcome
 
-Minimum:
-
 ```text
-22+
+Official minimum: 14
+Safe target: 20
+AlphaMind baseline (fully built): 34
 ```
 
 ---
 
-Likely:
+# 17. AlphaMind Evaluation Formula (unchanged principle from v3.0)
 
 ```text
-26+
-```
-
----
+Perceived Quality = Working Demo × Explanation Clarity × Architecture
+Coherence
 
-With Strong Demo:
-
-```text
-28~31
+A working demo with a clear explanation of a coherent architecture
+consistently outperforms a longer feature list with any one of those
+three missing.
 ```
-
----
 
-# 28. AlphaMind Evaluation Formula
-
-Technical Quality
-
-*
-
-Architecture Quality
-
-*
-
-Documentation Quality
-
-*
-
-Demo Quality
-
-*
-
-Evaluator Confidence
-
-=
-
-Final Score
-
-````
-
 ---
-
-# Final Mission
 
-AlphaMind should convince evaluators that:
+# 18. Final Mission
 
-
 ```text
-This is not only a school project.
-
-It is a workflow-driven AI investment platform built with production engineering practices and designed for long-term evolution after graduation.
+Show a real, working, honestly-scoped 3-service platform. Every module
+claimed must be demoed; every architectural claim (especially
+"microservices") must be shown working, not just described.
 ```
-````
 
 ---
-
-# END OF 42_EVALUATION_BLUEPRINT.md
 
-# Version 2.3 Enterprise
+# END OF EVAL_BLUEPRINT.md
+# Version 4.0

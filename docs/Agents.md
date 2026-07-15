@@ -1,1560 +1,351 @@
-# AlphaMind v2.3 Enterprise
-# AGENTS.md
+# AlphaMind v4.1
+# Agents.md — Multi-Agent System Design
 
-Version: 2.3
+Version: 4.1 
 
 ---
 
-# 1. Overview
+# 2. Architecture
 
-AlphaMind is built around a Multi-Agent Architecture.
-
-Instead of asking a single LLM to perform all reasoning, AlphaMind decomposes investment research into specialized AI agents.
-
-Each agent owns one responsibility.
-
-Benefits:
-
-```text
-Higher Accuracy
-
-Better Explainability
-
-Parallel Processing
-
-Lower Hallucination Rate
-
-Independent Evaluation
-
-Future Extensibility
+```
+                         Supervisor
+                    (dynamic agent selection —
+                     see §3)
+                              │
+        ┌──────┬──────┬──────┼──────┬──────┬──────┬───────────┐
+        ▼      ▼      ▼      ▼      ▼      ▼      ▼           ▼
+      Market  News  Sentiment Filing Technical Fundamental Risk  Macro  [Portfolio]*
+     (each an autonomous ReAct loop — see §4)                          *only if 2+ holdings
+        └──────┴──────┴──────┴──────┴──────┴──────┴───────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+                  Bull  ◄───────────►  Bear      (one round)
+                    └─────────┬─────────┘
+                              ▼
+                            Judge  ──── converged? ────┐
+                              │  no (and under round cap)│
+                              └──────────loop───────────┘
+                              │ yes, or cap reached
+                              ▼
+                         Reflection
+                        /           \
+              retry specific        accept
+              agents (bounded)         │
+                    │                  ▼
+                    ▼            Final Recommendation
+              [back to data       (action, confidence,
+               agents, then        reasoning, citations,
+               debate again]       participation + debate
+                                   transparency — see §8)
 ```
 
----
-
-# 2. Agent Architecture
-
-```text
-                         User Request
-
-                               │
-
-                               ▼
-
-                    Supervisor Agent
-
-                               │
-
-        ┌──────────────────────┼──────────────────────┐
-
-        ▼                      ▼                      ▼
-
-    Data Layer           Analysis Layer          Debate Layer
-
-        │                      │                      │
-
-        ▼                      ▼                      ▼
-
- Market Agent         Technical Agent         Bull Agent
-
- News Agent           Fundamental Agent       Bear Agent
-
- Filing Agent         Risk Agent
-
- Sentiment Agent      Macro Agent
-
-        │                      │
-
-        └──────────────┬───────┘
-
-                       ▼
-
-                  Judge Agent
-
-                       ▼
-
-               Reflection Agent
-
-                       ▼
-
-                Recommendation
-
-                       ▼
-
-                     User
-```
-
----
-
-# 3. LangGraph Workflow
+Concrete file locations (see `PROJECT_STRUCTURE.md v4.1`):
 
 ```text
-START
-
-↓
-
-Supervisor Agent
-
-↓
-
-Parallel Data Collection
-
-├── Market Agent
-├── News Agent
-├── Sentiment Agent
-├── Filing Agent
-
-↓
-
-Parallel Analysis
-
-├── Technical Agent
-├── Fundamental Agent
-├── Risk Agent
-├── Macro Agent
-
-↓
-
-Debate Layer
-
-├── Bull Agent
-├── Bear Agent
-
-↓
-
-Judge Agent
-
-↓
-
-Reflection Agent
-
-↓
-
-Recommendation Agent
-
-↓
-
-Backtest Agent
-
-↓
-
-Benchmark Evaluation
-
-↓
-
-Portfolio Evaluation
-
-↓
-
-END
-```
-
-The workflow is executed asynchronously by LangGraph.
-
-Independent agents execute concurrently using asyncio whenever possible.
-
-The frontend monitors workflow progress through Workflow APIs and WebSocket events.
----
-
-# 4. Agent Execution Model
-
-## Async Execution
-
-Agents execute concurrently whenever possible.
-
-Example:
-
-```python
-await asyncio.gather(
-    market_agent(),
-    news_agent(),
-    sentiment_agent(),
-    filing_agent()
-)
+BaseAgent, ReActAgentLoop  -> ai/agents/base.py, ai/agents/loop.py
+Tool interface              -> ai/tools/base.py
+AnalysisState                 -> ai/graph/state.py
+Graph wiring (with cycles)     -> ai/graph/builder.py, nodes.py, edges.py
+Hard caps                       -> ai/graph/edges.py
+  (MAX_DEBATE_ROUNDS, MAX_REFLECTION_RETRIES)
+Final recommendation             -> ai/recommendation/engine.py
+What other services may reference -> shared.schemas.refs
+  (AnalysisRef, RecommendationRef)
 ```
 
 ---
 
-## Agent Lifecycle
+# 3. Dynamic Agent Selection (Supervisor)
+
+`ai/agents/supervisor.py::SupervisorAgent.select_agents` decides which
+agents actually run, using three inputs, in priority order:
+
+1. **Explicit user choice** (`AnalysisCreate.requested_agents`) — when
+   provided, this REPLACES the task-type default entirely. An explicit
+   choice should not be silently expanded by the system.
+2. **Task type** (`AnalysisCreate.analysis_type`,
+   `shared.enums.analysis.AnalysisType`) — otherwise, a default agent
+   subset per type:
+
+   | Task type | Default agents |
+   |---|---|
+   | `FULL` | all 8 data/analysis agents |
+   | `TECHNICAL` | Market, Technical |
+   | `FUNDAMENTAL` | Market, Fundamental, Filing |
+   | `SENTIMENT` | News, Sentiment |
+   | `RISK` | Market, Risk |
+   | `MACRO` | Macro, Market |
+   | `NEWS` | News, Sentiment |
+   | `FILING` | Filing, Fundamental |
+
+3. **Portfolio context** — the **Portfolio Agent** (§4.9) is added
+   automatically whenever the analysis has 2+ holdings in context,
+   independent of task type/user choice, unless the user's explicit
+   selection positively excluded it. A single-ticker analysis (no
+   portfolio, or a portfolio with only 1 holding) never includes it —
+   there's no cross-holding scenario to reason about.
+
+**Every agent NOT selected is recorded, with a reason, not just
+silently skipped.** This is surfaced directly in the final output
+(`AnalysisRead.participation`, `ai/schemas/analysis.py`) — the user
+sees exactly which agents contributed to a given recommendation, which
+didn't, and why. `AnalysisState.confidence_adjustment_note()`
+(`ai/graph/state.py`) turns a non-empty skip list into a plain-English
+note attached to the final recommendation's confidence score — skipped
+agents are never a silent factor in a number the user can't interpret.
+
+---
+
+# 4. The Autonomous Agent Loop (ReAct)
+
+## 4.1 Why ReAct, and why explicit rather than a framework helper
+
+`ai/agents/loop.py::ReActAgentLoop` implements the standard ReAct
+pattern (Yao et al., 2022) by hand — deliberately not hidden behind
+`langgraph.prebuilt`'s ready-made agent helper. AlphaMind's whole pitch
+is explainability; a black-box "agent executor" import would work, but
+every step of *how* an agent decided to stop gathering evidence would
+then live inside a library the team didn't write and can't fully walk
+an evaluator through. The explicit version is a few dozen lines longer
+and completely transparent.
+
+## 4.2 The Loop, Concretely
+
+Every data/analysis agent wraps a `ReActAgentLoop` configured with its
+own **tools**, **system prompt**, and **iteration cap**:
+
+```
+for iteration in range(max_iterations):
+    Thought, Action, ActionInput, FinishAnswer = ask the LLM, given the
+        system prompt + task + everything gathered so far (the
+        "scratchpad": every prior Thought/Action/Observation triple)
+
+    if FinishAnswer is not None:
+        return  # the agent itself judged its evidence sufficient
+
+    Observation = execute the named tool with ActionInput
+    append (Thought, Action, ActionInput, Observation) to the scratchpad
+    # loop again with this new information
+
+# hit max_iterations without a Finish — return a best-effort summary,
+# flagged as `hit_iteration_cap=True`
+```
+
+`AgentLoopResult.is_well_supported` is `False` whenever the cap was hit
+rather than the agent volunteering `Finish` — this feeds directly into
+Reflection's decision about which agents to send back for more
+evidence (§6).
+
+## 4.3 Market Agent
+
+- **Task**: establish price trend and volume pattern.
+- **Tools**: `get_current_price`, `get_recent_price_history` (varying
+  interval/window).
+- **Loop behavior**: keeps pulling price history at different
+  intervals until confident in a trend conclusion (or confident the
+  signal is genuinely mixed) — per your example, "collect and validate
+  market data until evidence is sufficient."
+- **Cap**: 5 iterations.
+
+## 4.4 News Agent
+
+- **Task**: search, deduplicate, and weigh news by source credibility.
+- **Tools**: `search_news`, `assess_source_credibility`.
+- **Loop behavior**: keeps searching/re-assessing until its view of
+  recent sentiment is stable (an additional search unlikely to change
+  the conclusion) — matches "retrieval, dedup, credibility assessment,
+  until a stable conclusion."
+- **Cap**: 5 iterations.
+
+## 4.5 Sentiment Agent
+
+- **Task**: score sentiment (-1 to 1), building on News Agent's output
+  already in `AnalysisState`.
+- **Tools**: `search_news`, `assess_source_credibility` (same tools as
+  News — used to dig deeper when the initial signal is mixed).
+- **Cap**: 3 iterations (lighter — usually converges fast once News has
+  already done the heavy lifting).
+
+## 4.6 Filing Agent
+
+- **Task**: extract risk factors, recent results, guidance from
+  uploaded filings.
+- **Tools**: `search_filings` (RAG-backed — see §7).
+- **Cap**: 5 iterations.
+
+## 4.7 Fundamental Agent
+
+- **Task**: valuation (P/E, P/B, revenue growth, margins).
+- **Tools**: `search_filings`, `get_current_price`.
+- **Loop behavior**: "repeatedly queries filings/financial metrics as
+  needed" — per your example, this agent gets a slightly higher cap
+  than most since valuation typically needs several distinct filing
+  lookups (revenue, margins, growth are rarely all in one passage).
+- **Cap**: 6 iterations.
+
+## 4.8 Technical Agent
+
+- **Task**: RSI, MACD, moving averages, Bollinger Bands, ATR.
+- **Tools**: `get_technical_indicators`, `get_recent_price_history`.
+- **Loop behavior**: checks more than one indicator before concluding —
+  a single indicator alone isn't sufficient evidence.
+- **Cap**: 4 iterations.
+
+## 4.9 Risk Agent
+
+- **Task**: single-ticker volatility/drawdown/sector risk. Distinct
+  from Portfolio Agent (§4.10) — Risk never looks at the user's other
+  holdings.
+- **Tools**: `get_recent_price_history`.
+- **Cap**: 4 iterations.
+
+## 4.10 Macro Agent
+
+- **Task**: macroeconomic context (rates, sector rotation, market
+  regime).
+- **Tools**: `get_macro_indicators`.
+- **Cap**: 2 iterations (macro context changes slowly; rarely needs
+  more than one or two lookups).
+
+## 4.11 Portfolio Agent — NEW
+
+- **Only runs when the analysis has 2+ holdings in context** (§3) —
+  clarified during design review: this is not "risk, but
+  portfolio-flavored"; it specifically evaluates **what happens to the
+  whole portfolio** under a hypothetical action (e.g. buying more of
+  the analyzed ticker), which only makes sense when there's more than
+  one position to reason about concentration/correlation across. A
+  single-ticker analysis has nothing for this agent to do, so it's
+  skipped, not run with degraded input.
+- **Tools**: `get_portfolio_composition`, `recompute_scenario` (try
+  more than one position-size variant before concluding whether the
+  action meaningfully changes the portfolio's risk profile).
+- **Cap**: 4 iterations.
+
+---
+
+# 5. Multi-Round Debate (Bull / Bear / Judge)
+
+Previously a single Bull argument + single Bear argument + one Judge
+call. Now:
+
+1. **Bull** builds a case FOR, citing only facts already in
+   `AnalysisState.agent_outputs` (never inventing evidence).
+2. **Bear** builds a case AGAINST, same constraint. From round 2
+   onward, each side's argument explicitly responds to the other
+   side's argument from the previous round (not just repeating itself).
+3. **Judge** (`ai/agents/judge.py::assess_round`) evaluates the round
+   and returns **`converged: bool`** — "would another round change my
+   mind" — alongside its running verdict and confidence.
+4. If `converged` is `False` and the round count is still under
+   `MAX_DEBATE_ROUNDS` (**3**, `ai/graph/edges.py`), the graph loops
+   back to another Bull/Bear round. Otherwise it proceeds to
+   Reflection.
+
+`AnalysisState.debate.converged` — whether the debate stopped because
+the Judge said so, or because the round cap was hit — is preserved and
+surfaced to the user (`DebateRead.converged`,
+`ai/schemas/analysis.py`), and directly lowers the final confidence
+score when `False` (`ai/recommendation/engine.py`'s
+`_UNCONVERGED_DEBATE_PENALTY`).
+
+---
+
+# 6. Reflection — Now Able to Send Agents Back
+
+`ai/agents/reflection.py::ReflectionAgent.check` still verifies
+confidence calibration (`ai/evaluation/confidence.py`) and citation
+integrity (`ai/evaluation/hallucination.py`), but now ALSO inspects
+each agent's own result: any agent whose `AgentLoopResult` hit its
+iteration cap without volunteering `Finish` (i.e.
+`is_well_supported == False`, surfaced as a low `AgentResult.score`) is
+a candidate to be sent back for another pass.
+
+Reflection expresses this as `retry_agents: list[AgentRole]` on its
+verdict. The graph's `should_retry_after_reflection`
+(`ai/graph/edges.py`) allows the retry only if
+`reflection_retry_count < MAX_REFLECTION_RETRIES` (**2**) — Reflection
+decides *which* agents need another pass (dynamic), the cap decides
+*how many total rounds of this* the whole analysis is allowed to spend
+(hard limit), matching the team's explicit choice for both debate and
+reflection loops. After a retry, the graph re-runs one more debate
+round with the updated evidence before Reflection checks again.
+
+---
+
+# 7. Retrieval — One Knowledge Base, Many Business-Facing Retrievers
+
+`ai/rag/retriever.py` holds **one** `BaseRetriever` over the **one**
+Qdrant collection (`settings.QDRANT_COLLECTION_RESEARCH`) — there is no
+per-agent Qdrant collection. What differs per agent is the **retriever
+subclass**, which tailors the query/filter/top_k for its specific need:
+
+- **`FilingRetriever`** — filters to `document_type: filing`, higher
+  `top_k` (financial facts are often spread across several passages).
+  Used by Filing Agent and Fundamental Agent (via `SearchFilingsTool`,
+  `ai/tools/filing_tool.py`).
+- **`GeneralResearchRetriever`** — no document-type filter, used when
+  an agent wants broader context (e.g. Sentiment reading a user's own
+  research notes, if/when those get indexed too).
+
+Adding a new agent-specific retriever means subclassing
+`BaseRetriever` and overriding its filter/top_k — never creating a new
+Qdrant collection. This keeps ingestion (`ai/rag/{loader,parser,
+chunking,embedding,indexing}.py`) simple: one pipeline, one index,
+indexed once regardless of how many different agents will eventually
+query it differently.
+
+---
+
+# 8. Final Recommendation Output
+
+`ai/recommendation/engine.py::build_final_recommendation` combines the
+Judge's verdict with two explicit confidence adjustments — surfaced as
+text, not folded silently into a number:
 
 ```text
-Queued
-
-↓
-
-Running
-
-↓
-
-Completed
-
-↓
-
-Stored
-
-↓
-
-Evaluated
-```
-
----
-
-# 5. Agent Base Contract
-
-Every agent implements the same asynchronous interface.
-
-```python
-class BaseAgent:
-
-    async def run(
-        self,
-        state: AnalysisState,
-    ) -> AnalysisState:
-        ...
-```
-
----
-
-## Shared State
-
-All agents communicate exclusively through a shared **Pydantic v2** state model.
-
-Example
-
-```python
-class AnalysisState(BaseModel):
-
-    ticker: str
-
-    market: MarketAnalysis | None
-
-    news: NewsAnalysis | None
-
-    sentiment: SentimentAnalysis | None
-
-    technical: TechnicalAnalysis | None
-
-    recommendation: Recommendation | None
-```
-
-No agent should exchange anonymous dictionaries directly.
-
----
-
-Every agent returns a typed Pydantic model.
-
-Example
-
-```python
-class AgentResult(BaseModel):
-
-    score: float
-
-    confidence: float
-
-    summary: str
-
-    sources: list[str]
-```
-
-
-```text
-Concrete locations (see PROJECT_STRUCTURE.md):
-
-    BaseAgent        -> ai/agents/base.py
-    AnalysisState     -> ai/graph/state.py (the LangGraph shared state
-                          object every node reads/writes)
-    AgentResult        -> ai/schemas/outputs.py
-    Final analysis     -> ai/schemas/analysis.py (AnalysisRead) — the
-      entity/status                run/status entity; distinct from AgentResult,
-                                    which is one agent's individual output
-    Recommendation      -> ai/schemas/recommendation.py
-    What other domains  -> ai/schemas/refs.py (AnalysisRef,
-      may reference          RecommendationRef) — domains/notification and
-                              domains/portfolio embed these; they never
-                              import ai/graph/state.py or ai/schemas/outputs.py
-                              directly (see ALIGNMENT_README.md §5 rule 5:
-                              dependencies only point downward).
-```
-
----
-
-# 6. Supervisor Agent
-
-## Purpose
-
-Orchestrates the entire workflow.
-
----
-
-## Responsibilities
-
-### Task Routing
-
-Determines which agents should execute.
-
----
-
-### State Management
-
-Maintains LangGraph state.
-
----
-
-### Failure Handling
-
-Retries failed agents.
-
----
-
-### Dependency Resolution
-
-Ensures correct execution order.
-
----
-
-## Input
-
-```json
-{
-  "ticker":"NVDA"
-}
-```
-
----
-
-## Output
-
-```json
-{
-  "analysis_id":"uuid"
-}
-```
-
-### Workflow Management
-
-Creates and manages LangGraph workflows.
-
----
-
-### Workflow Streaming
-
-Publishes workflow progress through WebSocket events.
-
----
-
-### Parallel Scheduling
-
-Schedules independent agents concurrently using asyncio.
-
----
-
-# 7. Market Agent
-
-## Purpose
-
-Analyze price action and market behavior.
-
----
-
-## Data Sources
-
-```text
-Historical Prices
-
-Volume Data
-
-Technical Indicators
-```
-
----
-
-## Metrics
-
-```text
-RSI
-
-MACD
-
-EMA
-
-SMA
-
-ATR
-
-Volume Trend
-```
-
----
-
-## Output Example
-
-```json
-{
-  "score":82,
-  "trend":"bullish",
-  "summary":"Strong momentum"
-}
-```
-
----
-
-# 8. News Agent
-
-## Purpose
-
-Analyze recent financial news.
-
----
-
-## Sources
-
-```text
-Reuters
-
-Bloomberg
-
-Yahoo Finance
-
-Financial Times
-```
-
----
-
-## Tasks
-
-```text
-Summarization
-
-Sentiment Extraction
-
-Event Detection
-
-Impact Scoring
-```
-
----
-
-## Output
-
-```json
-{
-  "score":74,
-  "summary":"Positive earnings coverage"
-}
-```
-
----
-
-# 9. Sentiment Agent
-
-## Purpose
-
-Measure crowd sentiment.
-
----
-
-## Sources
-
-```text
-Reddit
-
-X
-
-Stocktwits
-```
-
----
-
-## Metrics
-
-```text
-Bullish %
-
-Bearish %
-
-Trend Momentum
-```
-
----
-
-## Output
-
-```json
-{
-  "score":69,
-  "summary":"Retail sentiment improving"
-}
-```
-
----
-
-# 10. Filing Agent
-
-## Purpose
-
-Analyze SEC filings.
-
----
-
-## Sources
-
-```text
-10-K
-
-10-Q
-
-8-K
-
-Earnings Calls
-```
-
----
-
-## Tasks
-
-```text
-Risk Detection
-
-Growth Detection
-
-Management Commentary
-
-Financial Trends
-```
-
----
-
-## Output
-
-```json
-{
-  "score":81,
-  "summary":"Revenue growth remains strong"
-}
-```
-
----
-
-# 11. Technical Agent
-
-## Purpose
-
-Convert market signals into investment signals.
-
----
-
-## Inputs
-
-```text
-Market Agent
-
-Historical Data
-```
-
----
-
-## Responsibilities
-
-```text
-Trend Classification
-
-Momentum Analysis
-
-Support/Resistance
-
-Signal Generation
-```
-
----
-
-## Output
-
-```json
-{
-  "score":78,
-  "signal":"BUY"
-}
-```
-
----
-
-# 12. Fundamental Agent
-
-## Purpose
-
-Evaluate company quality.
-
----
-
-## Inputs
-
-```text
-Financial Statements
-
-Filing Analysis
-```
-
----
-
-## Metrics
-
-```text
-Revenue Growth
-
-EPS Growth
-
-Margins
-
-Debt
-
-Cash Flow
-```
-
----
-
-## Output
-
-```json
-{
-  "score":85,
-  "summary":"Strong fundamentals"
-}
-```
-
----
-
-# 13. Risk Agent
-
-## Purpose
-
-Evaluate downside risk.
-
----
-
-## Metrics
-
-```text
-Volatility
-
-Drawdown
-
-Beta
-
-Sector Risk
-
-Concentration Risk
-```
-
----
-
-## Output
-
-```json
-{
-  "score":35,
-  "risk":"moderate"
-}
-```
-
----
-
-# 14. Macro Agent
-
-## Purpose
-
-Analyze macroeconomic environment.
-
----
-
-## Sources
-
-```text
-Interest Rates
-
-Inflation
-
-GDP
-
-Unemployment
-```
-
----
-
-## Output
-
-```json
-{
-  "score":65,
-  "summary":"Macro environment neutral"
-}
-```
-
----
-
-# 15. Bull Agent
-
-## Purpose
-
-Generate strongest bullish argument.
-
----
-
-## Question
-
-```text
-Why should we invest?
-```
-
----
-
-## Responsibilities
-
-```text
-Growth Drivers
-
-Catalysts
-
-Competitive Advantages
-
-Future Potential
-```
-
----
-
-## Output
-
-```json
-{
-  "argument":"AI demand supports future growth"
-}
-```
-
----
-
-# 16. Bear Agent
-
-## Purpose
-
-Generate strongest bearish argument.
-
----
-
-## Question
-
-```text
-Why should we avoid this investment?
-```
-
----
-
-## Responsibilities
-
-```text
-Valuation Risks
-
-Competition
-
-Execution Risk
-
-Macroeconomic Risks
-```
-
----
-
-## Output
-
-```json
-{
-  "argument":"Valuation significantly above sector average"
-}
-```
-
----
-
-# 17. Judge Agent
-
-## Purpose
-
-Evaluate Bull vs Bear debate.
-
----
-
-## Inputs
-
-```text
-Bull Argument
-
-Bear Argument
-
-Supporting Evidence
-```
-
----
-
-## Responsibilities
-
-```text
-Weight Evidence
-
-Determine Winner
-
-Calculate Confidence
-```
-
----
-
-## Output
-
-```json
-{
-  "winner":"bull",
-  "confidence":82
-}
-```
-
----
-
-# 18. Reflection Agent
-
-## Purpose
-
-Final quality control layer.
-
----
-
-## Questions
-
-### Check 1
-
-Are sources sufficient?
-
----
-
-### Check 2
-
-Are risks acknowledged?
-
----
-
-### Check 3
-
-Do agents disagree?
-
----
-
-### Check 4
-
-Is evidence recent?
-
----
-
-## Output
-
-```json
-{
-  "verified":true,
-  "issues":[]
-}
-```
-
----
-
-# 19. Recommendation Agent
-
-## Purpose
-
-Generate final recommendation.
-
----
-
-## Inputs
-
-```text
-Technical Score
-
-Fundamental Score
-
-News Score
-
-Sentiment Score
-
-Risk Score
-
-Macro Score
-
-Judge Result
-```
-
-## Output
-
-```json
-{
-  "recommendation":"BUY",
-  "confidence":0.91,
-  "investment_horizon":"LONG_TERM",
-  "risk_level":"MEDIUM"
-}
-```
-
----
-
-## Formula
-
-```text
-Recommendation Score
-
-=
-
-0.20 Technical
-
-+
-
-0.25 Fundamental
-
-+
-
-0.15 News
-
-+
-
-0.15 Sentiment
-
-+
-
-0.10 Macro
-
--
-
-0.15 Risk
-```
-
----
-
-## Thresholds
-
-### BUY
-
-```text
-Score > 75
-```
-
----
-
-### HOLD
-
-```text
-50 <= Score <= 75
-```
-
----
-
-### SELL
-
-```text
-Score < 50
-```
-
----
-
-# 20. RAG Retrieval Agent
-
-## Purpose
-
-Retrieve supporting context.
-
----
-
-## Sources
-
-```text
-Research Notes
-
-SEC Filings
-
-Uploaded PDFs
-
-Previous Analyses
-```
-
----
-
-## Retrieval Pipeline
-
-```text
-Query
-
-↓
-
-Embedding
-
-↓
-
-Qdrant Search
-
-↓
-
-Metadata Filtering
-
-↓
-
-Re-ranking
-
-↓
-
-Top-K Results
-```
-
----
-
-## Output
-
-```json
-{
-  "documents":[]
-}
-```
-
----
-
-# 21. Citation Agent
-
-## Purpose
-
-Generate evidence references.
-
----
-
-## Responsibilities
-
-```text
-Document Citations
-
-Page References
-
-Source Validation
-```
-
----
-
-## Output
-
-```json
-{
-  "citations":[]
-}
-```
-
----
-
-# 22. Portfolio Evaluation Agent
-
-## Purpose
-
-Analyze portfolio quality.
-
----
-
-## Metrics
-
-```text
-Diversification
-
-Risk Exposure
-
-Sector Allocation
-
-Drawdown
+action, confidence, reasoning        (as before)
++ confidence_adjustment_note          (from skipped/thin-evidence agents
+                                        — AnalysisState.confidence_adjustment_note())
++ debate_converged: bool               (False = round cap was hit, not
+                                          a Judge-reached stable verdict)
 ```
 
----
-
-## Output
-
-```json
-{
-  "portfolio_score":81
-}
-```
-
-## Additional Metrics
-
-```text
-Benchmark Comparison
-
-Portfolio Attribution
-
-Risk-adjusted Performance
-```
-
----
-
-# 23. Decision Review Agent
-
-## Purpose
-
-Evaluate historical decisions.
-
----
-
-## Inputs
-
-```text
-Decision
-
-Strategy Return
-
-Benchmark Return
-
-Alpha
-
-Investment Thesis
-```
-
----
-
-## Output
-
-```json
-{
-  "correct":true,
-  "alpha":4.8,
-  "outperformed":true,
-  "lesson":"Investment thesis validated"
-}
-```
-
----
-
-# 24. Backtest Agent
-
-## Purpose
-
-Execute historical simulations and evaluate AlphaMind investment recommendations.
-
----
-
-## Responsibilities
-
-```text
-Trade Generation
-
-Portfolio Simulation
-
-Performance Calculation
-
-Benchmark Comparison
-
-Portfolio Attribution
-```
-
----
-
-## Default Benchmark
-
-```text
-SPY (S&P500 ETF)
-```
-
-Optional
-
-```text
-QQQ
-
-DIA
-```
-
----
-
-## Performance Metrics
-
-```text
-Strategy Return
-
-Benchmark Return
-
-Alpha
-
-Beta
-
-Sharpe Ratio
-
-Sortino Ratio
-
-Maximum Drawdown
-
-Win Rate
-```
-
----
-
-## Output
-
-```json
-{
-  "strategy_return":18.4,
-  "benchmark_return":13.2,
-  "alpha":5.2,
-  "beta":1.01,
-  "sharpe_ratio":1.82,
-  "outperformed":true
-}
-```
----
-
-## Output
-
-```json
-{
-  "return":42.8,
-  "sharpe":1.8
-}
-```
-
----
-
-# 25. Memory Agent
-
-## Purpose
-
-Manage long-term AI memory.
-
----
-
-## Storage
-
-```text
-Qdrant
-
-Redis
-```
-
----
-
-## Memory Types
-
-### Episodic
-
-Past decisions.
-
----
-
-### Semantic
-
-Financial knowledge.
-
----
-
-### Analytical
-
-Past recommendations.
-
----
-
-# 26. Agent Evaluation Framework
-
-Every agent is measured.
-
----
-
-## Metrics
-
-### Accuracy
-
-```text
-Correct Outputs
-/
-Total Outputs
-```
-
----
-
-### Latency
-
-```text
-Average Response Time
-```
-
----
-
-### Reliability
-
-```text
-Successful Runs
-/
-Total Runs
-```
-
----
-
-### Contribution
-
-```text
-Impact On Final Recommendation
-```
-
-### Benchmark Performance
-
-```text
-Average Alpha
-
-Average Excess Return
-
-Benchmark Outperformance Rate
-```
-
----
+Both are part of `AnalysisRead` (`ai/schemas/analysis.py`) — a user
+looking at any recommendation can always see which agents ran, which
+didn't and why, and whether the debate actually converged or just ran
+out of rounds.
 
-# 27. Agent Registry
-
-Stored in database.
-
----
-
-Example:
-
-```json
-{
-  "name":"Market Agent",
-  "version":"1.0.0",
-  "active":true
-}
-```
-
----
-
-# 28. Future Agents (v3)
-
-Not required for AlphaMind v2.
-
----
-
-## Strategy Agent
-
-Generate investment strategies.
-
----
-
-## ETF Agent
-
-Analyze ETFs.
-
----
-
-## Crypto Agent
-
-Analyze cryptocurrencies.
-
----
-
-## Earnings Agent
-
-Analyze earnings reports.
-
----
-
-## Autonomous Research Agent
-
-Continuously monitor companies.
-
----
-
-## Alert Agent
-
-Generate proactive alerts.
-
----
-
-# 29. Agent Communication Protocol
-
-Agents never directly communicate.
-
-All communication goes through:
-
-```text
-LangGraph State
-```
-
----
-
-Example
-
-```text
-Market Agent
-
-↓
-
-Update State
-
-↓
-
-Fundamental Agent
-
-↓
-
-Read State
-```
-
----
-
-Benefits
-
-```text
-Loose Coupling
-
-Traceability
-
-Replayability
-
-Testing
-```
-
-Agents never invoke other agents directly.
-
-All execution is orchestrated by LangGraph through a shared workflow state.
-
-Workflow progress is exposed externally through the Workflow API layer while agent communication remains internal to the orchestration engine.
-
 ---
 
-# 30. Final Agent Architecture
+# 9. Hard Caps — Full List
 
-# 30. Final Agent Architecture
+| Cap | Value | File | Rationale |
+|---|---|---|---|
+| Per-agent ReAct loop iterations | 2–6 (varies per agent, §4) | each agent's own `max_iterations` | Bounds cost/latency per agent; higher for agents whose task genuinely needs more lookups (Fundamental) |
+| Debate rounds | 3 | `ai/graph/edges.py::MAX_DEBATE_ROUNDS` | Judge decides convergence dynamically; this is the safety net if it never does |
+| Reflection-triggered retries | 2 | `ai/graph/edges.py::MAX_REFLECTION_RETRIES` | Reflection decides which agents need retrying dynamically; this bounds total retry rounds for the whole analysis |
 
-```text
-                    Workflow API
+All three are deliberately small — a larger number doesn't meaningfully
+improve answer quality once the Judge/Reflection would have converged
+anyway; it mainly adds cost in the pathological case where convergence
+never naturally triggers.
 
-                         │
-
-                         ▼
-
-                 Supervisor Agent
-
-                         │
-
-        ┌────────────────┼────────────────┐
-
-        ▼                ▼                ▼
-
-   Data Agents     Analysis Agents   Debate Agents
-
-        │                │                │
-
-        └────────────────┴────────────────┘
-
-                         ▼
-
-                 Reflection Agent
-
-                         ▼
-
-               Recommendation Agent
-
-                         ▼
-
-                  Backtest Agent
-
-                         ▼
-
-              Benchmark Evaluation
-
-                         ▼
-
-          Portfolio Evaluation Agent
-
-                         ▼
-
-                     REST API
-```
-
----
-
-# Agent Statistics
-
-## Total Agents
-
-```text
-19
-```
-
----
-
-## Parallel Agents
-
-```text
-Market
-
-News
-
-Sentiment
-
-Filing
-
-Technical
-
-Fundamental
-
-Risk
-
-Macro
-```
-
 ---
-
-## Evaluation Agents
-
-```text
-Judge
-
-Reflection
-
-Decision Review
-```
-
----
-
-## Knowledge Agents
 
-```text
-RAG Retrieval
+# 10. Testing
 
-Citation
+See `tests/README.md` and `tests/ai_service/`:
 
-Memory
-```
+- `test_agent_loop.py` — the generic `ReActAgentLoop` mechanics (stops
+  on Finish, respects the cap), independent of any specific agent.
+- `test_supervisor_selection.py` — task-type defaults, explicit user
+  override, Portfolio Agent's conditional inclusion/exclusion.
+- `test_debate_convergence.py` — both hard caps in `ai/graph/edges.py`.
 
 ---
-
-## Future Compatibility
-
-✅ LangGraph
-
-✅ FastAPI
-
-✅ AsyncIO
-
-✅ PostgreSQL
-
-✅ Redis
-
-✅ Qdrant
 
-✅ Multi-Agent
-
-✅ RAG
-
-✅ Reflection
-
-✅ Debate Architecture
-
-✅ Workflow API
-
-✅ Pydantic v2
-
-✅ Benchmark Evaluation
-
-✅ Portfolio Attribution
-
----
 
-# END OF AGENTS.md
-# Version 2.3 Enterprise
+# END OF Agents.md
+# Version 4.1
