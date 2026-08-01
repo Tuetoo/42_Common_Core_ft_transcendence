@@ -1,5 +1,4 @@
 from functools import lru_cache
-from pydantic import field_validator
 from shared.config import BaseServiceSettings
 
 
@@ -22,13 +21,10 @@ class AIServiceSettings(BaseServiceSettings):
     RAG_CHUNK_OVERLAP_TOKEN: int = 64
     RAG_TOP_K_RESULTS: int = 5
 
-    @field_validator("QDRANT_URL", mode="before")
-    @classmethod
-    def assemble_qdrant_url(cls, v: str | None, info) -> str:
-        if v:
-            return v
-        data = info.data
-        return f"http://{data.get('QDRANT_HOST')}:{data.get('QDRANT_PORT')}"
+    def assemble_qdrant_url(self) -> str:
+        if self.QDRANT_URL:
+            return self.QDRANT_URL
+        return f"http://{self.QDRANT_HOST}:{self.QDRANT_PORT}"
 
 
 @lru_cache

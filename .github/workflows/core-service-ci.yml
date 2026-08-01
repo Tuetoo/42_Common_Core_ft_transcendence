@@ -2,7 +2,7 @@ name: core-service CI
 
 on:
   pull_request:
-    path:
+    paths:
       - "service/core-service/**"
       - "shared/**"
       - "pyproject.toml"

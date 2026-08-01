@@ -2,7 +2,7 @@ name: auth-service CI
 
 on:
   pull_request:
-    path:
+    paths:
       - "service/auth-service/**"
       - "shared/**"
       - "pyproject.toml"

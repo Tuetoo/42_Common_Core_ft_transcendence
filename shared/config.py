@@ -14,7 +14,7 @@ class BaseServiceSettings(BaseSettings):
     APP_DEBUG: bool = True
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
-    APP_V1_PREFIX: str = "/api/v1"
+    API_V1_PREFIX: str = "/api/v1"
 
     POSTGRES_HOST: str = "postgres"
     POSTGRES_PORT: int = 5432
@@ -46,6 +46,15 @@ class BaseServiceSettings(BaseSettings):
     AUTH_SERVICE_URL: str = "http://auth-service:8000"
     CORE_SERVICE_URL: str = "http://core-service:8000"
     AI_SERVICE_URL: str = "http://ai-service:8000"
+
+    FRONTEND_BASE_URL: str = "http://localhost:3000"
+
+    SMTP_HOST: str = "mailhog"
+    SMTP_PORT: int = 1025
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@alphamind.local"
+    SMTP_USE_TLS: bool = False
 
     # LANGCHAIN_TRACING_V2: bool = False
     # LANGCHAIN_API_KEY: str = ""

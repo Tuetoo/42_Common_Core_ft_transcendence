@@ -2,7 +2,7 @@ name: ai-service CI
 
 on:
   pull_request:
-    path:
+    paths:
       - "service/ai-service/**"
       - "shared/**"
       - "pyproject.toml"

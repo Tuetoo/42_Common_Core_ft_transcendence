@@ -3,7 +3,7 @@ from enum import StrEnum
 
 class EventName(StrEnum):
     # core -> ai
-    DOCUMENT_UPLOAD = "document.upload"
+    DOCUMENT_UPLOADED = "document.upload"
     # ai -> core
     DOCUMENT_STATUS_CHANGED = "document.status_changed"
     ANALYSIS_STARTED = "analysis.started"
@@ -12,7 +12,7 @@ class EventName(StrEnum):
     RECOMMENDATION_READY = "recommendation.ready"
     DECISION_OUTCOME_EVALUATED = "decision.outcome.evaluated"
     # auth -> core/ai
-    OGANIZATION_MEMBER_JOINED = "organization.member.joined"
+    ORGANIZATION_MEMBER_JOINED = "organization.member.joined"
     USER_PRESENCE_CHANGED = "user.presence.changed"
     # core -> auth
     PORTFOLIO_CREATED = "portfolio.created"
