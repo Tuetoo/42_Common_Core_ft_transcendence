@@ -35,6 +35,10 @@ dependencies = [
     "structlog>=25.4",
     "prometheus-fastapi-instrumentator>=7.0",
     "websockets>=12.0",
+    "aiosmtplib>=3.0",
+    "bm25s>=0.2",
+    "yfinance>=0.2",
+    "asyncpraw>=7.8",
 ]
 
 [dependency-groups]
@@ -48,6 +52,7 @@ dev = [
     "mypy>=1.17",
     "pre-commit>=4.2",
     "types-redis",
+    "flake8>=7.0",
 ]
 
 [tool.ruff]

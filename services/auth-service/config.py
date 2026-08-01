@@ -19,6 +19,9 @@ class AuthServiceSettings(BaseServiceSettings):
 
     PASSWORD_MIN_LENGTH: int = 10
 
+    EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS: int = 24
+    PASSWORD_RESET_TOKEN_EXPIRE_HOURS: int = 1
+
 
 @lru_cache
 def get_settings() -> AuthServiceSettings:

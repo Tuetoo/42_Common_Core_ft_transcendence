@@ -42,7 +42,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"],
 register_middleware(app)
 register_exception_handlers(app)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
-app.include_router(api_router, prefix=settings.APP_V1_PREFIX)
+app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/health")

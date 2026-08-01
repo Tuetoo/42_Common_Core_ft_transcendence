@@ -100,6 +100,12 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
   
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "8025:8025"
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     volumes:

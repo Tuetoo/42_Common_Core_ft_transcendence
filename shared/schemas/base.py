@@ -16,7 +16,7 @@ class IDMixin(BaseModel):
     id: UUID
 
 
-class TimestampMaxin(BaseModel):
+class TimestampMixin(BaseModel):
     created_at: datetime
     updated_at: datetime
 

@@ -1,4 +1,4 @@
-.PHONY: up down logs test test-auth test-core test-ai test-integration lint
+.PHONY: up down logs test test-auth test-core test-ai test-integration lint clean
 
 up:
 	docker compose up --build
@@ -33,3 +33,11 @@ test-integration:
 lint:
 	uv run ruff check shared services
 	uv run mypy shared services
+
+clean:
+	find . \( \
+	    -name "__pycache__" -o \
+	    -name ".pytest_cache" -o \
+	    -name ".cache" \
+	\) -type d -exec rm -rf {} +
+	find . -name "*.py[co]" -delete
