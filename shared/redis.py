@@ -1,18 +1,20 @@
-# import json
-# from collections.abc import AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
 import redis.asyncio as redis
 from shared.config import BaseServiceSettings
 
-_pools: dict[int, redis.Redis] = {}
+_pools: dict[tuple[str, int], redis.Redis] = {}
 
 
 def _get_client(settings: BaseServiceSettings, db_index: int) -> redis.Redis:
-    key = (settings.assemble_redis_url(), db_index)
+    base_url = settings.assemble_redis_url()
+    parsed = urlsplit(base_url)
+    url_without_db = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    key = (url_without_db, db_index)
     if key not in _pools:
         _pools[key] = redis.from_url(
-            settings.assemble_redis_url(), db=db_index, decode_responses=True,
-            max_connections=20)
-        return _pools[key]
+            url_without_db, db=db_index, decode_responses=True,
+            max_connections=20, socket_timeout=15, socket_connect_timeout=15)
+    return _pools[key]
 
 
 def get_cache_client(settings: BaseServiceSettings) -> redis.Redis:
@@ -29,22 +31,6 @@ def get_events_client(settings: BaseServiceSettings) -> redis.Redis:
 
 def get_queue_client(settings: BaseServiceSettings) -> redis.Redis:
     return _get_client(settings, settings.REDIS_DB_QUEUE)
-
-
-# async def get_redis() -> AsyncGenerator[redis.Redis, None]:
-#     yield get_cache_client()
-
-
-# async def cache_get_json(key: str) -> dict | None:
-#     client = get_cache_client()
-#     value = await client.get(key)
-#     return json.loads(value) if value else None
-
-
-# async def cache_set_json(key: str, value: str, ttl_seconds: int = 3000
-#                          ) -> None:
-#     client = get_cache_client()
-#     await client.set(key, json.dumps(value), ex=ttl_seconds)
 
 
 async def check_redis_connection(settings: BaseServiceSettings) -> bool:

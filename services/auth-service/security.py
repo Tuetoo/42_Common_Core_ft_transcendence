@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 import pyotp
 from typing import Any
 from jose import jwt, JWTError
@@ -10,6 +10,7 @@ _pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 EMAIL_VERIFICATION_TOKEN_TYPE = "email_verification"
 PASSWORD_RESET_TOKEN_TYPE = "password_reset"
+ORGANIZATION_INVITATION_TOKEN_TYPE = "organization_invitation"
 
 
 class SpecialTokenError(Exception):
@@ -17,16 +18,18 @@ class SpecialTokenError(Exception):
 
 
 def hash_password(plain_password: str) -> str:
-    return _pwd_context.hash(plain_password)
+    hashed: str = _pwd_context.hash(plain_password)
+    return hashed
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return _pwd_context.verify(plain_password, hashed_password)
+    is_valid: bool = _pwd_context.verify(plain_password, hashed_password)
+    return is_valid
 
 
 def _create_token(subject: str, expires_delta: timedelta, token_type: str,
                   extra_claims: dict[str, Any] | None = None) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": subject,
         "type": token_type,
@@ -36,8 +39,9 @@ def _create_token(subject: str, expires_delta: timedelta, token_type: str,
     }
     if extra_claims:
         payload.update(extra_claims)
-    return jwt.encode(payload, settings.JWT_SECRET,
-                      algorithm=settings.JWT_ALGORITHM)
+    token: str = jwt.encode(payload, settings.JWT_SECRET,
+                            algorithm=settings.JWT_ALGORITHM)
+    return token
 
 
 def create_access_token(subject: str,
@@ -66,6 +70,12 @@ def create_password_reset_token(user_id: str) -> str:
         expires_delta=timedelta(
             hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS),
         token_type=PASSWORD_RESET_TOKEN_TYPE)
+
+
+def create_organization_invitation_token(invitation_id: str, expire_days: int
+                                         ) -> str:
+    return _create_token(subject=invitation_id, expires_delta=timedelta(
+        days=expire_days), token_type=ORGANIZATION_INVITATION_TOKEN_TYPE)
 
 
 def decode_special_token(token: str, expected_type: str) -> dict[str, Any]:

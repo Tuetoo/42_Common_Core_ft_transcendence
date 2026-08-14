@@ -1,10 +1,14 @@
+from typing import Any
+from uuid import UUID
 import httpx
 from shared.exceptions import UpstreamServiceError
+from shared.http_client import get_http_client
 from shared.redis import get_cache_client
 from shared.schemas.refs import OrganizationRef, UserRef
 from config import settings
 
 _CACHE_TTL_SECONDS = 60
+_TIMEOUT = 3.0
 
 
 async def get_user_ref(user_id: str) -> UserRef:
@@ -15,9 +19,8 @@ async def get_user_ref(user_id: str) -> UserRef:
         return UserRef.model_validate_json(cached)
     url = f"{settings.AUTH_SERVICE_URL}/internal/users/{user_id}"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+        response = await get_http_client(_TIMEOUT).get(url)
+        response.raise_for_status()
     except httpx.HTTPError as exc:
         raise UpstreamServiceError("auth-service unreachable while resolving "
                                    f"user {user_id}") from exc
@@ -35,9 +38,8 @@ async def get_organization_ref(org_id: str) -> OrganizationRef:
         return OrganizationRef.model_validate_json(cached)
     url = f"{settings.AUTH_SERVICE_URL}/internal/organizations/{org_id}"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+        response = await get_http_client(_TIMEOUT).get(url)
+        response.raise_for_status()
     except httpx.HTTPError as exc:
         raise UpstreamServiceError("auth-service unreachable while resolving "
                                    f"org {org_id}") from exc
@@ -45,3 +47,40 @@ async def get_organization_ref(org_id: str) -> OrganizationRef:
     await cache.set(cache_key, org_ref.model_dump_json(),
                     ex=_CACHE_TTL_SECONDS)
     return org_ref
+
+
+async def are_users_connected(user_a: str, user_b: str) -> bool:
+    url = f"{settings.AUTH_SERVICE_URL}/internal/connections/check"
+    try:
+        response = await get_http_client(_TIMEOUT).get(
+            url, params={"user_a": user_a, "user_b": user_b})
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return False
+    return bool(response.json().get("connected"))
+
+
+async def list_user_organization_ids(user_id: str) -> list[UUID]:
+    url = f"{settings.AUTH_SERVICE_URL}/internal/users/{user_id}/organizations"
+    try:
+        response = await get_http_client(_TIMEOUT).get(url)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise UpstreamServiceError("auth-service unreachable while resolving "
+                                   "organizations for user "
+                                   f"{user_id}") from exc
+    return [UUID(org["id"]) for org in response.json()]
+
+
+async def get_notification_settings(user_id: str) -> dict[str, Any]:
+    url = (f"{settings.AUTH_SERVICE_URL}/internal/users/{user_id}"
+           "/notification-settings")
+    try:
+        response = await get_http_client(_TIMEOUT).get(url)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise UpstreamServiceError("auth-service unreachable while resolving "
+                                   "notification settings for user "
+                                   f"{user_id}") from exc
+    result: dict[str, Any] = response.json()
+    return result

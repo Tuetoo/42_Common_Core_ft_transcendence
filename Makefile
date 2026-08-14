@@ -1,38 +1,38 @@
 .PHONY: up down logs test test-auth test-core test-ai test-integration lint clean
 
 up:
-	docker compose up --build
+	docker compose --env-file .env.docker up --build
 
 down:
-	docker compose down
+	docker compose --env-file .env.docker down
 
 logs:
-	docker compose logs -f
-
-# --- Tests ------------------------------------------------------------
-# See tests/README.md for why these are 4 separate invocations, not one.
+	docker compose --env-file .env.docker logs -f
 
 test: test-auth test-core test-ai
 	@echo "Unit tests passed for all 3 services."
 	@echo "Run 'make test-integration' separately with docker compose up already running."
 
 test-auth:
-	uv run pytest tests/auth_service -v
+	uv run pytest tests/auth-service -v
 
 test-core:
-	uv run pytest tests/core_service -v
+	uv run pytest tests/core-service -v
 
 test-ai:
-	uv run pytest tests/ai_service -v
+	uv run pytest tests/ai-service -v
 
 test-integration:
-	uv run pytest tests/integration -v -m integration
+	QDRANT_URL=http://localhost:6333 uv run --env-file .env.docker pytest tests/integration -v -m integration
 
 # --- Lint ---------------------------------------------------------------
 
 lint:
 	uv run ruff check shared services
-	uv run mypy shared services
+	MYPYPATH=$(CURDIR) uv run mypy --explicit-package-bases shared
+	MYPYPATH=$(CURDIR) uv run mypy --explicit-package-bases services/auth-service
+	cd services/core-service && MYPYPATH=$(CURDIR) uv run mypy --explicit-package-bases .
+	cd services/ai-service && MYPYPATH=$(CURDIR) uv run mypy --explicit-package-bases .
 
 clean:
 	find . \( \

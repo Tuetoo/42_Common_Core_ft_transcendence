@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Any
 from fastapi import WebSocket
 from shared.schemas.websocket import WebSocketEnvelope
 
@@ -14,7 +15,7 @@ class WebSocketManager:
     def disconnect(self, websocket: WebSocket, channel: str) -> None:
         self._connections[channel].discard(websocket)
 
-    async def broadcast(self, channel: str, envelope: WebSocketEnvelope
+    async def broadcast(self, channel: str, envelope: WebSocketEnvelope[Any]
                         ) -> None:
         dead: list[WebSocket] = []
         for connection in self._connections.get(channel, set()):

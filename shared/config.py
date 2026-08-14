@@ -28,7 +28,7 @@ class BaseServiceSettings(BaseSettings):
     # used by Alembic (sync driver)
     SYNC_DATABASE_URL: str | None = None
 
-    DB_POOL_SIZE: int = 10
+    DB_POOL_SIZE: int = 20
     DB_MAX_OVERFLOW: int = 10
     DB_ECHO: bool = False
 
@@ -60,10 +60,21 @@ class BaseServiceSettings(BaseSettings):
     # LANGCHAIN_API_KEY: str = ""
     # LANGCHAIN_PROJECT: str = "alphamind"
 
-    # BACKEND_CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+    BACKEND_CORS_ORIGINS: str = "http://localhost:3000"
+
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in
+                self.BACKEND_CORS_ORIGINS.split(",") if origin.strip()]
 
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
+
+    S3_ENDPOINT_URL: str = "http://minio:9000"
+    S3_ACCESS_KEY: str = "minioadmin"
+    S3_SECRET_KEY: str = "minioadmin"
+    S3_REGION: str = "us-east-1"
+    S3_USE_SSL: bool = False
+    S3_BUCKET_DOCUMENTS: str = "research-documents"
 
     def assemble_database_url(self) -> str:
         if self.DATABASE_URL:

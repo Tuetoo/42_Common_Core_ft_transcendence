@@ -105,3 +105,10 @@ async def send_organization_invitation_email(*, settings: BaseServiceSettings,
         to=to,
         subject=f"You're invited to join {organization_name} on AlphaMind",
         html_body=html)
+
+
+async def send_notification_email(*, settings: BaseServiceSettings, to: str,
+                                  title: str, content: str | None) -> None:
+    html = f"<p>{title}</p>" + (f"<p>{content}</p>" if content else "")
+    sender = get_email_sender(settings)
+    await sender.send(to=to, subject=f"AlphaMind: {title}", html_body=html)
