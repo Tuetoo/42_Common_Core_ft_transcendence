@@ -1,329 +1,356 @@
-# AlphaMind v4.0
-# API_SPEC.md
+# AlphaMind — API Specification
 
-Version: 4.0 
+## 1. Base paths and gateway routing
 
----
+All three services sit behind an nginx gateway (`infra/gateway/nginx.conf`),
+exposed on `http://localhost:8000`. The gateway forwards the raw
+`Authorization` header as-is — it does no JWT validation itself; each service
+independently decodes and verifies its own tokens (`shared/security.py`).
 
-# 1. Overview
-
-All external traffic goes through the Nginx gateway at
-`http://localhost:8000` (dev) — the frontend never talks to a service's
-own port directly. Internally, each service also has its own Swagger
-UI, reachable in development via the gateway at `/docs/auth`,
-`/docs/core`, `/docs/ai`.
-
-## Base Paths (through the gateway)
-
-```text
-/api/v1/auth/*            -> auth-service
-/api/v1/organizations/*   -> auth-service
-/api/v1/connections/*     -> auth-service
-/api/v1/portfolios/*      -> core-service
-/api/v1/research/*        -> core-service
-/api/v1/notifications/*   -> core-service
-/api/v1/public/*          -> core-service (Public API module, W4)
-/ws/*                     -> core-service (WebSocket)
-/api/v1/analyses/*        -> ai-service
-/api/v1/market/*          -> ai-service
-/api/v1/analytics/*       -> ai-service
+```
+/api/v1/auth/*           -> auth-service
+/api/v1/organizations/*  -> auth-service
+/api/v1/connections/*    -> auth-service
+/api/v1/portfolios/*     -> core-service
+/api/v1/watchlists/*     -> core-service
+/api/v1/research/*       -> core-service
+/api/v1/notifications/*  -> core-service
+/api/v1/api-keys/*       -> core-service
+/api/v1/public/*         -> core-service (API-key-authenticated, see §5)
+/api/v1/analyses/*       -> ai-service
+/api/v1/decisions/*      -> ai-service
+/api/v1/backtests/*      -> ai-service
+/api/v1/market/*         -> ai-service
+/api/v1/analytics/*      -> ai-service
+/ws/*                    -> core-service (WebSocket upgrade)
 ```
 
-`/internal/*` exists on every service but is **not** proxied by the
-gateway — reachable only on the Docker-internal network, service to
-service.
+`/internal/*` exists on every service but is **not** proxied by the gateway —
+reachable only on the Docker-internal network, for service-to-service calls
+(`clients/*.py`) and the scheduler. `/health` and `/metrics` are likewise
+internal-only (Prometheus scrapes them directly).
 
-## Response Format
+## 2. auth-service
 
-Success (single resource):
-
-```json
-{
-  "data": { },
-  "request_id": "a1b2c3d4-..."
-}
+### Authentication
 ```
-
-Success (list, paginated):
-
-```json
-{
-  "items": [ ],
-  "total": 42,
-  "page": 1,
-  "page_size": 20
-}
-```
-
-Error:
-
-```json
-{
-  "error": {
-    "code": "invalid_credentials",
-    "message": "Email or password incorrect",
-    "request_id": "a1b2c3d4-..."
-  }
-}
-```
-
-`code` values are lower_snake_case, matching
-`shared.exceptions.AppError.code` subclasses. `request_id` is
-present on both success and error responses (set by each service's
-request-logging middleware) so a frontend bug report can be correlated
-with a specific backend log line, in a specific service.
-
----
-
-# 2. Authentication (auth-service)
-
-```text
 POST   /api/v1/auth/register
 POST   /api/v1/auth/login
-POST   /api/v1/auth/refresh
 POST   /api/v1/auth/logout
-GET    /api/v1/auth/oauth/{provider}/authorize      (google | github)
+POST   /api/v1/auth/refresh
+POST   /api/v1/auth/verify-email
+POST   /api/v1/auth/password-reset/request
+POST   /api/v1/auth/password-reset/confirm
+GET    /api/v1/auth/oauth/{provider}/authorize
 GET    /api/v1/auth/oauth/{provider}/callback
 POST   /api/v1/auth/2fa/setup
 POST   /api/v1/auth/2fa/verify
 POST   /api/v1/auth/2fa/disable
 ```
 
-Login response includes an access token (15 min) and a refresh token
-(30 days) — both issued exclusively by
-`services/auth-service/app/security.py`.
-
-# 3. User Profile (auth-service)
-
-```text
+### Current user
+```
 GET    /api/v1/auth/me
 PATCH  /api/v1/auth/me
 POST   /api/v1/auth/me/avatar
 ```
 
-# 4. Connections / Presence (auth-service)
+Avatar uploads use local disk storage (`AVATAR_STORAGE_DIR`), deliberately
+*not* MinIO like research documents — avatars are small, low-volume, and
+never consumed by another service the way research documents are read by
+ai-service's RAG ingestion.
 
-```text
-POST   /api/v1/connections                (send a request)
-POST   /api/v1/connections/{id}/accept
-POST   /api/v1/connections/{id}/block
-GET    /api/v1/connections                (my connections + online status)
+### Organizations
 ```
-
-# 5. Organizations (auth-service)
-
-```text
+GET    /api/v1/organizations
 POST   /api/v1/organizations
-GET    /api/v1/organizations/{id}
-PATCH  /api/v1/organizations/{id}
-DELETE /api/v1/organizations/{id}
-POST   /api/v1/organizations/{id}/invitations
-POST   /api/v1/organizations/{id}/members/{user_id}/remove
-PATCH  /api/v1/organizations/{id}/members/{user_id}/role
+GET    /api/v1/organizations/{org_id}
+PATCH  /api/v1/organizations/{org_id}
+DELETE /api/v1/organizations/{org_id}
+GET    /api/v1/organizations/{org_id}/members
+POST   /api/v1/organizations/{org_id}/members/{user_id}/remove
+PATCH  /api/v1/organizations/{org_id}/members/{user_id}/role
+GET    /api/v1/organizations/{org_id}/roles
+POST   /api/v1/organizations/{org_id}/roles
+POST   /api/v1/organizations/{org_id}/invitations
+POST   /api/v1/organizations/invitations/{token}/accept
 ```
 
-# 6. Portfolios (core-service)
+### Social connections
+```
+GET    /api/v1/connections
+POST   /api/v1/connections
+POST   /api/v1/connections/{connection_id}/accept
+POST   /api/v1/connections/{connection_id}/block
+DELETE /api/v1/connections/{connection_id}
+```
 
-```text
+### Internal (service-to-service only)
+```
+GET    /internal/users/{user_id}
+GET    /internal/users/{user_id}/organizations
+GET    /internal/users/{user_id}/notification-settings
+GET    /internal/organizations/{org_id}
+GET    /internal/connections/check
+```
+
+## 3. core-service
+
+### Portfolios
+```
+GET    /api/v1/portfolios
 POST   /api/v1/portfolios
-GET    /api/v1/portfolios/{id}
-PATCH  /api/v1/portfolios/{id}
-DELETE /api/v1/portfolios/{id}
-GET    /api/v1/portfolios                 (paginated, mine + org-shared)
+GET    /api/v1/portfolios/{portfolio_id}
+PATCH  /api/v1/portfolios/{portfolio_id}
+DELETE /api/v1/portfolios/{portfolio_id}
+GET    /api/v1/portfolios/{portfolio_id}/holdings
+POST   /api/v1/portfolios/{portfolio_id}/holdings
+PATCH  /api/v1/portfolios/{portfolio_id}/holdings/{holding_id}
+DELETE /api/v1/portfolios/{portfolio_id}/holdings/{holding_id}
+GET    /api/v1/portfolios/{portfolio_id}/transactions
+POST   /api/v1/portfolios/{portfolio_id}/transactions
 ```
 
-`PortfolioRead.owner` is populated by core-service calling
-`app/clients/auth_client.py::get_user_ref` — not a local join (see
-`COMMON_LIBRARY_README.md §4`).
+**Note**: portfolio-scoped decision tracking (`POST .../decisions`) that
+originally lived here has been retired — see §4's
+`/api/v1/analyses/{id}/decisions` in ai-service. This was a deliberate
+migration, not a removed feature; no frontend depended on the core-service
+version at the time it moved.
 
-# 7. Holdings & Transactions (core-service)
-
-```text
-POST   /api/v1/portfolios/{id}/holdings
-PATCH  /api/v1/portfolios/{id}/holdings/{holding_id}
-DELETE /api/v1/portfolios/{id}/holdings/{holding_id}
-GET    /api/v1/portfolios/{id}/holdings
-POST   /api/v1/portfolios/{id}/transactions
-GET    /api/v1/portfolios/{id}/transactions
+### Watchlists
 ```
-
-`HoldingRead` optionally includes `latest_recommendation:
-RecommendationRef | None`, populated by
-`app/clients/ai_client.py::get_latest_recommendation`.
-
-# 8. Watchlists (core-service)
-
-```text
-POST   /api/v1/watchlists
-POST   /api/v1/watchlists/{id}/items
-DELETE /api/v1/watchlists/{id}/items/{ticker}
 GET    /api/v1/watchlists
+POST   /api/v1/watchlists
+POST   /api/v1/watchlists/{watchlist_id}/items
+DELETE /api/v1/watchlists/{watchlist_id}/items/{ticker}
 ```
 
-# 9. Research (core-service)
-
-```text
+### Research (notes, comments, documents)
+```
+GET    /api/v1/research/notes
 POST   /api/v1/research/notes
-GET    /api/v1/research/notes/{id}
-PATCH  /api/v1/research/notes/{id}
-DELETE /api/v1/research/notes/{id}
-GET    /api/v1/research/notes             (filters, sort, pagination — W7)
-POST   /api/v1/research/notes/{id}/comments
-POST   /api/v1/research/documents          (multipart upload — W6)
-GET    /api/v1/research/documents/{id}
-DELETE /api/v1/research/documents/{id}
-GET    /api/v1/research/documents          (paginated)
+GET    /api/v1/research/notes/{note_id}
+PATCH  /api/v1/research/notes/{note_id}
+DELETE /api/v1/research/notes/{note_id}
+POST   /api/v1/research/notes/{note_id}/comments
+
+GET    /api/v1/research/documents
+POST   /api/v1/research/documents
+GET    /api/v1/research/documents/{document_id}
+DELETE /api/v1/research/documents/{document_id}
+GET    /api/v1/research/documents/{document_id}/content
 ```
 
-Uploading a document publishes `document.uploaded`
-(`shared.events_registry.EventName`) — ai-service reacts
-asynchronously; `DocumentRead.status` transitions from `uploaded` to
-`ready`/`failed` as `document.status_changed` events arrive back.
+`POST /api/v1/research/documents` is multipart; `category` and optional
+`ticker` are required form fields, not inferred from the file — see
+`docs/ERD.md` §3 for why. `GET .../content` streams the raw bytes back out of
+MinIO; it's the only way to actually retrieve a document's content —
+`storage_url` in the JSON response is an internal object key, not a browsable
+URL. `DELETE .../documents/{id}` cascades: deletes the MinIO object, the
+`core.documents` row, and publishes `document.deleted` (§6) so ai-service can
+clean up the matching Qdrant/BM25 vectors and its own `ai.document_chunks`/
+`ai.embedding_jobs` rows — a document delete is never partial across the two
+services.
 
-# 10. Notifications (core-service)
-
-```text
-GET    /api/v1/notifications              (paginated)
-PATCH  /api/v1/notifications/{id}/read
+### Notifications, API keys
+```
+GET    /api/v1/notifications
+POST   /api/v1/notifications/{notification_id}/read
+GET    /api/v1/api-keys
+POST   /api/v1/api-keys
+DELETE /api/v1/api-keys/{key_id}
 ```
 
-# 11. Public API — Module W4 (core-service)
-
-Every route requires `X-API-Key`; rate-limited to 60 req/min per key by
-default (`Settings.PUBLIC_API_RATE_LIMIT_PER_MINUTE`,
-`core-service/app/middleware.py`).
-
-```text
-GET    /api/v1/public/portfolios/{id}
-GET    /api/v1/public/portfolios/{id}/holdings          (paginated)
-POST   /api/v1/public/watchlists/{id}/items
-PUT    /api/v1/public/portfolios/{id}/holdings/{holding_id}
-DELETE /api/v1/public/watchlists/{id}/items/{ticker}
+### Public API (§5 — API-key authenticated, not unauthenticated)
+```
+GET    /api/v1/public/portfolios/{portfolio_id}
+GET    /api/v1/public/portfolios/{portfolio_id}/holdings
+PUT    /api/v1/public/portfolios/{portfolio_id}/holdings/{holding_id}
+POST   /api/v1/public/watchlists/{watchlist_id}/items
+DELETE /api/v1/public/watchlists/{watchlist_id}/items/{ticker}
 ```
 
-Exceeding the limit:
-
-```json
-{ "error": { "code": "rate_limit_exceeded", "message": "Too many requests" } }
+### WebSocket
 ```
-with HTTP 429. API keys are issued via
-`POST /api/v1/auth/me/api-keys` (auth-service issues the key hash; the
-key record itself lives in `core.api_keys` — see `ERD.md v4.0 PART 2`
-for why).
-
-# 12. WebSocket (core-service)
-
-```text
-WS /ws/{channel}        e.g. /ws/analysis:<uuid>, /ws/portfolio:<uuid>,
-                              /ws/document:<uuid>
+WS     /ws/{channel}          generic pub/sub relay
+WS     /ws/yjs/{note_id}      Yjs CRDT binary relay for collaborative note editing
 ```
 
-Every message on the socket has this shape
-(`shared.schemas.websocket.WebSocketEnvelope`):
+`/ws/{channel}` is a generic relay — the channel string itself carries the
+real meaning, not a fixed enum of endpoints. Real channel names currently in
+use: `analysis:{analysis_id}` (agent-run/recommendation progress for one
+analysis), `user:{user_id}` (a user's own notification stream — analysis
+completions, recommendations ready), `presence:{user_id}` (online/offline
+status changes for a user's connections).
 
-```json
-{
-  "event": "analysis.completed",
-  "payload": { "...": "event-specific fields" },
-  "emitted_at": "2026-07-04T10:00:00Z"
-}
+### Internal (service-to-service / scheduler only)
+```
+GET    /internal/portfolios/{portfolio_id}/holdings
+GET    /internal/portfolios/{portfolio_id}/cash-balance
+POST   /internal/portfolios/{portfolio_id}/transactions
+POST   /internal/scheduler/market-open
+POST   /internal/scheduler/market-close
+GET    /internal/tracked-tickers
+GET    /internal/documents/filenames
+POST   /internal/documents
 ```
 
-Example — a recommendation becoming ready (originally published by
-ai-service over Redis, relayed here by core-service):
+The `portfolios/{id}/holdings`, `cash-balance`, and `transactions` endpoints
+are ai-service's real callers (`clients/core_client.py`) into a portfolio's
+real state — used by the Portfolio agent's own tool, by position-sizing
+(needs real available cash to size a BUY against), and by the daily
+tier-monitoring job (executes a real transaction once a tier's price
+condition is met). No per-call ownership check on any of these — internal,
+Docker-network-only, service-to-service, not user-facing.
 
-```json
-{
-  "event": "recommendation.ready",
-  "payload": {
-    "id": "uuid", "analysis_id": "uuid", "ticker": "TSLA",
-    "action": "buy", "confidence": 0.78
-  },
-  "emitted_at": "2026-07-04T10:00:42Z"
-}
+`tracked-tickers` returns the union of every portfolio's holdings and every
+watchlist's items across all users — what ai-service's RAG auto-ingestion
+job should keep fresh. `documents/filenames` / `POST documents` are the
+automated-ingestion counterparts of the real, interactive
+`GET/POST /api/v1/research/documents` — used by the daily filing/news
+ingestion job (owned by a well-known system user, not a real logged-in one)
+rather than a multipart upload, since the job already has the raw text in
+memory.
+
+## 4. ai-service
+
+### Analyses
+```
+POST   /api/v1/analyses
+GET    /api/v1/analyses
+GET    /api/v1/analyses/{analysis_id}
+GET    /api/v1/analyses/{analysis_id}/recommendation
+GET    /api/v1/analyses/{analysis_id}/debate
+GET    /api/v1/analyses/{analysis_id}/reflection
+POST   /api/v1/analyses/{analysis_id}/decisions
 ```
 
-# 13. Analyses (ai-service)
+`POST /api/v1/analyses` returns immediately with `status: "pending"` — the
+actual agent graph run happens in a detached background task
+(`ai/workflows/analysis_workflow.py`). There is no synchronous "wait for the
+result" mode. It's callable two ways: an authenticated frontend request
+(JWT-derived user), or core-service's scheduled market-open job calling
+directly with no auth header at all (a batch analysis with no single owning
+user — see `deps.py::get_current_user_optional`). Optional `portfolio_id` in
+the request body: when set and the Judge's verdict is BUY/SELL (not HOLD), a
+real position-sizing step runs and writes real, pending recommendation tiers
+sized against that portfolio's actual cash/holdings; omitted entirely, the
+analysis is review-only and produces no tiers regardless of the verdict.
 
-```text
-POST   /api/v1/analyses                   {"ticker": "TSLA", "portfolio_id": null}
-GET    /api/v1/analyses/{id}              (status + steps so far)
-GET    /api/v1/analyses/{id}/recommendation
-GET    /api/v1/analyses                   (paginated, mine)
+`GET /api/v1/analyses/{id}` returns full detail: every agent run, the debate
+transcript, reflection history, and the final recommendation, in one
+response. `POST .../decisions` confirms followed/ignored/partial against
+that analysis's recommendation.
+
+### Decisions
+```
+GET    /api/v1/decisions
+GET    /api/v1/decisions/{decision_id}/outcome
+POST   /api/v1/decisions/{decision_id}/review
+GET    /api/v1/decisions/{decision_id}/review
 ```
 
-Starting an analysis returns immediately with `status: pending`; the
-live workflow timeline is delivered over WebSocket
-(`/ws/analysis:<id>`), not by polling.
+`POST .../review` generates a fresh, LLM-written critique of one past
+decision (was it a good call given what was actually knowable at the time,
+not just whether it made money) — user-triggered, not automatic, and
+generates a new one on every call rather than returning a cached result.
+`GET .../review` retrieves the most recently generated one.
 
-# 14. RAG / Document Q&A (ai-service)
-
-```text
-POST   /api/v1/analyses/{id}/ask          {"question": "..."}
+### Backtests
+```
+POST   /api/v1/backtests
+GET    /api/v1/backtests/{backtest_id}
+GET    /api/v1/backtests/{backtest_id}/metrics
 ```
 
-Retrieves relevant chunks from Qdrant (payload only: `document_id`,
-`chunk_id`), fetches the actual text from core-service's
-`core.document_chunks`-equivalent store (or ai-service's own
-`ai.document_chunks` cache of the same, per `ERD.md v4.0 PART 3` — see
-that document for exactly which service holds chunk text vs.
-metadata), and returns a cited answer.
+Same async-return pattern as analyses — `"pending"` immediately, real work in
+a background task (`ai/workflows/backtest_workflow.py`). Current engine
+scope: single-ticker buy-and-hold vs. a benchmark, not a multi-trade strategy
+simulator (see `docs/ERD.md`'s `backtest_trades` note). Distinct from
+`portfolio_evaluation` (§4's internal section) — this simulates a
+hypothetical position, that evaluates a real portfolio's actual holdings.
 
-# 15. Debate / Reflection (ai-service)
-
-```text
-GET    /api/v1/analyses/{id}/debate
-GET    /api/v1/analyses/{id}/reflection
+### Market data
 ```
-
-# 16. Decision Tracking & Backtesting (ai-service)
-
-```text
-POST   /api/v1/analyses/{id}/decisions    {"action_taken": "followed"}
-GET    /api/v1/decisions/{id}/outcome
-POST   /api/v1/backtests                  {"strategy_name": "...", "benchmark_symbol": "SPY", ...}
-GET    /api/v1/backtests/{id}
-GET    /api/v1/backtests/{id}/metrics
-```
-
-# 17. Market Data (ai-service)
-
-```text
 GET    /api/v1/market/instruments/{ticker}
 GET    /api/v1/market/instruments/{ticker}/prices?interval=1d
 ```
 
-# 18. Analytics (ai-service)
-
-```text
-GET    /api/v1/analytics/portfolio/{id}
-GET    /api/v1/analytics/recommendations
+### Analytics
+```
 GET    /api/v1/analytics/agents
-GET    /api/v1/analytics/export?format=csv
+GET    /api/v1/analytics/portfolio/{portfolio_id}
 ```
 
-# 19. Internal (all 3 services — not gateway-proxied)
+`GET .../portfolio/{id}` is the read side of `POST /internal/portfolios/
+{id}/evaluate` (real Sharpe/Sortino/drawdown, computed against a portfolio's
+actual holdings) — the write only happens via the internal, scheduler-driven
+path below; there's no user-facing "evaluate now" trigger yet.
 
-```text
-GET    /internal/users/{id}                        (auth-service)
-GET    /internal/organizations/{id}                (auth-service)
-GET    /internal/analyses/{id}                      (ai-service)
-GET    /internal/recommendations/latest?ticker=...  (ai-service)
+### Internal (service-to-service / scheduler only)
+```
+GET    /internal/analyses/{analysis_id}
+GET    /internal/recommendations/latest?ticker=...
+POST   /internal/review/run
+POST   /internal/scheduler/tier-monitoring
+POST   /internal/scheduler/rag-ingest
+POST   /internal/market/{ticker}/refresh
+POST   /internal/portfolios/{portfolio_id}/evaluate
 ```
 
-Called only by another service's `app/clients/*.py` — see
-`COMMON_LIBRARY_README.md §4` for the request/cache/error-handling
-pattern every one of these calls follows on the caller's side.
+`POST /internal/review/run` runs `ai/workflows/review_workflow.py`'s two
+evaluation passes (AI-accuracy scoring for all recommendations, decision-
+outcome evaluation for confirmed user decisions) — wired to
+`infra/scheduler/review-run.sh`, daily at 2:00 AM ET.
 
-# 20. Health & Metrics (all 3 services)
+`POST /internal/scheduler/tier-monitoring` runs the daily check of every
+accepted (or still-acceptable) recommendation tier for a real trigger
+(today's actual high/low crossing the target price) or expiry — the hook
+exists and works but is not yet wired into `infra/scheduler/crontab`.
 
-```text
-GET /health          (each service; also aggregated at the gateway as
-                       /health/auth, /health/core, /health/ai)
-GET /metrics          (Prometheus scrape target, each service)
-```
+`POST /internal/scheduler/rag-ingest` runs both the per-ticker (filing +
+news) and the separate macro-research auto-ingestion passes in one call —
+wired to `infra/scheduler/rag-ingest.sh`, daily.
 
----
+`POST /internal/market/{ticker}/refresh` proactively warms
+`domains/market`'s price-bar cache for one ticker ahead of real agent
+demand — not the only way the cache gets populated (agents themselves
+trigger a refresh on a cache miss/stale read via `ai/tools/market_data_
+cache.py`), and not yet wired to a cron entry.
 
-# END OF API_SPEC.md
-# Version 4.0
+`POST /internal/portfolios/{portfolio_id}/evaluate` computes a real
+portfolio's actual performance (vs. a benchmark) from its real transaction
+history, writing to `ai.portfolio_evaluations` — read back via
+`GET /api/v1/analytics/portfolio/{id}` above. Not yet on a schedule.
+
+## 5. The "public API" (developer API keys)
+
+core-service's `/api/v1/public/*` routes are authenticated by an `X-API-Key`
+header, not a JWT — keys are issued/managed via `/api/v1/api-keys`. "Public"
+here means "the developer-facing programmatic API surface," not
+"unauthenticated." `PublicAPIRateLimitMiddleware` validates the key and
+resolves its owning user/organization before the request reaches the route
+handler.
+
+## 6. Cross-service events (Redis pub/sub, not HTTP)
+
+Defined in `shared/events_registry.py::EventName`, published via
+`shared/events.py::publish_cross_service`, consumed via
+`CrossServiceSubscriber`. Not HTTP endpoints; listed here because they're as
+much a part of the API surface between services as the internal REST calls.
+
+| Event | Published by | Consumed by | Status |
+|---|---|---|---|
+| `document.uploaded` | core-service | ai-service | wired, drives RAG ingestion |
+| `document.deleted` | core-service | ai-service | wired, cleans up Qdrant/BM25 + `ai.document_chunks`/`ai.embedding_jobs` |
+| `document.status_changed` | ai-service | core-service | wired — two independent subscribers: a real DB write (`Document.status`, via the durable subscriber) and a separate WebSocket broadcast (plain pub/sub, deliberately not durable — see `event_listener.py`'s own note on why broadcast-only doesn't need delivery guarantees the way a DB write does) |
+| `analysis.completed` | ai-service | core-service | wired — WebSocket broadcast (`analysis:{id}`/`user:{id}`) + a real notification |
+| `recommendation.ready` | ai-service | core-service | wired — same as `analysis.completed` (WebSocket + notification) |
+| `analysis.started` / `.failed` | ai-service | — | published, no subscriber yet |
+| `decision.outcome.evaluated` | ai-service | — | published, no subscriber yet |
+| `organization.member.joined` | auth-service | core-service | wired — creates a real welcome notification |
+| `user.presence.changed` | auth-service | core-service | wired (WebSocket relay, `presence:{user_id}`) |
+| `portfolio.created` | core-service | — | published, no subscriber yet |
+
+"No subscriber yet" means exactly that — the event fires correctly and can be
+subscribed to at any time; nothing currently listens for it.

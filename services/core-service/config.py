@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import ClassVar
 
 from shared.config import BaseServiceSettings
+from shared.enums.document import DocumentCategory
 
 
 class CoreServiceSettings(BaseServiceSettings):
@@ -12,6 +13,8 @@ class CoreServiceSettings(BaseServiceSettings):
 
     MAX_UPLOAD_SIZE_BYTES: int = 20 * 1024 * 1024
     ALLOWED_DOCUMENT_EXTENSIONS: ClassVar[set[str]] = {".pdf", ".txt", ".md"}
+    ALLOWED_DOCUMENT_CATEGORIES: ClassVar[set[str]] = {
+        c.value for c in DocumentCategory}
 
 
 @lru_cache

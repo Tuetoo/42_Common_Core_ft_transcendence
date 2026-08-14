@@ -8,7 +8,10 @@ def configure_logging(settings: BaseServiceSettings) -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stdout,
                         level=settings.LOG_LEVEL)
 
-    def add_service_name(_logger, _method_name, event_dict):
+    def add_service_name(
+            _logger: structlog.types.WrappedLogger, _method_name: str,
+            event_dict: structlog.types.EventDict
+            ) -> structlog.types.EventDict:
         event_dict["service"] = settings.SERVICE_NAME
         return event_dict
 

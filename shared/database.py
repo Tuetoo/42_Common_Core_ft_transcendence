@@ -1,8 +1,10 @@
-from collections.abc import AsyncGenerator
-from sqlalchemy import MetaData, event
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
+from sqlalchemy import MetaData, func, select, text
 from sqlalchemy.ext.asyncio import (AsyncEngine, AsyncSession,
                                     async_sessionmaker, create_async_engine)
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.sql import Select
 from shared.config import BaseServiceSettings
 
 # index, unique, check, foreign key, primary key
@@ -23,14 +25,9 @@ def create_service_engine(settings: BaseServiceSettings) -> AsyncEngine:
     engine = create_async_engine(
         settings.assemble_database_url(), echo=settings.DB_ECHO,
         pool_size=settings.DB_POOL_SIZE, max_overflow=settings.DB_MAX_OVERFLOW,
-        pool_pre_ping=True)
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_search_path(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute(f"SET search_path TO {settings.POSTGRES_SCHEMA},"
-                       "public")
-        cursor.close()
+        pool_pre_ping=True,
+        connect_args={"server_settings": {
+            "search_path": f"{settings.POSTGRES_SCHEMA},public"}})
     return engine
 
 
@@ -40,7 +37,8 @@ def create_session_factory(engine: AsyncEngine
                               expire_on_commit=False, autoflush=False)
 
 
-def make_get_db(session_factory: async_sessionmaker[AsyncSession]):
+def make_get_db(session_factory: async_sessionmaker[AsyncSession]
+                ) -> Callable[[], AsyncGenerator[AsyncSession, None]]:
     async def get_db() -> AsyncGenerator[AsyncSession, None]:
         async with session_factory() as session:
             try:
@@ -54,8 +52,13 @@ def make_get_db(session_factory: async_sessionmaker[AsyncSession]):
     return get_db
 
 
+async def count_query(session: AsyncSession, stmt: Select[Any]) -> int:
+    count_stmt = select(func.count()).select_from(stmt.subquery())
+    result = await session.execute(count_stmt)
+    return int(result.scalar_one())
+
+
 async def check_database_connection(engine: AsyncEngine) -> bool:
-    from sqlalchemy import text
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))

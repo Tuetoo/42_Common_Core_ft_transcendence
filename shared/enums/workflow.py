@@ -31,4 +31,4 @@ class AgentRole(StrEnum):
     BULL = "bull"
     BEAR = "bear"
     JUDGE = "judge"
-    REFLECTION = "flection"
+    REFLECTION = "reflection"

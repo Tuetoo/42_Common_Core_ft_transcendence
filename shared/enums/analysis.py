@@ -3,7 +3,7 @@ from enum import StrEnum
 
 class AnalysisType(StrEnum):
     TECHNICAL = "technical"
-    FUNDANMENTAL = "fundamental"
+    FUNDAMENTAL = "fundamental"
     SENTIMENT = "sentiment"
     RISK = "risk"
     MACRO = "macro"

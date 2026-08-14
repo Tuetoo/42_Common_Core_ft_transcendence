@@ -2,12 +2,12 @@
 name = "alphamind"
 version = "0.1.0"
 description = "AlphaMind AI Investment Research Platform"
-requires-python = ">=3.13"
+requires-python = ">=3.11,<3.12"
 
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.35",
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
     "alembic>=1.16",
     "asyncpg>=0.30",
     "psycopg[binary]>=3.2",
@@ -23,10 +23,22 @@ dependencies = [
     "mistralai>=1.9",
     "langchain-google-genai>=2.1",
     "google-genai>=1.28",
-    "pydantic>=2.11",
+    "pydantic[email]>=2.11",
     "pydantic-settings>=2.10",
+    # FastAPI's Form(...)/UploadFile parameters (avatar upload,
+    # research document upload) need this; FastAPI itself doesn't
+    # declare it as a hard dependency since not every app uses forms.
+    "python-multipart>=0.0.9",
     "python-jose[cryptography]>=3.5",
     "passlib[bcrypt]>=1.7",
+    # passlib (unmaintained since ~2020) is incompatible with
+    # bcrypt>=4.1 -- that release removed the __about__ attribute
+    # passlib's version-detection relies on, and started raising
+    # (rather than silently truncating) on passwords over bcrypt's
+    # 72-byte limit, which breaks passlib's own internal self-test at
+    # import time. Pinned below the breaking version; verified this
+    # actually resolves it (hash/verify both work with bcrypt==4.0.1).
+    "bcrypt<4.1",
     "pyotp>=2.9",
     "authlib>=1.3",
     "httpx>=0.28",
@@ -35,10 +47,23 @@ dependencies = [
     "structlog>=25.4",
     "prometheus-fastapi-instrumentator>=7.0",
     "websockets>=12.0",
+    # Email (shared/email.py) -- vendor-agnostic async SMTP client.
     "aiosmtplib>=3.0",
+    # Yjs collaborative editing (core-service's yjs_relay.py) --
+    # Python bindings for the Rust Yrs CRDT implementation.
+    "y-py>=0.6,!=0.6.2",
+    # RAG hybrid search: lexical (BM25) side of BM25 + Qdrant + RRF.
     "bm25s>=0.2",
+    # Real market-data / macro / sentiment providers (ai-service).
     "yfinance>=0.2",
     "asyncpraw>=7.8",
+    # Object storage (MinIO in dev, real S3/R2 in production) --
+    # shared/storage.py. Real AWS SDK, works against any S3-compatible
+    # endpoint via endpoint_url.
+    "boto3>=1.35",
+    # PDF text extraction (ai/rag/parser.py). Pure-Python, BSD-licensed
+    # -- see that module's docstring for why not pymupdf/fitz (AGPL).
+    "pypdf>=5.0",
 ]
 
 [dependency-groups]
@@ -47,18 +72,22 @@ dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
     "pytest-cov>=6.2",
+    # Spins up a real, throwaway Postgres container per test session --
+    # needed because tests exercise Postgres-specific features (TSVECTOR
+    # full-text search, GENERATED ALWAYS AS columns, SELECT FOR UPDATE
+    # row locking) that a SQLite in-memory DB can't reproduce.
+    "testcontainers[postgres]>=4.8",
     "ruff>=0.12",
     "black>=25.1",
     "mypy>=1.17",
     "pre-commit>=4.2",
-    "types-redis",
     "flake8>=7.0",
 ]
 
 [tool.ruff]
 
 line-length = 88
-target-version = "py313"
+target-version = "py311"
 
 exclude = [
     ".git",
@@ -87,14 +116,29 @@ ignore = [
     "UP046",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# ai/graph/builder.py's module docstring contains an ASCII flowchart;
+# wrapping those lines to 88 chars would break its visual alignment.
+"services/ai-service/ai/graph/builder.py" = ["E501"]
+# These scripts' module docstrings contain copy-pasteable shell
+# command examples (docker compose / uv run invocations); wrapping
+# them to 88 chars would break copy-paste usability.
+"services/ai-service/scripts/analyze_recall_breakdown.py" = ["E501"]
+"services/ai-service/scripts/migrate_agent_report_category.py" = ["E501"]
+"services/ai-service/scripts/purge_iteration_cap_fallback_content.py" = ["E501"]
+"services/ai-service/scripts/purge_retroactive_near_duplicates.py" = ["E501"]
+"services/ai-service/scripts/reprocess_stuck_document.py" = ["E501"]
+"services/ai-service/scripts/split_recall_by_source.py" = ["E501"]
+"services/ai-service/scripts/sweep_category_weights.py" = ["E501"]
+
 [tool.black]
 
 line-length = 88
-target-version = ["py313"]
+target-version = ["py311"]
 
 [tool.mypy]
 
-python_version = "3.13"
+python_version = "3.11"
 
 strict = true
 
@@ -109,6 +153,23 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 
 asyncio_mode = "auto"
+# Every service's conftest.py has a session-scoped `_schema_ready`
+# fixture (spin up Postgres/Redis once per test session, not once per
+# test) and a module-level singleton `engine` (database.py) created
+# once at import time. Both assume one event loop for the whole
+# session. pytest-asyncio's default is function-scoped loops for both
+# fixtures AND test functions -- without both settings below, a
+# session-scoped fixture's engine ends up with connections bound to
+# whichever loop happened to be active when they were first opened,
+# and every later test (running in a fresh loop) hits
+# "got Future ... attached to a different loop" RuntimeErrors, or
+# worse, a partial fix (only one of the two settings) produces a
+# *mismatch* between fixture-loop-scope and test-loop-scope that's
+# more broken than setting neither. Confirmed by reproducing this
+# failure with only `asyncio_default_fixture_loop_scope` set and
+# fixing it by setting both to "session".
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 
 markers = [
     "integration: requires `docker compose up` to already be running (tests/integration/)",
@@ -118,3 +179,15 @@ markers = [
 # together in one process. See tests/README.md for why.
 
 [tool.uv]
+
+# Both are transitive deps (grpcio via qdrant-client, charset-normalizer
+# via requests) -- pinned here only to steer uv's resolver away from
+# specific PyPI-yanked releases, not because either is used directly:
+# - grpcio==1.82.0 was yanked 2026-07-06 (bad protobuf dependency
+#   version; https://github.com/grpc/grpc/issues/42906), fixed in 1.82.1.
+# - charset-normalizer==3.4.8 was yanked (decode-error regression in
+#   its fallback path, #771), fixed in 3.4.9.
+constraint-dependencies = [
+    "grpcio>=1.82.1",
+    "charset-normalizer>=3.4.9",
+]
