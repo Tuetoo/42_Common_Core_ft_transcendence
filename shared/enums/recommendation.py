@@ -30,3 +30,4 @@ class TierStatus(StrEnum):
     TRIGGERED = "triggered"
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
+    DECLINED = "declined"

@@ -44,6 +44,8 @@ class Transaction(Base, UUIDPKMixin):
     transaction_type: Mapped[str] = mapped_column(String, nullable=False)
     quantity: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
     price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    dividend_per_share: Mapped[Decimal | None] = mapped_column(
+        Numeric, nullable=True)
     transaction_date: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False)
 

@@ -21,6 +21,7 @@ from shared.events import publish_cross_service
 from shared.events_registry import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
+from shared.schemas.base import PaginationParams
 
 logger = structlog.get_logger(__name__)
 _CASH_TICKER = "CASH"
@@ -74,13 +75,13 @@ class PortfolioService:
         portfolio = await self._require_readable(portfolio_id, requester_id)
         return await self._to_read(portfolio)
 
-    async def list_mine(self, requester_id: UUID, *, page: int, page_size: int
+    async def list_mine(self, requester_id: UUID, *,
+                        pagination: PaginationParams
                         ) -> tuple[list[PortfolioRead], int]:
         org_ids = await auth_client.list_user_organization_ids(
             str(requester_id))
         portfolios, total = await self.portfolios.list_for_user(
-            requester_id, org_ids, offset=(page - 1) * page_size,
-            limit=page_size)
+            requester_id, org_ids, pagination=pagination)
         reads = await gather_bounded((self._to_read(p) for p in portfolios),
                                      limit=20)
         return reads, total
@@ -211,6 +212,12 @@ class PortfolioService:
             await self.holdings.delete(holding)
         await self._db.flush()
 
+    @staticmethod
+    def _validate_dividend(data: TransactionCreate) -> None:
+        if not data.quantity or not data.dividend_per_share:
+            raise ValidationAppError(
+                "A dividend requires both quantity and dividend_per_share.")
+
     async def record_transaction(self, portfolio_id: UUID, requester_id: UUID,
                                  data: TransactionCreate) -> TransactionRead:
         await self._require_owner(portfolio_id, requester_id)
@@ -220,19 +227,22 @@ class PortfolioService:
         txn = await self.transactions.create(
             portfolio_id=portfolio_id, ticker=ticker,
             transaction_type=data.transaction_type, quantity=data.quantity,
-            price=data.price, transaction_date=data.transaction_date)
+            price=data.price, dividend_per_share=data.dividend_per_share,
+            transaction_date=data.transaction_date)
         if data.transaction_type == TransactionType.BUY:
             await self._apply_buy(portfolio_id, data)
         elif data.transaction_type == TransactionType.SELL:
             await self._apply_sell(portfolio_id, data)
+        elif data.transaction_type == TransactionType.DIVIDEND:
+            self._validate_dividend(data)
         return TransactionRead.model_validate(txn)
 
     async def list_transactions(
-            self, portfolio_id: UUID, requester_id: UUID, *, page: int,
-            page_size: int) -> tuple[list[TransactionRead], int]:
+            self, portfolio_id: UUID, requester_id: UUID, *,
+            pagination: PaginationParams) -> tuple[list[TransactionRead], int]:
         await self._require_readable(portfolio_id, requester_id)
         txns, total = await self.transactions.list_for_portfolio(
-            portfolio_id, offset=(page - 1) * page_size, limit=page_size)
+            portfolio_id, pagination=pagination)
         return [TransactionRead.model_validate(t) for t in txns], total
 
     async def create_watchlist(self, owner_id: UUID, data: WatchlistCreate
@@ -297,8 +307,8 @@ class PortfolioService:
                   and txn.quantity):
                 cash -= txn.quantity
             elif (txn.transaction_type == TransactionType.DIVIDEND
-                  and txn.quantity and txn.price):
-                cash += txn.quantity * txn.price
+                  and txn.quantity and txn.dividend_per_share):
+                cash += txn.quantity * txn.dividend_per_share
             elif (txn.transaction_type == TransactionType.BUY
                   and txn.quantity and txn.price):
                 cash -= txn.quantity * txn.price

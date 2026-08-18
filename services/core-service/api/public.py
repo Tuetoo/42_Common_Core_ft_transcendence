@@ -9,7 +9,8 @@ from domains.portfolio.schema import (
 from domains.portfolio.service import PortfolioService
 from sqlalchemy.ext.asyncio import AsyncSession
 from shared.exceptions import ValidationAppError
-from shared.schemas.base import APIResponse, PaginatedResponse
+from shared.schemas.base import (APIResponse, PaginatedResponse,
+                                 PaginationParams)
 
 router = APIRouter(prefix="/public", tags=["public-api"])
 
@@ -42,10 +43,12 @@ async def list_holdings(
 ) -> PaginatedResponse[HoldingRead]:
     owner_id = _owner_user_id(request)
     holdings = await PortfolioService(db).list_holdings(portfolio_id, owner_id)
-    start = (page - 1) * page_size
-    page_items = holdings[start:start + page_size]
+    pagination = PaginationParams(page=page, page_size=page_size)
+    page_items = holdings[pagination.offset:pagination.offset
+                          + pagination.limit]
     return PaginatedResponse(
-        items=page_items, total=len(holdings), page=page, page_size=page_size)
+        items=page_items, total=len(holdings), page=pagination.page,
+        page_size=pagination.page_size)
 
 
 @router.post("/watchlists/{watchlist_id}/items",

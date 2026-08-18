@@ -8,7 +8,8 @@ from domains.portfolio.schema import (
     PortfolioUpdate, TransactionCreate, TransactionRead, WatchlistCreate,
     WatchlistItemCreate, WatchlistItemRead, WatchlistRead)
 from domains.portfolio.service import PortfolioService
-from shared.schemas.base import APIResponse, PaginatedResponse
+from shared.schemas.base import (APIResponse, PaginatedResponse,
+                                 PaginationParams)
 from shared.security import CurrentUser
 
 router = APIRouter(tags=["portfolios"])
@@ -33,10 +34,12 @@ async def list_portfolios(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> PaginatedResponse[PortfolioRead]:
+    pagination = PaginationParams(page=page, page_size=page_size)
     items, total = await PortfolioService(db).list_mine(
-        current_user.user_id, page=page, page_size=page_size)
+        current_user.user_id, pagination=pagination)
     return PaginatedResponse(
-        items=items, total=total, page=page, page_size=page_size)
+        items=items, total=total, page=pagination.page,
+        page_size=pagination.page_size)
 
 
 @router.get("/{portfolio_id}", response_model=APIResponse[PortfolioRead])
@@ -131,8 +134,9 @@ async def list_transactions(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> PaginatedResponse[TransactionRead]:
+    pagination = PaginationParams(page=page, page_size=page_size)
     items, total = await PortfolioService(db).list_transactions(
-        portfolio_id, current_user.user_id, page=page, page_size=page_size)
+        portfolio_id, current_user.user_id, pagination=pagination)
     return PaginatedResponse(
         items=items, total=total, page=page, page_size=page_size)
 

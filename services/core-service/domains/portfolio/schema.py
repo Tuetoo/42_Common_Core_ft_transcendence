@@ -53,6 +53,7 @@ class TransactionCreate(BaseModel):
     transaction_type: TransactionType
     quantity: Decimal | None = Field(default=None, gt=0)
     price: Decimal | None = Field(default=None, gt=0)
+    dividend_per_share: Decimal | None = Field(default=None, gt=0)
     transaction_date: datetime
 
 
@@ -62,6 +63,7 @@ class TransactionRead(BaseSchema, IDMixin):
     transaction_type: TransactionType
     quantity: Decimal | None = None
     price: Decimal | None = None
+    dividend_per_share: Decimal | None = None
     transaction_date: datetime
 
 

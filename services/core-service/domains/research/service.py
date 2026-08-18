@@ -20,6 +20,7 @@ from shared.events_registry import EventName
 from shared.exceptions import (NotFoundError, PermissionDeniedError,
                                ValidationAppError)
 from shared.storage import delete_object, download_bytes, upload_bytes
+from shared.schemas.base import PaginationParams
 
 logger = structlog.get_logger(__name__)
 
@@ -116,15 +117,15 @@ class ResearchService:
                                     {"document_id": str(document_id)})
 
     async def list_documents(
-            self, requester_id: UUID, *, page: int, page_size: int,
+            self, requester_id: UUID, *, pagination: PaginationParams,
             ticker: str | None = None,
             category: DocumentCategory | None = None
             ) -> tuple[list[DocumentRead], int]:
         org_ids = await auth_client.list_user_organization_ids(
             str(requester_id))
         docs, total = await self.documents.list_for_user(
-            requester_id, org_ids, offset=(page - 1) * page_size,
-            limit=page_size, ticker=ticker, category=category)
+            requester_id, org_ids, pagination=pagination, ticker=ticker,
+            category=category)
         return [DocumentRead.model_validate(d) for d in docs], total
 
     async def _note_to_read(self, note: ResearchNote) -> ResearchNoteRead:
@@ -204,8 +205,7 @@ class ResearchService:
             viewer_id=requester_id, viewer_org_ids=org_ids, q=filters.q,
             author_id=filters.author_id,
             organization_id=filters.organization_id, tag_id=tag_id,
-            sort=filters.sort, offset=(filters.page - 1) * filters.page_size,
-            limit=filters.page_size)
+            sort=filters.sort, offset=filters.offset, limit=filters.limit)
         reads = await gather_bounded((self._note_to_read(n) for n in notes),
                                      limit=20)
         return reads, total
