@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await close_http_clients()
 
 app = FastAPI(title="AlphaMind Auth Service", version="1.0.0",
-              docs_url="/api/docs", openapi_url="/api/openapi.json",
+              docs_url="/api/docs", openapi_url="/api/openapi-auth.json",
               lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins(),
                    allow_credentials=True, allow_methods=["*"],

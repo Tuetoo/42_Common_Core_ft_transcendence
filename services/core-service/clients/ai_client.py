@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import date
 from uuid import UUID
 import httpx
 from shared.exceptions import UpstreamServiceError
@@ -57,6 +58,35 @@ async def get_current_price(ticker: str) -> Decimal | None:
     if not bars:
         return None
     return Decimal(str(bars[0]["close"]))
+
+
+async def get_fx_rate(from_currency: str, to_currency: str) -> Decimal | None:
+    if from_currency.upper() == to_currency.upper():
+        return Decimal(1)
+    url = f"{settings.AI_SERVICE_URL}/internal/fx-rate"
+    try:
+        response = await get_http_client(_TIMEOUT).get(url, params={
+            "from_currency": from_currency, "to_currency": to_currency})
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    rate = response.json().get("rate")
+    return Decimal(str(rate)) if rate is not None else None
+
+
+async def get_price_history(ticker: str, *, start_date: date, end_date: date
+                            ) -> dict[date, Decimal] | None:
+    url = f"{settings.AI_SERVICE_URL}/internal/market/{ticker}/price-history"
+    try:
+        response = await get_http_client(15.0).get(url, params={
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat()})
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    bars = response.json().get("bars") or []
+    return {date.fromisoformat(bar["date"]): Decimal(str(bar["close"]))
+            for bar in bars}
 
 
 async def request_analysis(ticker: str, portfolio_id: UUID | None = None

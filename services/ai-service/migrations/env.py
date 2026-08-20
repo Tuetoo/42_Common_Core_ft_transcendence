@@ -6,6 +6,8 @@ from sqlalchemy import engine_from_config, pool, text
 from database import register_all_models
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(c for c in Path(__file__).resolve().parents if (
+    c / "shared" / "database.py").is_file())))
 
 
 from config import settings   # noqa: E402

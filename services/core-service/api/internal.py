@@ -1,11 +1,13 @@
 from typing import Any
+from datetime import date
 from uuid import UUID
 from database import get_db
 from domains.portfolio.schema import TransactionCreate
 from domains.portfolio.service import PortfolioService
 from domains.research.schema import SystemDocumentCreate
-from domains.portfolio.repository import (HoldingRepository,
-                                          WatchlistRepository)
+from domains.portfolio.repository import (
+    HoldingRepository, WatchlistRepository, PortfolioSnapshotRepository,
+    TransactionRepository)
 from domains.research.repository import DocumentRepository
 from domains.research.service import ResearchService
 from fastapi import APIRouter, Depends, Query
@@ -39,6 +41,32 @@ async def get_portfolio_cash_balance_internal(
         portfolio_id)
     return {"portfolio_id": str(portfolio_id),
             "cash_balance": float(cash_balance)}
+
+
+@router.get("/portfolios/{portfolio_id}/snapshots")
+async def get_portfolio_snapshots_internal(
+    portfolio_id: UUID, start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    db: AsyncSession = Depends(get_db)
+) -> list[dict[str, Any]]:
+    snapshots = await PortfolioSnapshotRepository(db).list_for_portfolio(
+        portfolio_id, start_date=start_date, end_date=end_date)
+    return [{"snapshot_date": s.snapshot_date.isoformat(),
+             "total_value": float(s.total_value),
+             "cash_balance": float(s.cash_balance)} for s in snapshots]
+
+
+@router.get("/portfolios/{portfolio_id}/cash-flows")
+async def get_portfolio_cash_flows_internal(
+    portfolio_id: UUID, start_date: date = Query(...),
+    end_date: date = Query(...), db: AsyncSession = Depends(get_db)
+) -> list[dict[str, Any]]:
+    flows = await TransactionRepository(db).list_cash_flows_for_portfolio(
+        portfolio_id, start_date=start_date, end_date=end_date)
+    return [{"transaction_date": f.transaction_date.isoformat(),
+             "amount": float(f.quantity or 0)
+             if f.transaction_type == "deposit" else -float(f.quantity or 0)}
+            for f in flows]
 
 
 @router.post("/portfolios/{portfolio_id}/transactions")

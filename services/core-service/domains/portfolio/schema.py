@@ -2,14 +2,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 from pydantic import BaseModel, Field
-from shared.enums.market import TransactionType
+from shared.enums.market import TransactionType, Currency
 from shared.schemas.base import BaseSchema, IDMixin, TimestampMixin
 from shared.schemas.refs import RecommendationRef, UserRef
 
 
 class PortfolioCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    currency: str = "USD"
+    currency: Currency = Currency.USD
     organization_id: UUID | None = None
     visibility: str = "private"
 
@@ -22,7 +22,7 @@ class PortfolioUpdate(BaseModel):
 
 class PortfolioRead(BaseSchema, IDMixin, TimestampMixin):
     name: str
-    currency: str
+    currency: Currency
     visibility: str
     organization_id: UUID | None = None
     auto_analyze_at_open: bool
@@ -54,6 +54,7 @@ class TransactionCreate(BaseModel):
     quantity: Decimal | None = Field(default=None, gt=0)
     price: Decimal | None = Field(default=None, gt=0)
     dividend_per_share: Decimal | None = Field(default=None, gt=0)
+    split_ratio: Decimal | None = Field(default=None, gt=0)
     transaction_date: datetime
 
 
@@ -64,6 +65,7 @@ class TransactionRead(BaseSchema, IDMixin):
     quantity: Decimal | None = None
     price: Decimal | None = None
     dividend_per_share: Decimal | None = None
+    split_ratio: Decimal | None = None
     transaction_date: datetime
 
 
@@ -72,6 +74,10 @@ class PortfolioSnapshotRead(BaseSchema, IDMixin):
     snapshot_date: date
     total_value: Decimal
     cash_balance: Decimal
+    total_value_converted: Decimal | None = None
+    cash_balance_converted: Decimal | None = None
+    fx_rate: Decimal | None = None
+    display_currency: Currency | None = None
 
 
 class WatchlistCreate(BaseModel):

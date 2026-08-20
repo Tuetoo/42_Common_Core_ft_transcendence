@@ -7,7 +7,7 @@ import structlog
 from config import settings
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from domains.portfolio.model import Holding, Portfolio, Watchlist
+from domains.portfolio.model import Holding, Portfolio, Watchlist, Transaction
 from domains.portfolio.repository import (
     HoldingRepository, PortfolioRepository, PortfolioSnapshotRepository,
     TransactionRepository, WatchlistRepository)
@@ -16,7 +16,7 @@ from domains.portfolio.schema import (
     PortfolioSnapshotRead, PortfolioUpdate, TransactionCreate, TransactionRead,
     WatchlistItemCreate, WatchlistCreate, WatchlistItemRead, WatchlistRead)
 from shared.concurrency import gather_bounded
-from shared.enums.market import TransactionType
+from shared.enums.market import TransactionType, Currency
 from shared.events import publish_cross_service
 from shared.events_registry import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
@@ -25,6 +25,38 @@ from shared.schemas.base import PaginationParams
 
 logger = structlog.get_logger(__name__)
 _CASH_TICKER = "CASH"
+
+
+def replay_holdings_and_cash_as_of(
+        transactions: list[Transaction], *, as_of: datetime
+        ) -> tuple[dict[str, Decimal], Decimal]:
+    holdings: dict[str, Decimal] = {}
+    cash = Decimal(0)
+    for txn in transactions:
+        if txn.transaction_date > as_of:
+            continue
+        if txn.transaction_type == TransactionType.DEPOSIT and txn.quantity:
+            cash += txn.quantity
+        elif (txn.transaction_type == TransactionType.WITHDRAWAL
+              and txn.quantity):
+            cash -= txn.quantity
+        elif (txn.transaction_type == TransactionType.DIVIDEND
+              and txn.quantity and txn.dividend_per_share):
+            cash += txn.quantity * txn.dividend_per_share
+        elif (txn.transaction_type == TransactionType.BUY and txn.quantity
+              and txn.price):
+            cash -= txn.quantity * txn.price
+            holdings[txn.ticker] = (holdings.get(txn.ticker, Decimal(0))
+                                    + txn.quantity)
+        elif (txn.transaction_type == TransactionType.SELL and txn.quantity
+              and txn.price):
+            cash += txn.quantity * txn.price
+            holdings[txn.ticker] = (holdings.get(txn.ticker, Decimal(0))
+                                    - txn.quantity)
+        elif (txn.transaction_type == TransactionType.STOCK_SPLIT
+              and txn.split_ratio and txn.ticker in holdings):
+            holdings[txn.ticker] = holdings[txn.ticker] * txn.split_ratio
+    return {t: q for t, q in holdings.items() if q != 0}, cash
 
 
 class PortfolioService:
@@ -39,7 +71,8 @@ class PortfolioService:
     async def _to_read(self, portfolio: Portfolio) -> PortfolioRead:
         owner = await auth_client.get_user_ref(str(portfolio.owner_id))
         return PortfolioRead(
-            id=portfolio.id, name=portfolio.name, currency=portfolio.currency,
+            id=portfolio.id, name=portfolio.name,
+            currency=Currency(portfolio.currency),
             visibility=portfolio.visibility,
             organization_id=portfolio.organization_id,
             auto_analyze_at_open=portfolio.auto_analyze_at_open, owner=owner,
@@ -212,6 +245,23 @@ class PortfolioService:
             await self.holdings.delete(holding)
         await self._db.flush()
 
+    async def _apply_stock_split(self, portfolio_id: UUID,
+                                 data: TransactionCreate) -> None:
+        if not data.split_ratio or data.split_ratio <= 0:
+            raise ValidationAppError(
+                "A stock split/dividend requires a positive split_ratio "
+                "(e.g. 2.0 for a 2-for-1 split, 0.5 for a 1-for-2 reverse "
+                "split, 1.05 for a 5% stock dividend).")
+        existing = await self.holdings.get_by_ticker(
+            portfolio_id, data.ticker, for_update=True)
+        if existing is None:
+            raise ValidationAppError(
+                f"Cannot apply a stock split/dividend for {data.ticker} "
+                "-- no existing holding to rescale.")
+        existing.quantity = existing.quantity * data.split_ratio
+        existing.average_cost = existing.average_cost / data.split_ratio
+        await self._db.flush()
+
     @staticmethod
     def _validate_dividend(data: TransactionCreate) -> None:
         if not data.quantity or not data.dividend_per_share:
@@ -228,6 +278,7 @@ class PortfolioService:
             portfolio_id=portfolio_id, ticker=ticker,
             transaction_type=data.transaction_type, quantity=data.quantity,
             price=data.price, dividend_per_share=data.dividend_per_share,
+            split_ratio=data.split_ratio,
             transaction_date=data.transaction_date)
         if data.transaction_type == TransactionType.BUY:
             await self._apply_buy(portfolio_id, data)
@@ -235,6 +286,8 @@ class PortfolioService:
             await self._apply_sell(portfolio_id, data)
         elif data.transaction_type == TransactionType.DIVIDEND:
             self._validate_dividend(data)
+        elif data.transaction_type == TransactionType.STOCK_SPLIT:
+            await self._apply_stock_split(portfolio_id, data)
         return TransactionRead.model_validate(txn)
 
     async def list_transactions(
@@ -250,7 +303,7 @@ class PortfolioService:
         watchlist = await self.watchlists.create(
             owner_id=owner_id, name=data.name)
         return WatchlistRead(id=watchlist.id, name=watchlist.name, items=[])
-    
+
     async def list_my_watchlists(self, owner_id: UUID) -> list[WatchlistRead]:
         watchlists = await self.watchlists.list_for_user(owner_id)
         results = []
@@ -321,12 +374,13 @@ class PortfolioService:
             self, portfolio_id: UUID, snapshot_date: date,
             holdings: list[Holding], prices: dict[str, Decimal | None]
             ) -> PortfolioSnapshotRead:
-        total_value = Decimal(0)
+        holdings_value = Decimal(0)
         for holding in holdings:
             price = prices.get(holding.ticker)
             unit_value = price if price is not None else holding.average_cost
-            total_value += holding.quantity * unit_value
+            holdings_value += holding.quantity * unit_value
         cash_balance = await self.compute_cash_balance(portfolio_id)
+        total_value = holdings_value + cash_balance
         snapshot = await self.snapshots.upsert(
             portfolio_id=portfolio_id, snapshot_date=snapshot_date,
             total_value=total_value, cash_balance=cash_balance)
@@ -371,3 +425,37 @@ class PortfolioService:
         logger.info("market_open_job_completed",
                     requests_attempted=len(requests))
         return len(requests)
+
+    async def get_snapshots(
+            self, portfolio_id: UUID, requester_id: UUID, *,
+            start_date: date | None = None, end_date: date | None = None
+            ) -> list[PortfolioSnapshotRead]:
+        portfolio = await self._require_readable(portfolio_id, requester_id)
+        snapshots = await self.snapshots.list_for_portfolio(
+            portfolio_id, start_date=start_date, end_date=end_date)
+        fx_rate: Decimal | None = None
+        if portfolio.currency != Currency.USD.value:
+            try:
+                fx_rate = await ai_client.get_fx_rate(
+                    "USD", portfolio.currency)
+            except Exception:
+                logger.warning(
+                    "portfolio_snapshot_fx_lookup_failed",
+                    portfolio_id=str(portfolio_id),
+                    currency=portfolio.currency)
+                fx_rate = None
+        reads = []
+        for snapshot in snapshots:
+            reads.append(PortfolioSnapshotRead(
+                id=snapshot.id, portfolio_id=snapshot.portfolio_id,
+                snapshot_date=snapshot.snapshot_date,
+                total_value=snapshot.total_value,
+                cash_balance=snapshot.cash_balance,
+                total_value_converted=(snapshot.total_value * fx_rate
+                                       if fx_rate is not None else None),
+                cash_balance_converted=(snapshot.cash_balance * fx_rate
+                                        if fx_rate is not None else None),
+                fx_rate=fx_rate,
+                display_currency=(Currency(portfolio.currency)
+                                  if fx_rate is not None else None)))
+        return reads

@@ -15,6 +15,7 @@ class TransactionType(StrEnum):
     DIVIDEND = "dividend"
     DEPOSIT = "deposit"
     WITHDRAWAL = "withdrawal"
+    STOCK_SPLIT = "stock_split"
 
 
 class Currency(StrEnum):
