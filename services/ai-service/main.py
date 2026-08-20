@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="AlphaMind AI Service", version="1.0.0",
-              docs_url="/api/docs", openapi_url="/api/openapi.json",
+              docs_url="/api/docs", openapi_url="/api/openapi-ai.json",
               lifespan=lifespan)
 
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"],

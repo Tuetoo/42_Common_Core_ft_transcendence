@@ -9,6 +9,7 @@ from domains.research.model import (Document, NoteTag, ResearchComment,
                                     ResearchNote, ResearchTag)
 from shared.database import count_query
 from shared.enums.document import DocumentCategory
+from shared.schemas.base import PaginationParams
 
 
 class DocumentRepository:
@@ -59,7 +60,8 @@ class DocumentRepository:
         ticker_condition = (Document.ticker.is_(None) if ticker is None
                             else Document.ticker == ticker.upper())
         result = await self._db.execute(select(Document.filename).where(
-            ticker_condition, Document.category == category))
+            ticker_condition, Document.category == category,
+            Document.status != "failed"))
         return list(result.scalars().all())
 
     async def update_status(self, document_id: UUID, status: str
@@ -72,8 +74,8 @@ class DocumentRepository:
         return document
 
     async def list_for_user(
-            self, user_id: UUID, allowed_org_ids: list[UUID], *, offset: int,
-            limit: int, ticker: str | None = None,
+            self, user_id: UUID, allowed_org_ids: list[UUID], *,
+            pagination: PaginationParams, ticker: str | None = None,
             category: DocumentCategory | None = None
             ) -> tuple[list[Document], int]:
         scope = [Document.owner_id == user_id]
@@ -86,7 +88,8 @@ class DocumentRepository:
             stmt = stmt.where(Document.category == category)
         total = await count_query(self._db, stmt)
         result = await self._db.execute(stmt.order_by(
-            Document.uploaded_at.desc()).offset(offset).limit(limit))
+            Document.uploaded_at.desc()).offset(pagination.offset)
+            .limit(pagination.limit))
         return list(result.scalars().all()), total
 
 

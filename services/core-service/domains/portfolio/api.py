@@ -1,14 +1,16 @@
 from uuid import UUID
+from datetime import date
 from database import get_db
 from deps import get_current_user
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.portfolio.schema import (
     HoldingCreate, HoldingRead, HoldingUpdate, PortfolioCreate, PortfolioRead,
-    PortfolioUpdate, TransactionCreate, TransactionRead, WatchlistCreate,
-    WatchlistItemCreate, WatchlistItemRead, WatchlistRead)
+    PortfolioUpdate, PortfolioSnapshotRead, TransactionCreate, TransactionRead,
+    WatchlistCreate, WatchlistItemCreate, WatchlistItemRead, WatchlistRead)
 from domains.portfolio.service import PortfolioService
-from shared.schemas.base import APIResponse, PaginatedResponse
+from shared.schemas.base import (APIResponse, PaginatedResponse,
+                                 PaginationParams)
 from shared.security import CurrentUser
 
 router = APIRouter(tags=["portfolios"])
@@ -33,10 +35,12 @@ async def list_portfolios(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> PaginatedResponse[PortfolioRead]:
+    pagination = PaginationParams(page=page, page_size=page_size)
     items, total = await PortfolioService(db).list_mine(
-        current_user.user_id, page=page, page_size=page_size)
+        current_user.user_id, pagination=pagination)
     return PaginatedResponse(
-        items=items, total=total, page=page, page_size=page_size)
+        items=items, total=total, page=pagination.page,
+        page_size=pagination.page_size)
 
 
 @router.get("/{portfolio_id}", response_model=APIResponse[PortfolioRead])
@@ -65,6 +69,20 @@ async def delete_portfolio(
     db: AsyncSession = Depends(get_db)
 ) -> None:
     await PortfolioService(db).delete(portfolio_id, current_user.user_id)
+
+
+@router.get("/{portfolio_id}/snapshots",
+            response_model=APIResponse[list[PortfolioSnapshotRead]])
+async def get_portfolio_snapshots(
+    portfolio_id: UUID, start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> APIResponse[list[PortfolioSnapshotRead]]:
+    result = await PortfolioService(db).get_snapshots(
+        portfolio_id, current_user.user_id, start_date=start_date,
+        end_date=end_date)
+    return APIResponse(data=result)
 
 
 @router.post("/{portfolio_id}/holdings", status_code=status.HTTP_201_CREATED,
@@ -131,10 +149,12 @@ async def list_transactions(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> PaginatedResponse[TransactionRead]:
+    pagination = PaginationParams(page=page, page_size=page_size)
     items, total = await PortfolioService(db).list_transactions(
-        portfolio_id, current_user.user_id, page=page, page_size=page_size)
+        portfolio_id, current_user.user_id, pagination=pagination)
     return PaginatedResponse(
-        items=items, total=total, page=page, page_size=page_size)
+        items=items, total=total, page=pagination.page,
+        page_size=pagination.page_size)
 
 
 @watchlist_router.post("", status_code=status.HTTP_201_CREATED,

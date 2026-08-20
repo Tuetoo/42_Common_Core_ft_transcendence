@@ -5,6 +5,9 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(c for c in Path(__file__).resolve().parents if (
+    c / "shared" / "database.py").is_file())))
+
 
 from config import settings   # noqa: E402
 from shared.database import Base  # noqa: E402

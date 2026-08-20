@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, UTC, time
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy import or_, select
@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domains.portfolio.model import (Holding, Portfolio, PortfolioSnapshot,
                                      Transaction, Watchlist, WatchlistItem)
 from shared.database import count_query
+from shared.enums.market import TransactionType
+from shared.schemas.base import PaginationParams
 
 
 class PortfolioRepository:
@@ -33,7 +35,7 @@ class PortfolioRepository:
         await self._db.flush()
 
     async def list_for_user(self, user_id: UUID, organization_ids: list[UUID],
-                            *, offset: int, limit: int
+                            *, pagination: PaginationParams
                             ) -> tuple[list[Portfolio], int]:
         conditions = [Portfolio.owner_id == user_id]
         if organization_ids:
@@ -41,7 +43,8 @@ class PortfolioRepository:
         stmt = select(Portfolio).where(or_(*conditions))
         total = await count_query(self._db, stmt)
         result = await self._db.execute(stmt.order_by(
-            Portfolio.created_at.desc()).offset(offset).limit(limit))
+            Portfolio.created_at.desc()).offset(pagination.offset)
+            .limit(pagination.limit))
         return list(result.scalars().all()), total
 
     async def list_all_with_auto_analyze(self) -> list[Portfolio]:
@@ -101,21 +104,27 @@ class TransactionRepository:
     async def create(
             self, *, portfolio_id: UUID, ticker: str, transaction_type: str,
             quantity: Decimal | None, price: Decimal | None,
+            dividend_per_share: Decimal | None,
+            split_ratio: Decimal | None = None,
             transaction_date: datetime) -> Transaction:
         txn = Transaction(portfolio_id=portfolio_id, ticker=ticker.upper(),
                           transaction_type=transaction_type, quantity=quantity,
-                          price=price, transaction_date=transaction_date)
+                          price=price, dividend_per_share=dividend_per_share,
+                          split_ratio=split_ratio,
+                          transaction_date=transaction_date)
         self._db.add(txn)
         await self._db.flush()
         return txn
 
-    async def list_for_portfolio(self, portfolio_id: UUID, *, offset: int,
-                                 limit: int) -> tuple[list[Transaction], int]:
+    async def list_for_portfolio(self, portfolio_id: UUID, *,
+                                 pagination: PaginationParams
+                                 ) -> tuple[list[Transaction], int]:
         stmt = select(Transaction).where(
             Transaction.portfolio_id == portfolio_id)
         total = await count_query(self._db, stmt)
         result = await self._db.execute(stmt.order_by(
-            Transaction.transaction_date.desc()).offset(offset).limit(limit))
+            Transaction.transaction_date.desc()).offset(pagination.offset)
+            .limit(pagination.limit))
         return list(result.scalars().all()), total
 
     async def list_all_for_portfolio(self, portfolio_id: UUID
@@ -123,6 +132,22 @@ class TransactionRepository:
         result = await self._db.execute(select(Transaction).where(
             Transaction.portfolio_id == portfolio_id)
             .order_by(Transaction.transaction_date.asc()))
+        return list(result.scalars().all())
+
+    async def list_cash_flows_for_portfolio(self, portfolio_id: UUID, *,
+                                            start_date: date, end_date: date
+                                            ) -> list[Transaction]:
+        stmt = (select(Transaction).where(
+            Transaction.portfolio_id == portfolio_id,
+            Transaction.transaction_type.in_(
+                (TransactionType.DEPOSIT.value,
+                 TransactionType.WITHDRAWAL.value)),
+            Transaction.transaction_date >= datetime.combine(
+                start_date, time.min, tzinfo=UTC),
+            Transaction.transaction_date <= datetime.combine(
+                end_date, time.max, tzinfo=UTC))
+                .order_by(Transaction.transaction_date.asc()))
+        result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
 
@@ -145,6 +170,19 @@ class PortfolioSnapshotRepository:
             PortfolioSnapshot.portfolio_id == portfolio_id,
             PortfolioSnapshot.snapshot_date == snapshot_date))
         return result.scalar_one()
+
+    async def list_for_portfolio(
+            self, portfolio_id: UUID, *, start_date: date | None = None,
+            end_date: date | None = None) -> list[PortfolioSnapshot]:
+        stmt = select(PortfolioSnapshot).where(
+            PortfolioSnapshot.portfolio_id == portfolio_id)
+        if start_date is not None:
+            stmt = stmt.where(PortfolioSnapshot.snapshot_date >= start_date)
+        if end_date is not None:
+            stmt = stmt.where(PortfolioSnapshot.snapshot_date <= end_date)
+        stmt = stmt.order_by(PortfolioSnapshot.snapshot_date)
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
 
 
 class WatchlistRepository:

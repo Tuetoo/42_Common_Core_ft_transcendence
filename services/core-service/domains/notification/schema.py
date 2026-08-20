@@ -16,3 +16,7 @@ class NotificationRead(BaseSchema, IDMixin):
 
 class NotificationMarkReadRequest(BaseModel):
     notification_ids: list[UUID]
+
+
+class NotificationMarkReadResponse(BaseModel):
+    marked_count: int

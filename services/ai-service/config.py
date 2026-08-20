@@ -42,9 +42,6 @@ class AIServiceSettings(BaseServiceSettings):
     SEC_EDGAR_USER_AGENT: str = ""
     FRED_API_KEY: str = ""
     NEWSAPI_API_KEY: str = ""
-    REDDIT_CLIENT_ID: str = ""
-    REDDIT_CLIENT_SECRET: str = ""
-    REDDIT_USER_AGENT: str = "AlphaMind/1.0 (research platform)"
     TAVILY_API_KEY: str = ""
     KG_EXTRACTION_LLM_TIER: str = "cheap"
 

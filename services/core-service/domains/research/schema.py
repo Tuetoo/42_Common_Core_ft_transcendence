@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel, Field
-from shared.schemas.base import BaseSchema, IDMixin
+from shared.schemas.base import BaseSchema, IDMixin, PaginationParams
 from shared.schemas.refs import UserRef
 
 
@@ -61,12 +61,10 @@ class ResearchNoteRead(BaseSchema, IDMixin):
     updated_at: datetime
 
 
-class ResearchNoteFilters(BaseModel):
+class ResearchNoteFilters(PaginationParams):
     q: str | None = None
     tag: str | None = None
     author_id: UUID | None = None
     organization_id: UUID | None = None
     sort: str = Field(default="-created_at",
                       pattern=r"^-?(created_at|title)$")
-    page: int = Field(default=1, ge=1)
-    page_size: int = Field(default=20, ge=1, le=100)

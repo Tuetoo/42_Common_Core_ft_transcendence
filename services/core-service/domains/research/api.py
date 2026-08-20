@@ -10,7 +10,8 @@ from domains.research.schema import (
     ResearchNoteUpdate)
 from domains.research.service import ResearchService
 from shared.enums.document import DocumentCategory
-from shared.schemas.base import APIResponse, PaginatedResponse
+from shared.schemas.base import (APIResponse, PaginatedResponse,
+                                 PaginationParams)
 from shared.security import CurrentUser
 
 router = APIRouter(tags=["research"])
@@ -108,11 +109,13 @@ async def list_documents(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> PaginatedResponse[DocumentRead]:
+    pagination = PaginationParams(page=page, page_size=page_size)
     items, total = await ResearchService(db).list_documents(
-        current_user.user_id, page=page, page_size=page_size, ticker=ticker,
+        current_user.user_id, pagination=pagination, ticker=ticker,
         category=category)
     return PaginatedResponse(
-        items=items, total=total, page=page, page_size=page_size)
+        items=items, total=total, page=pagination.page,
+        page_size=pagination.page_size)
 
 
 @router.get("/documents/{document_id}",
