@@ -2,7 +2,7 @@ from uuid import UUID
 from database import get_db
 from deps import get_current_user
 from fastapi import (APIRouter, Depends, Form, Query, Response, UploadFile,
-                     status)
+                     status, BackgroundTasks)
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.research.schema import (
     DocumentRead, ResearchCommentCreate, ResearchCommentRead,
@@ -86,8 +86,8 @@ async def add_comment(note_id: UUID, data: ResearchCommentCreate,
 @router.post("/documents", status_code=status.HTTP_201_CREATED,
              response_model=APIResponse[DocumentRead])
 async def upload_document(
-    file: UploadFile, category: str = Form(...),
-    ticker: str | None = Form(default=None),
+    background_tasks: BackgroundTasks, file: UploadFile,
+    category: str = Form(...), ticker: str | None = Form(default=None),
     organization_id: UUID | None = Form(default=None),
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -96,7 +96,7 @@ async def upload_document(
     result = await ResearchService(db).upload_document(
         owner_id=current_user.user_id, organization_id=organization_id,
         filename=file.filename or "upload", content=content,
-        category=category, ticker=ticker)
+        category=category, ticker=ticker, background_tasks=background_tasks)
     return APIResponse(data=result)
 
 
@@ -149,8 +149,9 @@ async def download_document_content(
 @router.delete("/documents/{document_id}",
                status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
-    document_id: UUID, current_user: CurrentUser = Depends(get_current_user),
+    document_id: UUID, background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> None:
     await ResearchService(db).delete_document(
-        document_id, current_user.user_id)
+        document_id, current_user.user_id, background_tasks=background_tasks)

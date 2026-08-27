@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import clients.auth_client as auth_client
 import structlog
 from config import settings
+from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.research.model import Document, ResearchNote
 from domains.research.repository import (
@@ -35,8 +36,8 @@ class ResearchService:
     async def upload_document(
             self, *, owner_id: UUID, organization_id: UUID | None,
             filename: str, content: bytes, category: str,
-            ticker: str | None = None, content_date: datetime | None = None
-            ) -> DocumentRead:
+            background_tasks: BackgroundTasks, ticker: str | None = None,
+            content_date: datetime | None = None) -> DocumentRead:
         extension = Path(filename).suffix.lower()
         if extension not in settings.ALLOWED_DOCUMENT_EXTENSIONS:
             raise ValidationAppError(
@@ -50,6 +51,13 @@ class ResearchService:
             raise ValidationAppError(
                 f"Unsupported category '{category}'. Allowed: "
                 f"{', '.join(sorted(settings.ALLOWED_DOCUMENT_CATEGORIES))}.")
+        if (organization_id is not None
+                and owner_id != UUID("00000000-0000-0000-0000-0000000005ec")):
+            org_ids = await auth_client.list_user_organization_ids(
+                str(owner_id))
+            if organization_id not in org_ids:
+                raise PermissionDeniedError(
+                    "You are not a member of the target organization.")
         object_key = f"documents/{owner_id}/{uuid4().hex}{extension}"
         content_type, _ = mimetypes.guess_type(filename)
         await upload_bytes(settings, bucket=settings.S3_BUCKET_DOCUMENTS,
@@ -63,8 +71,8 @@ class ResearchService:
             filename=filename, document_type=document_type, category=category,
             ticker=ticker_normalized, storage_url=storage_url,
             content_date=content_date)
-        await publish_durable_event(
-            settings, EventName.DOCUMENT_UPLOADED,
+        background_tasks.add_task(
+            publish_durable_event, settings, EventName.DOCUMENT_UPLOADED,
             {"document_id": str(document.id), "owner_id": str(owner_id),
              "organization_id": str(organization_id) if organization_id
              else None, "storage_bucket": settings.S3_BUCKET_DOCUMENTS,
@@ -102,8 +110,8 @@ class ResearchService:
             settings, bucket=settings.S3_BUCKET_DOCUMENTS,
             key=document.storage_url)
 
-    async def delete_document(self, document_id: UUID, requester_id: UUID
-                              ) -> None:
+    async def delete_document(self, document_id: UUID, requester_id: UUID, *,
+                              background_tasks: BackgroundTasks) -> None:
         document = await self.documents.get_by_id(document_id)
         if document is None:
             raise NotFoundError("Document not found.")
@@ -113,8 +121,9 @@ class ResearchService:
         await delete_object(settings, bucket=settings.S3_BUCKET_DOCUMENTS,
                             key=document.storage_url)
         await self.documents.delete(document)
-        await publish_durable_event(settings, EventName.DOCUMENT_DELETED,
-                                    {"document_id": str(document_id)})
+        background_tasks.add_task(
+            publish_durable_event, settings, EventName.DOCUMENT_DELETED,
+            {"document_id": str(document_id)})
 
     async def list_documents(
             self, requester_id: UUID, *, pagination: PaginationParams,

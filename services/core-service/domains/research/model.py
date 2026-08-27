@@ -1,7 +1,7 @@
 from uuid import UUID
 from datetime import datetime
 from sqlalchemy import (Computed, DateTime, ForeignKey, Index, LargeBinary,
-                        String, Text, UniqueConstraint, func)
+                        String, Text, text, func)
 from sqlalchemy.dialects.postgresql import TSVECTOR, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 from shared.database import Base
@@ -10,9 +10,14 @@ from shared.models import UUIDPKMixin
 
 class Document(Base, UUIDPKMixin):
     __tablename__ = "documents"
-    __table_args__ = (UniqueConstraint(
-        "ticker", "category", "filename",
-        name="uq_documents_ticker_category_filename"),)
+    __table_args__ = (Index("uq_documents_org_ticker_category_filename",
+                            "organization_id", "ticker", "category",
+                            "filename", unique=True, postgresql_where=text(
+                                "organization_id IS NOT NULL")),
+                      Index("uq_documents_owner_ticker_category_filename",
+                            "owner_id", "ticker", "category", "filename",
+                            unique=True, postgresql_where=text(
+                                "organization_id IS NULL")))
     owner_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), nullable=False, index=True)
     organization_id: Mapped[UUID | None] = mapped_column(

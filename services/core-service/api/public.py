@@ -53,12 +53,13 @@ async def list_holdings(
 
 @router.post("/watchlists/{watchlist_id}/items",
              response_model=APIResponse[WatchlistItemRead])
-async def add_watchlist_item(watchlist_id: UUID, ticker: str, request: Request,
-                             db: AsyncSession = Depends(get_db)
-                             ) -> APIResponse[WatchlistItemRead]:
+async def add_watchlist_item(
+    watchlist_id: UUID, data: WatchlistItemCreate, request: Request,
+    db: AsyncSession = Depends(get_db)
+) -> APIResponse[WatchlistItemRead]:
     owner_id = _owner_user_id(request)
     result = await PortfolioService(db).add_watchlist_item(
-        watchlist_id, owner_id, WatchlistItemCreate(ticker=ticker))
+        watchlist_id, owner_id, data)
     return APIResponse(data=result)
 
 
