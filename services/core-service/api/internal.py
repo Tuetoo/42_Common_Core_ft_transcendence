@@ -10,7 +10,7 @@ from domains.portfolio.repository import (
     TransactionRepository)
 from domains.research.repository import DocumentRepository
 from domains.research.service import ResearchService
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from shared.exceptions import NotFoundError
 
@@ -106,11 +106,13 @@ async def get_document_filenames(
 
 @router.post("/documents")
 async def create_system_document(
-    payload: SystemDocumentCreate, db: AsyncSession = Depends(get_db)
+    payload: SystemDocumentCreate, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
     result = await ResearchService(db).upload_document(
         owner_id=SYSTEM_INGESTION_OWNER_ID,
         organization_id=payload.organization_id, filename=payload.filename,
         content=payload.content.encode("utf-8"), category=payload.category,
-        ticker=payload.ticker, content_date=payload.content_date)
+        ticker=payload.ticker, content_date=payload.content_date,
+        background_tasks=background_tasks)
     return {"id": str(result.id), "filename": result.filename}

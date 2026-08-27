@@ -22,11 +22,17 @@ class DocumentRepository:
         return result.scalar_one_or_none()
 
     async def get_by_ticker_category_filename(
-            self, *, ticker: str | None, category: str, filename: str
+            self, *, owner_id: UUID, organization_id: UUID | None,
+            ticker: str | None, category: str, filename: str
             ) -> Document | None:
         stmt = select(Document).where(
             Document.ticker == ticker, Document.category == category,
             Document.filename == filename)
+        if organization_id is not None:
+            stmt = stmt.where(Document.organization_id == organization_id)
+        else:
+            stmt = stmt.where(Document.organization_id.is_(None),
+                              Document.owner_id == owner_id)
         result = await self._db.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -39,12 +45,13 @@ class DocumentRepository:
             filename=filename, document_type=document_type, category=category,
             ticker=ticker, storage_url=storage_url, status="uploaded",
             content_date=content_date)
-        self._db.add(doc)
         try:
-            await self._db.flush()
+            async with self._db.begin_nested():
+                self._db.add(doc)
+                await self._db.flush()
         except IntegrityError:
-            await self._db.rollback()
             existing = await self.get_by_ticker_category_filename(
+                owner_id=owner_id, organization_id=organization_id,
                 ticker=ticker, category=category, filename=filename)
             if existing is not None:
                 return existing

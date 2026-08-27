@@ -20,6 +20,8 @@ class AIServiceSettings(BaseServiceSettings):
     MISTRAL_API_KEY_3: str = ""
     MISTRAL_API_KEY_4: str = ""
     MISTRAL_API_KEY_5: str = ""
+    MISTRAL_API_KEY_6: str = ""
+    MISTRAL_API_KEY_7: str = ""
 
     LLM_DEFAULT_PROVIDER: str = "mistral"
     LLM_OPENAI_MODEL_FAST: str = "gpt-5.6-luna"
