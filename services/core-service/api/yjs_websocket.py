@@ -46,4 +46,4 @@ async def yjs_websocket_endpoint(
             await yjs_relay.relay.handle_local_update(
                 room, update, sender=websocket)
     except WebSocketDisconnect:
-        yjs_relay.relay.disconnect(websocket, room)
+        await yjs_relay.relay.disconnect(websocket, room)

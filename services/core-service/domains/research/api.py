@@ -1,4 +1,5 @@
 from uuid import UUID
+from datetime import datetime
 from database import get_db
 from deps import get_current_user
 from fastapi import (APIRouter, Depends, Form, Query, Response, UploadFile,
@@ -89,6 +90,7 @@ async def upload_document(
     background_tasks: BackgroundTasks, file: UploadFile,
     category: str = Form(...), ticker: str | None = Form(default=None),
     organization_id: UUID | None = Form(default=None),
+    content_date: datetime | None = Form(default=None),
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> APIResponse[DocumentRead]:
@@ -96,7 +98,8 @@ async def upload_document(
     result = await ResearchService(db).upload_document(
         owner_id=current_user.user_id, organization_id=organization_id,
         filename=file.filename or "upload", content=content,
-        category=category, ticker=ticker, background_tasks=background_tasks)
+        category=category, ticker=ticker, content_date=content_date,
+        background_tasks=background_tasks)
     return APIResponse(data=result)
 
 

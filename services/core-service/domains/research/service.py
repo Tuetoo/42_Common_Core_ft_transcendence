@@ -130,11 +130,12 @@ class ResearchService:
             ticker: str | None = None,
             category: DocumentCategory | None = None
             ) -> tuple[list[DocumentRead], int]:
+        ticker_normalized = ticker.upper() if ticker else None
         org_ids = await auth_client.list_user_organization_ids(
             str(requester_id))
         docs, total = await self.documents.list_for_user(
-            requester_id, org_ids, pagination=pagination, ticker=ticker,
-            category=category)
+            requester_id, org_ids, pagination=pagination,
+            ticker=ticker_normalized, category=category)
         return [DocumentRead.model_validate(d) for d in docs], total
 
     async def _note_to_read(self, note: ResearchNote) -> ResearchNoteRead:
@@ -147,6 +148,12 @@ class ResearchService:
 
     async def create_note(self, author_id: UUID, data: ResearchNoteCreate
                           ) -> ResearchNoteRead:
+        if data.organization_id is not None:
+            org_ids = await auth_client.list_user_organization_ids(
+                str(author_id))
+            if data.organization_id not in org_ids:
+                raise PermissionDeniedError(
+                    "You are not a member of the target organization.")
         note = await self.notes.create(
             author_id=author_id, organization_id=data.organization_id,
             title=data.title, content=data.content)
