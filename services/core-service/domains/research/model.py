@@ -59,7 +59,8 @@ class ResearchNote(Base, UUIDPKMixin):
 class ResearchComment(Base, UUIDPKMixin):
     __tablename__ = "research_comments"
     note_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("research_notes.id"), nullable=False,
+        PGUUID(as_uuid=True), ForeignKey(
+            "research_notes.id", ondelete="CASCADE"), nullable=False,
         index=True)
     author_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), nullable=False)
@@ -76,7 +77,8 @@ class ResearchTag(Base, UUIDPKMixin):
 class NoteTag(Base):
     __tablename__ = "note_tags"
     note_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("research_notes.id"),
-        primary_key=True)
+        PGUUID(as_uuid=True), ForeignKey(
+            "research_notes.id", ondelete="CASCADE"), primary_key=True)
     tag_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("research_tags.id"), primary_key=True)
+        PGUUID(as_uuid=True), ForeignKey(
+            "research_tags.id", ondelete="CASCADE"), primary_key=True)

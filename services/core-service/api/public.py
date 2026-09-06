@@ -1,5 +1,4 @@
 from uuid import UUID
-from decimal import Decimal
 from typing import Any, cast
 from fastapi import APIRouter, Depends, Query, Request
 from database import get_db
@@ -66,13 +65,12 @@ async def add_watchlist_item(
 @router.put("/portfolios/{portfolio_id}/holdings/{holding_id}",
             response_model=APIResponse[HoldingRead])
 async def update_holding(
-    portfolio_id: UUID, holding_id: UUID, quantity: Decimal,
-    average_cost: Decimal, request: Request, db: AsyncSession = Depends(get_db)
+    portfolio_id: UUID, holding_id: UUID, data: HoldingUpdate,
+    request: Request, db: AsyncSession = Depends(get_db)
 ) -> APIResponse[HoldingRead]:
     owner_id = _owner_user_id(request)
     result = await PortfolioService(db).update_holding(
-        portfolio_id, owner_id, holding_id,
-        HoldingUpdate(quantity=quantity, average_cost=average_cost))
+        portfolio_id, owner_id, holding_id, data)
     return APIResponse(data=result)
 
 

@@ -157,7 +157,12 @@ class ResearchNoteRepository:
         result = await self._db.execute(stmt.offset(offset).limit(limit))
         return list(result.scalars().all()), total
 
+    @staticmethod
+    def _normalize_tag_name(name: str) -> str:
+        return name.strip().lower()
+
     async def get_or_create_tag(self, name: str) -> ResearchTag:
+        name = self._normalize_tag_name(name)
         stmt = pg_insert(ResearchTag).values(name=name).on_conflict_do_nothing(
             index_elements=["name"])
         await self._db.execute(stmt)
@@ -167,15 +172,19 @@ class ResearchNoteRepository:
         return result.scalar_one()
 
     async def get_tag_by_name(self, name: str) -> ResearchTag | None:
-        result = await self._db.execute(select(ResearchTag)
-                                        .where(ResearchTag.name == name))
+        result = await self._db.execute(select(ResearchTag).where(
+            ResearchTag.name == self._normalize_tag_name(name)))
         return result.scalar_one_or_none()
 
     async def set_note_tags(self, note_id: UUID, tag_names: list[str]) -> None:
         await self._db.execute(delete(NoteTag)
                                .where(NoteTag.note_id == note_id))
+        seen_tag_ids: set[UUID] = set()
         for name in tag_names:
             tag = await self.get_or_create_tag(name)
+            if tag.id in seen_tag_ids:
+                continue
+            seen_tag_ids.add(tag.id)
             self._db.add(NoteTag(note_id=note_id, tag_id=tag.id))
         await self._db.flush()
 

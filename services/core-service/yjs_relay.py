@@ -66,13 +66,21 @@ async def _publish_cross_replica(note_id: str, update: bytes) -> None:
         f"{_REDIS_CHANNEL_PREFIX}{note_id}", f"{_REPLICA_ID}:{encoded}")
 
 
-async def _persist_snapshot(note_id: str, state: bytes) -> None:
+async def _persist_snapshot(note_id: str, state: bytes) -> bool:
     async with SessionLocal() as session:
         repo = ResearchNoteRepository(session)
         note = await repo.get_by_id(UUID(note_id))
-        if note is not None:
+        if note is None:
+            return False
+        if note.yjs_state:
+            merged_doc = Y.YDoc()
+            Y.apply_update(merged_doc, note.yjs_state)
+            Y.apply_update(merged_doc, state)
+            note.yjs_state = Y.encode_state_as_update(merged_doc)
+        else:
             note.yjs_state = state
-            await session.commit()
+        await session.commit()
+        return True
 
 
 class YjsRelay:
@@ -100,8 +108,26 @@ class YjsRelay:
         await websocket.send_bytes(room.encode_state())
         return room
 
-    def disconnect(self, websocket: WebSocket, room: YjsRoom) -> None:
+    async def disconnect(self, websocket: WebSocket, room: YjsRoom) -> None:
         room.connections.discard(websocket)
+        if room.connections:
+            return
+        async with room.lock:
+            if room.connections:
+                return
+            should_persist = room._dirty
+            snapshot = room.encode_state() if should_persist else None
+        if should_persist:
+            assert snapshot is not None
+            try:
+                if await _persist_snapshot(room.note_id, snapshot):
+                    room.mark_snapshotted()
+            except Exception:
+                logger.exception("yjs_snapshot_persist_failed_on_disconnect",
+                                 note_id=room.note_id)
+        async with self._creation_lock:
+            if not room.connections and self._rooms.get(room.note_id) is room:
+                self._rooms.pop(room.note_id, None)
 
     async def _broadcast_local(self, room: YjsRoom, update: bytes,
                                exclude: WebSocket | None) -> None:
@@ -122,12 +148,22 @@ class YjsRelay:
             room.apply(update, counts_toward_snapshot=True)
             await self._broadcast_local(room, update, exclude=sender)
             do_snapshot = room.should_snapshot()
-            if do_snapshot:
-                snapshot = room.encode_state()
-                room.mark_snapshotted()
+            snapshot = room.encode_state() if do_snapshot else None
         await _publish_cross_replica(room.note_id, update)
         if do_snapshot:
-            await _persist_snapshot(room.note_id, snapshot)
+            assert snapshot is not None
+            try:
+                persisted = await _persist_snapshot(room.note_id, snapshot)
+            except Exception:
+                logger.exception("yjs_snapshot_persist_failed",
+                                 note_id=room.note_id)
+            else:
+                if persisted:
+                    async with room.lock:
+                        room.mark_snapshotted()
+                else:
+                    logger.warning("yjs_persist_snapshot_note_missing",
+                                   note_id=room.note_id)
 
     async def apply_remote_update(self, note_id: str, update: bytes) -> None:
         room = self._rooms.get(note_id)
