@@ -5,6 +5,7 @@ import clients.ai_client as ai_client
 import clients.auth_client as auth_client
 import structlog
 from config import settings
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.portfolio.model import Holding, Portfolio, Watchlist, Transaction
@@ -25,6 +26,47 @@ from shared.schemas.base import PaginationParams
 
 logger = structlog.get_logger(__name__)
 _CASH_TICKER = "CASH"
+
+
+def _cash_delta(transaction_type: str, quantity: Decimal | None,
+                price: Decimal | None, dividend_per_share: Decimal | None
+                ) -> Decimal:
+    if transaction_type == TransactionType.DEPOSIT and quantity:
+        return quantity
+    if transaction_type == TransactionType.WITHDRAWAL and quantity:
+        return -quantity
+    if (transaction_type == TransactionType.DIVIDEND and quantity
+            and dividend_per_share):
+        return quantity * dividend_per_share
+    if transaction_type == TransactionType.BUY and quantity and price:
+        return -(quantity * price)
+    if transaction_type == TransactionType.SELL and quantity and price:
+        return quantity * price
+    return Decimal(0)
+
+
+def _ledger_day(moment: datetime) -> date:
+    if moment.tzinfo is None:
+        return moment.date()
+    return moment.astimezone(UTC).date()
+
+
+def lowest_cash_from(transactions: list[Transaction], *, new_day: date,
+                     new_delta: Decimal) -> tuple[Decimal, date]:
+    per_day: dict[date, Decimal] = {}
+    for txn in transactions:
+        day = _ledger_day(txn.transaction_date)
+        per_day[day] = per_day.get(day, Decimal(0)) + _cash_delta(
+            txn.transaction_type, txn.quantity, txn.price,
+            txn.dividend_per_share)
+    per_day[new_day] = per_day.get(new_day, Decimal(0)) + new_delta
+    running = Decimal(0)
+    balances: list[tuple[Decimal, date]] = []
+    for day in sorted(per_day):
+        running += per_day[day]
+        if day >= new_day:
+            balances.append((running, day))
+    return min(balances, key=lambda b: b[0])
 
 
 def replay_holdings_and_cash_as_of(
@@ -268,9 +310,51 @@ class PortfolioService:
             raise ValidationAppError(
                 "A dividend requires both quantity and dividend_per_share.")
 
+    async def _ensure_cash_stays_non_negative(
+            self, portfolio_id: UUID, data: TransactionCreate) -> None:
+        is_buy = data.transaction_type == TransactionType.BUY
+        if is_buy and (not data.quantity or not data.price):
+            raise ValidationAppError("A buy requires both quantity and price.")
+        if not is_buy and not data.quantity:
+            raise ValidationAppError("A withdrawal requires a quantity.")
+        quantity = data.quantity or Decimal(0)
+        amount = quantity * (data.price or Decimal(0)) if is_buy else quantity
+        await self._db.execute(select(Portfolio.id).where(
+            Portfolio.id == portfolio_id).with_for_update())
+        txns = await self.transactions.list_all_for_portfolio(portfolio_id)
+        new_day = _ledger_day(data.transaction_date)
+        lowest, lowest_day = lowest_cash_from(txns, new_day=new_day,
+                                              new_delta=-amount)
+        if lowest >= 0:
+            return
+        available = lowest + amount
+        when = (f"on {new_day.isoformat()}" if lowest_day == new_day
+                else f"on {new_day.isoformat()} (the balance would go negative"
+                f" on {lowest_day.isoformat()})")
+        logger.info("transaction_rejected_insufficient_cash",
+                    portfolio_id=str(portfolio_id),
+                    transaction_type=str(data.transaction_type),
+                    ticker=data.ticker.upper() if is_buy else _CASH_TICKER,
+                    required=str(amount), available=str(available),
+                    transaction_day=new_day.isoformat(),
+                    shortfall_day=lowest_day.isoformat())
+        if is_buy:
+            raise ValidationAppError("Insufficient cash to buy "
+                                     f"{data.quantity} {data.ticker.upper()} "
+                                     f"at {data.price} {when}: required "
+                                     f"{amount}, available cash {available}."
+                                     "Leverage is not allowed -- record a "
+                                     "deposit first.")
+        raise ValidationAppError(f"Insufficient cash to withdraw {amount} "
+                                 f"{when}: required {amount}, available cash "
+                                 f"{available}. Cash can never be negative.")
+
     async def record_transaction(self, portfolio_id: UUID, requester_id: UUID,
                                  data: TransactionCreate) -> TransactionRead:
         await self._require_owner(portfolio_id, requester_id)
+        if data.transaction_type in (TransactionType.BUY,
+                                     TransactionType.WITHDRAWAL):
+            await self._ensure_cash_stays_non_negative(portfolio_id, data)
         ticker = (_CASH_TICKER if data.transaction_type in (
             TransactionType.DEPOSIT, TransactionType.WITHDRAWAL)
             else data.ticker.upper())

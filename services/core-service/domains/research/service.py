@@ -79,7 +79,7 @@ class ResearchService:
              "storage_key": storage_url, "document_type": document_type,
              "category": category, "ticker": ticker_normalized,
              "content_date": content_date.isoformat() if content_date
-             else None})
+             else None, "filename": filename})
         return DocumentRead.model_validate(document)
 
     async def _require_readable_document(self, document_id: UUID,

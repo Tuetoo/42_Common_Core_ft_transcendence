@@ -18,7 +18,7 @@ class ApiKey(Base, UUIDPKMixin):
     __tablename__ = "api_keys"
     __table_args__ = (CheckConstraint(
         "owner_user_id IS NOT NULL OR owner_org_id IS NOT NULL",
-        name="ck_api_keys_has_owner"))
+        name="ck_api_keys_has_owner"),)
     owner_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), nullable=True, index=True)
     owner_org_id: Mapped[UUID | None] = mapped_column(
