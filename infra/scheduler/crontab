@@ -1,0 +1,19 @@
+
+# Market open: 9:30 AM ET, Monday-Friday
+30 9 * * 1-5 /scripts/market-open.sh >> /var/log/scheduler.log 2>&1
+
+# Market close: 4:00 PM ET, Monday-Friday
+0 16 * * 1-5 /scripts/market-close.sh >> /var/log/scheduler.log 2>&1
+
+# Tier monitoring: checks every accepted (or still-acceptable) recommendation
+# tier for a real trigger 5:00 PM ET, Monday-Friday 
+0 17 * * 1-5 /scripts/tier-monitoring.sh >> /var/log/scheduler.log 2>&1
+
+# Review: 2:00 AM ET
+0 2 * * * /scripts/review-run.sh >> /var/log/scheduler.log 2>&1
+
+# RAG auto-ingestion: 3:00 AM ET: after review-run, every day 
+0 3 * * * /scripts/rag-ingest.sh >> /var/log/scheduler.log 2>&1
+
+# Log retention 4:00 AM ET daily
+0 4 * * * /scripts/logs-cleanup.sh >> /var/log/scheduler.log 2>&1

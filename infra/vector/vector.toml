@@ -1,0 +1,74 @@
+# Persist every container's stdout/stderr to disk.
+#
+# Why: `docker compose logs` only shows what the Docker daemon still
+# holds, which is lost on container recreate (`up -d --build`,
+# `--force-recreate`), so a failing overnight batch could no longer be
+# investigated the next morning. This collector is independent of the
+# application code: it reads straight from the Docker daemon.
+#
+# Output: ./logs/<service>/<YYYY-MM-DD>.log on the host (mounted at /logs),
+# where <service> is the compose service name (label
+# com.docker.compose.service), falling back to the container name for
+# containers not started by compose. The date is the America/New_York
+# calendar date of the line (same zone as the scheduler's crontab), taken
+# from the timestamp Docker recorded for the line.
+#
+# Line format: "<timestamp> <stream> <original line>". The original line
+# is written byte-for-byte after the prefix (text codec, not JSON: JSON
+# would re-escape every quote of the services' own structured log lines
+# and make them hard to read or grep). The prefix exists because several
+# processes (e.g. uvicorn access logs) print lines without any timestamp.
+#
+# Retention: infra/scheduler/logs-cleanup.sh (daily, 14 days).
+#
+# Validate after pulling the image (skips the Docker socket health check):
+#   docker compose run --rm --no-deps vector validate --no-environment /etc/vector/vector.toml
+
+[api]
+enabled = false
+
+[sources.docker]
+type = "docker_logs"
+# Default is DOCKER_HOST or unix:///var/run/docker.sock; stated explicitly
+# because docker-compose.yaml mounts exactly this path.
+docker_host = "unix:///var/run/docker.sock"
+# Default true, stated for clarity: re-joins lines that Docker splits into
+# 16 KiB partial messages, so one original line stays one line.
+auto_partial_merge = true
+
+[transforms.prepare]
+type = "remap"
+inputs = ["docker"]
+# Events for which `abort` is reached are dropped (drop_on_abort default).
+drop_on_abort = true
+source = '''
+service = string(.label."com.docker.compose.service") ?? string(.container_name) ?? "unknown"
+service = replace(service, r'[^A-Za-z0-9_.-]', "_")
+if service == "" || service == "." || service == ".." {
+  service = "unknown"
+}
+# Never collect the collector's own output: an internal Vector warning
+# about an event would otherwise become a new event itself.
+if service == "vector" {
+  abort
+}
+ts = timestamp(.timestamp) ?? now()
+stream = string(.stream) ?? "-"
+line = string(.message) ?? ""
+. = {
+  "message": format_timestamp!(ts, format: "%Y-%m-%dT%H:%M:%S%.3f%:z", timezone: "America/New_York") + " " + stream + " " + line,
+  "log_service": service,
+  "log_date": format_timestamp!(ts, format: "%Y-%m-%d", timezone: "America/New_York")
+}
+'''
+
+[sinks.files]
+type = "file"
+inputs = ["prepare"]
+# Parent directories are created by the sink on first write.
+path = "/logs/{{ log_service }}/{{ log_date }}.log"
+# Close a file handle after 60s without writes (e.g. yesterday's file),
+# so the cleanup script never races an open handle for old files.
+idle_timeout_secs = 60
+# Writes only the `message` field, one event per line.
+encoding.codec = "text"
