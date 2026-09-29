@@ -91,7 +91,7 @@ async def get_price_history(ticker: str, *, start_date: date, end_date: date
 
 async def request_analysis(ticker: str, portfolio_id: UUID | None = None
                            ) -> AnalysisRef | None:
-    url = f"{settings.AI_SERVICE_URL}/api/v1/analyses"
+    url = f"{settings.AI_SERVICE_URL}/internal/analyses"
     payload = {"ticker": ticker, "portfolio_id": str(portfolio_id)
                if portfolio_id else None}
     try:

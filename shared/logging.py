@@ -7,7 +7,9 @@ from shared.config import BaseServiceSettings
 def configure_logging(settings: BaseServiceSettings) -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stdout,
                         level=settings.LOG_LEVEL)
-
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+        
     def add_service_name(
             _logger: structlog.types.WrappedLogger, _method_name: str,
             event_dict: structlog.types.EventDict

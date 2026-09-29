@@ -33,6 +33,21 @@ async def get_portfolio_holdings_internal(
              "average_cost": float(h.average_cost)} for h in holdings]
 
 
+@router.get("/portfolios/{portfolio_id}/owner")
+async def get_portfolio_owner_internal(
+    portfolio_id: UUID, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    portfolio = await PortfolioService(db).portfolios.get_by_id(portfolio_id)
+    if portfolio is None:
+        raise NotFoundError("Portfolio not found.")
+    return {"portfolio_id": str(portfolio.id),
+            "owner_id": str(portfolio.owner_id),
+            "organization_id": (str(portfolio.organization_id)
+                                if portfolio.organization_id is not None
+                                else None),
+            "visibility": portfolio.visibility}
+
+
 @router.get("/portfolios/{portfolio_id}/cash-balance")
 async def get_portfolio_cash_balance_internal(
     portfolio_id: UUID, db: AsyncSession = Depends(get_db)

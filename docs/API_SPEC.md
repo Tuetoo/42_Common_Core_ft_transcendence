@@ -1,5 +1,6 @@
 # AlphaMind — API Specification
 
+
 ## 1. Base paths and gateway routing
 
 All three services sit behind an nginx gateway (`infra/gateway/nginx.conf`),
@@ -210,6 +211,7 @@ status changes for a user's connections).
 ```
 GET    /internal/portfolios/{portfolio_id}/holdings
 GET    /internal/portfolios/{portfolio_id}/cash-balance
+GET    /internal/portfolios/{portfolio_id}/owner
 POST   /internal/portfolios/{portfolio_id}/transactions
 POST   /internal/scheduler/market-open
 POST   /internal/scheduler/market-close
@@ -262,10 +264,12 @@ POST   /api/v1/analyses/{analysis_id}/decisions
 `POST /api/v1/analyses` returns immediately with `status: "pending"` — the
 actual agent graph run happens in a detached background task
 (`ai/workflows/analysis_workflow.py`). There is no synchronous "wait for the
-result" mode. It's callable two ways: an authenticated frontend request
-(JWT-derived user), or core-service's scheduled market-open job calling
-directly with no auth header at all (a batch analysis with no single owning
-user — see `deps.py::get_current_user_optional`). Optional `portfolio_id` in
+result" mode. It requires a logged-in user (round111); the owner comes from
+the JWT only, and a `portfolio_id` must belong to the caller (owner, or a
+member of the portfolio's organization when the portfolio is not private --
+checked through core-service `GET /internal/portfolios/{id}/owner`), else
+404. System callers (core-service's market-open job, the owner's run scripts)
+use `POST /internal/analyses` on the docker network instead. Optional `portfolio_id` in
 the request body: when set and the Judge's verdict is BUY/SELL (not HOLD), a
 real position-sizing step runs and writes real, pending recommendation tiers
 sized against that portfolio's actual cash/holdings; omitted entirely, the
@@ -273,8 +277,13 @@ analysis is review-only and produces no tiers regardless of the verdict.
 
 `GET /api/v1/analyses/{id}` returns full detail: every agent run, the debate
 transcript, reflection history, and the final recommendation, in one
-response. `POST .../decisions` confirms followed/ignored/partial against
-that analysis's recommendation.
+response. `POST .../decisions` confirms followed/ignored/partial/declined
+against that analysis's recommendation. Since round111 every route in this
+section requires login; an analysis is visible to its user, or (for a
+system analysis with no user) to whoever may access its portfolio; anything
+else returns 404. The same ownership rule applies to decisions (outcome and
+review routes) and backtests (`GET /backtests/{id}` and `/metrics` match the
+backtest's user; creates require login and portfolio access).
 
 ### Decisions
 ```
@@ -361,7 +370,9 @@ ever). Real portfolio-level performance metrics now come from
 
 ### Internal (service-to-service / scheduler only)
 ```
+POST   /internal/analyses
 GET    /internal/analyses/{analysis_id}
+GET    /internal/analyses/{analysis_id}/detail
 GET    /internal/recommendations/latest?ticker=...
 POST   /internal/review/run
 POST   /internal/scheduler/tier-monitoring
