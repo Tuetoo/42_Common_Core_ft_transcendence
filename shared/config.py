@@ -1,19 +1,20 @@
+import logging
 from functools import lru_cache
 from typing import Literal
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_JWT_SECRET_MIN_LENGTH = 32
+
+_internal_token_warned = False
 
 
 class BaseServiceSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8",
-        case_sensitive=True, extra="ignore")
+    model_config = SettingsConfigDict(case_sensitive=True, extra="ignore")
 
     SERVICE_NAME: str = "unnamed-service"
-    APP_ENV: Literal["development", "staging", "production", "test"
-                     ] = "development"
-    APP_DEBUG: bool = True
-    APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8000
+    APP_ENV: Literal["development", "staging", "production",
+                     "test"] = ("development")
     API_V1_PREFIX: str = "/api/v1"
 
     POSTGRES_HOST: str = "postgres"
@@ -23,9 +24,7 @@ class BaseServiceSettings(BaseSettings):
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_SCHEMA: str = "public"
 
-    # async URL used by SQLAlchemy
     DATABASE_URL: str | None = None
-    # used by Alembic (sync driver)
     SYNC_DATABASE_URL: str | None = None
 
     DB_POOL_SIZE: int = 20
@@ -43,6 +42,11 @@ class BaseServiceSettings(BaseSettings):
     JWT_SECRET: str = "CHANGE_ME"
     JWT_ALGORITHM: str = "HS256"
 
+    INTERNAL_API_TOKEN: str = ""
+
+    USER_STATE_CHECK_ENABLED: bool = True
+    USER_STATE_CACHE_TTL_SECONDS: int = 300
+
     AUTH_SERVICE_URL: str = "http://auth-service:8000"
     CORE_SERVICE_URL: str = "http://core-service:8000"
     AI_SERVICE_URL: str = "http://ai-service:8000"
@@ -56,15 +60,13 @@ class BaseServiceSettings(BaseSettings):
     SMTP_FROM_EMAIL: str = "noreply@alphamind.local"
     SMTP_USE_TLS: bool = False
 
-    # LANGCHAIN_TRACING_V2: bool = False
-    # LANGCHAIN_API_KEY: str = ""
-    # LANGCHAIN_PROJECT: str = "alphamind"
-
     BACKEND_CORS_ORIGINS: str = "http://localhost:3000"
 
     def cors_origins(self) -> list[str]:
-        return [origin.strip() for origin in
-                self.BACKEND_CORS_ORIGINS.split(",") if origin.strip()]
+        return [
+            origin.strip() for origin in self.BACKEND_CORS_ORIGINS.split(",")
+            if origin.strip()
+        ]
 
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
@@ -82,8 +84,7 @@ class BaseServiceSettings(BaseSettings):
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:"
             f"{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:"
-            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
-        )
+            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}")
 
     def assemble_sync_database_url(self) -> str:
         if self.SYNC_DATABASE_URL:
@@ -91,17 +92,48 @@ class BaseServiceSettings(BaseSettings):
         return (
             f"postgresql+psycopg://{self.POSTGRES_USER}:"
             f"{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:"
-            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
-        )
+            f"{self.POSTGRES_PORT}/{self.POSTGRES_DB}")
 
     def assemble_redis_url(self) -> str:
         if self.REDIS_URL:
             return self.REDIS_URL
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}"
 
-    # @property
-    # def is_production(self) -> bool:
-    #     return self.APP_ENV == "production"
+    @model_validator(mode="after")
+    def _check_jwt_secret(self) -> "BaseServiceSettings":
+        weak = (
+            not self.JWT_SECRET or self.JWT_SECRET == "CHANGE_ME"
+            or len(self.JWT_SECRET) < _JWT_SECRET_MIN_LENGTH)
+        if weak:
+            if self.APP_ENV in ("development", "test"):
+                logging.getLogger(__name__).warning(
+                    "JWT_SECRET is weak (placeholder, empty or shorter than "
+                    "%d chars); acceptable only in %s.",
+                    _JWT_SECRET_MIN_LENGTH, self.APP_ENV)
+            else:
+                raise ValueError(
+                    f"JWT_SECRET must be set to a random value of at least "
+                    f"{_JWT_SECRET_MIN_LENGTH} characters when APP_ENV="
+                    f"{self.APP_ENV}.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_internal_token(self) -> "BaseServiceSettings":
+        global _internal_token_warned
+        if self.INTERNAL_API_TOKEN:
+            return self
+        if self.APP_ENV in ("development", "test"):
+            if not _internal_token_warned:
+                _internal_token_warned = True
+                logging.getLogger(__name__).warning(
+                    "INTERNAL_API_TOKEN is empty: /internal/* routes accept "
+                    "requests without a token; acceptable only in %s.",
+                    self.APP_ENV)
+            return self
+        raise ValueError(
+            "INTERNAL_API_TOKEN must be set to a random value (e.g. "
+            "`openssl rand -hex 32`) when APP_ENV="
+            f"{self.APP_ENV}; every service and the scheduler share it.")
 
 
 @lru_cache
