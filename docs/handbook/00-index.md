@@ -187,6 +187,7 @@ Reference documents next to this handbook:
 [API_SPEC](../API_SPEC.md) (every route),
 [ERD](../ERD.md) (every table and column),
 [DISASTER_RECOVERY](../DISASTER_RECOVERY.md) (backup and restore),
+[DEPLOYMENT](../DEPLOYMENT.md) (the cloud host and continuous deployment),
 [MODULE_MAPPING](../MODULE_MAPPING.md) (subject modules and where each is
 implemented),
 [DESIGN](../DESIGN.md),

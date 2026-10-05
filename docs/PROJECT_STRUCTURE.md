@@ -25,7 +25,8 @@ alphamind/
 │   ├── filing/
 │   ├── macro_research/
 │   └── news/
-├── .github/workflows/       one CI workflow per service + stack smoke
+├── .github/workflows/       one CI workflow per service, stack smoke and
+│                            deploy (cloud host, docs/DEPLOYMENT.md)
 ├── docker-compose.yaml      the whole stack
 ├── docker-compose.override.yml  local development (source mounted into the
 │                            containers, development image stage)
@@ -284,7 +285,8 @@ process cannot import two of them.
 ├── snapshots.sh             recompute portfolio snapshots
 ├── health.sh, logs.sh, rebuild.sh, probe.sh
 ├── psql.sh, redis-cli.sh, qdrant.sh, objectstore.sh   data store shells
-└── backups.sh               list, make, check and drill backups
+├── backups.sh               list, make, check and drill backups
+└── deploy.sh                deploy main on the cloud host (run there)
 ```
 
 ## 9. `docs/`
@@ -294,6 +296,7 @@ process cannot import two of them.
 ├── API_SPEC.md              routes and events
 ├── ERD.md                   tables per schema
 ├── DISASTER_RECOVERY.md     backups and restore
+├── DEPLOYMENT.md            the cloud host and continuous deployment
 ├── MODULE_MAPPING.md        code mapped to the subject's modules
 ├── PROJECT_STRUCTURE.md     this file
 └── handbook/                00-index.md and one chapter per part
