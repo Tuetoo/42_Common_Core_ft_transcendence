@@ -1,19 +1,40 @@
 from datetime import datetime
-from typing import Any
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
-from shared.enums.role import OrganizationRole
-from shared.schemas.base import BaseSchema, IDMixin, TimestampMixin
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
+from domains.auth.schema import Email
+from shared.enums import OrganizationRole
+from shared.schemas import BaseSchema, IDMixin, TimestampMixin
+
+
+def _reject_owner(role: OrganizationRole) -> OrganizationRole:
+    if role == OrganizationRole.OWNER:
+        raise ValueError("the owner role cannot be assigned")
+    return role
 
 
 class OrganizationCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=1000)
 
 
 class OrganizationUpdate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "description": (
+                "PATCH: only fields present change. `description` can be "
+                "cleared "
+                "with null; `name` cannot be null.")
+        })
+
     name: str | None = Field(default=None, min_length=1, max_length=128)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _name_not_null(self) -> "OrganizationUpdate":
+        if "name" in self.model_fields_set and self.name is None:
+            raise ValueError("name cannot be null")
+        return self
 
 
 class OrganizationRead(BaseSchema, IDMixin, TimestampMixin):
@@ -33,10 +54,20 @@ class OrganizationMemberRead(BaseSchema, IDMixin):
 class MemberRoleUpdate(BaseModel):
     role: OrganizationRole
 
+    @field_validator("role")
+    @classmethod
+    def _no_owner(cls, value: OrganizationRole) -> OrganizationRole:
+        return _reject_owner(value)
+
 
 class InvitationCreate(BaseModel):
-    email: EmailStr
+    email: Email
     role: OrganizationRole = OrganizationRole.MEMBER
+
+    @field_validator("role")
+    @classmethod
+    def _no_owner(cls, value: OrganizationRole) -> OrganizationRole:
+        return _reject_owner(value)
 
 
 class InvitationRead(BaseSchema, IDMixin):
@@ -47,17 +78,10 @@ class InvitationRead(BaseSchema, IDMixin):
     accepted_at: datetime | None = None
 
 
+class InvitationAccept(BaseModel):
+    token: str = Field(min_length=1, max_length=4096)
+
+
 class InvitationAcceptResult(BaseModel):
     organization_id: UUID
     role: OrganizationRole
-
-
-class OrganizationRoleCreate(BaseModel):
-    role_name: str = Field(min_length=1, max_length=64)
-    permissions: dict[str, Any] = Field(default_factory=dict)
-
-
-class OrganizationRoleRead(BaseSchema, IDMixin):
-    organization_id: UUID
-    role_name: str
-    permissions: dict[str, Any]

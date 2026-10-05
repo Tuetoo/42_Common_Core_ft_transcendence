@@ -1,22 +1,32 @@
-import mimetypes
 from pathlib import Path
 from uuid import uuid4
-from fastapi import APIRouter, Depends, Request, UploadFile, status
-from fastapi.responses import RedirectResponse
-from sqlalchemy.ext.asyncio import AsyncSession
+import rate_limit
 from config import settings
 from database import get_db
-from deps import get_current_user
+from deps import get_current_user, require_recent_login
+from events_out import schedule_events
+from fastapi import (APIRouter, BackgroundTasks, Depends, Request, Response,
+                     UploadFile, status)
+from fastapi.responses import RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 from domains.auth.schema import (AvatarUploadRead, LogoutRequest, MeRead,
-                                 MeUpdate, PasswordResetConfirm,
+                                 MeUpdate, OAuthTwoFactorChallenge,
+                                 OAuthTwoFactorVerify, PasswordResetConfirm,
                                  PasswordResetRequest, RefreshRequest,
-                                 TokenPair, TwoFactorDisableRequest,
+                                 ResendVerificationRequest, TokenPair,
+                                 TwoFactorDisableRequest,
                                  TwoFactorSetupResponse,
                                  TwoFactorVerifyRequest, UserLogin,
                                  UserRegister, VerifyEmailRequest)
-from domains.auth.service import AuthService
+from domains.auth.service import (OAUTH_NONCE_COOKIE, OAUTH_STATE_TTL_SECONDS,
+                                  AuthService, delete_stored_avatar,
+                                  extension_for, oauth_authorize_url,
+                                  oauth_cookie_path,
+                                  send_password_reset_email_safely,
+                                  send_verification_email_safely,
+                                  sniff_image_type)
 from shared.exceptions import ValidationAppError
-from shared.schemas.base import APIResponse
+from shared.schemas import APIResponse
 from shared.security import CurrentUser
 
 router = APIRouter(tags=["auth"])
@@ -24,149 +34,288 @@ router = APIRouter(tags=["auth"])
 
 def _client_context(request: Request) -> dict[str, str | None]:
     return {
-        "ip_address": request.client.host if request.client else None,
-        "device_info": request.headers.get("user-agent"),
+        "ip_address": rate_limit.client_ip(request),
+        "device_info": request.headers.get("user-agent")
     }
 
 
-@router.post("/register", status_code=status.HTTP_201_CREATED,
-             response_model=APIResponse[dict[str, str]])
-async def register(data: UserRegister, db: AsyncSession = Depends(get_db)
-                   ) -> APIResponse[dict[str, str]]:
-    await AuthService(db).register(data)
-    return APIResponse(data={
-            "message": "Registered. Check your email to verify your account."})
+@router.post(
+    "/register", status_code=status.HTTP_201_CREATED,
+    response_model=APIResponse[dict[str, str]])
+async def register(
+    data: UserRegister, request: Request, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[dict[str, str]]:
+    await rate_limit.hit(
+        "register:ip", rate_limit.client_ip(request),
+        limit=settings.RATE_LIMIT_REGISTER_PER_IP,
+        window=settings.RATE_LIMIT_REGISTER_WINDOW_SECONDS)
+    dispatch = await AuthService(db).register(data)
+    background_tasks.add_task(send_verification_email_safely, dispatch)
+    return APIResponse(
+        data={
+            "message": "Registered. Check your email to verify your account."
+        })
 
 
 @router.post("/verify-email", response_model=APIResponse[dict[str, str]])
 async def verify_email(
-    data: VerifyEmailRequest, db: AsyncSession = Depends(get_db)
+    data: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
     await AuthService(db).verify_email(data.token)
     return APIResponse(data={"message": "Email verified."})
 
 
-@router.post("/password-reset/request",
-             response_model=APIResponse[dict[str, str]])
+@router.post(
+    "/verify-email/resend", response_model=APIResponse[dict[str, str]],
+    description=(
+        "Send a new email verification link. The response is the same 200 "
+        "whether"
+        " or not the email belongs to an account."))
+async def resend_verification_email(
+    data: ResendVerificationRequest, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[dict[str, str]]:
+    await rate_limit.hit(
+        "resend:email", data.email,
+        limit=settings.RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL,
+        window=settings.RATE_LIMIT_RESEND_VERIFICATION_WINDOW_SECONDS)
+    dispatch = await AuthService(db).resend_verification(data.email)
+    if dispatch is not None:
+        background_tasks.add_task(send_verification_email_safely, dispatch)
+    return APIResponse(
+        data={
+            "message": "If an unverified account exists for this email, a new "
+            "verification link has been sent."
+        })
+
+
+@router.post(
+    "/password-reset/request", response_model=APIResponse[dict[str, str]])
 async def request_password_reset(
-    data: PasswordResetRequest, db: AsyncSession = Depends(get_db)
+    data: PasswordResetRequest, request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
-    await AuthService(db).request_password_reset(data.email)
-    return APIResponse(data={"message": "If an account exists for this email,"
-                             " a reset link has been sent."})
+    await rate_limit.hit(
+        "reset:ip", rate_limit.client_ip(request),
+        limit=settings.RATE_LIMIT_PASSWORD_RESET_PER_IP,
+        window=settings.RATE_LIMIT_PASSWORD_RESET_WINDOW_SECONDS)
+    await rate_limit.hit(
+        "reset:email", data.email,
+        limit=settings.RATE_LIMIT_PASSWORD_RESET_PER_EMAIL,
+        window=settings.RATE_LIMIT_PASSWORD_RESET_WINDOW_SECONDS)
+    dispatch = await AuthService(db).request_password_reset(data.email)
+    if dispatch is not None:
+        background_tasks.add_task(send_password_reset_email_safely, dispatch)
+    return APIResponse(
+        data={
+            "message": "If an account exists for this email, a reset link has "
+            "been sent."
+        })
 
 
-@router.post("/password-reset/confirm",
-             response_model=APIResponse[dict[str, str]])
+@router.post(
+    "/password-reset/confirm", response_model=APIResponse[dict[str, str]])
 async def confirm_password_reset(
-    data: PasswordResetConfirm, db: AsyncSession = Depends(get_db)
+    data: PasswordResetConfirm, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
-    await AuthService(db).confirm_password_reset(data.token, data.new_password)
+    service = AuthService(db)
+    await service.confirm_password_reset(data.token, data.new_password)
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data={"message": "Password has been reset."})
 
 
 @router.post("/login", response_model=APIResponse[TokenPair])
-async def login(data: UserLogin, request: Request,
-                db: AsyncSession = Depends(get_db)) -> APIResponse[TokenPair]:
-    tokens = await AuthService(db).login(
+async def login(
+    data: UserLogin, request: Request, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[TokenPair]:
+    await rate_limit.hit(
+        "login:ip", rate_limit.client_ip(request),
+        limit=settings.RATE_LIMIT_LOGIN_PER_IP,
+        window=settings.RATE_LIMIT_LOGIN_WINDOW_SECONDS)
+    await rate_limit.hit(
+        "login:email", data.email, limit=settings.RATE_LIMIT_LOGIN_PER_EMAIL,
+        window=settings.RATE_LIMIT_LOGIN_WINDOW_SECONDS)
+    service = AuthService(db)
+    tokens = await service.login(
         email=data.email, password=data.password, totp_code=data.totp_code,
         **_client_context(request))
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data=tokens)
 
 
 @router.post("/refresh", response_model=APIResponse[TokenPair])
-async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_db)
-                  ) -> APIResponse[TokenPair]:
-    tokens = await AuthService(db).refresh(data.refresh_token)
+async def refresh(
+    data: RefreshRequest, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[TokenPair]:
+    service = AuthService(db)
+    tokens = await service.refresh(data.refresh_token)
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data=tokens)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(data: LogoutRequest, db: AsyncSession = Depends(get_db)
-                 ) -> None:
-    await AuthService(db).logout(data.refresh_token)
+async def logout(
+    data: LogoutRequest, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> None:
+    service = AuthService(db)
+    await service.logout(data.refresh_token)
+    schedule_events(background_tasks, service.pending_events)
 
 
-@router.get("/oauth/{provider}/authorize")
-async def oauth_authorize(provider: str, db: AsyncSession = Depends(get_db)
-                          ) -> RedirectResponse:
-    url = await AuthService(db).oauth_authorize_url(provider)
-    return RedirectResponse(
-        url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+@router.get(
+    "/oauth/{provider}/authorize", description=(
+        "Start an OAuth sign-in: redirects to the provider and sets a "
+        "short-lived HttpOnly cookie that binds the sign-in to this browser. "
+        "Open it as a top-level navigation, not with fetch."))
+async def oauth_authorize(provider: str) -> RedirectResponse:
+    start = await oauth_authorize_url(provider)
+    response = RedirectResponse(
+        start.url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    response.set_cookie(
+        OAUTH_NONCE_COOKIE, start.nonce, max_age=OAUTH_STATE_TTL_SECONDS,
+        path=oauth_cookie_path(), secure=True, httponly=True, samesite="lax")
+    return response
 
 
-@router.get("/oauth/{provider}/callback",
-            response_model=APIResponse[TokenPair])
+@router.get(
+    "/oauth/{provider}/callback",
+    response_model=APIResponse[TokenPair | OAuthTwoFactorChallenge],
+    description=(
+        "Complete an OAuth sign-in. Requires the cookie set by the authorize "
+        "step in the same browser. Returns a token pair, or a two-factor "
+        "challenge when the account has 2FA enabled (then call POST "
+        "/api/v1/auth/oauth/2fa)."))
 async def oauth_callback(
-    provider: str, code: str, state: str, db: AsyncSession = Depends(get_db)
+    provider: str, request: Request, response: Response,
+    code: str | None = None, state: str | None = None,
+    error: str | None = None, *, background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[TokenPair | OAuthTwoFactorChallenge]:
+    service = AuthService(db)
+    result = await service.oauth_callback(
+        provider, code, state, error,
+        nonce=request.cookies.get(OAUTH_NONCE_COOKIE),
+        **_client_context(request))
+    response.delete_cookie(
+        OAUTH_NONCE_COOKIE, path=oauth_cookie_path(), secure=True,
+        httponly=True, samesite="lax")
+    schedule_events(background_tasks, service.pending_events)
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/oauth/2fa", response_model=APIResponse[TokenPair], description=(
+        "Exchange an OAuth two-factor challenge token and a TOTP code for a "
+        "token"
+        " pair."))
+async def oauth_two_factor(
+    data: OAuthTwoFactorVerify, request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[TokenPair]:
-    tokens = await AuthService(db).oauth_callback(provider, code, state)
+    service = AuthService(db)
+    tokens = await service.oauth_complete_two_factor(
+        data.challenge_token, data.code, **_client_context(request))
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data=tokens)
 
 
 @router.post("/2fa/setup", response_model=APIResponse[TwoFactorSetupResponse])
 async def setup_two_factor(
-    current_user: CurrentUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+        current_user: CurrentUser = Depends(require_recent_login),
+        db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[TwoFactorSetupResponse]:
-    service = AuthService(db)
-    me = await service.get_me(current_user.user_id)
-    result = await service.setup_two_factor(current_user.user_id, me.email)
+    result = await AuthService(db).setup_two_factor(current_user.user_id)
     return APIResponse(data=result)
 
 
 @router.post("/2fa/verify", status_code=status.HTTP_204_NO_CONTENT)
 async def verify_two_factor(
-    data: TwoFactorVerifyRequest,
-    current_user: CurrentUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    data: TwoFactorVerifyRequest, background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(require_recent_login),
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
-    await AuthService(db).verify_two_factor(current_user.user_id, data.code)
+    service = AuthService(db)
+    await service.verify_two_factor(current_user.user_id, data.code)
+    schedule_events(background_tasks, service.pending_events)
 
 
 @router.post("/2fa/disable", status_code=status.HTTP_204_NO_CONTENT)
 async def disable_two_factor(
-    data: TwoFactorDisableRequest,
+    data: TwoFactorDisableRequest, background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
-    await AuthService(db).disable_two_factor(current_user.user_id, data.code)
+    service = AuthService(db)
+    await service.disable_two_factor(current_user.user_id, data.code)
+    schedule_events(background_tasks, service.pending_events)
 
 
 @router.get("/me", response_model=APIResponse[MeRead])
-async def get_me(current_user: CurrentUser = Depends(get_current_user),
-                 db: AsyncSession = Depends(get_db)) -> APIResponse[MeRead]:
+async def get_me(
+        current_user: CurrentUser = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db,
+                                   scope="function")) -> APIResponse[MeRead]:
     result = await AuthService(db).get_me(current_user.user_id)
     return APIResponse(data=result)
 
 
 @router.patch("/me", response_model=APIResponse[MeRead])
-async def update_me(data: MeUpdate,
-                    current_user: CurrentUser = Depends(get_current_user),
-                    db: AsyncSession = Depends(get_db)) -> APIResponse[MeRead]:
-    result = await AuthService(db).update_me(current_user.user_id, data)
+async def update_me(
+    data: MeUpdate, background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[MeRead]:
+    service = AuthService(db)
+    result = await service.update_me(current_user.user_id, data)
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data=result)
 
 
 @router.post("/me/avatar", response_model=APIResponse[AvatarUploadRead])
-async def upload_avatar(file: UploadFile,
-                        current_user: CurrentUser = Depends(get_current_user),
-                        db: AsyncSession = Depends(get_db)
-                        ) -> APIResponse[AvatarUploadRead]:
+async def upload_avatar(
+    file: UploadFile, background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[AvatarUploadRead]:
     if file.content_type not in settings.AVATAR_ALLOWED_CONTENT_TYPES:
         raise ValidationAppError(
-            f"Unsupported image type '{file.content_type}'. "
-            f"Allowed: {', '.join(settings.AVATAR_ALLOWED_CONTENT_TYPES)}")
+            f"Unsupported image type '{file.content_type}'. Allowed: "
+            f"{', '.join(settings.AVATAR_ALLOWED_CONTENT_TYPES)}.")
+
     max_bytes = settings.AVATAR_MAX_SIZE_MB * 1024 * 1024
-    contents = await file.read()
+    contents = await file.read(max_bytes + 1)
     if len(contents) > max_bytes:
         raise ValidationAppError(
             f"Image exceeds the {settings.AVATAR_MAX_SIZE_MB}MB size limit.")
-    extension = mimetypes.guess_extension(file.content_type) or ".bin"
+
+    detected = sniff_image_type(contents)
+    if detected is None or detected != file.content_type:
+        raise ValidationAppError(
+            "The file content is not a valid image of the declared type.")
+
     storage_dir = Path(settings.AVATAR_STORAGE_DIR)
     storage_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{current_user.user_id}-{uuid4().hex}{extension}"
+    filename = f"{current_user.user_id}-{uuid4().hex}{extension_for(detected)}"
     (storage_dir / filename).write_bytes(contents)
+
     avatar_url = f"/static/avatars/{filename}"
-    await AuthService(db).set_avatar_url(current_user.user_id, avatar_url)
+    service = AuthService(db)
+    try:
+        previous = await service.set_avatar_url(
+            current_user.user_id, avatar_url)
+        await db.commit()
+    except Exception:
+        delete_stored_avatar(avatar_url, storage_dir)
+        raise
+    schedule_events(background_tasks, service.pending_events)
+    if previous and previous != avatar_url:
+        background_tasks.add_task(delete_stored_avatar, previous, storage_dir)
     return APIResponse(data=AvatarUploadRead(avatar_url=avatar_url))
