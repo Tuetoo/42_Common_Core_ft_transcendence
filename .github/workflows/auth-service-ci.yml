@@ -1,36 +1,41 @@
 name: auth-service CI
 
+# Real test/lint/type-check gates. Tests use
+# testcontainers (tests/auth-service/conftest.py starts its own Postgres
+# and Redis through the runner's Docker daemon), so no `services:` block
+# is needed.
+# The paths are everything the suite, its lint and its type check read:
+# the shared test helpers, the Makefile targets the steps call, and the
+# repository files the tests check.
 on:
   pull_request:
     paths:
-      - "service/auth-service/**"
+      - "services/auth-service/**"
       - "shared/**"
+      - "tests/auth-service/**"
+      - "tests/alembic_contract.py"
+      - "tests/auth_tokens.py"
+      - "Makefile"
       - "pyproject.toml"
       - "uv.lock"
+      - ".github/workflows/auth-service-ci.yml"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: uv sync
-      # - run: make test-auth
-      - run: uv run ruff check services/auth-service shared
-        continue-on-error: true
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - name: Flake8
+        run: >-
+          uv run flake8 --extend-exclude mistral_provider.py
+          services/auth-service shared tests/auth-service
+      - name: Mypy
+        run: make mypy-shared mypy-auth
+      - name: Tests
+        run: make test-auth
       - name: Build image
-        run: docker build -f services/auth-service/Dockerfile -t auth-service:ci .
+        run: docker build -f services/auth-service/Dockerfile --target production -t auth-service:ci .
