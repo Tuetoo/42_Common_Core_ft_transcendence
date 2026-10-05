@@ -893,3 +893,4 @@ anywhere with only Docker.
 - [27-observability.md](27-observability.md): the alert rules under test.
 - [28-email.md](28-email.md): MailHog, used by `e2e_check`.
 - [30-shared-library.md](30-shared-library.md): `shared/e2e_lock.py`.
+- [32-ci-cd.md](32-ci-cd.md): how CI gates the deployment to the cloud host.
