@@ -1,0 +1,40 @@
+# Everything a Docker build does not need. All service images and the
+# scheduler/restore image build with the repo root as context and only
+# COPY pyproject.toml, uv.lock, shared/, services/<name>/ and
+# infra/scheduler/*. Excluding the rest keeps the local .venv, caches,
+# backups, logs and secrets out of the build context and the images.
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python virtualenv and caches (also inside services/<name>/)
+.venv
+**/__pycache__
+**/*.pyc
+**/.mypy_cache
+**/.pytest_cache
+.coverage
+htmlcov
+
+# Runtime data
+backups
+logs
+**/*.rdb
+runs
+run_*
+*_run_*
+batch_run_*
+Claude outputs
+
+# Not needed by any image
+.git
+.github
+.idea
+.vscode
+**/.vscode
+docs
+frontend
+tests
+rag_seed_documents
