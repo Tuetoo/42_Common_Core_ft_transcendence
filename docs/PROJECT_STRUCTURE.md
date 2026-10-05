@@ -1,168 +1,303 @@
-# AlphaMind — Complete Project Structure (v4.1)
+# AlphaMind — Project Structure
 
+The repository tree: directories and key files with their purpose. Not
+listed: `.venv/`, caches (`__pycache__/`, `.mypy_cache/`), editor folders
+(`.vscode/`), and the run-time folders `logs/`, `backups/` and `runs/`
+(created by the stack and the scripts, ignored by git). The design behind
+the tree is in `docs/DESIGN.md`; the handbook explains each part.
+
+## 1. Top level
 
 ```
 alphamind/
-├── docker-compose.yaml            # 9 containers, one command
-├── pyproject.toml                 # ONE dependency file for shared/ + all 3 services
-├── uv.lock
-├── Makefile                       # up/down/test-*/lint targets
-├── .env / .env.example
-├── README.md
-│
-├── .github/workflows/              # root-level, path-filtered per service
-│   ├── auth-service-ci.yml          # triggers on services/auth-service/** or shared/**
-│   ├── core-service-ci.yml
-│   ├── ai-service-ci.yml
-│   └── integration-ci.yml           # full docker-compose stack, runs on push to main
-│
-├── docs/
-│   ├── Proposal.md
-│   ├── MODULE_MAPPING.md            # v4.1
-│   ├── ERD.md                       # v4.0 (schema-per-service — unaffected by this revision)
-│   ├── PROJECT_STRUCTURE.md         # this file
-│   ├── ROADMAP.md                   # v4.1
-│   ├── COMMON_LIBRARY_README.md     # v4.1
-│   ├── system_design.md
-│   ├── technical_design_doc.md
-│   ├── API_SPEC.md
-│   ├── EVAL_BLUEPRINT.md
-│   └── Agents.md                    # v4.1 — major rewrite, read this one first
-│
-├── infra/
-│   ├── gateway/
-│   │   └── nginx.conf                # moved here from top-level gateway/
-│   ├── postgres/init-schemas.sql
-│   ├── prometheus/prometheus.yml
-│   └── grafana/provisioning/datasources.yml
-│
-├── shared/                          # was libs/alphamind_common/src/alphamind_common —
-│   ├── __init__.py                   # flattened: no libs/ wrapper, no src/ layer, no
-│   ├── config.py                     # separate pyproject.toml/pip-install step. Every
-│   ├── database.py                   # service's Dockerfile just COPYs this folder in
-│   ├── models.py                     # alongside its own app/ — both importable because
-│   ├── redis.py                      # the container's WORKDIR contains both as siblings.
-│   ├── security.py                   # (JWT verify only — issuing stays auth-service-only)
-│   ├── exceptions.py
-│   ├── logging.py
-│   ├── events.py                     # LocalEventBus + Redis Pub/Sub cross-service transport
-│   ├── events_registry.py            # EventName catalog
-│   ├── enums/
-│   │   ├── role.py  market.py  recommendation.py
-│   │   └── workflow.py  analysis.py  notification.py
-│   └── schemas/
-│       ├── base.py                   # BaseSchema, IDMixin, TimestampMixin, PaginatedResponse, APIResponse
-│       ├── refs.py                    # UserRef, OrganizationRef, TickerRef, AnalysisRef, RecommendationRef
-│       └── websocket.py                # WebSocketEnvelope
-│
-├── services/
-│   ├── auth-service/                # Backend Lead
-│   │   ├── Dockerfile                 # simplified: no path dependency, just
-│   │   │                               # COPY shared + COPY this service's app/
-│   │   └── app/
-│   │       ├── main.py  config.py  database.py  deps.py
-│   │       ├── security.py             # ★ token issuing, password hashing, TOTP —
-│   │       │                            #   the ONLY place in the whole system
-│   │       ├── domains/
-│   │       │   ├── _template/            # 7-file reference pattern
-│   │       │   ├── auth/  organization/  social/   (Backend Lead builds these)
-│   │       └── api/
-│   │           ├── router.py  internal.py
-│   │
-│   ├── core-service/                 # Backend Lead
-│   │   ├── Dockerfile
-│   │   └── app/
-│   │       ├── main.py  config.py  database.py  deps.py  middleware.py
-│   │       ├── websocket_manager.py    # ★ only service holding live WS connections
-│   │       ├── event_listener.py
-│   │       ├── clients/
-│   │       │   ├── auth_client.py  ai_client.py
-│   │       ├── domains/
-│   │       │   ├── _template/
-│   │       │   ├── portfolio/  research/  notification/
-│   │       └── api/
-│   │           ├── router.py  public.py  websocket.py
-│   │
-│   └── ai-service/                    # AI Lead — see Agents.md v4.1 for the design
-│       ├── Dockerfile
-│       └── app/
-│           ├── main.py  config.py  database.py  deps.py  qdrant.py
-│           ├── event_listener.py
-│           ├── clients/
-│           │   ├── auth_client.py  core_client.py
-│           ├── ai/
-│           │   ├── agents/                       # ★ now fully broken down, one file
-│           │   │   ├── base.py                     #   per agent, every file real
-│           │   │   ├── loop.py                      # generic ReAct loop (thought ->
-│           │   │   │                                 # action -> observation -> ... ->
-│           │   │   │                                 # finish) every data/analysis
-│           │   │   │                                 # agent below runs on top of
-│           │   │   ├── supervisor.py                 # dynamic agent selection
-│           │   │   ├── market.py  news.py  sentiment.py  filing.py
-│           │   │   ├── technical.py  fundamental.py  risk.py  macro.py
-│           │   │   ├── portfolio.py                  # ★ NEW — only runs when the
-│           │   │   │                                  #   analysis has 2+ holdings
-│           │   │   ├── bull.py  bear.py               # multi-round, not one-shot
-│           │   │   ├── judge.py                        # decides convergence each round
-│           │   │   └── reflection.py                    # can request specific agents retry
-│           │   ├── graph/
-│           │   │   ├── state.py                      # participation tracking, debate
-│           │   │   │                                  # rounds, reflection retry count
-│           │   │   ├── builder.py                       # dynamic graph WITH cycles
-│           │   │   ├── nodes.py  edges.py                # hard caps live in edges.py
-│           │   ├── llm/
-│           │   │   ├── base.py  router.py
-│           │   │   └── openai_provider.py  anthropic_provider.py
-│           │   │       gemini_provider.py  mistral_provider.py
-│           │   ├── memory/
-│           │   │   ├── episodic.py  manager.py
-│           │   ├── rag/
-│           │   │   ├── loader.py  parser.py  chunking.py  embedding.py
-│           │   │   ├── indexing.py  citation.py
-│           │   │   └── retriever.py                   # ★ BaseRetriever + business-
-│           │   │                                        #   specific subclasses
-│           │   │                                        #   (FilingRetriever, ...) —
-│           │   │                                        #   ONE Qdrant collection,
-│           │   │                                        #   many tailored retrievers
-│           │   ├── recommendation/engine.py
-│           │   ├── benchmark/
-│           │   │   ├── comparator.py  evaluator.py
-│           │   ├── evaluation/
-│           │   │   ├── confidence.py  hallucination.py
-│           │   ├── tools/                             # ★ Tool subclasses each agent's
-│           │   │   ├── base.py                          #   loop calls into
-│           │   │   ├── market_tool.py  news_tool.py
-│           │   │   ├── filing_tool.py  macro_tool.py
-│           │   │   └── portfolio_tool.py
-│           │   ├── workflows/
-│           │   │   └── analysis_workflow.py             # top-level entry point
-│           │   └── schemas/
-│           │       ├── refs.py  analysis.py  backtest.py
-│           │       └── benchmark.py  debate.py  outputs.py  recommendation.py  retrieval.py
-│           └── domains/
-│               ├── _template/
-│               ├── market/                              # ★ real fields now (Instrument,
-│               │                                          #   PriceBar, TechnicalIndicatorCache)
-│               └── analytics/                             # ★ real fields (PortfolioMetric,
-│                                                            #   RecommendationMetric, ...)
-│
-├── tests/                             # ★ NEW — root-level, 4 independent pytest runs
-│   ├── README.md                        # explains why 4 invocations, not 1
-│   ├── auth_service/  core_service/  ai_service/    # unit tests, mocked clients/DB
-│   └── integration/                                  # black-box HTTP tests against
-│                                                        # a running docker-compose stack
-│
-└── frontend/                          # Frontend Lead — unchanged from v4.0
-    └── ...
+├── services/                the three FastAPI services (§2-§4)
+├── shared/                  code every service imports (§5)
+├── tests/                   one test suite per service + integration (§6)
+├── infra/                   gateway, Postgres init, scheduler, object
+│                            storage, monitoring, log shipping (§7)
+├── scripts/                 host-side operator scripts (§8)
+├── docs/                    design, API, ERD, disaster recovery, module
+│                            mapping, this file; handbook/ (§9)
+├── rag_seed_documents/      seed corpus for
+│                            scripts/upload_seed_documents.py:
+│   ├── analyst_report/
+│   ├── earnings_call/
+│   ├── filing/
+│   ├── macro_research/
+│   └── news/
+├── .github/workflows/       one CI workflow per service + stack smoke
+├── docker-compose.yaml      the whole stack
+├── docker-compose.override.yml  local development (source mounted into the
+│                            containers, development image stage)
+├── Makefile                 up/down/logs, certs, backup/restore, tests per
+│                            service, promtool-test, lint (flake8 + mypy),
+│                            clean, and short targets for scripts/
+├── pyproject.toml, uv.lock  one dependency list for all services; pytest,
+│                            mypy and isort configuration
+├── .style.yapf              yapf layout settings (formatting helper)
+├── .env.example             template for .env.docker (never committed)
+└── .dockerignore, .gitignore, .editorconfig
 ```
 
+## 2. `services/auth-service/`
 
-## Who owns what
+```
+├── Dockerfile, alembic.ini
+├── main.py, config.py, database.py, db_bootstrap.py, deps.py
+├── security.py              password hashing, token issuing, TOTP
+│                            helpers, Fernet encryption of stored TOTP
+│                            secrets
+├── rate_limit.py            limits for login, 2FA, reset, registration,
+│                            invitations (on shared/rate_limit.py)
+├── events_out.py            event payload builders; events are published
+│                            after the commit
+├── user_state_sync.py       writes each user's live role and active flag to
+│                            Redis (shared/user_state.py)
+├── api/                     internal.py (/internal/*)
+├── domains/                 api.py, model.py, repository.py, schema.py,
+│   │                        service.py per domain
+│   ├── auth/                users, profiles, settings, sessions, OAuth
+│   │                        accounts, 2FA, avatar files
+│   ├── admin/               /api/v1/admin: users, soft delete, statistics
+│   ├── organization/        organizations, members, invitations
+│   └── social/              friends (connections), presence
+├── data/avatars/            empty folder; in compose the avatar_data
+│                            volume is mounted at /app/data/avatars
+├── migrations/              Alembic: env.py, script.py.mako,
+│                            versions/ (f1160b000001 baseline,
+│                            f1190b000001, f1210b000001), archive/ (the
+│                            archived chain, for converting old backups)
+└── scripts/                 set_system_role.py (the first admin),
+                             alembic_convert.py (old backups)
+```
 
-| Person | Service(s) | Also owns |
-|---|---|---|
-| Backend Lead | `auth-service`, `core-service` | `infra/`, `docker-compose.yaml`, `.github/workflows/*-service-ci.yml`, Prometheus/Grafana |
-| AI Lead | `ai-service` | — |
-| Frontend Lead | `frontend/` | — |
+## 3. `services/core-service/`
 
-Everyone reviews changes to `shared/` and `docs/MODULE_MAPPING.md` / `docs/ERD.md` / `Agents.md`.
+```
+├── Dockerfile, alembic.ini
+├── main.py, config.py, database.py, db_bootstrap.py, deps.py
+│                            (deps.py: current user, from/to date-range
+│                            check (422))
+├── middleware.py            public API: key check, owner state, per-key
+│                            and per-owner rate limits
+├── apikeys.py               API key model and functions
+├── event_listener.py        auth and ai events -> notifications and
+│                            WebSocket pushes; document status (durable)
+├── websocket_manager.py     WebSocketEnvelope, sockets per channel,
+│                            cross-replica fan-out
+├── yjs_relay.py             Yjs rooms, body write-back, active-room markers
+├── job_health.py            scheduled-job heartbeat and market-close skip
+│                            gauges, kept in Redis across restarts
+├── outbox.py, outbox_model.py  transactional outbox (core.event_outbox) for
+│                            the durable events, and its dispatcher
+├── api/
+│   ├── internal.py          /internal/*: scheduler jobs, heartbeats,
+│   │                        portfolios, stats, tracked tickers, ingestion
+│   │                        and system documents
+│   ├── public.py            /api/v1/public/* (API key)
+│   ├── apikeys_api.py       /api/v1/api-keys/*
+│   ├── websocket.py, ws_common.py   /ws/{channel}
+│   └── yjs_websocket.py     /ws/yjs/{note_id}
+├── clients/                 auth_client.py, ai_client.py
+├── domains/
+│   ├── portfolio/           portfolios, transactions (ledger), holdings,
+│   │                        snapshots, watchlists; ledger.py (pure ledger
+│   │                        math)
+│   ├── research/            notes, comments, tags, documents;
+│   │                        moderation_api.py, sentiment.py, yjs_guard.py
+│   │                        (Yjs updates decoded in worker processes)
+│   └── notification/        notifications; actions.py (the one path every
+│                            core notification goes through)
+├── migrations/              env.py, script.py.mako, versions/
+│                            (f1160c000001 baseline, f1170c000001,
+│                            f1200c000001 event_outbox,
+│                            f1250c000001 status_changed_at), archive/
+└── scripts/                 e2e_check.py (end to end through the gateway),
+                             backfill_sentiment.py, delete_documents.py,
+                             recompute_snapshots.py, alembic_convert.py
+```
+
+## 4. `services/ai-service/`
+
+```
+├── Dockerfile, alembic.ini
+├── main.py, config.py, database.py, db_bootstrap.py, deps.py
+├── event_listener.py        durable: document uploaded/deleted, portfolio
+│                            deleted
+├── ai_events.py             event payload builders + best-effort publisher
+├── observability.py         Prometheus metrics (analyses, queue, LLM errors)
+├── qdrant.py                Qdrant client and collection check
+├── api/                     internal.py (/internal/*)
+├── clients/                 core_client.py, auth_client.py
+├── domains/                 persistence and HTTP, one folder per context
+│   ├── analysis/            analyses, agent runs, debate, reflections,
+│   │                        recommendations, tiers; queue.py (the serial
+│   │                        analysis queue)
+│   ├── decision/            investment decisions, outcomes, reviews
+│   ├── backtest/            backtests, metrics, benchmarks
+│   ├── analytics/           recommendation and agent metrics; dashboard.py
+│   ├── rag/                 document_chunks, embedding_jobs; the RAG
+│   │                        assistant (api.py, qa.py)
+│   ├── memory/              episodic and procedural memory rows
+│   ├── knowledge/           agent reports, knowledge graph, ticker names
+│   ├── filings/             ai.filing_records (structured filing records)
+│   └── market/              instruments, price bars (the cache), prices API
+├── ai/                      the AI logic (only domains/ touches the DB)
+│   ├── agents/              one file per role (filing, fundamental, macro,
+│   │                        market, news, portfolio, risk, sentiment,
+│   │                        technical), supervisor.py, debate_side.py,
+│   │                        judge.py, reflection.py, loop.py (the ReAct
+│   │                        loop and BaseAgent), finish_checks.py,
+│   │                        evidence_grounding.py, debate_common.py
+│   ├── graph/               LangGraph: state, builder, nodes, edges
+│   ├── llm/                 router.py, base.py (incl. the concurrency gate), adapters
+│   │                        (google, mistral, openai, anthropic),
+│   │                        json_fence.py
+│   ├── providers/           yahoo_finance, sec_edgar, fred, newsapi,
+│   │                        tavily, news_filters, news_relevance, retry,
+│   │                        registry, base
+│   ├── tools/               agent tools, indicators.py,
+│   │                        market_data_cache.py, search_relevance.py
+│   ├── rag/                 chunking (incl. parsing), embedding, indexing,
+│   │                        retriever (incl. query expansion and fusion),
+│   │                        visibility, category_weights.json
+│   ├── knowledge/           archival, KG extraction and context, filing
+│   │                        summaries and records, ticker names, checks on
+│   │                        recycled and prior-note content
+│   ├── ingestion/           SEC filings, news, macro research ingestion
+│   ├── memory/              episodic.py (L2), procedural.py (L4)
+│   ├── recommendation/      engine.py (incl. the position limit),
+│   │                        position_sizing.py
+│   ├── benchmark/           metrics.py (returns, drawdown, Sharpe, ...)
+│   ├── evaluation/          golden set and recall
+│   ├── user_sentiment.py    sentiment of notes and comments
+│   └── workflows/           analysis, RAG ingestion, auto ingestion, tier
+│                            monitoring, review, and the three backtests
+├── migrations/              env.py, script.py.mako, versions/
+│                            (f1160a000001 baseline, f1170a000001,
+│                            f1210a000001, f1220a000001, f1230a000001,
+│                            f1240a000001, f1250a000001), archive/
+└── scripts/                 analysis_cli.py (used by run_analysis.sh),
+                             e2e_tier_check.py, smoke_check.py,
+                             upload_seed_documents.py, delete_analyses.py,
+                             RAG evaluation (generate_rag_golden_set.py,
+                             measure_rag_recall.py incl. --sweep),
+                             reembed_collection.py, filing tools
+                             (backfill_filing_records.py,
+                             regenerate_filing_summaries.py),
+                             verify_portfolio_backtest.py,
+                             probe_model_latency.py, alembic_convert.py,
+                             _text.py (output helpers)
+```
+
+## 5. `shared/`
+
+```
+├── config.py                BaseServiceSettings (each service subclasses it)
+├── database.py              Base (naming convention), column mixins
+│                            (UUIDPKMixin, TimestampColumnsMixin), engine
+│                            and session factories, get_db
+├── alembic_bootstrap.py     schema bootstrap at startup (upgrade only)
+├── alembic_convert.py       conversion of databases on the archived chain
+├── security.py              CurrentUser, JWT verification, permissions
+├── permissions.py           system role -> permissions map
+├── user_state.py            live role and active flag (Redis + auth)
+├── org_membership_cache.py  organization roles of a user, cached
+├── rate_limit.py            fixed-window limiter and 429 response
+├── scheduled_jobs.py        job_response: 500 when every unit of a step
+│                            failed
+├── metrics.py               get_or_create for Prometheus collectors
+├── tickers.py               the ticker rule
+├── events.py, events_registry.py   pub/sub and durable events, event names
+├── redis.py, http_client.py, storage.py (S3), email.py, concurrency.py
+├── market_calendar.py       NYSE trading days and holidays
+├── e2e_lock.py              lock shared by the end-to-end scripts
+├── exceptions.py            error hierarchy and error body
+├── request_id.py            request id middleware (logs, error body,
+│                            X-Request-ID header)
+├── logging.py               structured logs (structlog)
+├── enums.py                 shared StrEnums (analysis, connection,
+│                            document, market, notification, oauth,
+│                            recommendation, role, workflow)
+└── schemas.py               APIResponse, PaginatedResponse, cross-service
+                             refs
+```
+
+## 6. `tests/`
+
+```
+├── auth-service/            conftest.py, helpers.py, test_accounts.py,
+│                            test_organizations.py, test_platform.py
+├── core-service/            conftest.py, helpers.py, test_platform.py,
+│                            test_portfolio.py, test_realtime.py,
+│                            test_research.py
+├── ai-service/              conftest.py, helpers.py and 14 test_*.py files
+│                            (agents, API, data agents, debate and Judge,
+│                            filings, graph, knowledge, LLM, market data,
+│                            news, RAG, scripts, tools, workflows)
+├── integration/             conftest.py, test_rag_recall.py (needs the
+│                            running stack with the real corpus)
+├── fixtures/                rag_golden_set.json
+├── alembic_contract.py      migration-versus-model checks, star-imported by
+│                            one test file per service
+├── auth_tokens.py           access tokens for the tests
+└── README.md                how to run each suite
+```
+
+The suites run separately (`make test-auth`, `test-core`, `test-ai`): the
+services share top-level module names (`config`, `database`, `main`), so one
+process cannot import two of them.
+
+## 7. `infra/`
+
+```
+├── gateway/                 nginx.conf, gen-certs.sh (self-signed TLS),
+│                            status.html + csp_hashes.py (its CSP hashes),
+│                            certs/ (generated, only README.md tracked)
+├── postgres/init-schemas.sql   the three schemas
+├── scheduler/               Dockerfile, entrypoint.sh, crontab,
+│                            call-job.sh (the seven HTTP jobs:
+│                            market-open, market-close, tier-monitoring,
+│                            review-run, rag-ingest, purge-unverified,
+│                            notification-retention), logs-cleanup.sh,
+│                            heartbeat.sh, backup.sh, restore.sh,
+│                            s3-remote.sh (rclone remote for the
+│                            object storage's S3 API)
+├── drill/docker-compose.drill.yml   compose override of the restore drill
+├── objectstore/             SeaweedFS entrypoint.sh and healthcheck.sh
+├── prometheus/              prometheus.yml, alert_rules.yml,
+│                            alert_rules_test.yml
+├── alertmanager/alertmanager.yml
+├── grafana/provisioning/    datasources/datasource.yml,
+│                            dashboards/ (dashboard.yml, two dashboards)
+└── vector/vector.toml       log shipping into ./logs
+```
+
+## 8. `scripts/`
+
+```
+├── lib.sh                   shared helpers (compose wrapper, busy windows)
+├── run_analysis.sh          real analyses with a per-run output folder
+├── token.sh                 a short-lived access token
+├── e2e.sh, smoke.sh         end-to-end and smoke checks (make e2e/smoke)
+├── tiers.sh                 recommendation tiers of a portfolio
+├── snapshots.sh             recompute portfolio snapshots
+├── health.sh, logs.sh, rebuild.sh, probe.sh
+├── psql.sh, redis-cli.sh, qdrant.sh, objectstore.sh   data store shells
+└── backups.sh               list, make, check and drill backups
+```
+
+## 9. `docs/`
+
+```
+├── DESIGN.md                the system as built
+├── API_SPEC.md              routes and events
+├── ERD.md                   tables per schema
+├── DISASTER_RECOVERY.md     backups and restore
+├── MODULE_MAPPING.md        code mapped to the subject's modules
+├── PROJECT_STRUCTURE.md     this file
+└── handbook/                00-index.md and one chapter per part
+                             (01-02 overview and operations, 10-19
+                             services and AI, 20-31 data stores,
+                             infrastructure, shared code, testing)
+```

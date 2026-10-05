@@ -1,31 +1,33 @@
-from datetime import date, datetime, UTC, time
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
-from sqlalchemy import or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from domains.portfolio.ledger import snapshot_cutoff
 from domains.portfolio.model import (Holding, Portfolio, PortfolioSnapshot,
                                      Transaction, Watchlist, WatchlistItem)
 from shared.database import count_query
-from shared.enums.market import TransactionType
-from shared.schemas.base import PaginationParams
+from shared.enums import TransactionType
+from shared.schemas import PaginationParams
 
 
 class PortfolioRepository:
+
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
 
     async def get_by_id(self, portfolio_id: UUID) -> Portfolio | None:
-        result = await self._db.execute(select(Portfolio)
-                                        .where(Portfolio.id == portfolio_id))
+        result = await self._db.execute(
+            select(Portfolio).where(Portfolio.id == portfolio_id))
         return result.scalar_one_or_none()
 
-    async def create(self, *, owner_id: UUID, name: str, currency: str,
-                     organization_id: UUID | None, visibility: str
-                     ) -> Portfolio:
-        portfolio = Portfolio(owner_id=owner_id, name=name, currency=currency,
-                              organization_id=organization_id,
-                              visibility=visibility)
+    async def create(
+            self, *, owner_id: UUID, name: str, currency: str,
+            organization_id: UUID | None, visibility: str) -> Portfolio:
+        portfolio = Portfolio(
+            owner_id=owner_id, name=name, currency=currency,
+            organization_id=organization_id, visibility=visibility)
         self._db.add(portfolio)
         await self._db.flush()
         return portfolio
@@ -34,22 +36,28 @@ class PortfolioRepository:
         await self._db.delete(portfolio)
         await self._db.flush()
 
-    async def list_for_user(self, user_id: UUID, organization_ids: list[UUID],
-                            *, pagination: PaginationParams
-                            ) -> tuple[list[Portfolio], int]:
+    async def list_for_user(
+            self, user_id: UUID, organization_ids: list[UUID], *,
+            pagination: PaginationParams) -> tuple[list[Portfolio], int]:
         conditions = [Portfolio.owner_id == user_id]
         if organization_ids:
-            conditions.append(Portfolio.organization_id.in_(organization_ids))
+            conditions.append(
+                and_(
+                    Portfolio.organization_id.in_(organization_ids),
+                    Portfolio.visibility != "private"))
         stmt = select(Portfolio).where(or_(*conditions))
+
         total = await count_query(self._db, stmt)
-        result = await self._db.execute(stmt.order_by(
-            Portfolio.created_at.desc()).offset(pagination.offset)
-            .limit(pagination.limit))
+
+        result = await self._db.execute(
+            stmt.order_by(Portfolio.created_at.desc(),
+                          Portfolio.id.desc()).offset(pagination.offset).limit(
+                              pagination.limit))
         return list(result.scalars().all()), total
 
     async def list_all_with_auto_analyze(self) -> list[Portfolio]:
-        result = await self._db.execute(select(Portfolio).where(
-            Portfolio.auto_analyze_at_open.is_(True)))
+        result = await self._db.execute(
+            select(Portfolio).where(Portfolio.auto_analyze_at_open.is_(True)))
         return list(result.scalars().all())
 
     async def list_all(self) -> list[Portfolio]:
@@ -58,36 +66,43 @@ class PortfolioRepository:
 
 
 class HoldingRepository:
+
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
 
-    async def list_all_distinct_tickers(self) -> list[str]:
-        result = await self._db.execute(select(Holding.ticker).distinct())
-        return list(result.scalars().all())
+    async def list_all_owner_tickers(self) -> list[tuple[UUID, str]]:
+        result = await self._db.execute(
+            select(Portfolio.owner_id, Holding.ticker).join(
+                Portfolio, Portfolio.id == Holding.portfolio_id).distinct())
+        return [(row[0], row[1]) for row in result.all()]
 
     async def get_by_id(self, holding_id: UUID) -> Holding | None:
-        result = await self._db.execute(select(Holding)
-                                        .where(Holding.id == holding_id))
+        result = await self._db.execute(
+            select(Holding).where(Holding.id == holding_id))
         return result.scalar_one_or_none()
 
-    async def get_by_ticker(self, portfolio_id: UUID, ticker: str, *,
-                            for_update: bool = False) -> Holding | None:
-        stmt = select(Holding).where(Holding.portfolio_id == portfolio_id,
-                                     Holding.ticker == ticker.upper())
+    async def get_by_ticker(
+            self, portfolio_id: UUID, ticker: str, *,
+            for_update: bool = False) -> Holding | None:
+        stmt = select(Holding).where(
+            Holding.portfolio_id == portfolio_id,
+            Holding.ticker == ticker.upper())
         if for_update:
             stmt = stmt.with_for_update()
         result = await self._db.execute(stmt)
         return result.scalar_one_or_none()
 
     async def list_for_portfolio(self, portfolio_id: UUID) -> list[Holding]:
-        result = await self._db.execute(select(Holding).where(
-            Holding.portfolio_id == portfolio_id))
+        result = await self._db.execute(
+            select(Holding).where(Holding.portfolio_id == portfolio_id))
         return list(result.scalars().all())
 
-    async def create(self, *, portfolio_id: UUID, ticker: str,
-                     quantity: Decimal, average_cost: Decimal) -> Holding:
-        holding = Holding(portfolio_id=portfolio_id, ticker=ticker.upper(),
-                          quantity=quantity, average_cost=average_cost)
+    async def create(
+            self, *, portfolio_id: UUID, ticker: str, quantity: Decimal,
+            average_cost: Decimal) -> Holding:
+        holding = Holding(
+            portfolio_id=portfolio_id, ticker=ticker.upper(),
+            quantity=quantity, average_cost=average_cost)
         self._db.add(holding)
         await self._db.flush()
         return holding
@@ -98,6 +113,7 @@ class HoldingRepository:
 
 
 class TransactionRepository:
+
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
 
@@ -105,70 +121,111 @@ class TransactionRepository:
             self, *, portfolio_id: UUID, ticker: str, transaction_type: str,
             quantity: Decimal | None, price: Decimal | None,
             dividend_per_share: Decimal | None,
-            split_ratio: Decimal | None = None,
-            transaction_date: datetime) -> Transaction:
-        txn = Transaction(portfolio_id=portfolio_id, ticker=ticker.upper(),
-                          transaction_type=transaction_type, quantity=quantity,
-                          price=price, dividend_per_share=dividend_per_share,
-                          split_ratio=split_ratio,
-                          transaction_date=transaction_date)
+            split_ratio: Decimal | None = None, transaction_date: datetime,
+            idempotency_key: str | None = None) -> Transaction:
+        txn = Transaction(
+            portfolio_id=portfolio_id, ticker=ticker.upper(),
+            transaction_type=transaction_type, quantity=quantity, price=price,
+            dividend_per_share=dividend_per_share, split_ratio=split_ratio,
+            transaction_date=transaction_date, idempotency_key=idempotency_key)
         self._db.add(txn)
         await self._db.flush()
         return txn
 
-    async def list_for_portfolio(self, portfolio_id: UUID, *,
-                                 pagination: PaginationParams
-                                 ) -> tuple[list[Transaction], int]:
+    async def get_by_idempotency_key(self, key: str) -> Transaction | None:
+        result = await self._db.execute(
+            select(Transaction).where(Transaction.idempotency_key == key))
+        return result.scalar_one_or_none()
+
+    async def list_for_portfolio(
+            self, portfolio_id: UUID, *,
+            pagination: PaginationParams) -> tuple[list[Transaction], int]:
         stmt = select(Transaction).where(
             Transaction.portfolio_id == portfolio_id)
         total = await count_query(self._db, stmt)
-        result = await self._db.execute(stmt.order_by(
-            Transaction.transaction_date.desc()).offset(pagination.offset)
-            .limit(pagination.limit))
+        result = await self._db.execute(
+            stmt.order_by(
+                Transaction.transaction_date.desc(),
+                Transaction.id.desc()).offset(pagination.offset).limit(
+                    pagination.limit))
         return list(result.scalars().all()), total
 
-    async def list_all_for_portfolio(self, portfolio_id: UUID
-                                     ) -> list[Transaction]:
-        result = await self._db.execute(select(Transaction).where(
-            Transaction.portfolio_id == portfolio_id)
-            .order_by(Transaction.transaction_date.asc()))
+    async def latest_date_for_ticker(
+            self, portfolio_id: UUID, ticker: str) -> datetime | None:
+        result = await self._db.execute(
+            select(func.max(Transaction.transaction_date)).where(
+                Transaction.portfolio_id == portfolio_id,
+                Transaction.ticker == ticker.upper()))
+        return result.scalar_one_or_none()
+
+    async def list_all_for_portfolio(self,
+                                     portfolio_id: UUID) -> list[Transaction]:
+        result = await self._db.execute(
+            select(Transaction).where(
+                Transaction.portfolio_id == portfolio_id).order_by(
+                    Transaction.transaction_date.asc()))
         return list(result.scalars().all())
 
-    async def list_cash_flows_for_portfolio(self, portfolio_id: UUID, *,
-                                            start_date: date, end_date: date
-                                            ) -> list[Transaction]:
-        stmt = (select(Transaction).where(
-            Transaction.portfolio_id == portfolio_id,
-            Transaction.transaction_type.in_(
-                (TransactionType.DEPOSIT.value,
-                 TransactionType.WITHDRAWAL.value)),
-            Transaction.transaction_date >= datetime.combine(
-                start_date, time.min, tzinfo=UTC),
-            Transaction.transaction_date <= datetime.combine(
-                end_date, time.max, tzinfo=UTC))
-                .order_by(Transaction.transaction_date.asc()))
+    async def list_filtered(
+            self, portfolio_id: UUID, *, start: datetime | None = None,
+            end: datetime | None = None,
+            transaction_type: TransactionType | None = None
+    ) -> list[Transaction]:
+        stmt = select(Transaction).where(
+            Transaction.portfolio_id == portfolio_id)
+        if start is not None:
+            stmt = stmt.where(Transaction.transaction_date >= start)
+        if end is not None:
+            stmt = stmt.where(Transaction.transaction_date < end)
+        if transaction_type is not None:
+            stmt = stmt.where(
+                Transaction.transaction_type == transaction_type.value)
+        result = await self._db.execute(
+            stmt.order_by(
+                Transaction.transaction_date.asc(), Transaction.id.asc()))
+        return list(result.scalars().all())
+
+    async def list_cash_flows_for_portfolio(
+            self, portfolio_id: UUID, *, start_date: date,
+            end_date: date) -> list[Transaction]:
+        stmt = (
+            select(Transaction).where(
+                Transaction.portfolio_id == portfolio_id,
+                Transaction.transaction_type.in_((
+                    TransactionType.DEPOSIT.value,
+                    TransactionType.WITHDRAWAL.value,
+                    TransactionType.ADJUSTMENT.value)),
+                Transaction.transaction_date
+                > snapshot_cutoff(start_date - timedelta(days=1)),
+                Transaction.transaction_date
+                <= snapshot_cutoff(end_date)).order_by(
+                    Transaction.transaction_date.asc()))
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
 
 class PortfolioSnapshotRepository:
+
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
 
-    async def upsert(self, *, portfolio_id: UUID, snapshot_date: date,
-                     total_value: Decimal, cash_balance: Decimal
-                     ) -> PortfolioSnapshot:
+    async def upsert(
+            self, *, portfolio_id: UUID, snapshot_date: date,
+            total_value: Decimal, cash_balance: Decimal) -> PortfolioSnapshot:
         stmt = pg_insert(PortfolioSnapshot).values(
             portfolio_id=portfolio_id, snapshot_date=snapshot_date,
             total_value=total_value, cash_balance=cash_balance)
         stmt = stmt.on_conflict_do_update(
-            index_elements=["portfolio_id", "snapshot_date"],
-            set_={"total_value": total_value, "cash_balance": cash_balance})
+            index_elements=["portfolio_id", "snapshot_date"], set_={
+                "total_value": total_value,
+                "cash_balance": cash_balance
+            })
         await self._db.execute(stmt)
         await self._db.flush()
-        result = await self._db.execute(select(PortfolioSnapshot).where(
-            PortfolioSnapshot.portfolio_id == portfolio_id,
-            PortfolioSnapshot.snapshot_date == snapshot_date))
+        result = await self._db.execute(
+            select(PortfolioSnapshot).where(
+                PortfolioSnapshot.portfolio_id == portfolio_id,
+                PortfolioSnapshot.snapshot_date == snapshot_date))
         return result.scalar_one()
 
     async def list_for_portfolio(
@@ -186,17 +243,18 @@ class PortfolioSnapshotRepository:
 
 
 class WatchlistRepository:
+
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
 
     async def get_by_id(self, watchlist_id: UUID) -> Watchlist | None:
-        result = await self._db.execute(select(Watchlist)
-                                        .where(Watchlist.id == watchlist_id))
+        result = await self._db.execute(
+            select(Watchlist).where(Watchlist.id == watchlist_id))
         return result.scalar_one_or_none()
 
     async def list_for_user(self, user_id: UUID) -> list[Watchlist]:
-        result = await self._db.execute(select(Watchlist)
-                                        .where(Watchlist.owner_id == user_id))
+        result = await self._db.execute(
+            select(Watchlist).where(Watchlist.owner_id == user_id))
         return list(result.scalars().all())
 
     async def create(self, *, owner_id: UUID, name: str) -> Watchlist:
@@ -205,25 +263,36 @@ class WatchlistRepository:
         await self._db.flush()
         return watchlist
 
+    async def delete(self, watchlist: Watchlist) -> None:
+        await self._db.execute(
+            delete(WatchlistItem).where(
+                WatchlistItem.watchlist_id == watchlist.id))
+        await self._db.delete(watchlist)
+        await self._db.flush()
+
     async def list_items(self, watchlist_id: UUID) -> list[WatchlistItem]:
-        result = await self._db.execute(select(WatchlistItem).where(
-            WatchlistItem.watchlist_id == watchlist_id))
+        result = await self._db.execute(
+            select(WatchlistItem).where(
+                WatchlistItem.watchlist_id == watchlist_id))
         return list(result.scalars().all())
 
-    async def get_item(self, watchlist_id: UUID, ticker: str
-                       ) -> WatchlistItem | None:
-        result = await self._db.execute(select(WatchlistItem).where(
-            WatchlistItem.watchlist_id == watchlist_id,
-            WatchlistItem.ticker == ticker.upper()))
+    async def get_item(
+            self, watchlist_id: UUID, ticker: str) -> WatchlistItem | None:
+        result = await self._db.execute(
+            select(WatchlistItem).where(
+                WatchlistItem.watchlist_id == watchlist_id,
+                WatchlistItem.ticker == ticker.upper()))
         return result.scalar_one_or_none()
 
-    async def list_all_distinct_tickers(self) -> list[str]:
+    async def list_all_owner_tickers(self) -> list[tuple[UUID, str]]:
         result = await self._db.execute(
-            select(WatchlistItem.ticker).distinct())
-        return list(result.scalars().all())
+            select(Watchlist.owner_id, WatchlistItem.ticker).join(
+                Watchlist,
+                Watchlist.id == WatchlistItem.watchlist_id).distinct())
+        return [(row[0], row[1]) for row in result.all()]
 
-    async def add_item(self, *, watchlist_id: UUID, ticker: str
-                       ) -> WatchlistItem:
+    async def add_item(
+            self, *, watchlist_id: UUID, ticker: str) -> WatchlistItem:
         item = WatchlistItem(watchlist_id=watchlist_id, ticker=ticker.upper())
         self._db.add(item)
         await self._db.flush()

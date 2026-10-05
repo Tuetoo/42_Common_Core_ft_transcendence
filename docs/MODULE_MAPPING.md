@@ -1,260 +1,231 @@
-# AlphaMind v4.1
-# MODULE_MAPPING.md
+# AlphaMind — MODULE_MAPPING.md
 
-Version: 4.1
+This document maps the code to the modules of the ft_transcendence
+subject (v21.1).
 
----
-
-## 1. Team & Ownership (3 developers, 3 services)
-
-| Role | Owns service(s) | Domains inside |
-|---|---|---|
-| **Backend Lead** | `auth-service`, `core-service` | auth, organization, social (connections/presence) — in auth-service; portfolio, research, notification — in core-service |
-| **AI Lead** | `ai-service` | the entire multi-agent/RAG/LLM engine, market data, AI-driven analytics |
-| **Frontend Lead** | `frontend/` | consumes all 3 services through the Nginx gateway |
-
-Backend Lead additionally owns: `gateway/nginx.conf`,
-`docker-compose.yaml`, `infra/`, CI/CD pipelines for all 3 services
-(see 4.5), Prometheus/Grafana setup.
+Scoring: a Major module is worth 2 points, a Minor module 1 point, and
+only fully working modules count at evaluation. "Backend ✅" below means
+every backend requirement of the module is implemented and tested and
+can be shown through the API (Swagger, curl, WebSocket client). Modules
+whose requirement is inherently something a user sees in the browser are
+marked "needs frontend" even when their backend is complete.
 
 ---
 
-## 2. Point Strategy (unchanged targets, updated composition)
+## 1. Team and ownership (3 developers)
 
-| Tier | Points |
+| Role | Owns |
 |---|---|
-| Official minimum | 14 |
-| Safe pass | 20 |
-| AlphaMind baseline (v4.0) | **33** |
-| Officially countable bonus above 14 | capped at +5 per the subject |
+| **Backend Lead** | `auth-service` (auth, users, administration, organizations, social), `core-service` (portfolios and ledger, research notes/comments/documents, notifications, WebSocket and Yjs relay, public API), gateway, compose, CI |
+| **AI Lead** (Jenny) | `ai-service` (multi-agent analysis, RAG, LLM router, recommendations, decisions, backtests, analytics), monitoring, backups |
+| **Frontend Lead** | `frontend/` — consumes all three services through the gateway at https://localhost:8443 |
 
 ---
 
-## 3. Architecture Overview
+## 2. Architecture in one picture
 
 ```
-Frontend (Next.js)
-        │
+Browser / scripts / external API clients
+        │  HTTPS 8443 (HTTP 8000 only redirects), WSS for WebSockets
         ▼
-   Nginx Gateway (path-based routing + WebSocket upgrade; no custom
-                   gateway service to build/maintain)
+   nginx gateway ── /status page, /grafana/ (login), rate limit on /api/v1/auth
         │
-   ┌────┼────────────────┬─────────────────┐
-   ▼                      ▼                  ▼
-auth-service         core-service        ai-service
-(Backend Lead)       (Backend Lead)      (AI Lead)
-auth, organization,  portfolio,          agents, LangGraph,
-social/connections   research,           RAG, LLM router,
-                      notification,       recommendation,
-                      WebSocket           backtesting,
-                      connections          market, analytics
-   │                      │                  │
-   └──────────┬───────────┴─────────┬────────┘
-              ▼                     ▼
-      One Postgres instance      Redis (cache, rate
-      (schemas: auth/core/ai)    limit, cross-service
-                                  Pub/Sub events)
-                                     │
-                                     ▼
-                              Qdrant (ai-service only)
-
-shared/ — shared Python source (no packaging step), containing:
-config base, DB/Redis factories, JWT verification, exceptions,
-logging, event bus, ORM mixins, enums, Pydantic base schemas + refs
+   ┌────┴───────────────┬─────────────────────┐
+   ▼                    ▼                     ▼
+auth-service       core-service           ai-service
+users, roles,      portfolios + ledger,   9-agent LangGraph pipeline,
+admin, orgs,       research + Yjs,        debate/Judge/Reflection,
+friends, 2FA,      notifications,         RAG + ask/stream, LLM router,
+OAuth              public API (API keys), decisions, backtests,
+                   WebSockets             analytics, sentiment
+   │                    │                     │
+   └─── REST (/internal/*, X-Internal-Token) + Redis pub/sub and streams ───┘
+              │                  │                 │
+        Postgres (auth/core/ai schemas)   Redis   Qdrant (ai only)
+        S3-compatible object storage (SeaweedFS)
+        Prometheus + exporters, Alertmanager, Grafana; scheduler (cron jobs, backups)
 ```
 
-Services never import each other's code. They talk over:
-1. **REST** — synchronous, via `app/clients/*.py` (typed, cached,
-   raise `UpstreamServiceError` on failure).
-2. **Redis Pub/Sub** — asynchronous, via `alphamind_common.events`,
-   for events listed in `alphamind_common.events_registry.EventName`.
+Services never import each other's code. They talk over REST
+(`services/*/clients/*.py`, service-to-service routes under `/internal/*`
+protected by a shared token) and over Redis events
+(`shared/events_registry.py`).
 
 ---
 
-## 4. Scored Modules
+## 3. Mandatory part (the project is rejected if any is missing)
 
-### 4.1 Web (`IV.1`)
-
-| # | Module | Type | Pts | What we build | Owner |
-|---|---|---|---|---|---|
-| W1 | Framework for both frontend and backend | Major | 2 | Next.js + FastAPI (×3 services) | All |
-| W2 | ORM | Minor | 1 | SQLAlchemy 2.0 async, `alphamind_common.database.Base` | Backend |
-| W3 | Real-time features (WebSocket) | Major | 2 | core-service holds connections; ai-service/auth-service push via Redis Pub/Sub → core-service rebroadcasts | Backend + AI |
-| W4 | Public API: API key + rate limiting + docs + ≥5 endpoints | Major | 2 | `/api/v1/public/*`, hosted by core-service, `X-API-Key`, Redis sliding window | Backend |
-| W5 | Notification system | Minor | 1 | core-service `domains/notification`, triggered by local + cross-service events | Backend |
-| W6 | File upload | Minor | 1 | core-service `domains/research`: PDF/TXT/MD upload, validation, storage, preview, progress, delete | Backend |
-| W7 | Advanced search | Minor | 1 | Postgres full-text (notes) + Qdrant semantic (documents, via ai-service) | Backend + AI |
-| **Subtotal** | | | **10** | | |
-
-### 4.2 User Management (`IV.3`)
-
-| # | Module | Type | Pts | What we build | Owner |
-|---|---|---|---|---|---|
-| U1 | Standard user management (profile, avatar, connections + online status) | Major | 2 | auth-service | Backend |
-| U2 | OAuth 2.0 | Minor | 1 | Google + GitHub, auth-service | Backend |
-| U3 | 2FA | Minor | 1 | TOTP, auth-service | Backend |
-| U4 | Advanced permissions system | Major | 2 | RBAC, auth-service | Backend |
-| U5 | Organization system | Major | 2 | auth-service | Backend |
-| **Subtotal** | | | **8** | | |
-
-### 4.3 Artificial Intelligence (`IV.4`)
-
-| # | Module | Type | Pts | What we build | Owner |
-|---|---|---|---|---|---|
-| A1 | Complete RAG system | Major | 2 | ai-service: chunk → embed → Qdrant → retrieve → cite | AI |
-| A2 | Complete LLM system interface | Major | 2 | ai-service: multi-provider router (OpenAI/Anthropic/Gemini/Mistral), streaming, rate limiting | AI |
-| A3 | Sentiment analysis | Minor | 1 | ai-service Sentiment Agent | AI |
-| **Subtotal** | | | **5** | | |
-
-### 4.4 Devops (`IV.7`) — corrected: Microservices is now real
-
-| # | Module | Type | Pts | What we build | Owner |
-|---|---|---|---|---|---|
-| D1 | Monitoring (Prometheus + Grafana) | Major | 2 | All 3 services expose `/metrics` (`prometheus-fastapi-instrumentator`); Grafana dashboards per service | Backend |
-| D2 | **Backend as microservices** | Major | 2 | 3 real services, own Dockerfiles, own schemas, REST + Redis Pub/Sub communication, single responsibility each — see PROJECT_STRUCTURE.md v4.0 | Backend + AI |
-| D3 | Health check / status page | Minor | 1 | Each service's `/health`; Nginx exposes `/health/auth`, `/health/core`, `/health/ai` | Backend |
-| **Subtotal** | | | **5** | | |
-
-Still **not claimed**: ELK log management Major — the team runs
-structured JSON logs (`alphamind_common.logging`) but not a real
-Elasticsearch+Logstash+Kibana stack. Claim it only if that stack is
-actually stood up.
-
-### 4.5 CI/CD — Modules of Choice (`IV.10`)
-
-CI/CD is not a listed module in categories I–IX, so it's claimed here,
-with the justification the subject requires:
-
-| # | Module | Type | Pts | What we build |
-|---|---|---|---|---|
-| C1 | Multi-Agent Investment Debate & Reflection Engine | Major | 2 | v4.1: dynamic, task-aware agent selection + every data/analysis agent as an autonomous ReAct loop (Thought→Action→Observation→...→Finish) with its own tools + multi-round Bull/Bear/Judge debate with Judge-decided convergence + Reflection that can send specific agents back for more evidence — see `Agents.md v4.1` |
-| C2 | Decision Tracking & Backtesting Evaluation Engine | Minor | 1 | (unchanged — see below) |
-| C3 | **Per-service CI/CD pipeline** | Minor | 1 | GitHub Actions: on every PR, lint + test + build a Docker image independently for whichever of the 3 services changed (path-filtered triggers); on merge to main, push images to a registry. |
-
-**Draft justification for C1 (Major, 2 pts) — strengthened in v4.1:**
-- *Why we chose it*: a single LLM call producing a recommendation is
-  unverifiable and non-transparent, and treats every agent as a
-  one-shot prompt rather than something responsible for its own
-  result. Structuring the reasoning as dynamically-selected, autonomous
-  specialist agents (each gathering and validating its own evidence via
-  a ReAct loop, not answering blind on the first pass) → adversarial
-  multi-round debate → Judge-assessed convergence → self-critique
-  produces an explainable, auditable decision trail, and each agent is
-  genuinely responsible for its own evidence quality rather than just
-  executing a single prompt.
-- *Technical challenge*: coordinating up to 9 autonomous agents (8 data/
-  analysis + conditionally Portfolio), each running its own bounded
-  Thought/Action/Observation loop with tool-calling; a LangGraph with
-  real cycles (not a linear pipeline) for multi-round debate and
-  Reflection-triggered agent retries, each dynamically decided by an
-  LLM but bounded by an explicit hard cap as a safety net; a shared,
-  strongly-typed state object every node reads/writes without race
-  conditions; per-agent business-specific retrievers over one shared
-  knowledge base.
-- *Value added*: the debate/reflection output — including exactly which
-  agents participated, which didn't and why, and whether the debate
-  actually converged or just ran out of rounds — is the core UX of the
-  product and the main reason a user would trust, and return to, a
-  recommendation (see `Proposal.md`).
-- *Why Major (2 pts)*: comparable in scope/complexity to the official
-  "Recommendation system using ML" Major, implemented as autonomous
-  multi-agent reasoning with tool use rather than a trained model —
-  arguably a harder and more novel engineering problem than fitting a
-  standard recommender model.
-
-**Draft justification for C2 (Minor, 1 pt) — unchanged from v3.0:**
-Closes the feedback loop (recommendation → decision → real outcome);
-technical challenge is correct time-windowed evaluation without
-look-ahead bias; smaller in scope than C1.
-
-**Draft justification for C3 (Minor, 1 pt) — new in v4.0:**
-- *Why we chose it*: with 3 independently deployable services, manual
-  testing/building doesn't scale — a change to `ai-service` shouldn't
-  require manually rebuilding and retesting `auth-service`.
-- *Technical challenge*: path-filtered pipeline triggers (only build/test
-  the service(s) that actually changed, plus `libs/alphamind_common`
-  changes triggering all 3, since every service depends on it), and
-  running integration tests that spin up more than one service against
-  a shared Postgres+Redis in CI.
-- *Value added*: catches a broken inter-service contract (e.g.
-  `core-service`'s `auth_client.py` expecting a `UserRef` field
-  `auth-service` no longer returns) before it reaches the demo.
-- *Why Minor, not Major*: the pipeline itself (lint/test/build/push) is
-  standard practice, not a novel technical contribution — it doesn't
-  carry the same weight as C1's actual system design work.
-
-### 4.6 Data & Analytics (`IV.8`)
-
-| # | Module | Type | Pts | What we build | Owner |
-|---|---|---|---|---|---|
-| N1 | Advanced analytics dashboard | Major | 2 | ai-service `domains/analytics`, charts, real-time via WebSocket relay through core-service, CSV export | AI |
-| **Subtotal** | | | **2** | | |
-
----
-
-## 5. Running Total
-
-| Category | Points |
+| Requirement | Status |
 |---|---|
-| Web | 10 |
-| User Management | 8 |
-| Artificial Intelligence | 5 |
-| Devops | 5 |
-| Modules of Choice | 4 |
-| Data & Analytics | 2 |
-| **Total** | **34** |
-
-(Corrected arithmetic note: Devops 2+2+1=5, Modules of Choice 2+1+1=4;
-total = 10+8+5+5+4+2 = **34**.)
-
-Mandatory minimum: 14 ✅. Officially countable bonus above 14 is capped
-at +5 per the subject's Bonus chapter — build everything above for
-resilience against demo-day validation failures and because the AI
-stack is the actual product, not to inflate the formal score past the
-cap.
+| Frontend + backend + database, one-command Docker deployment | Backend ✅ (`make up`); frontend in progress |
+| Several users at once, concurrent actions without corruption, real-time updates | ✅ (row locks and idempotency keys on the ledger and tiers, per-user queue limits, WebSocket fan-out) |
+| Credentials in an ignored env file, `.env.example` provided | ✅ (`.env.docker` ignored, `.env.example` complete) |
+| Clear database schema with relations | ✅ (`docs/ERD.md`, Alembic in every service) |
+| Secure sign-up and login, hashed and salted passwords | ✅ (bcrypt, email verification, rate limits) |
+| Input validation in the backend | ✅ (Pydantic on every route, 422 instead of 500 on bad input) |
+| Input validation in the frontend | Frontend |
+| HTTPS for every connection from outside | ✅ (TLS gateway on 8443; HTTP 8000 only redirects) |
+| Privacy Policy and Terms of Service pages | Frontend |
+| README with the required sections | Not written yet |
 
 ---
 
-## 6. What NOT to claim (carried over from v3.0, still applies)
+## 4. Modules
+
+### 4.1 Web
+
+| # | Module | Type | Pts | Status | Evidence |
+|---|---|---|---|---|---|
+| W1 | Framework for frontend and backend | Major | 2 | Needs frontend | FastAPI in all three services; the frontend framework is the Frontend Lead's part. |
+| W2 | ORM | Minor | 1 | ✅ | SQLAlchemy 2.0 async (`shared/database.py`), Alembic per service. |
+| W3 | Real-time features | Major | 2 | Backend ✅, needs frontend | `core-service` WebSockets: per-channel authorization, reconnect-safe Redis relay across replicas, each message delivered once per socket, presence heartbeats, analysis/tier/decision events on `analysis:<id>`, notification pushes. |
+| W4 | Public API | Major | 2 | ✅ | `/api/v1/public/*` with `X-API-Key`, per-key and per-user rate limits (429), GET/POST/PUT/DELETE, Swagger at `/docs/core/`; keys of deactivated owners stop working immediately. |
+| W5 | Notification system for all create/update/delete actions | Minor | 1 | ✅ | Every create, update and delete in core notifies the actor (and affected users); auth and ai actions arrive as events (`shared/enums.py` lists all types). In-app rows, live WebSocket push by default, optional email. |
+| W6 | File upload and management | Minor | 1 | Backend ✅ (upload progress is frontend) | Type, size and content checks (a `.pdf` must really be a PDF), access-controlled S3 storage, download, inline preview, rename, delete with index clean-up. |
+| W7 | Advanced search | Minor | 1 | ✅ | Notes: full-text search with filters, sort, pagination. Documents: filters (status, category, ticker, dates), sort, pagination. |
+| W8 | Real-time collaborative features | Minor | 1 | Backend ✅, needs frontend | Yjs live editing of research notes: the Yjs document is the source of truth and is written back to the note text and search index; REST body edits get 409 during a session; organization viewers and guests are read-only; malformed updates are isolated in worker processes so they cannot crash the service. |
+
+### 4.2 User management
+
+| # | Module | Type | Pts | Status | Evidence |
+|---|---|---|---|---|---|
+| U1 | Standard user management | Major | 2 | Backend ✅, needs frontend | Profile update, avatar upload with a default avatar, friends with online status, profile data. |
+| U2 | Remote authentication (OAuth 2.0) | Minor | 1 | Code ✅, not configured | Google and GitHub, with 2FA enforced on OAuth logins. No OAuth app is registered yet: register both with the real domain before the evaluation. |
+| U3 | Two-factor authentication | Minor | 1 | ✅ | TOTP, enforced on password and OAuth logins, lockout after repeated failures. |
+| U4 | Advanced permissions system | Major | 2 | ✅ (role-based UI is frontend) | System roles admin / moderator / user / guest (`shared/permissions.py`); admin user CRUD (`/api/v1/admin/users`), deactivate/reactivate/soft delete, site statistics; moderators hide/delete any note or comment and deactivate users; guests are read-only everywhere; `/me` returns `permissions` so the UI can adapt; a demotion or deactivation applies immediately to existing tokens. |
+| U5 | Organization system | Major | 2 | ✅ | Create/edit/delete organizations, invite, join, leave, remove, change roles; OWNER/ADMIN/MEMBER/VIEWER enforced (viewers are read-only in shared notes and documents); shared portfolios. |
+
+Not claimed: "User activity analytics" (Minor) — no dedicated activity
+dashboard.
+
+### 4.3 Artificial intelligence
+
+| # | Module | Type | Pts | Status | Evidence |
+|---|---|---|---|---|---|
+| A1 | Complete RAG system | Major | 2 | ✅ | Ingestion of filings, news, macro research and user uploads; category-aware chunking; hybrid BM25 + vector + RRF retrieval with per-user visibility; users ask questions at `POST /api/v1/rag/ask` and get answers grounded in cited sources; the analysis agents also retrieve from it. |
+| A2 | Complete LLM system interface | Major | 2 | ✅ | Text generation from user input (`/rag/ask`, `mode=draft` writes a note paragraph), streaming over SSE (`/rag/ask/stream`), error events instead of broken streams, per-user rate limits, multi-provider router with fallbacks and timeouts. |
+| A3 | Sentiment analysis | Minor | 1 | ✅ | Sentiment of user-generated content: every research note and comment is scored (label and score) after it is saved; `GET /api/v1/research/sentiment/summary` aggregates it per ticker and per day. |
+
+Not claimed: "Recommendation system using machine learning" (Major) —
+recommendations come from multi-agent LLM reasoning, not a trained
+model (claimed as C1 instead).
+
+### 4.4 DevOps
+
+| # | Module | Type | Pts | Status | Evidence |
+|---|---|---|---|---|---|
+| D1 | Monitoring with Prometheus and Grafana | Major | 2 | ✅ | `/metrics` on every service plus postgres/redis exporters, custom metrics for analyses, queue and LLM errors, two provisioned dashboards, 12 alert rules (9 of them with promtool unit tests), Alertmanager email, Grafana behind the gateway with a required admin password and no anonymous access. |
+| D2 | Backend as microservices | Major | 2 | ✅ | Three services with their own schemas, images and migrations; REST with typed clients and Redis events; internal routes protected by a service token. |
+| D3 | Health check, status page, backups and disaster recovery | Minor | 1 | ✅ | `/health` returns 503 when a dependency is down, `/status` page, daily backups of Postgres, Qdrant, object storage and avatars with checksums and 7-day retention, dry-run-first restore, `docs/DISASTER_RECOVERY.md`. |
+
+Not claimed: ELK log management — logs are structured JSON collected by
+Vector into files, not an Elasticsearch/Logstash/Kibana stack.
+
+### 4.5 Data and analytics
+
+| # | Module | Type | Pts | Status | Evidence |
+|---|---|---|---|---|---|
+| N1 | Advanced analytics dashboard | Major | 2 | Backend ✅, needs frontend | Overview and time series with date ranges and filters (`/api/v1/analytics/overview`, `/timeseries`), CSV export of analyses/recommendations/decisions, portfolio history and transaction CSVs; live updates can use the existing WebSocket events. Charts and PDF export are frontend work. |
+
+Not claimed: "Data export and import" (Minor) — export exists, import
+does not. GDPR (Minor) — not implemented.
+
+### 4.6 Modules of choice
+
+| # | Module | Type | Pts | Status |
+|---|---|---|---|---|
+| C1 | Multi-agent investment debate and reflection engine | Major | 2 | ✅ |
+| C2 | Decision tracking and backtesting engine | Minor | 1 | ✅ |
+| C3 | Per-service CI pipeline | Minor | 1 | ✅ |
+
+**C1 (Major).** *Why:* one LLM call producing a recommendation cannot be
+checked. The engine selects up to 9 specialist agents, each running its
+own tool-using ReAct loop with evidence gates, then runs a multi-round
+Bull/Bear debate, a Judge that decides convergence and weighs its own
+past track record on the ticker (L2 episodic memory with measured
+outcomes), and a Reflection stage that verifies claims against tool
+evidence and re-runs the agents that failed. *Challenge:* a cyclic
+LangGraph with concurrent agent writes, retries and failure states that
+are recorded honestly (no placeholder verdicts); a production LLM layer
+that survives provider rate limits and overloads (pooled keys, pacing,
+escalating cooldowns, fallback chains). *Why Major:* comparable in scope
+to the official ML recommendation Major, implemented as auditable
+multi-agent reasoning.
+
+**C2 (Minor).** Decision tracking (one decision per user and
+recommendation, accept/decline of trade tiers that the scheduler then
+executes into the ledger), three backtests (recommendation replay,
+single-ticker triggered tiers, whole-portfolio time-weighted return with
+external flows handled correctly), review workflow scoring AI accuracy
+after 30 days and user decisions at 7, 30 and 90 days. A live portfolio evaluation is not
+part of it and is not claimed.
+
+**C3 (Minor).** GitHub Actions per service (path filters, flake8 and
+mypy with errors failing the job, the service's test suite, the
+production image build) plus an integration workflow.
+
+---
+
+## 5. Point total
+
+| Category | Shown through the API today | Needs the frontend to be shown |
+|---|---|---|
+| Web | 6 (W2, W4, W5, W6, W7) | 5 (W1, W3, W8) |
+| User management | 6 (U2 after OAuth apps are registered, U3, U4, U5) | 2 (U1) |
+| Artificial intelligence | 5 (A1, A2, A3) | 0 |
+| DevOps | 5 (D1, D2, D3) | 0 |
+| Data and analytics | 0 | 2 (N1) |
+| Modules of choice | 4 (C1, C2, C3) | 0 |
+| **Total** | **26** | **9** |
+
+Every row was checked against the module list of the subject (v21.1):
+each module above exists there with the type shown. The minimum of 14
+points is covered by the API-demonstrable modules alone. With the
+frontend parts done the claim is 35 points. The subject counts at most 5
+bonus points above the required 14 (each extra module must be fully
+working and justified in the README), so the extra modules are a margin
+for modules that fail at the evaluation, not a higher grade. Evaluators
+count only modules that fully work, so U2 needs its OAuth apps
+registered and every "needs frontend" module needs its screens before
+the evaluation.
+
+---
+
+## 6. What not to claim
 
 | Do not claim | Why |
 |---|---|
-| "Database" as a standalone module | Mandatory baseline requirement, not a module |
-| "Docker" as a standalone module | Mandatory baseline requirement, not a module |
-| ELK log management | Only claim if real Elasticsearch+Logstash+Kibana is running, not just structured JSON logs |
-| "Recommendation system using ML" (official module) | Our engine is multi-agent/LLM reasoning, not a trained collaborative/content-based filtering model — claimed instead as Modules of Choice C1, which is honest about what was built |
-| CI/CD as a standalone Devops/Web module | Not in the official list — claimed via Modules of Choice (C3) with justification instead |
+| Database or Docker as modules | Mandatory baseline, not modules |
+| ELK log management | No Elasticsearch/Logstash/Kibana |
+| Official ML recommendation system | No trained model — claimed as C1 |
+| User interaction (chat) | No chat |
+| Data export/import, GDPR | Import and GDPR flows not implemented |
+| User activity analytics | No activity dashboard |
 
 ---
 
-## 7. Evaluation Demo Checklist (updated for 3 services)
+## 7. Evaluation demo checklist
 
-- [ ] `docker compose up` from a clean clone starts all 9 containers
-      (frontend, gateway, 3 services, postgres, redis, qdrant,
-      prometheus, grafana) with one command
-- [ ] Register/login/OAuth/2FA against auth-service through the gateway
-- [ ] Create an organization, invite a member (auth-service)
-- [ ] Create a portfolio, add holdings (core-service) — show the
-      owner's username was resolved via a live call to auth-service
-      (open Grafana/logs to show the actual inter-service HTTP call)
-- [ ] Upload a research document (core-service) → show it get
-      chunked/embedded (ai-service reacted to a Redis Pub/Sub event, not
-      a direct call) → ask a question, get a cited answer
-- [ ] Run a full analysis (ai-service) → show the live workflow
-      timeline over WebSocket (core-service relaying ai-service's
-      Redis-published events)
-- [ ] Show a recommendation on the portfolio page (core-service calling
-      ai-service's `/internal/recommendations/latest`)
-- [ ] Show a backtest report and decision-tracking outcome
-- [ ] Show the analytics dashboard
-- [ ] Call the public API with `X-API-Key`, trigger a 429
-- [ ] Show 3 separate Grafana dashboards (one per service) and each
-      service's independent `/health`
-- [ ] Show the GitHub Actions run: a PR touching only `ai-service`
-      building/testing only `ai-service` (plus `alphamind_common`)
+Items marked (frontend) need the frontend; everything else can be shown
+with Swagger (https://localhost:8443/docs/{auth,core,ai}/), curl or a
+WebSocket client.
 
+- [ ] Fresh clone: `cp .env.example .env.docker`, fill the secrets, `make up` (creates the certificate and starts everything with one command)
+- [ ] https://localhost:8443/status all green; http://localhost:8000 redirects to HTTPS
+- [ ] Register, verify email (MailHog), log in, enable 2FA, log in with 2FA; OAuth login (after registering the apps)
+- [ ] First admin with `scripts.set_system_role`; list/edit users, make someone a guest and show a 403 on a write, deactivate a user and show their token rejected at once
+- [ ] Organization: create, invite, accept, change a member to viewer and show read-only access to a shared note
+- [ ] Portfolio: deposit, buy, sell, transfer shares in (adjustment), CSV export of history and transactions; notifications for each action
+- [ ] Upload a PDF, preview it, see it indexed, ask a question at `/api/v1/rag/ask`, watch `/rag/ask/stream` stream tokens with citations
+- [ ] Write a note and a comment, show their sentiment and the ticker sentiment summary; moderator hides a comment
+- [ ] Two clients editing one note live (frontend); REST body edit gets 409 during the session
+- [ ] Run an analysis, follow `analysis:<id>` events over WSS, inspect agents, debate, Judge track record and Reflection; accept a tier and show its execution notification
+- [ ] Backtests and analytics overview/time series/CSV export; dashboard charts (frontend)
+- [ ] Public API with `X-API-Key`, trigger a 429
+- [ ] Grafana dashboards behind login; stop an exporter and show the alert email in MailHog
+- [ ] `make backup` and a dry-run `make restore`
+- [ ] A GitHub Actions run testing only the changed service
 
 ---
 
 # END OF MODULE_MAPPING.md
-# Version 4.1

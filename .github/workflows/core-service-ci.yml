@@ -1,36 +1,43 @@
 name: core-service CI
 
+# Real test/lint/type-check gates. Tests use
+# testcontainers (tests/core-service/conftest.py starts its own Postgres
+# and Redis through the runner's Docker daemon), so no `services:` block
+# is needed.
+# The paths are everything the suite, its lint and its type check read:
+# the shared test helpers, the Makefile targets the steps call, and the
+# repository files the tests check.
 on:
   pull_request:
     paths:
-      - "service/core-service/**"
+      - "services/core-service/**"
       - "shared/**"
+      - "tests/core-service/**"
+      - "tests/alembic_contract.py"
+      - "tests/auth_tokens.py"
+      - "Makefile"
+      - "infra/scheduler/**"
+      - "infra/gateway/nginx.conf"
       - "pyproject.toml"
       - "uv.lock"
+      - ".github/workflows/core-service-ci.yml"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: uv sync
-      # - run: make test-core
-      - run: uv run ruff check services/core-service shared
-        continue-on-error: true
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - name: Flake8
+        run: >-
+          uv run flake8 --extend-exclude mistral_provider.py
+          services/core-service shared tests/core-service
+      - name: Mypy
+        run: make mypy-shared mypy-core
+      - name: Tests
+        run: make test-core
       - name: Build image
-        run: docker build -f services/core-service/Dockerfile -t core-service:ci .
+        run: docker build -f services/core-service/Dockerfile --target production -t core-service:ci .

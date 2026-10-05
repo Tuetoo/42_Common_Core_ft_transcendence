@@ -9,6 +9,7 @@ def _get_client(settings: BaseServiceSettings, db_index: int) -> redis.Redis:
     base_url = settings.assemble_redis_url()
     parsed = urlsplit(base_url)
     url_without_db = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
     key = (url_without_db, db_index)
     if key not in _pools:
         _pools[key] = redis.from_url(

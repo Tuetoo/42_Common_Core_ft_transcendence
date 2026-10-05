@@ -12,6 +12,7 @@ __pycache__/
 
 .ruff_cache/
 
+
 .coverage
 
 htmlcov/
@@ -23,6 +24,10 @@ htmlcov/
 .vscode/
 
 # Environment
+# The real env file is `.env.docker` (not `.env`, which shared/config.py
+# would load into local pytest runs). The tracked template is
+# `.env.example` (copy it to `.env.docker`); the exception below must
+# match that filename or the template stops being tracked.
 
 .env
 
@@ -30,9 +35,33 @@ htmlcov/
 
 !.env.example
 
+# Docker-mount artifacts: empty, root-owned directories that appear under
+# each service because docker-compose.override.yml mounts ./shared into
+# ./services/<name>:/app as a nested bind mount. Harmless, never imported
+# by anything (the real `shared/` package lives only at the repo root),
+# but shouldn't be tracked.
+
+services/auth-service/shared/
+
+services/core-service/shared/
+
+services/ai-service/shared/
+
 # Logs
 
 *.log
+
+# Per-service daily container logs written by the `vector`
+# service (docker-compose.yaml) -- runtime data, never committed.
+
+/logs/
+
+# Locally generated TLS certificate for the gateway
+# (infra/gateway/gen-certs.sh). Only the README is tracked.
+
+infra/gateway/certs/*
+
+!infra/gateway/certs/README.md
 
 # macOS
 
@@ -51,3 +80,17 @@ build/
 # uv
 
 uv.lock.bak
+
+# Daily backups (infra/scheduler/backup.sh)
+backups/
+
+# Redis snapshots written by a redis-server started inside the repo
+# (local testing), the output folders of run_analysis.sh (runs/; the
+# top-level patterns cover the older per-ticker / batch run folders), and the local folder of Claude
+# session outputs.
+*.rdb
+/runs/
+/run_*/
+/*_run_*/
+/batch_run_*/
+Claude outputs/

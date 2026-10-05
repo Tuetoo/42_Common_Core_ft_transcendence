@@ -1,0 +1,10 @@
+[style]
+based_on_style = pep8
+column_limit = 79
+allow_split_before_default_or_named_assigns = false
+split_before_named_assigns = false
+coalesce_brackets = true
+split_arguments_when_comma_terminated = false
+split_before_first_argument = true
+allow_split_before_dict_value = false
+each_dict_entry_on_separate_line = true
