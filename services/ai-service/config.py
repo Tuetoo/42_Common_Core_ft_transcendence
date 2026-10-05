@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import Field
 from shared.config import BaseServiceSettings
 
 
@@ -9,12 +10,30 @@ class AIServiceSettings(BaseServiceSettings):
     QDRANT_HOST: str = "qdrant"
     QDRANT_PORT: int = 6333
     QDRANT_URL: str | None = None
-    QDRANT_COLLECTION_RESEARCH: str = "research_documents"
-    QDRANT_VECTOR_SIZE: int = 1024
+    QDRANT_API_KEY: str = ""
+    QDRANT_COLLECTION_RESEARCH: str = "research_documents_gemini"
+    QDRANT_VECTOR_SIZE: int = 1536
+
+    EMBEDDING_PROVIDER: str = "google"
+    GOOGLE_EMBEDDING_MODEL: str = "gemini-embedding-2"
+    GOOGLE_EMBEDDING_DIMENSIONS: int = 1536
+    EMBEDDING_REQUEST_TIMEOUT_SECONDS: float = 30.0
+    ARCHIVAL_NEAR_DUPLICATE_THRESHOLD: float | None = None
+    ARCHIVAL_RECYCLED_SHARE_MAX: float = 0.5
+    PRIOR_NOTE_MAX_SIMILARITY: float = 0.9
 
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     GOOGLE_API_KEY: str = ""
+    GOOGLE_API_KEY_2: str = ""
+    GOOGLE_API_KEY_3: str = ""
+    GOOGLE_API_KEY_4: str = ""
+    GOOGLE_API_KEY_5: str = ""
+    GOOGLE_API_KEY_6: str = ""
+    GOOGLE_API_KEY_7: str = ""
+    GOOGLE_API_KEY_8: str = ""
+    GOOGLE_API_KEY_9: str = ""
+    GOOGLE_API_KEY_10: str = ""
     MISTRAL_API_KEY: str = ""
     MISTRAL_API_KEY_2: str = ""
     MISTRAL_API_KEY_3: str = ""
@@ -23,33 +42,94 @@ class AIServiceSettings(BaseServiceSettings):
     MISTRAL_API_KEY_6: str = ""
     MISTRAL_API_KEY_7: str = ""
 
-    LLM_DEFAULT_PROVIDER: str = "mistral"
-    LLM_OPENAI_MODEL_FAST: str = "gpt-5.6-luna"
+    LLM_DEFAULT_PROVIDER: str = "google"
     LLM_OPENAI_MODEL_CHEAP: str = "gpt-5.6-luna"
     LLM_OPENAI_MODEL_HIGHEST_ACCURACY: str = "gpt-5.6-sol"
-    LLM_ANTHROPIC_MODEL_FAST: str = "claude-haiku-4-5-20251001"
     LLM_ANTHROPIC_MODEL_CHEAP: str = "claude-haiku-4-5-20251001"
     LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY: str = "claude-opus-4-8"
-    LLM_GOOGLE_MODEL_FAST: str = "gemini-3.5-flash-lite"
     LLM_GOOGLE_MODEL_CHEAP: str = "gemini-3.5-flash-lite"
-    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY: str = "gemini-3.1-pro"
-    LLM_MISTRAL_MODEL_FAST: str = "mistral-small-latest"
-    LLM_MISTRAL_MODEL_CHEAP: str = "mistral-small-latest"
+    LLM_GOOGLE_MODEL_CHEAP_FALLBACK: str = "gemini-3.1-flash-lite"
+    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY: str = "gemini-3.8-flash"
+    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "gemini-3.7-flash"
+    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2: str = "gemini-3.6-flash"
+    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3: str = "gemini-3.5-flash"
+    LLM_MISTRAL_MODEL_CHEAP: str = "mistral-small-2603"
     LLM_MISTRAL_MODEL_HIGHEST_ACCURACY: str = "mistral-medium-latest"
-    LLM_MISTRAL_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "mistral-large-latest"
+    LLM_MISTRAL_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "mistral-large-2512"
     LLM_MISTRAL_MODEL_CHEAP_FALLBACK: str = "ministral-8b-2512"
-    LLM_MISTRAL_CHEAP_MIN_INTERVAL_SECONDS: float = 1.3
-    LLM_MISTRAL_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS: float = 1.3
+
+    LLM_MISTRAL_CHEAP_MIN_INTERVAL_SECONDS: float = 15.0
+    LLM_MISTRAL_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS: float = 22.0
+
+    LLM_GOOGLE_CHEAP_MIN_INTERVAL_SECONDS: float = 5.0
+    LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS: float = 13.5
+
+    LLM_GOOGLE_LITE_MAX_CONCURRENT_REQUESTS: int = 2
+
+    LLM_GOOGLE_LITE_POOL_MIN_DISPATCH_INTERVAL_SECONDS: float = 3.0
+
+    LLM_GOOGLE_LITE_POOL_MAX_WAIT_SECONDS: float = 30.0
+
+    LLM_GOOGLE_LITE_RUNAWAY_RETRY_THINKING_BUDGET: int = 1024
+
+    LLM_GOOGLE_SERVER_ERROR_COOLDOWN_SECONDS: float = 20.0
+    LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS: float = 30.0
+    LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS: float = 300.0
+    LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS: dict[str, float] = Field(
+        default_factory=lambda: {"gemini-3.7-flash": 60.0})
+    LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS: int = 0
+    LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS: float = 90.0
+    LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS: float = 300.0
 
     SEC_EDGAR_USER_AGENT: str = ""
+    SEC_EDGAR_MAX_REQUESTS_PER_SECOND: float = 8.0
+    FILING_RECORDS_MAX_FILINGS: int = 5
+    FILING_RECORDS_BACKFILL_LLM_TIER: str = "cheap"
     FRED_API_KEY: str = ""
     NEWSAPI_API_KEY: str = ""
+    NEWSAPI_SEARCH_IN: str = "title,description"
+    NEWSAPI_SORT_BY: str = "relevancy"
+    NEWSAPI_RECENT_EXTRA_LIMIT: int = 10
+    NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS: float = 3600.0
+    NEWS_RELEVANCE_BATCH_SIZE: int = 8
+    NEWS_CONSUMER_MAX_ITEMS: int = 2
+    NEWS_WEB_FALLBACK_DAYS: int = 7
     TAVILY_API_KEY: str = ""
+
     KG_EXTRACTION_LLM_TIER: str = "cheap"
 
-    RAG_CHUNK_SIZE_TOKEN: int = 512
-    RAG_CHUNK_OVERLAP_TOKEN: int = 64
     RAG_TOP_K_RESULTS: int = 5
+
+    ANALYSIS_TIMEOUT_SECONDS: float = 2700.0
+    ANALYSIS_MAX_ACTIVE_PER_USER: int = 3
+    ANALYSIS_QUEUE_MAX_PENDING: int = 50
+
+    JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS: float = 10.0
+
+    LLM_GOOGLE_LITE_COOLDOWN_RETRY_MAX_SECONDS: float = 70.0
+
+    JUDGE_DELAYED_RETRY_SECONDS: float = 120.0
+    DEBATE_SIDE_REPAIR_DELAY_SECONDS: float = 60.0
+    AGENT_PREFETCH_ENABLED: bool = True
+    REFLECTION_REVIEW_DELAYED_RETRY_SECONDS: float = 60.0
+    JUDGE_STATE_QUARTER_DECLINE_PCT: float = 15.0
+    FALLBACK_ANCHOR_MIN_WORD_SHARE: float = 0.3
+    TIER_MIN_NOTIONAL_USD: float = 100.0
+    TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION: float = 0.01
+    MAX_POSITION_WEIGHT_PCT: float = 50.0
+    MIN_BUY_TIER_CONFIDENCE: float = 0.5
+    TIER_WINDOW_DAYS_MAX: int = 30
+    MIN_USABLE_AGENTS_FOR_DEBATE: int = 4
+    EPISODIC_CONTEXT_LIMIT: int = 3
+    AI_ACCURACY_EVALUATION_DAYS: int = 30
+
+    RAG_ASK_RATE_LIMIT_PER_MINUTE: int = 10
+    RAG_ASK_RATE_LIMIT_PER_DAY: int = 200
+    RAG_ASK_LLM_TIER: str = "cheap"
+    RAG_ASK_MAX_OUTPUT_TOKENS: int = 1024
+    RAG_ASK_SNIPPET_CHARS: int = 300
+    RAG_ASK_STREAM_TIMEOUT_SECONDS: float = 120.0
+    SENTIMENT_MAX_INPUT_CHARS: int = 6000
 
     def assemble_qdrant_url(self) -> str:
         if self.QDRANT_URL:

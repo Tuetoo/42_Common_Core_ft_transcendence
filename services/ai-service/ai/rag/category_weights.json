@@ -1,0 +1,33 @@
+{
+  "_comment": "RAG retrieval weights per DocumentCategory, loaded by ai/rag/retriever.py at import time. A weight of 0.0 for a source means that source is skipped entirely (no wasted API call), not zeroed after the fetch. Written by 'scripts/measure_rag_recall.py --sweep --apply' for every category whose best grid ratio beats the current one by at least one hit (a thin margin is applied too and flagged in that category's _evidence). Keys starting with '_' are ignored by the loader. Edit by hand only to override what the sweep found.",
+  "news": {
+    "bm25": 0.8,
+    "vector": 0.2,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 60/61 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  },
+  "risk_analysis": {
+    "bm25": 0.7,
+    "vector": 0.3,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 24/25 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  },
+  "macro_research": {
+    "bm25": 0.7,
+    "vector": 0.3,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 24/26 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  },
+  "filing": {
+    "bm25": 0.5,
+    "vector": 0.5,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 125/131 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  },
+  "earnings_call": {
+    "bm25": 0.5,
+    "vector": 0.5,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 682/706 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  },
+  "analyst_report": {
+    "bm25": 0.5,
+    "vector": 0.5,
+    "_evidence": "scripts/measure_rag_recall.py --sweep, real run: 53/53 hits at this ratio. THIN MARGIN CAVEAT: only 2 hit(s) or fewer better than the previous config in this specific run -- applied anyway per Jenny's call (2026-08-08: a stable plateau across multiple grid points is a real signal even at small sample size, worth more than a hard block), but worth re-confirming on the next few sweeps before treating this as fully settled."
+  }
+}
