@@ -1,16 +1,19 @@
 import asyncio
+from typing import TYPE_CHECKING
 import boto3
 import structlog
-from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 from shared.config import BaseServiceSettings
 
+if TYPE_CHECKING:
+    from mypy_boto3_s3.client import S3Client
+
 logger = structlog.get_logger(__name__)
 
-_clients: dict[str, BaseClient] = {}
+_clients: "dict[str, S3Client]" = {}
 
 
-def _get_client(settings: BaseServiceSettings) -> BaseClient:
+def _get_client(settings: BaseServiceSettings) -> "S3Client":
     key = settings.S3_ENDPOINT_URL
     if key not in _clients:
         _clients[key] = boto3.client(
@@ -32,37 +35,45 @@ async def ensure_bucket(settings: BaseServiceSettings, bucket: str) -> None:
             if error_code not in ("404", "NoSuchBucket"):
                 raise
             client.create_bucket(Bucket=bucket)
+
     await asyncio.to_thread(_ensure)
     logger.info("storage_bucket_ready", bucket=bucket)
 
 
-async def upload_bytes(settings: BaseServiceSettings, *, bucket: str, key: str,
-                       content: bytes, content_type: str | None = None
-                       ) -> None:
+async def upload_bytes(
+        settings: BaseServiceSettings, *, bucket: str, key: str,
+        content: bytes, content_type: str | None = None) -> None:
     client = _get_client(settings)
-    extra_args = {"ContentType": content_type} if content_type else {}
 
     def _upload() -> None:
-        client.put_object(Bucket=bucket, Key=key, Body=content, **extra_args)
+        if content_type:
+            client.put_object(
+                Bucket=bucket, Key=key, Body=content, ContentType=content_type)
+        else:
+            client.put_object(Bucket=bucket, Key=key, Body=content)
+
     await asyncio.to_thread(_upload)
 
 
-async def download_bytes(settings: BaseServiceSettings, *, bucket: str,
-                         key: str) -> bytes:
+async def download_bytes(
+        settings: BaseServiceSettings, *, bucket: str, key: str) -> bytes:
     client = _get_client(settings)
 
     def _download() -> bytes:
         response = client.get_object(Bucket=bucket, Key=key)
-        return response["Body"].read()
+        body_bytes: bytes = response["Body"].read()
+        return body_bytes
+
     return await asyncio.to_thread(_download)
 
 
-async def delete_object(settings: BaseServiceSettings, *, bucket: str,
-                        key: str) -> None:
+async def delete_object(
+        settings: BaseServiceSettings, *, bucket: str, key: str) -> None:
     client = _get_client(settings)
 
     def _delete() -> None:
         client.delete_object(Bucket=bucket, Key=key)
+
     await asyncio.to_thread(_delete)
 
 
@@ -72,6 +83,7 @@ async def check_storage_connection(settings: BaseServiceSettings) -> bool:
     def _check() -> bool:
         client.list_buckets()
         return True
+
     try:
         return await asyncio.to_thread(_check)
     except Exception:

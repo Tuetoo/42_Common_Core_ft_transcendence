@@ -1,35 +1,99 @@
 from datetime import datetime
-from typing import Any
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import security
 from config import settings
-from shared.schemas.base import BaseSchema, IDMixin
+from pydantic import (AfterValidator, BaseModel, ConfigDict, EmailStr, Field,
+                      field_validator, model_validator)
+from shared.enums import NotificationChannel
+from shared.schemas import BaseSchema, IDMixin
+
+USERNAME_PATTERN = r"^[A-Za-z0-9_.-]{3,32}$"
+
+Theme = Literal["system", "light", "dark"]
+PROFILE_FIELDS = ("first_name", "last_name", "bio", "timezone", "country")
 
 
-# Registration/login
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def validate_timezone(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown timezone '{value}'") from exc
+    return value
+
+
+Email = Annotated[EmailStr, AfterValidator(normalize_email)]
+TimezoneName = Annotated[str,
+                         Field(max_length=64),
+                         AfterValidator(validate_timezone)]
+
+
+def validate_new_password(value: str) -> str:
+    if len(value) < settings.PASSWORD_MIN_LENGTH:
+        raise ValueError(
+            f"password must be at least {settings.PASSWORD_MIN_LENGTH} "
+            "characters")
+    return validate_password_bytes(value)
+
+
+def validate_password_bytes(value: str) -> str:
+    if len(value.encode("utf-8")) > security.PASSWORD_MAX_BYTES:
+        raise ValueError(
+            f"password must be at most {security.PASSWORD_MAX_BYTES} bytes")
+    return value
+
+
 class UserRegister(BaseModel):
-    email: EmailStr
-    username: str = Field(min_length=3, max_length=32)
+    email: Email
+    username: str = Field(pattern=USERNAME_PATTERN)
     password: str
 
     @field_validator("password")
     @classmethod
-    def _password_min_length(cls, value: str) -> str:
-        if len(value) < settings.PASSWORD_MIN_LENGTH:
-            raise ValueError("password must be at least "
-                             f"{settings.PASSWORD_MIN_LENGTH} characters")
-        return value
+    def _check_password(cls, value: str) -> str:
+        return validate_new_password(value)
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: Email
     password: str
-    totp_code: str | None = None
+    totp_code: str | None = Field(default=None, max_length=16)
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, value: str) -> str:
+        return validate_password_bytes(value)
 
 
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+
+
+class OAuthTwoFactorChallenge(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "description": (
+                "Returned by the OAuth callback instead of a token pair when "
+                "the "
+                "account has 2FA enabled. Exchange `challenge_token` plus a "
+                "TOTP "
+                "code at POST /api/v1/auth/oauth/2fa.")
+        })
+
+    two_factor_required: Literal[True] = True
+    challenge_token: str
+    expires_in: int
+
+
+class OAuthTwoFactorVerify(BaseModel):
+    challenge_token: str
+    code: str = Field(min_length=1, max_length=16)
 
 
 class RefreshRequest(BaseModel):
@@ -40,13 +104,16 @@ class LogoutRequest(BaseModel):
     refresh_token: str
 
 
-# Email verification/password reset
 class VerifyEmailRequest(BaseModel):
     token: str
 
 
+class ResendVerificationRequest(BaseModel):
+    email: Email
+
+
 class PasswordResetRequest(BaseModel):
-    email: EmailStr
+    email: Email
 
 
 class PasswordResetConfirm(BaseModel):
@@ -55,28 +122,23 @@ class PasswordResetConfirm(BaseModel):
 
     @field_validator("new_password")
     @classmethod
-    def _password_min_length(cls, value: str) -> str:
-        if len(value) < settings.PASSWORD_MIN_LENGTH:
-            raise ValueError("password must be at least "
-                             f"{settings.PASSWORD_MIN_LENGTH} characters")
-        return value
+    def _check_password(cls, value: str) -> str:
+        return validate_new_password(value)
 
 
-# 2FA
 class TwoFactorSetupResponse(BaseModel):
     secret: str
     provisioning_uri: str
 
 
 class TwoFactorVerifyRequest(BaseModel):
-    code: str
+    code: str = Field(max_length=16)
 
 
 class TwoFactorDisableRequest(BaseModel):
-    code: str
+    code: str = Field(max_length=16)
 
 
-# Profile
 class UserProfileRead(BaseSchema):
     first_name: str | None = None
     last_name: str | None = None
@@ -97,6 +159,7 @@ class MeRead(BaseSchema, IDMixin):
     email: str
     username: str
     system_role: str
+    permissions: list[str] = Field(default_factory=list)
     is_active: bool
     is_verified: bool
     last_seen_at: datetime | None = None
@@ -106,24 +169,34 @@ class MeRead(BaseSchema, IDMixin):
 
 
 class MeUpdate(BaseModel):
-    username: str | None = Field(default=None, min_length=3, max_length=32)
-    first_name: str | None = None
-    last_name: str | None = None
-    bio: str | None = None
-    timezone: str | None = None
-    country: str | None = None
-    preferred_currency: str | None = None
-    theme: str | None = None
-    default_model: str | None = None
-    notification_preferences: dict[str, Any] | None = None
+    model_config = ConfigDict(
+        json_schema_extra={
+            "description": (
+                "PATCH semantics: only fields present in the body change. An "
+                "explicit null clears a nullable field; null is rejected "
+                "(422) "
+                "for username, theme and preferred_currency.")
+        })
+
+    username: str | None = Field(default=None, pattern=USERNAME_PATTERN)
+    first_name: str | None = Field(default=None, max_length=100)
+    last_name: str | None = Field(default=None, max_length=100)
+    bio: str | None = Field(default=None, max_length=500)
+    timezone: TimezoneName | None = None
+    country: str | None = Field(default=None, max_length=100)
+    preferred_currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    theme: Theme | None = None
+    default_model: str | None = Field(
+        default=None, max_length=64, pattern=r"^[A-Za-z0-9._:/-]+$")
+    notification_preferences: dict[NotificationChannel, bool] | None = None
+
+    @model_validator(mode="after")
+    def _no_null_for_required(self) -> "MeUpdate":
+        for field in ("username", "theme", "preferred_currency"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        return self
 
 
 class AvatarUploadRead(BaseModel):
     avatar_url: str
-
-
-# Refschemas
-class UserPublicRead(BaseSchema, IDMixin):
-    username: str
-    avatar_url: str | None = None
-    is_online: bool = False

@@ -1,34 +1,80 @@
+# Run with `make up` (= docker compose --env-file .env.docker up
+# --build). `--env-file .env.docker` is required: the ${VAR:?...} values
+# below (Grafana admin password, object storage S3 keys) are read from it
+# for interpolation, and compose stops with a clear message without them.
+# Create .env.docker from .env.example. `make up` also generates the
+# gateway's self-signed TLS certificate (infra/gateway/gen-certs.sh).
+#
+# Host ports: only the gateway is published on all
+# interfaces (https://localhost:8443, http://localhost:8000 redirects to
+# https). Developer UIs are bound to 127.0.0.1 only; everything else is
+# reachable only on the internal Docker network.
+
+# Every container's Docker log is capped (5 x 20 MB) so the json-file logs
+# cannot fill the disk shared with Postgres and the backups. `vector` still
+# copies every line into ./logs (kept 14 days).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # frontend:
   #   build:
   #     context: ./frontend
   #     dockerfile: Dockerfile
-  #   env_file: .env
-  #   ports:
-  #     - "3000:3000"
+  #   env_file: .env.docker
   #   depends_on:
   #     - gateway
   #   restart: unless-stopped
+  # (Served through the gateway once it exists -- no host port.)
 
   gateway:
+    logging: *default-logging
     image: nginx:1.27-alpine
     volumes:
       - ./infra/gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      # TLS certificate from infra/gateway/gen-certs.sh.
+      - ./infra/gateway/certs:/etc/nginx/certs:ro
+      # Static status page served at /status.
+      - ./infra/gateway/status.html:/usr/share/nginx/status/status.html:ro
     ports:
+      # HTTPS. The external port (8443) is also written
+      # in nginx.conf ($external_https_port) for the http -> https
+      # redirect; change both together.
+      - "8443:443"
+      # Plain HTTP: only redirects to https://<host>:8443.
       - "8000:80"
     depends_on:
-      - auth-service
-      - core-service
-      - ai-service
+      auth-service:
+        condition: service_healthy
+      core-service:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
     restart: unless-stopped
 
   auth-service:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/auth-service/Dockerfile
-    env_file: .env
+      target: production
+    env_file: .env.docker
     environment:
       SERVICE_NAME: auth-service
+    volumes:
+      - avatar_data:/app/data/avatars
+    # /health returns 200 only when the database and
+    # Redis are reachable (503 otherwise; urlopen raises on 503). The
+    # image has no curl, so the stdlib client is used.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,54 +83,145 @@ services:
     restart: unless-stopped
 
   core-service:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/core-service/Dockerfile
-    env_file: .env
+      target: production
+    env_file: .env.docker
     environment:
       SERVICE_NAME: core-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      objectstore:
+        condition: service_healthy
     restart: unless-stopped
-  
+
   ai-service:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/ai-service/Dockerfile
-    env_file: .env
+      target: production
+    env_file: .env.docker
     environment:
       SERVICE_NAME: ai-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Slower start than the other two (Qdrant client, RAG warm-up).
+      start_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
+      objectstore:
+        condition: service_healthy
     restart: unless-stopped
-  
+
+  # S3-compatible object storage for research documents (shared/storage.py).
+  # core-service uploads to it, ai-service reads from it during RAG
+  # ingestion. Same boto3 client code works against a real AWS S3 or
+  # Cloudflare R2 endpoint in staging/production -- only S3_ENDPOINT_URL/
+  # S3_ACCESS_KEY/S3_SECRET_KEY need to change, see .env.example.
+  #
+  # SeaweedFS runs here as one process
+  # (`weed server -s3`: master + volume server + filer + S3 gateway), S3
+  # API on port 9000 inside the Docker network only. The network alias
+  # `minio` is the hostname behind S3_ENDPOINT_URL=http://minio:9000. Credentials: S3_ACCESS_KEY / S3_SECRET_KEY, written into
+  # SeaweedFS's S3 identity file at start by infra/objectstore/entrypoint.sh
+  # (unsigned or wrongly signed requests get 403). Data: the
+  # objectstore_data volume.
+  objectstore:
+    logging: *default-logging
+    # Official image, pinned (release 4.47; the `_large_disk` variants use a
+    # different on-disk format -- do not switch between them on one volume).
+    image: chrislusf/seaweedfs:4.47
+    entrypoint: ["/bin/sh", "/objectstore/entrypoint.sh"]
+    # -ip / -ip.bind 127.0.0.1: master, volume server and filer (which have
+    # no authentication of their own) listen on the container's loopback
+    # only; -s3.ip.bind 0.0.0.0 publishes just the S3 gateway (9000, plus
+    # its gRPC port 19000) to the Docker network. The Iceberg and Lance
+    # catalog endpoints are not used and are turned off. The image's own
+    # entrypoint adds -dir=/data -volume.max=0 -master.volumeSizeLimitMB=1024.
+    command:
+      - server
+      - -s3
+      - -s3.port=9000
+      - -s3.ip.bind=0.0.0.0
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+      - -ip=127.0.0.1
+      - -ip.bind=127.0.0.1
+    # No env_file: only the S3 keys are needed, with no built-in default.
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env.docker and run docker compose with --env-file .env.docker}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env.docker and run docker compose with --env-file .env.docker}
+      S3_REGION: ${S3_REGION:-us-east-1}
+    volumes:
+      - objectstore_data:/data
+      - ./infra/objectstore:/objectstore:ro
+    networks:
+      default:
+        aliases:
+          - minio
+    # A real SigV4-signed S3 ListBuckets with the configured keys
+    # (infra/objectstore/healthcheck.sh): healthy only when the whole
+    # SeaweedFS chain answers and accepts the keys. First start takes
+    # about 15-20 s.
+    healthcheck:
+      test: ["CMD", "sh", "/objectstore/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
   postgres:
+    logging: *default-logging
     image: postgres:16-alpine
-    env_file: .env
-    # environment:
-    #   POSTGRES_DB: ${POSTGRES_DB}
-    #   POSTGRES_USER: ${POSTGRES_USER}
-    #   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Only the three values the image needs, from .env.docker through
+    # `--env-file` interpolation (the same values the services and
+    # postgres-exporter use); no env_file, so the application secrets are
+    # not in this container's environment.
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-alphamind}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init-schemas.sql:/docker-entrypoint-initdb.d/init-schemas.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      # -h 127.0.0.1 (TCP): over the Unix socket, pg_isready already succeeds
+      # against the image's temporary init server during first-time
+      # initialisation, which would report "healthy" too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
+    # Append-only file, fsync every second, so the durable event streams
+    # (document.uploaded/deleted, portfolio.deleted) lose at most about a
+    # second on a crash (RDB snapshots alone could lose up to an hour).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -95,38 +232,257 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    logging: *default-logging
+    # Pinned, not :latest (matches the qdrant-client
+    # minor version in uv.lock).
+    image: qdrant/qdrant:v1.18.3
     volumes:
       - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"  # REST API + dashboard at /dashboard, local only
+    # Ready = GET /readyz answers 200. The image has bash but no curl or
+    # wget, so the request uses bash's /dev/tcp ($$ is a literal $ for
+    # compose). ai-service waits for it so its startup checks do not fail
+    # while Qdrant is restarting.
+    healthcheck:
+      test: ["CMD", "bash", "-c", 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf "GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && read -r status <&3 && [[ "$$status" == *" 200 "* ]]']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
-  
+
+  # Local SMTP catcher for development -- every email any service sends
+  # (verification, password reset, org invitation, notifications, and
+  # Alertmanager alerts) lands here instead of a real inbox. Web UI at
+  # http://127.0.0.1:8025.
+  # In staging/production, point the SMTP_* env vars at a real provider
+  # instead (e.g. Brevo) -- no code change needed, see .env.example.
   mailhog:
+    logging: *default-logging
     image: mailhog/mailhog:v1.0.1
     ports:
-      - "8025:8025"
+      - "127.0.0.1:8025:8025"
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    logging: *default-logging
+    # Pinned, not :latest.
+    image: prom/prometheus:v3.13.2
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Alerting rules referenced by prometheus.yml rule_files.
+      - ./infra/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"  # UI, local only
+    depends_on:
+      - alertmanager
+    restart: unless-stopped
+
+  # Receives alerts from Prometheus and emails them.
+  # Development: SMTP to MailHog (mailhog:1025), so alert emails show up
+  # in the MailHog UI. Recipient and SMTP settings are in
+  # infra/alertmanager/alertmanager.yml (Alertmanager does not expand env
+  # vars; see the comments there).
+  alertmanager:
+    logging: *default-logging
+    image: prom/alertmanager:v0.28.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"  # UI, local only
+    depends_on:
+      - mailhog
+    restart: unless-stopped
+
+  # PostgreSQL metrics for Prometheus (job "postgres").
+  # Same credentials as the services (.env.docker, read through
+  # `--env-file .env.docker` interpolation). Split URI/USER/PASS form so a
+  # password with URL-special characters needs no escaping. No host port.
+  postgres-exporter:
+    logging: *default-logging
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/${POSTGRES_DB:-alphamind}?sslmode=disable"
+      DATA_SOURCE_USER: ${POSTGRES_USER:-postgres}
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Redis metrics for Prometheus (job "redis"). No host port.
+  # Redis runs without a password in this stack (see `redis` service); if
+  # one is added later, also set REDIS_PASSWORD here.
+  redis-exporter:
+    logging: *default-logging
+    image: oliver006/redis_exporter:v1.74.0
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
-    env_file: .env
+    logging: *default-logging
+    # Pinned, not :latest.
+    image: grafana/grafana:13.1.1
+    # Served only through the gateway at
+    # https://localhost:8443/grafana/ (no host port), login required.
+    # No env_file: Grafana needs none of the application secrets.
+    # Note: GF_SECURITY_ADMIN_PASSWORD only applies when the Grafana
+    # database is first created; for an existing grafana_data volume run
+    #   docker compose --env-file .env.docker exec grafana \
+    #     grafana cli admin reset-admin-password '<new password>'
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env.docker}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # The public gateway address, the same value as the OAuth callbacks.
+      GF_SERVER_ROOT_URL: ${OAUTH_REDIRECT_BASE_URL:-https://localhost:8443}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
-    ports:
-      - "3001:3000"
     depends_on:
       - prometheus
+    restart: unless-stopped
+
+  # Cron-based scheduler: on trading days calls core-service's internal
+  # /internal/scheduler/market-open and /market-close and ai-service's
+  # /internal/scheduler/tier-monitoring; every day ai-service's
+  # /internal/review/run and /internal/scheduler/rag-ingest, auth-service's
+  # /internal/scheduler/purge-unverified and core-service's
+  # /internal/scheduler/notification-retention, plus
+  # backup.sh and logs-cleanup.sh. See infra/scheduler/crontab for exact
+  # times (the trading-day jobs themselves skip NYSE holidays).
+  scheduler:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: infra/scheduler/Dockerfile
+    # The job scripts send X-Internal-Token
+    # (INTERNAL_API_TOKEN from .env.docker).
+    env_file: .env.docker
+    environment:
+      CORE_SERVICE_URL: http://core-service:8000
+      AI_SERVICE_URL: http://ai-service:8000
+      AUTH_SERVICE_URL: http://auth-service:8000
+      # See infra/scheduler/backup.sh and
+      # docs/DISASTER_RECOVERY.md; BACKUP_RETENTION_DAYS and the S3_*
+      # settings (the object storage is copied through its S3 API) come
+      # from .env.docker.
+      BACKUP_DIR: /backups
+      AVATAR_DATA_DIR: /avatar-data
+    volumes:
+      # logs-cleanup.sh (daily 04:00 ET) prunes the files
+      # the `vector` service below writes here.
+      - ./logs:/logs
+      # Daily backups land in ./backups/<YYYY-MM-DD_HHMM>/
+      # on the host (gitignored).
+      - ./backups:/backups
+      # auth-service's avatars, READ-ONLY -- backup.sh tars them; restores
+      # go through `restore`.
+      - avatar_data:/avatar-data:ro
+    # Depends only on what backup.sh needs, so a core-service or ai-service
+    # that fails to start does not also stop the nightly backups. The HTTP
+    # jobs report a down service themselves (and the stale-job alerts fire).
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      objectstore:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-off restore runner, never started by `up`:
+  #   make restore BACKUP=<YYYY-MM-DD_HHMM> [CONFIRM=yes]
+  #   make restore-drill [BACKUP=<YYYY-MM-DD_HHMM>]
+  # Same image as the scheduler. Objects go back through the object
+  # storage's S3 API, so objectstore must be running (the Makefile target
+  # starts it). avatar_data is mounted READ-WRITE so restore.sh can put
+  # files back; objectstore_data is mounted READ-WRITE only for backups
+  # that hold a tarball of the SeaweedFS data directory (objectstore
+  # stopped for those).
+  restore:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: infra/scheduler/Dockerfile
+    profiles: ["tools"]
+    env_file: .env.docker
+    environment:
+      BACKUP_DIR: /backups
+      OBJECTSTORE_DATA_DIR: /objectstore-data
+      AVATAR_DATA_DIR: /avatar-data
+    entrypoint: []
+    command: ["/scripts/restore.sh", "--help"]
+    volumes:
+      - ./backups:/backups
+      - objectstore_data:/objectstore-data
+      - avatar_data:/avatar-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: "no"
+
+  # Adminer: a small web UI for browsing and querying PostgreSQL, for
+  # learning and debugging. Never started by `up`: it has its own profile.
+  #   make adminer        (= docker compose --profile adminer up -d adminer)
+  #   make adminer-stop
+  # Then open (only the password is left to type)
+  #   http://127.0.0.1:8080/?pgsql=postgres&username=postgres&db=alphamind&ns=core
+  # It selects System "PostgreSQL" (the plain form defaults to MySQL, which
+  # gives "Connection refused"), Server "postgres", the user, the database
+  # and the schema; the tables are in the schemas auth, core and ai, while
+  # public is empty. Password: POSTGRES_PASSWORD from .env.docker. Bound to
+  # 127.0.0.1 only, so other
+  # machines on the network cannot reach it. It can change data: use the
+  # SQL command page for SELECTs unless a change is intended.
+  adminer:
+    logging: *default-logging
+    image: adminer:4.8.1
+    profiles: ["adminer"]
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Persists every container's stdout/stderr to
+  # ./logs/<compose service>/<YYYY-MM-DD>.log (America/New_York date) so
+  # logs survive container recreation. Reads from the Docker daemon, not
+  # from the apps. See infra/vector/vector.toml for the line format;
+  # retention (14 days) is infra/scheduler/logs-cleanup.sh. Only lines
+  # emitted while this container runs are captured (docker_logs starts
+  # at "now"), so keep it up alongside the rest of the stack.
+  vector:
+    logging: *default-logging
+    image: timberio/vector:0.46.1-alpine
+    command: ["--config", "/etc/vector/vector.toml"]
+    environment:
+      VECTOR_LOG: warn
+      # Only this project's containers are written to ./logs.
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - ./infra/vector/vector.toml:/etc/vector/vector.toml:ro
+      # Read-only mount: Vector only lists containers and reads their
+      # logs. (Note: ":ro" on a socket does not restrict Docker API calls
+      # themselves; the collector config is what keeps this read-only.)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./logs:/logs
     restart: unless-stopped
 
 volumes:
@@ -135,3 +491,6 @@ volumes:
   qdrant_data:
   prometheus_data:
   grafana_data:
+  avatar_data:
+  objectstore_data:
+  alertmanager_data:

@@ -1,9 +1,8 @@
 from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel, Field
-from domains.auth.schema import UserPublicRead
-from shared.enums.connection import ConnectionStatus
-from shared.schemas.base import BaseSchema, IDMixin
+from shared.enums import ConnectionStatus
+from shared.schemas import BaseSchema, IDMixin, UserRef
 
 
 class ConnectionRequestCreate(BaseModel):
@@ -16,4 +15,4 @@ class ConnectionRead(BaseSchema, IDMixin):
     status: ConnectionStatus
     created_at: datetime
     responded_at: datetime | None = None
-    other_user: UserPublicRead
+    other_user: UserRef

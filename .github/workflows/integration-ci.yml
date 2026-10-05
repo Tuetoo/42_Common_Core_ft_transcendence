@@ -1,27 +1,100 @@
-name: intergration CI
+# Two jobs. `config-checks` runs on every pull request that changes the
+# infrastructure, the compose files, the operator scripts or the Makefile
+# (and on main): flake8 of infra/, the gateway status page's CSP hashes,
+# the compose file, the shell scripts' syntax and the Prometheus alert
+# rule tests. `stack-smoke` (main only) starts the full stack and
+# smoke-tests the gateway. Neither runs tests/integration (those need a
+# seeded Qdrant corpus and a real embedding key, so
+# `make test-integration` is a local run).
+name: stack smoke CI
 
 on:
-  push: 
+  push:
     branches: [main]
+  pull_request:
+    paths:
+      - "infra/**"
+      - "scripts/**"
+      - "docker-compose.yaml"
+      - "docker-compose.override.yml"
+      - "Makefile"
+      - ".env.example"
+      - ".github/workflows/integration-ci.yml"
 
 jobs:
-  integration:
+  config-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - name: Prepare .env
-        run: cp .env.example .env
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - name: Flake8 of infra/
+        run: uv run flake8 infra
+      - name: Gateway status page CSP hashes up to date
+        run: python3 infra/gateway/csp_hashes.py --check
+      - name: Compose file
+        run: |
+          cp .env.example .env.docker
+          echo "GRAFANA_ADMIN_PASSWORD=ci" >> .env.docker
+          docker compose --env-file .env.docker config -q
+          docker compose --env-file .env.docker -p alphamind-drill \
+            -f docker-compose.yaml -f infra/drill/docker-compose.drill.yml \
+            --profile tools config -q
+      - name: Shell syntax
+        run: |
+          for f in scripts/*.sh; do bash -n "$f"; done
+          for f in infra/scheduler/*.sh infra/objectstore/*.sh infra/gateway/*.sh; do sh -n "$f"; done
+      - name: Alert rules and their tests
+        run: make promtool-test
+
+  stack-smoke:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.17"
+      # The template is .env.example; compose reads
+      # .env.docker (env_file + --env-file interpolation). Values that
+      # have no usable default are filled with throwaway random ones.
+      - name: Prepare .env.docker
+        run: |
+          cp .env.example .env.docker
+          {
+            echo "GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)"
+            echo "INTERNAL_API_TOKEN=$(openssl rand -hex 32)"
+            echo "JWT_SECRET=$(openssl rand -hex 32)"
+          } >> .env.docker
+      - name: Generate TLS certificate
+        run: make certs
       - name: Start full stack
-        run: docker compose up -d --build
+        run: docker compose --env-file .env.docker -f docker-compose.yaml up -d --build
+      # Fail the job (with logs) if the stack is not
+      # healthy in time, instead of silently continuing. -k: the
+      # certificate is self-signed.
       - name: Wait for services
         run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8000/health/auth && curl -sf http://localhost:8000/health/core && curl -sf http://localhost:8000/health/ai && break
-            sleep 2
+          for i in $(seq 1 60); do
+            if curl -skf https://localhost:8443/health/auth \
+              && curl -skf https://localhost:8443/health/core \
+              && curl -skf https://localhost:8443/health/ai; then
+              echo "stack is healthy"
+              exit 0
+            fi
+            sleep 5
           done
-      - run: uv sync
-      # - run: make test-integration
+          echo "services did not become healthy within 5 minutes" >&2
+          docker compose --env-file .env.docker -f docker-compose.yaml ps
+          docker compose --env-file .env.docker -f docker-compose.yaml logs --tail 100
+          exit 1
+      - name: Gateway smoke checks
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/status)" = 301
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/status)" = 200
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/internal/x)" = 404
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/metrics)" = 404
       - if: always()
-        run: docker compose down
-      
+        run: docker compose --env-file .env.docker -f docker-compose.yaml down -v

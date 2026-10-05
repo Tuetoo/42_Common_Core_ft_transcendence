@@ -1,32 +1,37 @@
-import uuid
 from datetime import datetime
+from uuid import UUID
 from sqlalchemy import (Computed, DateTime, ForeignKey, String, Text,
-                        UniqueConstraint)
+                        UniqueConstraint, func)
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
-from shared.database import Base
-from shared.models import UUIDPKMixin
+from shared.database import Base, UUIDPKMixin
 
 
 class Connection(Base, UUIDPKMixin):
     __tablename__ = "connections"
     __table_args__ = (
-        UniqueConstraint("requester_id", "addressee_id",
-                         name="uq_connection_requester_addressee"),
+        UniqueConstraint(
+            "requester_id", "addressee_id",
+            name="uq_connection_requester_addressee"),
         UniqueConstraint("pair_key", name="uq_connection_pair_key"))
-    requester_id: Mapped[uuid.UUID] = mapped_column(
+
+    requester_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=False,
         index=True)
-    addressee_id: Mapped[uuid.UUID] = mapped_column(
+    addressee_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=False,
         index=True)
     pair_key: Mapped[str] = mapped_column(
-        Text, Computed("LEAST(requester_id, addressee_id)::text || ':' || "
-                       "GREATEST(requester_id, addressee_id)::text",
-                       persisted=True))
-    status: Mapped[str] = mapped_column(String, nullable=False,
-                                        default="pending")
+        Text,
+        Computed(
+            "LEAST(requester_id, addressee_id)::text || ':' || "
+            "GREATEST(requester_id, addressee_id)::text", persisted=True))
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default="now()", nullable=False)
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
     responded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    blocked_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True)
