@@ -1,276 +1,303 @@
 # AlphaMind — Project Structure
 
-Rewritten from scratch against the actual repository tree (verified via a full
-file listing, not carried over from an earlier plan). Directories that don't
-exist yet, or exist but are empty, are called out explicitly rather than
-described as if built.
+The repository tree: directories and key files with their purpose. Not
+listed: `.venv/`, caches (`__pycache__/`, `.mypy_cache/`), editor folders
+(`.vscode/`), and the run-time folders `logs/`, `backups/` and `runs/`
+(created by the stack and the scripts, ignored by git). The design behind
+the tree is in `docs/DESIGN.md`; the handbook explains each part.
 
 ## 1. Top level
 
 ```
 alphamind/
-├── services/           three independently deployable FastAPI services
-├── shared/             code imported by all three services (see §5)
-├── tests/              one subdirectory per service + integration (see §6)
-├── infra/              nginx gateway, Postgres init, scheduler, monitoring
-├── frontend/           
-├── docs/               this document and its siblings
-├── docker-compose.yaml
-├── docker-compose.override.yml   local-dev-only overrides
-├── pyproject.toml      single root dependency list + pytest config, shared
-│                       by all three services (see docs/ROADMAP.md for why)
-├── uv.lock
-├── Makefile            make test / test-auth / test-core / test-ai /
-│                       test-integration -- see tests/README.md for why
-│                       each is a separate invocation
-└── alphamind.code-workspace   VSCode multi-root workspace; see its sibling
-                        per-folder .vscode/settings.json files -- needed
-                        because the three services share top-level module
-                        names (config.py, database.py, main.py, ...) and a
-                        single flat editor view can't resolve imports
-                        correctly across all of them at once
+├── services/                the three FastAPI services (§2-§4)
+├── shared/                  code every service imports (§5)
+├── tests/                   one test suite per service + integration (§6)
+├── infra/                   gateway, Postgres init, scheduler, object
+│                            storage, monitoring, log shipping (§7)
+├── scripts/                 host-side operator scripts (§8)
+├── docs/                    design, API, ERD, disaster recovery, module
+│                            mapping, this file; handbook/ (§9)
+├── rag_seed_documents/      seed corpus for
+│                            scripts/upload_seed_documents.py:
+│   ├── analyst_report/
+│   ├── earnings_call/
+│   ├── filing/
+│   ├── macro_research/
+│   └── news/
+├── .github/workflows/       one CI workflow per service + stack smoke
+├── docker-compose.yaml      the whole stack
+├── docker-compose.override.yml  local development (source mounted into the
+│                            containers, development image stage)
+├── Makefile                 up/down/logs, certs, backup/restore, tests per
+│                            service, promtool-test, lint (flake8 + mypy),
+│                            clean, and short targets for scripts/
+├── pyproject.toml, uv.lock  one dependency list for all services; pytest,
+│                            mypy and isort configuration
+├── .style.yapf              yapf layout settings (formatting helper)
+├── .env.example             template for .env.docker (never committed)
+└── .dockerignore, .gitignore, .editorconfig
 ```
 
-## 2. `services/ai-service/`
+## 2. `services/auth-service/`
 
 ```
-services/ai-service/
-├── main.py                 FastAPI app, lifespan (schema bootstrap, Qdrant
-│                           bucket check), CORS, exception handlers, metrics
-├── config.py, database.py, db_bootstrap.py, deps.py
-├── event_listener.py       subscribes to DOCUMENT_UPLOADED (from
-│                           core-service) -- drives RAG ingestion
-├── qdrant.py                Qdrant client singleton
-├── clients/                 core_client.py -- sync
-│                           service-to-service HTTP calls
-├── scripts/
-│   ├── smoke_test_mistral.py       run manually, not in CI
-│   └── generate_rag_golden_set.py  run manually, not in CI (needs real
-│                                   indexed Qdrant data + an LLM key)
-├── api/
-│   ├── router.py            mounts every domain's router (see below)
-│   └── internal.py          /internal/* -- service-to-service + scheduler
-│                           hooks only, not proxied by the gateway
-├── domains/                 persistence + HTTP layer, one folder per
-│   │                       bounded context, each with the same 5-file
-│   │                       shape (model.py, schema.py, repository.py,
-│   │                       service.py, api.py) except where noted
-│   ├── analysis/            analyses, recommendations, debate, reflections,
-│   │                       agent run/result records
-│   ├── decision/            investment_decisions, decision_outcomes,
-│   │                       decision_reviews (singular name -- every domain
-│   │                       here is singular; this one was briefly plural
-│   │                       and got renamed for consistency)
-│   ├── backtest/            backtests, positions, trades, metrics,
-│   │                       benchmarks, benchmark_results
-│   ├── rag/                 document_chunks, embedding_jobs, rag_collections,
-│   │                       retrieval_logs (no service.py/api.py -- this
-│   │                       domain is Postgres bookkeeping only; the actual
-│   │                       RAG pipeline lives in ai/rag/, not here)
-│   ├── memory/              episodic_memories, agent_memories,
-│   │                       memory_references (no service.py/api.py --
-│   │                       written and read by ai/memory/ and the graph
-│   │                       nodes directly, not exposed as its own API)
-│   ├── analytics/            portfolio_metrics, recommendation_metrics,
-│   │                       agent_metrics, portfolio_evaluations -- mostly
-│   │                       read-side; only recommendation_metrics is
-│   │                       actually written to (by review_workflow.py)
-│   └── market/               instruments, price_bars,
-│                             technical_indicator_cache -- modeled, but the
-│                             write path (refresh from the provider) isn't
-│                             implemented yet; agents call
-│                             ai/providers/yahoo_finance.py directly instead
-│                             of through this cache layer
-└── ai/                       the actual AI/agent logic -- no persistence
-    │                        code lives here, only domains/ touches the DB
-    ├── agents/               one file per agent role (market, news,
-    │                        sentiment, filing, technical, fundamental,
-    │                        risk, macro, portfolio, bull, bear, judge,
-    │                        reflection) + supervisor.py (dynamic fan-out)
-    │                        + loop.py (shared ReAct loop) + registry.py
-    ├── graph/                LangGraph wiring: state.py (AnalysisState),
-    │                        builder.py, nodes.py, edges.py, naming.py
-    ├── llm/                  provider-agnostic router + one adapter per
-    │                        vendor (anthropic, openai, google, mistral)
-    ├── providers/            external data sources: yahoo_finance.py,
-    │                        sec_edgar.py, fred.py, newsapi.py,
-    │                        tavily.py, news_relevance.py (the
-    │                        Bloomberg/TradingView/Finviz/Macrotrends
-    │                        stubs were removed in round111: no
-    │                        free/official API, never wired in)
-    ├── tools/                agent-callable wrappers around providers +
-    │                        indicators.py (SMA/EMA/RSI/MACD/Bollinger/ATR,
-    │                        pure functions, no provider dependency)
-    ├── rag/                  chunking, embedding, indexing, fusion (RRF),
-    │                        query_expansion, retriever, loader, parser --
-    │                        the actual retrieval pipeline
-    ├── memory/               episodic.py (L2 read/write), procedural.py
-    │                        (L4 read/write + combine_context helper)
-    ├── benchmark/            metrics.py -- pure Sharpe/Sortino/drawdown/
-    │                        win-rate/alpha/beta math, no DB, no network;
-    │                        shared by backtest_workflow.py and (once built)
-    │                        a live-portfolio-evaluation workflow
-    ├── evaluation/           golden_set.py + recall.py -- RAG retrieval
-    │                        quality measurement, see docs/ERD.md's note on
-    │                        tests/integration/test_rag_recall.py
-    ├── recommendation/       engine.py -- final buy/hold/sell + confidence
-    │                        assembly from the debate + reflection outcome
-    └── workflows/            the actual background-task entry points HTTP
-                             handlers hand off to: analysis_workflow.py,
-                             rag_ingestion_workflow.py, backtest_workflow.py,
-                             review_workflow.py
+├── Dockerfile, alembic.ini
+├── main.py, config.py, database.py, db_bootstrap.py, deps.py
+├── security.py              password hashing, token issuing, TOTP
+│                            helpers, Fernet encryption of stored TOTP
+│                            secrets
+├── rate_limit.py            limits for login, 2FA, reset, registration,
+│                            invitations (on shared/rate_limit.py)
+├── events_out.py            event payload builders; events are published
+│                            after the commit
+├── user_state_sync.py       writes each user's live role and active flag to
+│                            Redis (shared/user_state.py)
+├── api/                     internal.py (/internal/*)
+├── domains/                 api.py, model.py, repository.py, schema.py,
+│   │                        service.py per domain
+│   ├── auth/                users, profiles, settings, sessions, OAuth
+│   │                        accounts, 2FA, avatar files
+│   ├── admin/               /api/v1/admin: users, soft delete, statistics
+│   ├── organization/        organizations, members, invitations
+│   └── social/              friends (connections), presence
+├── data/avatars/            empty folder; in compose the avatar_data
+│                            volume is mounted at /app/data/avatars
+├── migrations/              Alembic: env.py, script.py.mako,
+│                            versions/ (f1160b000001 baseline,
+│                            f1190b000001, f1210b000001), archive/ (the
+│                            archived chain, for converting old backups)
+└── scripts/                 set_system_role.py (the first admin),
+                             alembic_convert.py (old backups)
 ```
-
-**Not present**: `ai/schema/` was an empty leftover directory (never used --
-every domain's Pydantic schemas live in its own `domains/*/schema.py`
-instead) and has been deleted rather than filled in.
 
 ## 3. `services/core-service/`
 
 ```
-services/core-service/
+├── Dockerfile, alembic.ini
 ├── main.py, config.py, database.py, db_bootstrap.py, deps.py
-├── middleware.py            PublicAPIRateLimitMiddleware -- the only piece
-│                           of request handling that runs outside the
-│                           normal dependency-injected DB session (see
-│                           docs/ERD.md's note on why this matters for tests)
-├── apikeys.py                plain functions (create/get/list/revoke), not
-│                           a domains/ package -- deliberately small,
-│                           doesn't need the full 5-file shape
-├── event_listener.py          publishes DOCUMENT_UPLOADED; subscribes to
-│                           DOCUMENT_STATUS_CHANGED (from ai-service)
-├── websocket_manager.py, yjs_relay.py
-├── clients/                  ai_client.py, auth_client.py
+│                            (deps.py: current user, from/to date-range
+│                            check (422))
+├── middleware.py            public API: key check, owner state, per-key
+│                            and per-owner rate limits
+├── apikeys.py               API key model and functions
+├── event_listener.py        auth and ai events -> notifications and
+│                            WebSocket pushes; document status (durable)
+├── websocket_manager.py     WebSocketEnvelope, sockets per channel,
+│                            cross-replica fan-out
+├── yjs_relay.py             Yjs rooms, body write-back, active-room markers
+├── job_health.py            scheduled-job heartbeat and market-close skip
+│                            gauges, kept in Redis across restarts
+├── outbox.py, outbox_model.py  transactional outbox (core.event_outbox) for
+│                            the durable events, and its dispatcher
 ├── api/
-│   ├── router.py, internal.py
-│   ├── public.py             /api/v1/public/* -- API-key-authenticated
-│   │                        developer surface, see docs/API_SPEC.md §5
-│   ├── apikeys_api.py         /api/v1/api-keys/* -- issuing/managing keys
-│   │                        (distinct from public.py, which *uses* them)
-│   ├── websocket.py           generic /ws/{channel} relay
-│   └── yjs_websocket.py       /ws/yjs/{note_id} -- Yjs CRDT binary relay
-└── domains/
-    ├── portfolio/             portfolios, holdings, transactions, snapshots,
-    │                        watchlists -- decision tracking that used to
-    │                        live here has moved to ai-service's decision/
-    │                        domain, see docs/ERD.md §3
-    ├── research/               notes, comments, tags, documents (MinIO-backed
-    │                        storage, category/ticker fields for RAG)
-    └── notification/           in-app notifications
+│   ├── internal.py          /internal/*: scheduler jobs, heartbeats,
+│   │                        portfolios, stats, tracked tickers, ingestion
+│   │                        and system documents
+│   ├── public.py            /api/v1/public/* (API key)
+│   ├── apikeys_api.py       /api/v1/api-keys/*
+│   ├── websocket.py, ws_common.py   /ws/{channel}
+│   └── yjs_websocket.py     /ws/yjs/{note_id}
+├── clients/                 auth_client.py, ai_client.py
+├── domains/
+│   ├── portfolio/           portfolios, transactions (ledger), holdings,
+│   │                        snapshots, watchlists; ledger.py (pure ledger
+│   │                        math)
+│   ├── research/            notes, comments, tags, documents;
+│   │                        moderation_api.py, sentiment.py, yjs_guard.py
+│   │                        (Yjs updates decoded in worker processes)
+│   └── notification/        notifications; actions.py (the one path every
+│                            core notification goes through)
+├── migrations/              env.py, script.py.mako, versions/
+│                            (f1160c000001 baseline, f1170c000001,
+│                            f1200c000001 event_outbox,
+│                            f1250c000001 status_changed_at), archive/
+└── scripts/                 e2e_check.py (end to end through the gateway),
+                             backfill_sentiment.py, delete_documents.py,
+                             recompute_snapshots.py, alembic_convert.py
 ```
 
-## 4. `services/auth-service/`
+## 4. `services/ai-service/`
 
 ```
-services/auth-service/
+├── Dockerfile, alembic.ini
 ├── main.py, config.py, database.py, db_bootstrap.py, deps.py
-├── security.py               password hashing (passlib/bcrypt -- pinned
-│                           below bcrypt 4.1, see pyproject.toml) + TOTP
-├── api/router.py, api/internal.py
-└── domains/
-    ├── auth/                  users, profiles, settings, sessions, OAuth
-    │                        accounts, 2FA secrets -- registration, login,
-    │                        token refresh, password reset, avatar upload
-    ├── organization/           organizations, members, custom roles,
-    │                        invitations
-    └── social/                 connections (friend/follow-style requests)
+├── event_listener.py        durable: document uploaded/deleted, portfolio
+│                            deleted
+├── ai_events.py             event payload builders + best-effort publisher
+├── observability.py         Prometheus metrics (analyses, queue, LLM errors)
+├── qdrant.py                Qdrant client and collection check
+├── api/                     internal.py (/internal/*)
+├── clients/                 core_client.py, auth_client.py
+├── domains/                 persistence and HTTP, one folder per context
+│   ├── analysis/            analyses, agent runs, debate, reflections,
+│   │                        recommendations, tiers; queue.py (the serial
+│   │                        analysis queue)
+│   ├── decision/            investment decisions, outcomes, reviews
+│   ├── backtest/            backtests, metrics, benchmarks
+│   ├── analytics/           recommendation and agent metrics; dashboard.py
+│   ├── rag/                 document_chunks, embedding_jobs; the RAG
+│   │                        assistant (api.py, qa.py)
+│   ├── memory/              episodic and procedural memory rows
+│   ├── knowledge/           agent reports, knowledge graph, ticker names
+│   ├── filings/             ai.filing_records (structured filing records)
+│   └── market/              instruments, price bars (the cache), prices API
+├── ai/                      the AI logic (only domains/ touches the DB)
+│   ├── agents/              one file per role (filing, fundamental, macro,
+│   │                        market, news, portfolio, risk, sentiment,
+│   │                        technical), supervisor.py, debate_side.py,
+│   │                        judge.py, reflection.py, loop.py (the ReAct
+│   │                        loop and BaseAgent), finish_checks.py,
+│   │                        evidence_grounding.py, debate_common.py
+│   ├── graph/               LangGraph: state, builder, nodes, edges
+│   ├── llm/                 router.py, base.py (incl. the concurrency gate), adapters
+│   │                        (google, mistral, openai, anthropic),
+│   │                        json_fence.py
+│   ├── providers/           yahoo_finance, sec_edgar, fred, newsapi,
+│   │                        tavily, news_filters, news_relevance, retry,
+│   │                        registry, base
+│   ├── tools/               agent tools, indicators.py,
+│   │                        market_data_cache.py, search_relevance.py
+│   ├── rag/                 chunking (incl. parsing), embedding, indexing,
+│   │                        retriever (incl. query expansion and fusion),
+│   │                        visibility, category_weights.json
+│   ├── knowledge/           archival, KG extraction and context, filing
+│   │                        summaries and records, ticker names, checks on
+│   │                        recycled and prior-note content
+│   ├── ingestion/           SEC filings, news, macro research ingestion
+│   ├── memory/              episodic.py (L2), procedural.py (L4)
+│   ├── recommendation/      engine.py (incl. the position limit),
+│   │                        position_sizing.py
+│   ├── benchmark/           metrics.py (returns, drawdown, Sharpe, ...)
+│   ├── evaluation/          golden set and recall
+│   ├── user_sentiment.py    sentiment of notes and comments
+│   └── workflows/           analysis, RAG ingestion, auto ingestion, tier
+│                            monitoring, review, and the three backtests
+├── migrations/              env.py, script.py.mako, versions/
+│                            (f1160a000001 baseline, f1170a000001,
+│                            f1210a000001, f1220a000001, f1230a000001,
+│                            f1240a000001, f1250a000001), archive/
+└── scripts/                 analysis_cli.py (used by run_analysis.sh),
+                             e2e_tier_check.py, smoke_check.py,
+                             upload_seed_documents.py, delete_analyses.py,
+                             RAG evaluation (generate_rag_golden_set.py,
+                             measure_rag_recall.py incl. --sweep),
+                             reembed_collection.py, filing tools
+                             (backfill_filing_records.py,
+                             regenerate_filing_summaries.py),
+                             verify_portfolio_backtest.py,
+                             probe_model_latency.py, alembic_convert.py,
+                             _text.py (output helpers)
 ```
 
 ## 5. `shared/`
 
-Code imported by all three services -- none of it is itself deployable.
-
 ```
-shared/
-├── config.py                BaseServiceSettings -- each service's own
-│                           config.py subclasses this
-├── database.py               Base, create_service_engine, create_session_
-│                           factory, make_get_db -- see docs/ERD.md §1 for
-│                           the cross-schema-FK rule this enforces, and the
-│                           search_path fix (server_settings, not a connect
-│                           event) this file's docstring explains
-├── security.py               CurrentUser + JWT verification -- every
-│                           service decodes/verifies its own tokens; only
-│                           auth-service issues them
-├── events.py, events_registry.py    Redis pub/sub cross-service events,
-│                           see docs/API_SPEC.md §6 for the full event table
-├── redis.py, http_client.py, concurrency.py, storage.py (MinIO/S3), email.py
-├── exceptions.py              AppError hierarchy + EXCEPTION_STATUS_MAP,
-│                           looked up via MRO walk (a subclass inherits its
-│                           nearest registered ancestor's HTTP status) --
-│                           not an exact-type-only dict lookup
-├── lifecycle.py, logging.py, models.py (UUIDPKMixin etc.)
-├── enums/                    one file per enum family (analysis, connection,
-│                           document, market, notification, oauth,
-│                           recommendation, role, workflow)
-└── schemas/                  base.py (APIResponse, PaginatedResponse --
-                             note PaginatedResponse's field is `items`, not
-                             `data`; only single-object APIResponse uses
-                             `data`), refs.py (cross-service reference DTOs),
-                             websocket.py
+├── config.py                BaseServiceSettings (each service subclasses it)
+├── database.py              Base (naming convention), column mixins
+│                            (UUIDPKMixin, TimestampColumnsMixin), engine
+│                            and session factories, get_db
+├── alembic_bootstrap.py     schema bootstrap at startup (upgrade only)
+├── alembic_convert.py       conversion of databases on the archived chain
+├── security.py              CurrentUser, JWT verification, permissions
+├── permissions.py           system role -> permissions map
+├── user_state.py            live role and active flag (Redis + auth)
+├── org_membership_cache.py  organization roles of a user, cached
+├── rate_limit.py            fixed-window limiter and 429 response
+├── scheduled_jobs.py        job_response: 500 when every unit of a step
+│                            failed
+├── metrics.py               get_or_create for Prometheus collectors
+├── tickers.py               the ticker rule
+├── events.py, events_registry.py   pub/sub and durable events, event names
+├── redis.py, http_client.py, storage.py (S3), email.py, concurrency.py
+├── market_calendar.py       NYSE trading days and holidays
+├── e2e_lock.py              lock shared by the end-to-end scripts
+├── exceptions.py            error hierarchy and error body
+├── request_id.py            request id middleware (logs, error body,
+│                            X-Request-ID header)
+├── logging.py               structured logs (structlog)
+├── enums.py                 shared StrEnums (analysis, connection,
+│                            document, market, notification, oauth,
+│                            recommendation, role, workflow)
+└── schemas.py               APIResponse, PaginatedResponse, cross-service
+                             refs
 ```
 
 ## 6. `tests/`
 
 ```
-tests/
-├── auth-service/    conftest.py (testcontainers Postgres+Redis, session-
-│                   scoped schema fixture) + test_auth.py, test_organization.py,
-│                   test_social.py
-├── core-service/     conftest.py (same pattern) + test_apikeys.py,
-│                   test_portfolio.py, test_research.py, test_notification.py
-├── ai-service/       conftest.py (same pattern) + test_agent_loop.py,
-│                   test_agents.py, test_analysis_domain.py, test_graph.py,
-│                   test_llm_router.py, test_providers.py, test_rag.py,
-│                   test_tools.py
-└── integration/      conftest.py (assumes `docker compose up` already
-                     running, no testcontainers) + test_rag_recall.py --
-                     the RAG retrieval-quality gate, see docs/ERD.md;
-                     currently skips (no golden set generated yet)
+├── auth-service/            conftest.py, helpers.py, test_accounts.py,
+│                            test_organizations.py, test_platform.py
+├── core-service/            conftest.py, helpers.py, test_platform.py,
+│                            test_portfolio.py, test_realtime.py,
+│                            test_research.py
+├── ai-service/              conftest.py, helpers.py and 14 test_*.py files
+│                            (agents, API, data agents, debate and Judge,
+│                            filings, graph, knowledge, LLM, market data,
+│                            news, RAG, scripts, tools, workflows)
+├── integration/             conftest.py, test_rag_recall.py (needs the
+│                            running stack with the real corpus)
+├── fixtures/                rag_golden_set.json
+├── alembic_contract.py      migration-versus-model checks, star-imported by
+│                            one test file per service
+├── auth_tokens.py           access tokens for the tests
+└── README.md                how to run each suite
 ```
 
-Each service's tests are a separate `pytest` invocation (`make test-auth`,
-`make test-core`, `make test-ai`) rather than one combined run -- the three
-services share top-level module names (`config`, `database`, `main`, ...),
-so collecting them together in one process causes import collisions.
-`make test` runs all three sequentially. `make test-integration` is separate
-again, and requires real infrastructure already running.
+The suites run separately (`make test-auth`, `test-core`, `test-ai`): the
+services share top-level module names (`config`, `database`, `main`), so one
+process cannot import two of them.
 
 ## 7. `infra/`
 
 ```
-infra/
-├── gateway/nginx.conf         routes /api/v1/* to the right service by
-│                            path prefix, proxies /ws/* for WebSocket
-│                            upgrade -- does not touch JWTs itself
-├── postgres/init-schemas.sql  creates the three schemas (auth/core/ai) on
-│                            first container start
-├── scheduler/                a small standalone container: crontab +
-│                            market-open.sh / market-close.sh, hits
-│                            core-service's /internal/scheduler/* endpoints
-├── prometheus/prometheus.yml
-└── grafana/provisioning/       datasource + one dashboard
+├── gateway/                 nginx.conf, gen-certs.sh (self-signed TLS),
+│                            status.html + csp_hashes.py (its CSP hashes),
+│                            certs/ (generated, only README.md tracked)
+├── postgres/init-schemas.sql   the three schemas
+├── scheduler/               Dockerfile, entrypoint.sh, crontab,
+│                            call-job.sh (the seven HTTP jobs:
+│                            market-open, market-close, tier-monitoring,
+│                            review-run, rag-ingest, purge-unverified,
+│                            notification-retention), logs-cleanup.sh,
+│                            heartbeat.sh, backup.sh, restore.sh,
+│                            s3-remote.sh (rclone remote for the
+│                            object storage's S3 API)
+├── drill/docker-compose.drill.yml   compose override of the restore drill
+├── objectstore/             SeaweedFS entrypoint.sh and healthcheck.sh
+├── prometheus/              prometheus.yml, alert_rules.yml,
+│                            alert_rules_test.yml
+├── alertmanager/alertmanager.yml
+├── grafana/provisioning/    datasources/datasource.yml,
+│                            dashboards/ (dashboard.yml, two dashboards)
+└── vector/vector.toml       log shipping into ./logs
 ```
 
-## 8. What's genuinely not built yet
+## 8. `scripts/`
 
-Listed explicitly rather than left to be discovered by absence:
+```
+├── lib.sh                   shared helpers (compose wrapper, busy windows)
+├── run_analysis.sh          real analyses with a per-run output folder
+├── token.sh                 a short-lived access token
+├── e2e.sh, smoke.sh         end-to-end and smoke checks (make e2e/smoke)
+├── tiers.sh                 recommendation tiers of a portfolio
+├── snapshots.sh             recompute portfolio snapshots
+├── health.sh, logs.sh, rebuild.sh, probe.sh
+├── psql.sh, redis-cli.sh, qdrant.sh, objectstore.sh   data store shells
+└── backups.sh               list, make, check and drill backups
+```
 
-- **`frontend/`** — directory scaffolding only, no code in any of it.
-- **`domains/market/service.py`'s cache-refresh path** (ai-service) — models
-  exist, nothing populates them from the provider yet.
-- **A live-portfolio-evaluation workflow** writing to
-  `ai.portfolio_evaluations` — `ai/benchmark/metrics.py` is written to serve
-  it, but the workflow itself doesn't exist; only backtesting
-  (`ai.backtests`) does.
-- **`ai.agent_metrics` rollup** — table exists, nothing aggregates into it.
-- **`ai.decision_reviews`** — table exists, nothing writes `review_text`/
-  `lessons_learned` into it (would need an LLM call to generate that text, a
-  design decision not yet made).
-- **A cron entry actually calling `/internal/review/run`** — the endpoint
-  exists (see docs/API_SPEC.md §4), no schedule is wired up yet.
-- **A real, measured RAG recall baseline** — the framework
-  (`ai/evaluation/`, `tests/integration/test_rag_recall.py`) is built and
-  its logic is verified, but the actual baseline numbers need a real run
-  against indexed data (`scripts/generate_rag_golden_set.py`) which hasn't
-  happened yet.
+## 9. `docs/`
+
+```
+├── DESIGN.md                the system as built
+├── API_SPEC.md              routes and events
+├── ERD.md                   tables per schema
+├── DISASTER_RECOVERY.md     backups and restore
+├── MODULE_MAPPING.md        code mapped to the subject's modules
+├── PROJECT_STRUCTURE.md     this file
+└── handbook/                00-index.md and one chapter per part
+                             (01-02 overview and operations, 10-19
+                             services and AI, 20-31 data stores,
+                             infrastructure, shared code, testing)
+```
