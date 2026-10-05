@@ -1,8 +1,8 @@
 from datetime import datetime
 from uuid import UUID
-from pydantic import BaseModel
-from shared.enums.notification import NotificationType
-from shared.schemas.base import BaseSchema, IDMixin
+from pydantic import BaseModel, Field
+from shared.enums import NotificationType
+from shared.schemas import BaseSchema, IDMixin
 
 
 class NotificationRead(BaseSchema, IDMixin):
@@ -14,8 +14,11 @@ class NotificationRead(BaseSchema, IDMixin):
     created_at: datetime
 
 
+MAX_BULK_MARK_READ_IDS = 500
+
+
 class NotificationMarkReadRequest(BaseModel):
-    notification_ids: list[UUID]
+    notification_ids: list[UUID] = Field(max_length=MAX_BULK_MARK_READ_IDS)
 
 
 class NotificationMarkReadResponse(BaseModel):
