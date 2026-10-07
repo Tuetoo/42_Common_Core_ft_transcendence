@@ -312,7 +312,7 @@ def _macro_series(series: str, lookback_days: int) -> list:
         newest = _month_start(today, 2)
         dates = [_month_start(newest, i) for i in range(30)]
         values = [300.0 * 1.03**(-i / 12) for i in range(30)]
-    start = today - timedelta(days=lookback_days)
+    start = (today - timedelta(days=lookback_days)).replace(day=1)
     series_id = "CPIAUCSL" if series == "cpi" else series.upper()
     return sorted((
         MacroDataPoint(

@@ -1094,6 +1094,35 @@ class TestFinishChecks:
             assert check("Up 25%.", None, pad) is None
         assert logs[0]["event"] == "finish_checks.own_evidence_check_failed"
 
+    def test_counts_need_fresh_evidence_not_prior_notes(self):
+        check = own_evidence_figure_check()
+        note = (
+            "Prior news note search results (1 passages):\n"
+            "- (TSLA) [agent:news] (2026-10-06): deliveries rose from "
+            "496,579 units a year ago.")
+        fresh = "- (TSLA) [search_news] 2026-10-02: 435,012 vehicles delivered"
+        answer = "Tesla delivered 435,012 vehicles, down from 496,579."
+        cases = {
+            "only-in-prior-note": ([note, fresh], answer, ["496,579"]),
+            "in-fresh-output": (
+                [note, fresh + "; 496,579 a year earlier"], answer, []),
+            "plain-digits-in-fresh-output": (
+                ["volume 48720500 shares"], "Volume was 48,720,500.", []),
+            "within-one-percent": (
+                ["volume 48720500 shares"], "Volume was 48,600,000.", []),
+            "dollar-and-percent-unchanged": (
+                ["close 100.0"], "Closed at $100, up 25%.", ["25%"])
+        }
+        for case_id, (observations, text, expected) in cases.items():
+            pad = [_entry("search_news", o) for o in observations]
+            assert finish_checks_module.own_evidence_ungrounded_figures(
+                text, pad) == expected, case_id
+            issue = check(text, None, pad)
+            assert (issue is None) == (not expected), case_id
+        mixed = _entry("search_prior_news_notes", note + "\n" + fresh)
+        reference = finish_checks_module.primary_reference_text([mixed])
+        assert "435,012" in reference and "496,579" not in reference
+
     def test_agents_wire_the_shared_checks(self):
         figure = "own_evidence_figure_check("
         token = "InternalTokenValidator("

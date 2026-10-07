@@ -373,11 +373,23 @@ an agent's prose (the debate and the Judge read code-built `raw_output`
 lists), so the check is safe for all of them.
 
 **Own-evidence figure check** (`own_evidence_figure_check(extra)`, check
-name `own_evidence_figures`). Every "%" and "$" figure in the answer must
-match a number in this run's own successful evidence-tool results
-(`loop.evidence_reference_text`: knowledge-graph lookups, errored calls and
-correction turns left out) plus `extra` (context the agent was given in
-code). Matching is `debate_common.find_ungrounded_figures` (3.16): scale
+name `own_evidence_figures`). Every "%" and "$" figure, and every number
+written with thousands separators (such as 496,579), in the answer must
+match a number in this run's own primary evidence
+(`finish_checks.primary_reference_text`: the successful evidence-tool
+results of `loop.evidence_reference_text`, with knowledge-graph lookups,
+errored calls and correction turns left out, and with every prior
+AI-written `[agent:...]` note passage removed, as split by
+`recycled_content.note_and_source_passages`) plus `extra` (context the
+agent was given in code). A prior note is a lead, never evidence: a TSLA
+News answer (October 2026) invented a year-ago delivery count, 496,579,
+and later runs repeated it from the archived note, where the old check
+counted it as grounded and never looked at plain counts. Counts
+(`ungrounded_counts`) match any number of the reference, written grouped
+or as plain digits of four or more, within 1%. Replayed on 1,041 stored
+answers of eight batches, the counts and the note exclusion flag exactly
+the four TSLA News answers with 496,579 and nothing else (the note
+exclusion alone changes no "$"/"%" result). Matching of "$" and "%" figures is `debate_common.find_ungrounded_figures` (3.16): scale
 normalized ($17.8B = $17,800 million), 1.5% relative tolerance for scaled
 figures and percentages, 1% for plain dollar amounts. With no evidence at
 all the check is silent (the zero-evidence gate handles it); an internal
@@ -552,7 +564,10 @@ the tolerance of one allowed value.
   (`fundamental.unresolved_finish_issue_after_retries`);
   `get_fundamentals`' soft "note: ..." flags are appended as "Data caveat
   (from get_fundamentals): ..." and stored as `raw_output["data_caveats"]`
-  (data context, not warnings, so they do not block archival); the SEC
+  (data context, not warnings, so they do not block archival). The
+  operating-below-net-margin note names its period ("for the fiscal year
+  ended <date>"): without it the AMD Judge (October 2026) tied FY2025
+  margins to 2026 investment gains. The SEC
   XBRL latest-quarter text and "Revenue growth YoY (get_fundamentals,
   <label>): <value>%" are appended to the summary; the three margins are
   exported as `key_facts` (the Judge's valuation note reads them).
@@ -1001,15 +1016,37 @@ the tolerance of one allowed value.
   `OVERLAP_RULE` (unusual items and XBRL items can overlap, e.g. an
   impairment also tagged as restructuring, an upward adjustment inside the
   equity gains, the same event in an XBRL line and a record: count each
-  event once, never add overlapping items); `FREE_CASH_FLOW_RULE` (when
+  event once, never add overlapping items; a year-to-date amount already
+  contains its quarters, so cite that amount or its quarterly parts, never
+  both -- the INTC, UNH and DIS Judges listed both in October 2026);
+  `FREE_CASH_FLOW_RULE` (when
   arguing from cash flow and the line gives free cash flow, cite it with
   its period; if negative, say so, never call capex covered by operating
   cash flow, and say how the gap was funded; if free cash flow after
   buybacks and dividends is negative, say so, never say cash flow funds or
-  supports those returns, and say how the gap was funded; a funding source
-  is named only with a figure the evidence gives for it (debt issued, a
-  fall in cash; debt repaid is a use of cash, not a source), and without
-  such a figure the text says the funding is not shown. The earlier
+  supports those returns, and say how the gap was funded; operating cash
+  flow, not free cash flow, is what covers capex: with a positive free cash
+  flow "operating cash flow covered capital spending" is correct and must
+  not be flagged, and only "free cash flow covered (or funded) capital
+  spending" is wrong (the first wording, "never say free cash flow covered
+  capital spending", made Reflection flag correct operating-cash-flow
+  sentences for AMD, TSLA and UNH in October 2026 and cost AMD and UNH 0.15
+  confidence); with a positive free cash flow, debt issued is not presented
+  as funding capex, operations or a gap; when the
+  after-returns value (or free cash flow, with no return line) is positive
+  there is no funding gap, and a fall in cash reflects other uses the line
+  does not show, so no funding is described as "not shown" (the AMD Judge
+  wrote "free cash flow fully covered capital expenditures" and called a
+  cash fall with positive after-returns flow "funding not shown"); the
+  after-returns line covers only the
+  returns its label names; a funding source is named only with a figure
+  the evidence gives for it (debt issued, a fall in cash; debt repaid is a
+  use of cash, not a source) and covers only its own amount -- a smaller
+  source leaves the rest "not shown" -- and without such a figure the text
+  says the funding is not shown. The TSLA Judge (October 2026) read a
+  positive six-month free cash flow as "requiring" the debt raised, and
+  the KO Judge called a $1.00B gap "funded by existing cash" when cash
+  fell $15M; the two middle clauses answer those. The earlier
   wording "name how the gap was funded (debt issued, cash)" made the BA
   Judge write "funded by cash reserves and debt" while the filing showed
   debt repaid; the XBRL cash-flow line now also carries debt issued, debt
@@ -1628,7 +1665,7 @@ creating one writes data). Everything below is read-only.
 | File | What it holds |
 |---|---|
 | `services/ai-service/ai/agents/loop.py` | `BaseAgent`, `ReActAgentLoop`, `ScratchpadEntry`, prefetch, finish gates, peer-ticker tagging, `is_successful_tool_entry`, `tool_reported_error`, `derive_agent_quality`, `SCORE_UNRESOLVED`, `evidence_reference_text`. |
-| `services/ai-service/ai/agents/finish_checks.py` | `InternalTokenValidator`, `RejectOnceBudget`, the internal-token and own-evidence figure checks, `reported_number_issue`. |
+| `services/ai-service/ai/agents/finish_checks.py` | `InternalTokenValidator`, `RejectOnceBudget`, the internal-token and own-evidence figure checks (`primary_reference_text`, `ungrounded_counts`), `reported_number_issue`. |
 | `services/ai-service/ai/agents/supervisor.py` | `AGENT_REGISTRY` (eight generic roles), `select_agents`, `DEFAULT_AGENTS_BY_TYPE`. |
 | `services/ai-service/ai/agents/market.py` ... `portfolio.py` | The nine data agents with prompts and validators. |
 | `services/ai-service/ai/agents/debate_side.py`, `debate_common.py` | Debate sides (`DebateSideAgent`), the shared prompt rules, `format_evidence` and the code-built lines, `find_ungrounded_figures`. |
