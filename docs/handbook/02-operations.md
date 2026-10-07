@@ -899,8 +899,7 @@ root, Compose command, `PORTFOLIO_ID` default, `psql_stdin`), so it works
 from any folder.
 
 Output folder `runs/run_<timestamp>/` in the repository root (`runs/` is
-gitignored; older run folders may still sit directly in the root, also
-gitignored by `/run_*/`):
+gitignored):
 
 ```
 runs/run_<YYYYMMDD_HHMMSS>/

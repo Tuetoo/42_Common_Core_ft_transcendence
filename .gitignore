@@ -1,99 +1,48 @@
 # Python
-
 __pycache__/
-
 *.pyc
-
 .venv/
-
 .pytest_cache/
-
 .mypy_cache/
-
-.ruff_cache/
-
-
 .coverage
-
 htmlcov/
 
 # IDE
-
 .idea/
-
 .vscode/
+
+# macOS
+.DS_Store
 
 # Environment
 # The real env file is `.env.docker` (not `.env`, which shared/config.py
 # would load into local pytest runs). The tracked template is
 # `.env.example` (copy it to `.env.docker`); the exception below must
 # match that filename or the template stops being tracked.
-
 .env
-
 .env.*
-
 !.env.example
 
 # Docker-mount artifacts: empty, root-owned directories that appear under
 # each service because docker-compose.override.yml mounts ./shared into
-# ./services/<name>:/app as a nested bind mount. Harmless, never imported
-# by anything (the real `shared/` package lives only at the repo root),
-# but shouldn't be tracked.
-
+# ./services/<name>:/app as a nested bind mount. Never imported (the real
+# `shared/` package lives only at the repo root).
 services/auth-service/shared/
-
 services/core-service/shared/
-
 services/ai-service/shared/
 
-# Logs
-
+# Runtime data
+# Container logs written by the `vector` service, daily backups
+# (infra/scheduler/backup.sh) and the output of scripts/run_analysis.sh.
 *.log
-
-# Per-service daily container logs written by the `vector`
-# service (docker-compose.yaml) -- runtime data, never committed.
-
 /logs/
+backups/
+/runs/
 
 # Locally generated TLS certificate for the gateway
 # (infra/gateway/gen-certs.sh). Only the README is tracked.
-
 infra/gateway/certs/*
-
 !infra/gateway/certs/README.md
-
-# macOS
-
-.DS_Store
-
-# Database
-
-*.sqlite3
-
-# Build
-
-dist/
-
-build/
-
-# uv
-
-uv.lock.bak
-
-# Daily backups (infra/scheduler/backup.sh)
-backups/
-
-# Redis snapshots written by a redis-server started inside the repo
-# (local testing), the output folders of run_analysis.sh (runs/; the
-# top-level patterns cover the older per-ticker / batch run folders), and the local folder of Claude
-# session outputs.
-*.rdb
-/runs/
-/run_*/
-/*_run_*/
-/batch_run_*/
-Claude outputs/
 
 # RAG seed corpus: third-party documents (earnings calls, analyst
 # reports, news), kept locally and never committed. See

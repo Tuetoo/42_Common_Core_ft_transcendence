@@ -702,8 +702,10 @@ What still needs an image **rebuild** (`up -d --build`, or
   Python 3.11 in `uv.lock`.
 - The build context is the repository root. Each image copies `shared/`
   to `/app/shared` and `services/<name>/` to `/app`. `.dockerignore`
-  keeps secrets (`.env.*` except `.env.example`), caches, `backups/`,
-  `logs/` and run folders out of the build.
+  excludes everything except the paths the Dockerfiles copy
+  (`pyproject.toml`, `uv.lock`, `shared/`, `services/`,
+  `infra/scheduler/`), and inside those it excludes `.env` files, virtual
+  environments and caches.
 - The scheduler image (`infra/scheduler/Dockerfile`) is Alpine 3.20 with
   `dcron`, `curl`, `tzdata`, `jq`, `postgresql16-client` and `rclone`,
   with `TZ=America/New_York`. Its job scripts and crontab are **copied**

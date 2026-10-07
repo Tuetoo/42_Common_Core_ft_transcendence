@@ -1514,10 +1514,35 @@ class TestRepositoryConfiguration:
         lines = (ROOT / ".gitignore").read_text().splitlines()
         entries = [ln for ln in lines if ln and not ln.startswith("#")]
         assert "/runs/" in entries
-        assert "Claude outputs/" in entries
         for keep in (".env", ".env.*", "!.env.example", "backups/", "/logs/"):
             assert keep in entries
         assert len(entries) == len(set(entries))
+
+        ignore = [
+            ln for ln in (ROOT / ".dockerignore").read_text().splitlines()
+            if ln and not ln.startswith("#")
+        ]
+        assert ignore[0] == "*"
+        allowed = {ln[1:] for ln in ignore if ln.startswith("!")}
+        for key in ("**/.env", "**/.env.*", "**/.venv"):
+            assert key in ignore
+        dockerfiles = [
+            *ROOT.glob("services/*/Dockerfile"),
+            ROOT / "infra" / "scheduler" / "Dockerfile"
+        ]
+        for dockerfile in dockerfiles:
+            for line in dockerfile.read_text().splitlines():
+                parts = line.split()
+                if not parts or parts[0] != "COPY":
+                    continue
+                if any(p.startswith("--from") for p in parts[1:]):
+                    continue
+                for source in [p for p in parts[1:-1]
+                               if not p.startswith("--")]:
+                    path = source.rstrip("/").rstrip("*")
+                    assert any(
+                        path == a or path.startswith(a + "/")
+                        for a in allowed), (dockerfile, source)
         makefile = (ROOT / "Makefile").read_text()
         clean = makefile.split("\nclean:\n", 1)[1].split("\n\n", 1)[0]
         assert '".mypy_cache"' in clean

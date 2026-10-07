@@ -83,8 +83,9 @@ Read `A <- B` as "B imports A".
 - **Production image** (`services/<svc>/Dockerfile`, stage `production`):
   `COPY shared /app/shared`, then `COPY services/<svc>/ /app/`, and
   `ENV PYTHONPATH=/app`. The build context is the repo root, which is
-  why compose builds with `context: .`. `.dockerignore` keeps the rest of
-  the repo (venv, caches, backups, logs, `.env.docker`) out of the build.
+  why compose builds with `context: .`. `.dockerignore` lets only the
+  copied paths into the build context (venv, caches and `.env` files
+  excluded even there).
 - **Development** (`docker-compose.override.yml`): the services use the
   `development` stage and bind-mount `./shared:/app/shared` and
   `./services/<svc>:/app`. Because the second mount sits inside the

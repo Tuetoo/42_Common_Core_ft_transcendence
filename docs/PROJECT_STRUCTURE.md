@@ -37,7 +37,7 @@ alphamind/
 │                            mypy and isort configuration
 ├── .style.yapf              yapf layout settings (formatting helper)
 ├── .env.example             template for .env.docker (never committed)
-└── .dockerignore, .gitignore, .editorconfig
+└── .dockerignore, .gitignore
 ```
 
 ## 2. `services/auth-service/`
