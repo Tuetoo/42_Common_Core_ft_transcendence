@@ -497,6 +497,8 @@ lint:
 | `integration-ci.yml` ("stack smoke CI"), job `config-checks` | pull request touching `infra/**`, `scripts/**`, the compose files, `Makefile`, `.env.example` or the workflow; push to `main` | `uv run flake8 infra`; `csp_hashes.py --check`; `docker compose config -q` of the stack and of the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` |
 | `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404; `down -v` (always, also after a failure) |
 
+| `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand | SSH to the cloud host with a key that may only run `scripts/deploy.sh` (fast-forward to `origin/main`, `docker compose up -d --build --wait`); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
+
 The stack smoke job does not run `tests/integration` (no seeded corpus or
 embedding key in CI) despite the file name.
 
@@ -891,3 +893,4 @@ anywhere with only Docker.
 - [27-observability.md](27-observability.md): the alert rules under test.
 - [28-email.md](28-email.md): MailHog, used by `e2e_check`.
 - [30-shared-library.md](30-shared-library.md): `shared/e2e_lock.py`.
+- [32-ci-cd.md](32-ci-cd.md): how CI gates the deployment to the cloud host.

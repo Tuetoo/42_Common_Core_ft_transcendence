@@ -129,7 +129,8 @@ There is no user interface yet (section 8).
    [25 Real-time](25-realtime-yjs.md), [26 Scheduler](26-scheduler-jobs.md),
    [27 Observability](27-observability.md), [28 Email](28-email.md),
    [29 Security](29-security.md), [30 Shared library](30-shared-library.md),
-   [31 Testing and quality](31-testing-quality.md).
+   [31 Testing and quality](31-testing-quality.md),
+   [32 CI/CD](32-ci-cd.md).
 
 ### Path B: "I have an evaluation tomorrow" (about three hours)
 
@@ -182,11 +183,13 @@ There is no user interface yet (section 8).
 | [29 Security](29-security.md) | TLS, headers, tokens, hashing, permissions, internal tokens, rate limits, API keys, input validation, secrets, exposure, error-body shapes, known limitations. |
 | [30 The shared library](30-shared-library.md) | Every module in `shared/`, who uses it, and the rule for what belongs there. |
 | [31 Testing and code quality](31-testing-quality.md) | Test suites and fixtures, integration and end-to-end checks, flake8, mypy `--strict`, the no-comments code style, CI, writing a new test. |
+| [32 CI/CD](32-ci-cd.md) | Basic CI/CD ideas, the pull-request checks, the stack smoke gate on `main`, the deploy workflow and script, the cloud host, keys and secrets, rollback, troubleshooting. |
 
 Reference documents next to this handbook:
 [API_SPEC](../API_SPEC.md) (every route),
 [ERD](../ERD.md) (every table and column),
 [DISASTER_RECOVERY](../DISASTER_RECOVERY.md) (backup and restore),
+[DEPLOYMENT](../DEPLOYMENT.md) (the cloud host and continuous deployment),
 [MODULE_MAPPING](../MODULE_MAPPING.md) (subject modules and where each is
 implemented),
 [DESIGN](../DESIGN.md),
@@ -268,7 +271,7 @@ not finished; the chapters give the details.
 | Item | State | Chapter |
 |---|---|---|
 | Frontend | No frontend code in the repository. The `frontend` service in `docker-compose.yaml` is commented out; the API contract a frontend must follow is ready, and every route can be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) sections 3.6b and 3.11 |
-| Cloud deployment | None. The stack runs with Docker Compose on one machine. A deployment needs real secrets and a strong `JWT_SECRET`; with `APP_ENV` outside `development`/`test` a service refuses to start with weak ones. | [01](01-architecture.md) section 4, [29](29-security.md) |
+| Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main`. The first deployment waits for the new `infra/` to reach `main`. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 | Top-level README | None. The only READMEs are `tests/README.md` and `infra/gateway/certs/README.md`. | - |
 | Calibration of the confidence rules | The penalties and caps in `ai/recommendation/engine.py`, the HOLD flat band of the accuracy score (`review_workflow.py::_HOLD_FLAT_BAND`) and the procedural-memory score bar (`_MIN_SCORE_TO_REMEMBER`) are fixed constants. Nothing derives them from scored outcomes yet; that needs enough rows in `ai.recommendation_metrics`. | [16](16-ai-analysis-pipeline.md) section 3.12, [19](19-ai-workflows-backtest.md) section 3.11 |
 | Debate and Reflection quality signals | Debate convergence and Reflection retries are stored per analysis but not aggregated into a metric. | [19](19-ai-workflows-backtest.md) section 3.11 |

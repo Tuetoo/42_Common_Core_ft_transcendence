@@ -94,3 +94,8 @@ backups/
 /*_run_*/
 /batch_run_*/
 Claude outputs/
+
+# RAG seed corpus: third-party documents (earnings calls, analyst
+# reports, news), kept locally and never committed. See
+# docs/handbook/17-ai-rag.md section 3.14.
+/rag_seed_documents/
