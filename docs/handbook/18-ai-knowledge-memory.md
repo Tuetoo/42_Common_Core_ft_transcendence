@@ -998,8 +998,8 @@ us-gaap concepts in priority order with a display label:
 | operating cash flow (`operating_cash_flow`) | NetCashProvidedByUsedInOperatingActivities |
 | capital expenditures (`capital_expenditures`) | PaymentsToAcquirePropertyPlantAndEquipment, PaymentsToAcquireProductiveAssets |
 | share repurchases | PaymentsForRepurchaseOfCommonStock |
-| dividends paid | PaymentsOfDividendsCommonStock, PaymentsOfDividends |
-| long-term debt issued (`long_term_debt_issued`) | ProceedsFromIssuanceOfLongTermDebt ("long-term debt issued"), else ProceedsFromIssuanceOfDebt ("debt issued") |
+| dividends paid | PaymentsOfDividendsCommonStock, PaymentsOfDividends, PaymentsOfOrdinaryDividends |
+| long-term debt issued (`long_term_debt_issued`) | ProceedsFromIssuanceOfLongTermDebt ("long-term debt issued"), else ProceedsFromIssuanceOfDebt ("debt issued"), else ProceedsFromDebtNetOfIssuanceCosts ("debt issued (proceeds after issuance costs, before repayments)") |
 | long-term debt repaid (`long_term_debt_repaid`) | RepaymentsOfLongTermDebt ("long-term debt repaid"), else RepaymentsOfDebt ("debt repaid") |
 | net change in cash (`net_change_in_cash`, signed) | CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect ("net change in cash, cash equivalents and restricted cash"), else CashAndCashEquivalentsPeriodIncreaseDecrease ("net change in cash and cash equivalents") |
 
@@ -1022,10 +1022,14 @@ Rules (`_group_item`):
   capex, only when both groups exist; its current value needs both facts
   for the current period and its prior value both for the prior period.
   Free cash flow after buybacks and dividends (key
-  `free_cash_flow_after_returns`, label "free cash flow after buybacks and
-  dividends (computed: free cash flow minus share repurchases minus
-  dividends paid)", naming only the return lines present) is free cash flow
-  minus share repurchases minus dividends paid, inserted right after the
+  `free_cash_flow_after_returns`) is free cash flow minus share repurchases
+  minus dividends paid. Its label names only the return lines present:
+  "free cash flow after buybacks and dividends (computed: free cash flow
+  minus share repurchases minus dividends paid)" when both exist, else for
+  example "free cash flow after buybacks (computed: free cash flow minus
+  share repurchases, no dividends paid line in the data)". A fixed label
+  once called QCOM's +$21M (buybacks only) the result after dividends too,
+  while about $2.9B of dividends had been paid. It is inserted right after the
   last of those two lines, only when free cash flow and at least one of
   them exist; for each period it needs free cash flow and a value of every
   return line shown (a return line not tagged for that period leaves that
@@ -1051,6 +1055,16 @@ Rules (`_group_item`):
   with such a figure). The general debt concepts are the fallback for
   filers that do not use the long-term ones (BA tags RepaymentsOfDebt and
   ProceedsFromIssuanceOfDebt); the label says which concept was used.
+  Two more standard concepts are fallbacks because companies switched to
+  them: PaymentsOfOrdinaryDividends (QCOM's and GOOGL's recent dividends;
+  without it QCOM had no dividend line and GOOGL's current dividends were
+  "not tagged") and ProceedsFromDebtNetOfIssuanceCosts (NVDA's $24.90B
+  six-month issuance, GOOGL's $56.23B). Its label says "proceeds after
+  issuance costs, before repayments" because the first wording, "net of
+  issuance costs", was read as net debt issued by every GOOGL writer. Replayed on the 16 tickers' October
+  2026 companyfacts: only AMD, BA, GOOGL, NVDA and QCOM change; QCOM's
+  after-returns value goes from +$21M to -$2.85B and GOOGL's from "not
+  tagged" to -$970M.
   Measured on the live companyfacts of the 16 batch tickers (October
   2026): the net change in cash is tagged for all 16, the general debt
   concepts add BA (debt repaid $8.38B, debt issued $35M, six months), KO

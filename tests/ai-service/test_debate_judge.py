@@ -942,17 +942,30 @@ class TestPrompts:
         assert "claimed, sought, assessed or awarded" in dc.LEGAL_AMOUNT_RULE
         assert "accrued, paid or escrowed" in dc.LEGAL_AMOUNT_RULE
         assert "Count each event once" in dc.OVERLAP_RULE
+        assert "cite either that amount or its quarterly parts" in (
+            dc.OVERLAP_RULE)
         assert "XBRL lines and in a filing record" in dc.OVERLAP_RULE
         assert "free cash flow" in dc.FREE_CASH_FLOW_RULE
         assert "do not call capital spending covered" in (
             dc.FREE_CASH_FLOW_RULE)
-        assert "free cash flow after buybacks and dividends is negative" in (
+        assert "after buybacks and/or dividends is negative" in (
+            dc.FREE_CASH_FLOW_RULE)
+        assert "'operating cash flow covered capital spending' is" in (
+            dc.FREE_CASH_FLOW_RULE)
+        assert "only 'free cash flow covered (or funded) capital" in (
+            dc.FREE_CASH_FLOW_RULE)
+        assert "there is no funding gap" in dc.FREE_CASH_FLOW_RULE
+        assert "When free cash flow is positive, do not present debt" in (
+            dc.FREE_CASH_FLOW_RULE)
+        assert "That line covers only the returns its label names" in (
+            dc.FREE_CASH_FLOW_RULE)
+        assert "a source covers only its own amount" in (
             dc.FREE_CASH_FLOW_RULE)
         assert "never say cash flow funds or supports those returns" in (
             dc.FREE_CASH_FLOW_RULE)
         assert "Name a funding source only with a figure the evidence" in (
             dc.FREE_CASH_FLOW_RULE)
-        assert "debt repaid is a use of cash, not a source" in (
+        assert "Debt repaid is a use of cash, not a source" in (
             dc.FREE_CASH_FLOW_RULE)
         assert "say the funding is not shown -- never guess it" in (
             dc.FREE_CASH_FLOW_RULE)

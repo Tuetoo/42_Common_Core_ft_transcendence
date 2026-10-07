@@ -871,20 +871,37 @@ class TestQuarterResults:
 
     def test_free_cash_flow_after_returns(self):
         cases = {
-            "period-missing-one-return-is-not-computed": ({
-                "PaymentsForRepurchaseOfCommonStock": [7.25e9, 2.5e9],
-                "PaymentsOfDividendsCommonStock": [1.34e9, None]
-            }, (5.74e9 - 8.59e9,
-                None), "share repurchases minus dividends paid"),
+            "period-missing-one-return-is-not-computed": (
+                {
+                    "PaymentsForRepurchaseOfCommonStock": [7.25e9, 2.5e9],
+                    "PaymentsOfDividendsCommonStock": [1.34e9, None]
+                }, (5.74e9 - 8.59e9,
+                    None), "free cash flow after buybacks and "
+                "dividends (computed: free cash flow minus share "
+                "repurchases minus dividends paid)"),
             "dividends-only": ({
                 "PaymentsOfDividends": [1e9, 2e9]
-            }, (4.74e9, 5.52e9), "dividends paid"),
+            }, (4.74e9, 5.52e9), "free cash flow after dividends (computed: "
+                               "free cash flow minus dividends paid, no share "
+                               "repurchases line in the data)"),
+            "buybacks-and-ordinary-dividends": (
+                {
+                    "PaymentsForRepurchaseOfCommonStock": [1e9, 1e9],
+                    "PaymentsOfOrdinaryDividends": [2e9, 1e9]
+                }, (2.74e9, 5.52e9), "free cash flow after buybacks and "
+                "dividends (computed: free cash flow minus share "
+                "repurchases minus dividends paid)"),
+            "buybacks-only": ({
+                "PaymentsForRepurchaseOfCommonStock": [6e9, 1e9]
+            }, (-0.26e9, 6.52e9), "free cash flow after buybacks (computed: "
+                              "free cash flow minus share repurchases, no "
+                              "dividends paid line in the data)"),
             "no-returns": ({}, None, "")
         }
         for case_id, (extra, expected, minus) in cases.items():
             self._check_after_returns(case_id, extra, expected, minus)
 
-    def _check_after_returns(self, case_id, extra, expected, minus):
+    def _check_after_returns(self, case_id, extra, expected, label):
 
         def facts(current, prior):
             rows = [_q(_YTD, current)]
@@ -921,9 +938,8 @@ class TestQuarterResults:
             "(comparison period not tagged)" if after.prior is None else
             "vs " + sec_edgar._usd(after.prior, signed=True))
         assert sec_edgar._items_text(items).endswith(
-            "free cash flow after buybacks and dividends (computed: free "
-            f"cash flow minus {minus}) " +
-            sec_edgar._usd(after.current, signed=True) + " " + prior), case_id
+            label + " " + sec_edgar._usd(after.current, signed=True) + " " +
+            prior), case_id
 
     def test_debt_and_cash_change_lines(self):
         cases = {
@@ -947,6 +963,15 @@ class TestQuarterResults:
                 },
                 "long-term debt repaid $2.00B vs $1.00B; net change in cash "
                 "and cash equivalents +$500M vs -$200M"),
+            "debt-net-of-issuance-costs": (
+                {
+                    "ProceedsFromDebtNetOfIssuanceCosts": [2.49e10, 1e9],
+                    "CashAndCashEquivalentsPeriodIncreaseDecrease": [
+                        1e9, -2e8
+                    ]
+                }, "debt issued (proceeds after issuance costs, before "
+                "repayments) $24.90B vs $1.00B; net change in cash and cash "
+                "equivalents +$1.00B vs -$200M"),
             "untagged-adds-nothing": ({}, "")
         }
         for case_id, (extra, expected) in cases.items():
@@ -979,8 +1004,9 @@ class TestQuarterResults:
         items = sec_edgar._cash_flow_items(us_gaap, lookup)
         text = sec_edgar._items_text(items)
         after = (
-            "free cash flow after buybacks and dividends (computed: free "
-            "cash flow minus dividends paid) -$992M vs -$2.65B")
+            "free cash flow after dividends (computed: free cash flow minus "
+            "dividends paid, no share repurchases line in the data) -$992M "
+            "vs -$2.65B")
         if not expected:
             assert text.endswith(after), case_id
             return

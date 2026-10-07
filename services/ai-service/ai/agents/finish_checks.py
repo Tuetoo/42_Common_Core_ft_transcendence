@@ -4,8 +4,10 @@ from collections.abc import Callable, Sequence
 from typing import Any
 import structlog
 from ai.agents.debate_common import find_ungrounded_figures
-from ai.agents.loop import (MAX_FINISH_VALIDATION_RETRIES, ScratchpadEntry,
+from ai.agents.loop import (MAX_FINISH_VALIDATION_RETRIES,
+                            NUMBER_MATCH_REL_TOLERANCE, ScratchpadEntry,
                             evidence_reference_text)
+from ai.knowledge.recycled_content import note_and_source_passages
 from ai.tools.news_tool import tool_labels_in_text
 
 logger = structlog.get_logger(__name__)
@@ -116,15 +118,54 @@ OWN_EVIDENCE_FIGURE_MESSAGE = (
     "figures from other agents, earlier runs or memory.")
 
 
+GROUPED_NUMBER_RE = re.compile(
+    r"(?<![\w.$/-])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\w%]|,\d)")
+_PLAIN_NUMBER_RE = re.compile(r"(?<![\d.,])\d{4,}(?:\.\d+)?(?![\d,])")
+
+
+def primary_reference_text(scratchpad: Sequence[ScratchpadEntry]) -> str:
+    parts: list[str] = []
+    for entry in scratchpad:
+        observation = evidence_reference_text([entry])
+        if not observation:
+            continue
+        notes, sources = note_and_source_passages(observation)
+        parts.append("\n- ".join(sources) if notes else observation)
+    return "\n".join(parts)
+
+
+def _number_values(text: str) -> set[float]:
+    return {
+        float(m.group(0).replace(",", ""))
+        for pattern in (GROUPED_NUMBER_RE, _PLAIN_NUMBER_RE)
+        for m in pattern.finditer(text)
+    }
+
+
+def ungrounded_counts(final_answer: str, evidence: str) -> list[str]:
+    known = _number_values(evidence)
+    missing: list[str] = []
+    for match in GROUPED_NUMBER_RE.finditer(final_answer):
+        value = float(match.group(0).replace(",", ""))
+        grounded = any(
+            abs(value - v) <= NUMBER_MATCH_REL_TOLERANCE * abs(v)
+            for v in known)
+        if not grounded and match.group(0) not in missing:
+            missing.append(match.group(0))
+    return missing
+
+
 def own_evidence_ungrounded_figures(
         final_answer: str, scratchpad: Sequence[ScratchpadEntry],
         extra_reference: str = "") -> list[str]:
-    evidence = evidence_reference_text(scratchpad)
+    evidence = primary_reference_text(scratchpad)
     if not evidence:
         return []
     if extra_reference:
         evidence += "\n" + extra_reference
-    return sorted(find_ungrounded_figures(final_answer, evidence))
+    found = set(find_ungrounded_figures(final_answer, evidence))
+    found.update(ungrounded_counts(final_answer, evidence))
+    return sorted(found)
 
 
 def own_evidence_figure_check(extra_reference: str = "") -> FinishCheck:
