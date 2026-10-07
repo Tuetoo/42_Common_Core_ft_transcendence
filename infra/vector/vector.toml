@@ -1,15 +1,18 @@
-# Persist every container's stdout/stderr to disk.
+# Persist the stdout/stderr of every docker compose container to disk.
 #
 # Why: `docker compose logs` only shows what the Docker daemon still
 # holds, which is lost on container recreate (`up -d --build`,
-# `--force-recreate`), so a failing overnight batch could no longer be
-# investigated the next morning. This collector is independent of the
+# `--force-recreate`). This collector is independent of the
 # application code: it reads straight from the Docker daemon.
 #
 # Output: ./logs/<service>/<YYYY-MM-DD>.log on the host (mounted at /logs),
 # where <service> is the compose service name (label
-# com.docker.compose.service), falling back to the container name for
-# containers not started by compose. The date is the America/New_York
+# com.docker.compose.service). Only containers carrying that label are
+# kept: compose services of this project, including `docker compose run`
+# containers.
+# Lines of containers not started by docker compose (testcontainers from
+# `make test`, `docker run` one-offs with random names) are dropped, so
+# they never get a folder under logs/. The date is the America/New_York
 # calendar date of the line (same zone as the scheduler's crontab), taken
 # from the timestamp Docker recorded for the line.
 #
@@ -42,7 +45,11 @@ inputs = ["docker"]
 # Events for which `abort` is reached are dropped (drop_on_abort default).
 drop_on_abort = true
 source = '''
-service = string(.label."com.docker.compose.service") ?? string(.container_name) ?? "unknown"
+service = string(.label."com.docker.compose.service") ?? ""
+# Containers not started by docker compose carry no service label.
+if service == "" {
+  abort
+}
 service = replace(service, r'[^A-Za-z0-9_.-]', "_")
 if service == "" || service == "." || service == ".." {
   service = "unknown"
@@ -50,6 +57,15 @@ if service == "" || service == "." || service == ".." {
 # Never collect the collector's own output: an internal Vector warning
 # about an event would otherwise become a new event itself.
 if service == "vector" {
+  abort
+}
+# Only containers of this compose project (COMPOSE_PROJECT, set by
+# docker-compose.yaml): a second project on the same Docker daemon, such
+# as the restore drill (`make restore-drill`), has its own services of the
+# same names and must not write into these files.
+expected_project = get_env_var("COMPOSE_PROJECT") ?? ""
+project = string(.label."com.docker.compose.project") ?? ""
+if expected_project != "" && project != expected_project {
   abort
 }
 ts = timestamp(.timestamp) ?? now()

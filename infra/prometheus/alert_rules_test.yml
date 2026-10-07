@@ -1,0 +1,191 @@
+# Unit tests for alert_rules.yml.
+# Run:  promtool test rules infra/prometheus/alert_rules_test.yml
+rule_files:
+  - alert_rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "1 1 0 0 0 0"
+      - series: 'pg_up{job="postgres", instance="postgres-exporter:9187", service="postgres"}'
+        values: "1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ServiceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: core-service
+              instance: core-service:8000
+              service: core-service
+            exp_annotations:
+              summary: "core-service is down"
+              description: "Prometheus could not scrape job core-service (core-service:8000) for more than 1 minute."
+      - eval_time: 5m
+        alertname: PostgresDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: postgres
+              instance: postgres-exporter:9187
+              service: postgres
+            exp_annotations:
+              summary: "PostgreSQL is unreachable"
+              description: "postgres-exporter is running but cannot connect to PostgreSQL (pg_up == 0) for more than 1 minute."
+
+  # 10 req/s, 20% of them 5xx, for 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{service="ai-service", handler="/api/v1/analyses", method="GET", status="2xx"}'
+        values: "0+480x15"
+      - series: 'http_requests_total{service="ai-service", handler="/api/v1/analyses", method="GET", status="5xx"}'
+        values: "0+120x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: High5xxRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: ai-service
+            exp_annotations:
+              summary: "ai-service: more than 5% of requests fail with 5xx"
+              description: "ai-service answered 20% of its requests with a 5xx status over the last 5 minutes."
+
+  # An idle service: Prometheus scrapes and health checks (8 req/min)
+  # plus one real request per minute, which fails. The probes do not count
+  # as traffic, so 1 req/min stays below the 0.05 req/s minimum.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{service="core-service", handler="/metrics", method="GET", status="2xx"}'
+        values: "0+4x15"
+      - series: 'http_requests_total{service="core-service", handler="/health", method="GET", status="2xx"}'
+        values: "0+4x15"
+      - series: 'http_requests_total{service="core-service", handler="/api/v1/portfolios", method="GET", status="5xx"}'
+        values: "0+1x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: High5xxRate
+        exp_alerts: []
+
+  # p95 latency: every backtest request takes 2-5 s on ai-service (fires
+  # with the interpolated p95 2 + 3 * 0.95 = 4.85 s); core-service's
+  # /internal scheduler route is just as slow but excluded.
+  - interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/backtests", method="POST", le="1"}'
+        values: "0x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/backtests", method="POST", le="2"}'
+        values: "0x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/backtests", method="POST", le="5"}'
+        values: "0+6x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/backtests", method="POST", le="+Inf"}'
+        values: "0+6x30"
+      - series: 'http_request_duration_seconds_bucket{service="core-service", handler="/internal/scheduler/market-close", method="POST", le="2"}'
+        values: "0x30"
+      - series: 'http_request_duration_seconds_bucket{service="core-service", handler="/internal/scheduler/market-close", method="POST", le="5"}'
+        values: "0+6x30"
+      - series: 'http_request_duration_seconds_bucket{service="core-service", handler="/internal/scheduler/market-close", method="POST", le="+Inf"}'
+        values: "0+6x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HighLatencyP95
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: ai-service
+            exp_annotations:
+              summary: "ai-service: p95 latency above 2s"
+              description: "The 95th percentile request latency of ai-service has been 4.85s for 10 minutes."
+
+  # Jobs waiting, nothing finished for 40 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'alphamind_analysis_queue_pending{job="ai-service", instance="ai-service:8000", service="ai-service"}'
+        values: "3x70"
+      - series: 'alphamind_analyses_total{job="ai-service", instance="ai-service:8000", service="ai-service", status="completed", failure_reason="none"}'
+        values: "5x70"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AnalysisQueueBacklog
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: AnalysisQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: ai-service
+              instance: ai-service:8000
+              service: ai-service
+            exp_annotations:
+              summary: "Analysis queue is backed up"
+              description: "3 analyses are waiting in ai-service's serial queue and the queue is not draining."
+
+  # A daily job that stopped reporting, a trading-day job within its
+  # window, and a market-close that skipped portfolios. The series carry
+  # the labels a real scrape stores (job="core-service" from the scrape
+  # job, the job name in scheduled_job).
+  - interval: 1m
+    input_series:
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="backup", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "0x1900"
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="market-close", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "0x1900"
+      - series: 'alphamind_market_close_portfolios_skipped{job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "0x60 2x60"
+    alert_rule_test:
+      - eval_time: 20h
+        alertname: DailyJobStale
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: DailyJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: backup
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job backup has not succeeded for over 26 hours"
+              description: "The daily job backup last succeeded 1d 6h 0m 0s ago. Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time)."
+      - eval_time: 30h
+        alertname: TradingDayJobStale
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: MarketCloseSkippedPortfolios
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: core-service
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "The last market-close skipped 2 portfolio(s)"
+              description: "A holding had no close for the session, so no snapshot was written for 2 portfolio(s) (see the market_close_snapshot_skipped log lines). Fill the day later with scripts/recompute_snapshots.py --to <date>."
+
+  # Outbox backlog: fires only when unpublished events stay for 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'alphamind_outbox_unpublished_events{job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "0x10 3x30 0x10"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OutboxBacklog
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: OutboxBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: core-service
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "3 durable event(s) not yet published"
+              description: "core-service has 3 event(s) in core.event_outbox that it could not publish to Redis for 15 minutes (see the outbox_publish_failed log lines). ai-service has not received them yet (document indexing or removal, tier cancellation)."
+      - eval_time: 50m
+        alertname: OutboxBacklog
+        exp_alerts: []

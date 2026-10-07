@@ -1,0 +1,228 @@
+# AlphaMind alerting rules, loaded by prometheus.yml
+# (rule_files) and routed to Alertmanager (infra/alertmanager/).
+#
+# Check locally:  promtool check rules infra/prometheus/alert_rules.yml
+#
+# Label conventions: every alert has `severity` (critical | warning) and
+# keeps the `service` label from the scrape config where one exists.
+
+groups:
+  - name: availability
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: >-
+            Prometheus could not scrape job {{ $labels.job }}
+            ({{ $labels.instance }}) for more than 1 minute.
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: postgres
+        annotations:
+          summary: "PostgreSQL is unreachable"
+          description: >-
+            postgres-exporter is running but cannot connect to PostgreSQL
+            (pg_up == 0) for more than 1 minute.
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis is unreachable"
+          description: >-
+            redis-exporter is running but cannot connect to Redis
+            (redis_up == 0) for more than 1 minute.
+
+  - name: http
+    rules:
+      # prometheus-fastapi-instrumentator groups status codes ("2xx",
+      # "5xx", ...). The /metrics scrapes and /health checks (about
+      # 0.13 req/s per service) are left out of every sum, so they neither
+      # dilute the 5xx share nor count as traffic. Requires a minimum of
+      # 0.05 real requests per second, so a single failed request on an
+      # idle service does not page anyone.
+      - alert: High5xxRate
+        expr: |
+          (
+            sum by (service) (rate(http_requests_total{status=~"5..", handler!~"/metrics|/health"}[5m]))
+            /
+            sum by (service) (rate(http_requests_total{handler!~"/metrics|/health"}[5m]))
+          ) > 0.05
+          and
+          sum by (service) (rate(http_requests_total{handler!~"/metrics|/health"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }}: more than 5% of requests fail with 5xx"
+          description: >-
+            {{ $labels.service }} answered {{ $value | humanizePercentage }}
+            of its requests with a 5xx status over the last 5 minutes.
+
+      # Per-handler histogram (buckets up to 30s, see the services'
+      # main.py). Excluded: /internal/* (scheduler jobs such as the daily
+      # review run are long by design) and the /metrics and /health
+      # probes. Creating an analysis or a backtest only stores the row and
+      # starts the work in the background, so both stay included.
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (service, le) (
+              rate(http_request_duration_seconds_bucket{handler!~"/internal/.*|/metrics|/health"}[10m])
+            )
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }}: p95 latency above 2s"
+          description: >-
+            The 95th percentile request latency of {{ $labels.service }}
+            has been {{ $value | humanizeDuration }} for 10 minutes.
+
+  - name: ai-pipeline
+    rules:
+      # alphamind_analyses_total is counted by ai-service
+      # (services/ai-service/observability.py) when an analysis reaches
+      # a terminal state. At least 3 finished analyses in the window,
+      # so one failure alone never fires it.
+      - alert: AnalysisFailureRateHigh
+        expr: |
+          (
+            sum(increase(alphamind_analyses_total{status="failed"}[1h]))
+            /
+            sum(increase(alphamind_analyses_total[1h]))
+          ) > 0.5
+          and
+          sum(increase(alphamind_analyses_total[1h])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+          service: ai-service
+        annotations:
+          summary: "More than half of the analyses failed in the last hour"
+          description: >-
+            {{ $value | humanizePercentage }} of the analyses that finished
+            in the last hour failed. Check failure_reason on
+            alphamind_analyses_total and alphamind_llm_errors_total.
+
+      # The queue is strictly serial and one analysis takes about 1.5 to
+      # 4 minutes (up to the 45-minute hard limit when a filing must be
+      # summarised first), so a market-open batch of ~15 tickers
+      # legitimately keeps jobs queued for 30-40 minutes. Alert when the backlog is very large, or when jobs
+      # are waiting but no analysis finished in the last 30 minutes
+      # (`unless` also covers a counter with no samples yet).
+      - alert: AnalysisQueueBacklog
+        expr: |
+          alphamind_analysis_queue_pending > 20
+          or
+          (
+            alphamind_analysis_queue_pending > 0
+            unless on (service)
+            sum by (service) (increase(alphamind_analyses_total[30m])) > 0
+          )
+        for: 30m
+        labels:
+          severity: warning
+          service: ai-service
+        annotations:
+          summary: "Analysis queue is backed up"
+          description: >-
+            {{ $value }} analyses are waiting in ai-service's serial queue
+            and the queue is not draining.
+
+      - alert: LLMProviderErrorsHigh
+        expr: sum by (provider, kind) (increase(alphamind_llm_errors_total[15m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+          service: ai-service
+        annotations:
+          summary: "LLM provider {{ $labels.provider }}: many {{ $labels.kind }} errors"
+          description: >-
+            {{ $value | humanize }} failed {{ $labels.provider }} calls of
+            kind {{ $labels.kind }} in the last 15 minutes.
+
+  # Scheduled jobs (infra/scheduler). Each job script reports success to
+  # core-service (job_health.py), exported as
+  # alphamind_job_last_success_timestamp_seconds{scheduled_job}. The label
+  # is not `job`: Prometheus keeps `job` for the scrape job and would rename
+  # the metric's own label to `exported_job`.
+  - name: scheduled_jobs
+    rules:
+      - alert: DailyJobStale
+        expr: |
+          time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup|review-run|rag-ingest|logs-cleanup|purge-unverified|notification-retention"}
+            > 26 * 3600
+        for: 10m
+        labels:
+          severity: warning
+          service: scheduler
+        annotations:
+          summary: "Scheduled job {{ $labels.scheduled_job }} has not succeeded for over 26 hours"
+          description: >-
+            The daily job {{ $labels.scheduled_job }} last succeeded
+            {{ $value | humanizeDuration }} ago. Check `docker compose logs
+            scheduler` (and that the Mac was awake at the scheduled time).
+
+      # Trading-day jobs: a closed market day still reports success (the
+      # job answers "skipped"), so the longest normal gap is a weekend
+      # (Friday 17:30 to Monday 17:30, 72 hours); 100 hours leaves room.
+      - alert: TradingDayJobStale
+        expr: |
+          time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"market-open|market-close|tier-monitoring"}
+            > 100 * 3600
+        for: 10m
+        labels:
+          severity: warning
+          service: scheduler
+        annotations:
+          summary: "Scheduled job {{ $labels.scheduled_job }} has not succeeded for over 100 hours"
+          description: >-
+            The trading-day job {{ $labels.scheduled_job }} last succeeded
+            {{ $value | humanizeDuration }} ago.
+
+      - alert: MarketCloseSkippedPortfolios
+        expr: alphamind_market_close_portfolios_skipped > 0
+        labels:
+          severity: warning
+          service: core-service
+        annotations:
+          summary: "The last market-close skipped {{ $value }} portfolio(s)"
+          description: >-
+            A holding had no close for the session, so no snapshot was
+            written for {{ $value }} portfolio(s) (see the
+            market_close_snapshot_skipped log lines). Fill the day later
+            with scripts/recompute_snapshots.py --to <date>.
+
+  # Durable events (core-service outbox.py): an event written to
+  # core.event_outbox that has not reached Redis. The dispatcher retries
+  # every 5 s, so a value that stays above 0 means Redis (or the
+  # dispatcher) has been failing for a while.
+  - name: durable_events
+    rules:
+      - alert: OutboxBacklog
+        expr: alphamind_outbox_unpublished_events > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: core-service
+        annotations:
+          summary: "{{ $value }} durable event(s) not yet published"
+          description: >-
+            core-service has {{ $value }} event(s) in core.event_outbox that
+            it could not publish to Redis for 15 minutes (see the
+            outbox_publish_failed log lines). ai-service has not received
+            them yet (document indexing or removal, tier cancellation).

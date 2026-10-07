@@ -1,0 +1,10 @@
+# Compose override for the restore drill (`make restore-drill`, see
+# scripts/backups.sh and docs/DISASTER_RECOVERY.md section 6). The drill
+# runs postgres, qdrant, objectstore and the `restore` tool as a separate
+# compose project (alphamind-drill) with its own empty volumes and
+# network, next to the live stack. Of these services only qdrant
+# publishes a host port, which the live stack already holds, so the
+# drill copy publishes none.
+services:
+  qdrant:
+    ports: !reset []

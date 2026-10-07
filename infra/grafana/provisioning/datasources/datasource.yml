@@ -1,0 +1,21 @@
+apiVersion: 1
+
+# Drop a same-named datasource left in an existing grafana_data volume
+# (created without the fixed uid below) so it is re-created with uid
+# "Prometheus".
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    # Fixed uid -- the provisioned dashboards reference
+    # the datasource as {"type": "prometheus", "uid": "Prometheus"}.
+    uid: Prometheus
+    type: prometheus
+    access: proxy
+    # Container-to-container URL on the compose network (Prometheus has no
+    # route prefix; its UI is only published on 127.0.0.1:9090).
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
