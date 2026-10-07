@@ -228,6 +228,24 @@ class TestSecEdgarProvider:
         assert prior == 383_000
 
     async def _get_fundamentals_computes_growth_and_margins(self, monkeypatch):
+        snap = await self._fundamentals_with_net_income(monkeypatch, 96_000)
+        assert snap.revenue_growth_yoy == pytest.approx(
+            (400_000 - 380_000) / 380_000)
+        assert snap.gross_margin == pytest.approx(180_000 / 400_000)
+        assert snap.net_margin == pytest.approx(96_000 / 400_000)
+        assert snap.source == "sec_edgar"
+        assert not any("is below" in n for n in snap.unavailable_notes)
+
+    async def _margin_note_names_the_fiscal_year(self, monkeypatch):
+        snap = await self._fundamentals_with_net_income(monkeypatch, 140_000)
+        assert snap.unavailable_notes == [
+            "note: operating margin (30.0%) is below net margin (35.0%) for "
+            "the fiscal year ended 2024-09-28 -- can be legitimate (e.g. "
+            "one-time gains, tax adjustments) but worth double-checking "
+            "against the filing directly"
+        ]
+
+    async def _fundamentals_with_net_income(self, monkeypatch, net: int):
 
         def _handler(request: httpx.Request) -> httpx.Response:
             assert "CIK0000320193" in str(request.url)
@@ -258,7 +276,7 @@ class TestSecEdgarProvider:
                             },
                             "NetIncomeLoss": {
                                 "units": {
-                                    "USD": [_fy2024_fact(96_000)]
+                                    "USD": [_fy2024_fact(net)]
                                 }
                             }
                         }
@@ -266,12 +284,7 @@ class TestSecEdgarProvider:
                 })
 
         _sec_edgar_backend(monkeypatch, _handler)
-        snap = await SecEdgarProvider().get_fundamentals("AAPL")
-        assert snap.revenue_growth_yoy == pytest.approx(
-            (400_000 - 380_000) / 380_000)
-        assert snap.gross_margin == pytest.approx(180_000 / 400_000)
-        assert snap.net_margin == pytest.approx(96_000 / 400_000)
-        assert snap.source == "sec_edgar"
+        return await SecEdgarProvider().get_fundamentals("AAPL")
 
     async def _unknown_ticker_raises_request_error(self, monkeypatch):
         _sec_edgar_backend(monkeypatch)
@@ -308,7 +321,9 @@ class TestSecEdgarProvider:
 
     async def test_annual_values_growth_and_margins(self):
         self._picks_latest_two_fiscal_years_and_dedupes_amendments()
-        await _run_steps(self._get_fundamentals_computes_growth_and_margins)
+        await _run_steps(
+            self._get_fundamentals_computes_growth_and_margins,
+            self._margin_note_names_the_fiscal_year)
 
     async def test_lookup_errors_and_retries(self):
         await _run_steps(

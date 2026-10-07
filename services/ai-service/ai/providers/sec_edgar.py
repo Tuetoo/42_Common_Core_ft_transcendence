@@ -307,11 +307,14 @@ class SecEdgarProvider(FundamentalDataProvider):
 
         if (operating_margin is not None and net_margin is not None
                 and operating_margin < net_margin - _SANITY_EPSILON):
+            fiscal_year = (
+                f" for the fiscal year ended {revenue_period_end}"
+                if revenue_period_end else " for the latest fiscal year")
             unavailable_notes.append(
                 f"note: operating margin ({operating_margin:.1%}) is below "
-                f"net margin ({net_margin:.1%}) -- can be legitimate (e.g. "
-                "one-time gains, tax adjustments) but worth double-checking "
-                "against the filing directly")
+                f"net margin ({net_margin:.1%}){fiscal_year} -- can be "
+                "legitimate (e.g. one-time gains, tax adjustments) but worth "
+                "double-checking against the filing directly")
 
         return FundamentalsSnapshot(
             ticker=ticker, revenue_growth_yoy=revenue_growth_yoy,
@@ -773,8 +776,15 @@ _FREE_CASH_FLOW_LABEL = (
     "free cash flow (computed: operating cash flow minus capital expenditures)"
 )
 _AFTER_RETURNS_KEY = "free_cash_flow_after_returns"
-_AFTER_RETURNS_LABEL = "free cash flow after buybacks and dividends"
 _RETURN_KEYS = ("share_repurchases", "dividends_paid")
+_RETURN_NAMES = {
+    "share_repurchases": "buybacks",
+    "dividends_paid": "dividends"
+}
+_RETURN_LABELS = {
+    "share_repurchases": "share repurchases",
+    "dividends_paid": "dividends paid"
+}
 _CASH_FLOW_GROUPS: tuple[_XbrlGroup, ...] = (
     (
         _OCF_KEY, False,
@@ -788,16 +798,19 @@ _CASH_FLOW_GROUPS: tuple[_XbrlGroup, ...] = (
     (
         "share_repurchases", False,
         (("PaymentsForRepurchaseOfCommonStock", "share repurchases"), )), (
-            "dividends_paid",
-            False, (("PaymentsOfDividendsCommonStock", "dividends paid"),
-                    ("PaymentsOfDividends", "dividends paid"))),
+            "dividends_paid", False,
+            (("PaymentsOfDividendsCommonStock", "dividends paid"),
+             ("PaymentsOfDividends", "dividends paid"),
+             ("PaymentsOfOrdinaryDividends", "dividends paid"))),
     (
         "long_term_debt_issued", False,
         (("ProceedsFromIssuanceOfLongTermDebt", "long-term debt issued"),
-         ("ProceedsFromIssuanceOfDebt", "debt issued"))), (
-             "long_term_debt_repaid", False,
-             (("RepaymentsOfLongTermDebt", "long-term debt repaid"),
-              ("RepaymentsOfDebt", "debt repaid"))),
+         ("ProceedsFromIssuanceOfDebt", "debt issued"),
+         ("ProceedsFromDebtNetOfIssuanceCosts", "debt issued (proceeds "
+          "after issuance costs, before repayments)"))), (
+              "long_term_debt_repaid", False,
+              (("RepaymentsOfLongTermDebt", "long-term debt repaid"),
+               ("RepaymentsOfDebt", "debt repaid"))),
     (
         "net_change_in_cash", True, ((
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
@@ -963,13 +976,17 @@ def _with_after_returns(items: list[XbrlItem]) -> tuple[XbrlItem, ...]:
     if current is None and prior is None:
         return tuple(items)
     minus = " minus ".join(r.label for r in returns)
+    after = " and ".join(_RETURN_NAMES[r.key] for r in returns)
+    missing = "".join(
+        f", no {_RETURN_LABELS[key]} line in the data" for key in _RETURN_KEYS
+        if key not in by_key)
     items.insert(
         max(items.index(r) for r in returns) + 1,
         XbrlItem(
             key=_AFTER_RETURNS_KEY, label=(
-                f"{_AFTER_RETURNS_LABEL} (computed: free cash flow minus "
-                f"{minus})"), current=current, prior=prior, signed=True,
-            computed=True))
+                f"free cash flow after {after} (computed: free cash flow "
+                f"minus {minus}{missing})"), current=current, prior=prior,
+            signed=True, computed=True))
     return tuple(items)
 
 
