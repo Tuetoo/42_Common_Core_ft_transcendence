@@ -1,0 +1,199 @@
+<!doctype html>
+<!--
+  AlphaMind public status page, served by the gateway at
+  /status (infra/gateway/nginx.conf). Self-contained: no external
+  resources, no inline event handlers or style attributes.
+
+  The gateway sends a Content-Security-Policy for this page that allows
+  exactly the <style> and <script> blocks below by SHA-256 hash. After
+  editing either block, recompute both hashes and update the
+  $content_security_policy map in nginx.conf:
+
+    python3 infra/gateway/csp_hashes.py --write
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaMind Status</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6675;
+  --border: #dde1e7; --ok: #1f8a4c; --down: #c62828; --unknown: #8a6d00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --card: #1b2029; --text: #e6e9ef; --muted: #9aa3b2;
+    --border: #2c3340; --ok: #4cc27f; --down: #ff6b6b; --unknown: #e0b640;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+.overall {
+  border: 1px solid var(--border); background: var(--card); border-radius: 10px;
+  padding: 16px 20px; margin-bottom: 20px; font-weight: 600; font-size: 17px;
+  display: flex; align-items: center; gap: 10px;
+}
+.card {
+  border: 1px solid var(--border); background: var(--card); border-radius: 10px;
+  padding: 14px 20px; margin-bottom: 12px;
+}
+.row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.name { font-weight: 600; }
+.deps { list-style: none; margin: 10px 0 0; padding: 0; }
+.deps li {
+  display: flex; justify-content: space-between; padding: 4px 0;
+  border-top: 1px solid var(--border); font-size: 14px;
+}
+.deps li:first-child { border-top: none; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.ok .dot, .dot.ok { background: var(--ok); }
+.down .dot, .dot.down { background: var(--down); }
+.unknown .dot, .dot.unknown { background: var(--unknown); }
+.state { font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+.state.ok { color: var(--ok); }
+.state.down { color: var(--down); }
+.state.unknown { color: var(--unknown); }
+.err { color: var(--muted); font-size: 13px; margin-top: 6px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AlphaMind status</h1>
+  <p class="sub" id="updated">Checking...</p>
+  <div class="overall unknown" id="overall"><span class="dot"></span><span id="overall-text">Checking all services</span></div>
+  <div id="services"></div>
+  <footer>Refreshes every 15 seconds. Data from /health/auth, /health/core and /health/ai.</footer>
+</main>
+<script>
+(function () {
+  "use strict";
+  var SERVICES = [
+    { key: "auth", label: "Auth service", url: "/health/auth" },
+    { key: "core", label: "Core service", url: "/health/core" },
+    { key: "ai", label: "AI service", url: "/health/ai" }
+  ];
+  var REFRESH_MS = 15000;
+  var TIMEOUT_MS = 8000;
+  var META_KEYS = { service: true, status: true };
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
+  }
+
+  function stateBadge(state, text) {
+    var badge = el("span", "state " + state);
+    badge.appendChild(el("span", "dot " + state));
+    badge.appendChild(document.createTextNode(text));
+    return badge;
+  }
+
+  // A dependency value is usually a boolean; accept a few other shapes
+  // ("ok"/"up" strings, {status: ...} objects) without breaking.
+  function depState(value) {
+    if (value === true) { return "ok"; }
+    if (value === false || value === null) { return "down"; }
+    if (typeof value === "string") {
+      var v = value.toLowerCase();
+      if (v === "ok" || v === "up" || v === "healthy") { return "ok"; }
+      return "down";
+    }
+    if (value && typeof value === "object" && "status" in value) {
+      return depState(value.status);
+    }
+    return "unknown";
+  }
+
+  function check(svc) {
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = setTimeout(function () { if (controller) { controller.abort(); } }, TIMEOUT_MS);
+    var opts = { cache: "no-store", headers: { Accept: "application/json" } };
+    if (controller) { opts.signal = controller.signal; }
+    return fetch(svc.url, opts).then(function (resp) {
+      return resp.json().then(function (body) {
+        return { svc: svc, httpStatus: resp.status, body: body };
+      }, function () {
+        return { svc: svc, httpStatus: resp.status, body: null,
+                 error: "HTTP " + resp.status + " (no JSON body)" };
+      });
+    }, function (err) {
+      return { svc: svc, httpStatus: 0, body: null,
+               error: err && err.name === "AbortError" ? "timed out" : "unreachable" };
+    }).then(function (result) {
+      clearTimeout(timer);
+      return result;
+    });
+  }
+
+  function serviceState(result) {
+    if (!result.body) { return "down"; }
+    var st = result.body.status;
+    if (result.httpStatus === 200 && (st === undefined || st === "ok")) {
+      // Older /health responses have no "status" key: derive it.
+      var deps = Object.keys(result.body).filter(function (k) { return !META_KEYS[k]; });
+      for (var i = 0; i < deps.length; i++) {
+        if (depState(result.body[deps[i]]) === "down") { return "down"; }
+      }
+      return "ok";
+    }
+    return "down";
+  }
+
+  function render(results) {
+    var container = document.getElementById("services");
+    container.textContent = "";
+    var allOk = true;
+    results.forEach(function (result) {
+      var state = serviceState(result);
+      if (state !== "ok") { allOk = false; }
+      var card = el("section", "card");
+      var row = el("div", "row");
+      row.appendChild(el("span", "name", result.svc.label));
+      row.appendChild(stateBadge(state, state === "ok" ? "Operational"
+        : (result.body ? "Degraded" : "Down")));
+      card.appendChild(row);
+      if (result.error) {
+        card.appendChild(el("div", "err", "Health check failed: " + result.error));
+      }
+      if (result.body) {
+        var list = el("ul", "deps");
+        Object.keys(result.body).forEach(function (key) {
+          if (META_KEYS[key]) { return; }
+          var ds = depState(result.body[key]);
+          var li = el("li");
+          li.appendChild(el("span", "", key));
+          li.appendChild(stateBadge(ds, ds === "ok" ? "up" : (ds === "down" ? "down" : "unknown")));
+          list.appendChild(li);
+        });
+        if (list.childNodes.length) { card.appendChild(list); }
+      }
+      container.appendChild(card);
+    });
+    var overall = document.getElementById("overall");
+    overall.className = "overall " + (allOk ? "ok" : "down");
+    document.getElementById("overall-text").textContent =
+      allOk ? "All systems operational" : "Some services are degraded";
+    document.getElementById("updated").textContent =
+      "Last checked " + new Date().toLocaleTimeString();
+  }
+
+  function refresh() {
+    Promise.all(SERVICES.map(check)).then(render);
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

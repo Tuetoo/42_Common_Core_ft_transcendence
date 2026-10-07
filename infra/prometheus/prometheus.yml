@@ -2,6 +2,18 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Alerting rules and where to send firing alerts.
+# The rules file is mounted next to this file by docker-compose.yaml.
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+# Every job carries a `service` label; the Grafana dashboards and the
+# alert rules group by it.
 scrape_configs:
   - job_name: "auth-service"
     metrics_path: /metrics
@@ -23,7 +35,29 @@ scrape_configs:
       - targets: ["ai-service:8000"]
         labels:
           service: ai-service
-  
+
+  # Database and cache exporters (compose services
+  # `postgres-exporter` and `redis-exporter`, no host ports).
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          service: postgres
+
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          service: redis
+
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels:
+          service: alertmanager
+
   - job_name: "prometheus"
     static_configs:
       - targets: ["localhost:9090"]
+        labels:
+          service: prometheus

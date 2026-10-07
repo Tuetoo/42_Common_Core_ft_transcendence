@@ -1,19 +1,95 @@
+# AlphaMind scheduler -- times are in America/New_York (see Dockerfile's TZ),
+# so these stay correct across DST changes automatically.
+#
+# Holidays: cron only knows weekdays (`1-5`); the NYSE
+# calendar (weekends, market holidays such as Thanksgiving, Christmas,
+# July 4th) is checked by the services themselves (shared/market_calendar.py,
+# "today" in America/New_York). On a closed market day market-open,
+# market-close (core-service) and tier-monitoring (ai-service) answer
+# 200 {"skipped": true, "reason": ...} without doing any work, and
+# call-job.sh logs that answer. Early-close days (13:00 close) are treated
+# as normal trading days: the after-close jobs simply run later than
+# needed. review-run, rag-ingest, backup, logs-cleanup, purge-unverified
+# and notification-retention run every day on purpose (see their comments
+# below).
+#
+# Output: every job writes to the container's own
+# stdout/stderr (/proc/1/fd/1, /proc/1/fd/2 -- PID 1 is entrypoint.sh,
+# crond's parent) instead of /var/log/scheduler.log inside the container,
+# so `docker compose logs scheduler` and the `vector` collector
+# (./logs/scheduler/<date>.log) capture it.
 
 # Market open: 9:30 AM ET, Monday-Friday
-30 9 * * 1-5 /scripts/market-open.sh >> /var/log/scheduler.log 2>&1
+30 9 * * 1-5 /scripts/call-job.sh market-open >/proc/1/fd/1 2>/proc/1/fd/2
 
-# Market close: 4:00 PM ET, Monday-Friday
-0 16 * * 1-5 /scripts/market-close.sh >> /var/log/scheduler.log 2>&1
+# Market close: 5:30 PM ET, Monday-Friday.
+# Recomputes every portfolio's NAV snapshot for the day. It runs AFTER
+# tier monitoring (5:00 PM, below), because tier monitoring can execute
+# triggered recommendation tiers into the portfolios' transaction ledger,
+# and those trades must be in the day's snapshot. By 5:30 PM the provider's final end-of-day bar is also
+# settled. Tier monitoring has a 900 s time limit
+# (call-job.sh), so it has finished before this starts.
+30 17 * * 1-5 /scripts/call-job.sh market-close >/proc/1/fd/1 2>/proc/1/fd/2
 
 # Tier monitoring: checks every accepted (or still-acceptable) recommendation
-# tier for a real trigger 5:00 PM ET, Monday-Friday 
-0 17 * * 1-5 /scripts/tier-monitoring.sh >> /var/log/scheduler.log 2>&1
+# tier for a real trigger (today's actual high/low crossing the target price)
+# or expiry (past its window) -- Workflow C phase 2/3 (the tier state
+# machine is described in shared/enums.py). 5:00 PM ET, Monday-Friday only (no new price data
+# on a closed market day, so nothing to check; holidays are skipped by
+# ai-service itself, see the top of this file). One hour after the 4:00 PM
+# market close: the data provider's final EOD bar for the day isn't
+# necessarily available the instant the market closes, so this waits a
+# buffer rather than racing for data that might not be settled yet.
+# market-close (5:30 PM, above) runs after it.
+0 17 * * 1-5 /scripts/call-job.sh tier-monitoring >/proc/1/fd/1 2>/proc/1/fd/2
 
-# Review: 2:00 AM ET
-0 2 * * * /scripts/review-run.sh >> /var/log/scheduler.log 2>&1
+# Review: AI recommendation accuracy, user decision outcomes, and agent
+# metrics rollup (ai-service). Runs once daily rather than tied to market
+# hours -- unlike market-open/close, nothing here is time-sensitive to
+# the trading session itself (it scores recommendations once they are 30
+# days old and user decisions at 7, 30 and 90 days). 2:00 AM ET: after the prior day's
+# market-close processing, well before the next market-open job, on
+# every day of the week (not just weekdays) since decision/recommendation
+# aging doesn't pause on weekends the way market data does.
+0 2 * * * /scripts/call-job.sh review-run >/proc/1/fd/1 2>/proc/1/fd/2
 
-# RAG auto-ingestion: 3:00 AM ET: after review-run, every day 
-0 3 * * * /scripts/rag-ingest.sh >> /var/log/scheduler.log 2>&1
+# RAG auto-ingestion: checks every tracked ticker (portfolio holdings +
+# watchlists) for new SEC filings AND recent news, adding both to the RAG
+# corpus automatically. See ai/workflows/auto_ingestion_workflow.py for
+# exactly what's covered (filing/SEC EDGAR and news/NewsAPI; the same
+# endpoint also runs the macro_research auto-ingestion). 3:00 AM ET: after review-run,
+# every day (SEC EDGAR itself has no concept of "market closed" -- filings
+# get posted any day, and checking on a day with nothing new is a harmless
+# no-op, not a bug, same reasoning as market-open/close's holiday-handling
+# note at the top).
+0 3 * * * /scripts/call-job.sh rag-ingest >/proc/1/fd/1 2>/proc/1/fd/2
 
-# Log retention 4:00 AM ET daily
-0 4 * * * /scripts/logs-cleanup.sh >> /var/log/scheduler.log 2>&1
+# Log retention: deletes ./logs/<service>/*.log files (written
+# by the `vector` service) older than 14 days, plus empty directories.
+# 4:00 AM ET daily: after rag-ingest, long before market-open; the date
+# boundary of the log files is also America/New_York midnight, so every
+# file it considers is closed. Needs ./logs mounted at /logs (see
+# docker-compose.yaml's scheduler service).
+0 4 * * * /scripts/logs-cleanup.sh >/proc/1/fd/1 2>/proc/1/fd/2
+
+# Backups: Postgres dump + Qdrant snapshots + a copy of every object in
+# the object storage (SeaweedFS, through its S3 API) + avatars into
+# /backups/<YYYY-MM-DD_HHMM>/ (host ./backups), then prunes backups older
+# than BACKUP_RETENTION_DAYS (default 7). 2:30 AM ET daily: between
+# review-run (2:00) and rag-ingest (3:00), the quietest window -- no
+# market job and no ingestion writes documents at that time. See
+# docs/DISASTER_RECOVERY.md.
+30 2 * * * /scripts/backup.sh >/proc/1/fd/1 2>/proc/1/fd/2
+
+# Unverified account purge (auth-service): deletes, through the same path
+# as an admin deletion (anonymized row, user.deleted event), every account
+# that registered more than UNVERIFIED_ACCOUNT_RETENTION_DAYS (default 7)
+# days ago, never verified its email, never signed in and has no OAuth
+# link. 04:10 AM ET daily: after the backup, so a purged account is still
+# in the previous night's backup.
+10 4 * * * /scripts/call-job.sh purge-unverified >/proc/1/fd/1 2>/proc/1/fd/2
+
+# Notification retention (core-service): deletes READ notifications
+# created more than NOTIFICATION_READ_RETENTION_DAYS (default 90) days
+# ago; unread ones are kept whatever their age. 04:20 AM ET daily.
+20 4 * * * /scripts/call-job.sh notification-retention >/proc/1/fd/1 2>/proc/1/fd/2
