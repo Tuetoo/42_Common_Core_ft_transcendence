@@ -511,7 +511,13 @@ the Judge to leave debate-process text out.
 `judge_node` logs `judge_node.delayed_retry`, waits
 `JUDGE_DELAYED_RETRY_SECONDS` (120 s; skipped when a strong-chain model is
 free now, logged `delay_seconds=0` and `free_model`) and tries once more,
-at most once per analysis (`judge_delayed_retry_used`).
+at most once per analysis (`judge_delayed_retry_used`). A model counts as
+free as soon as its cooldown ends, even if it would fail again at once;
+so when that immediate retry fails for availability too, it does not use
+up the retry: `judge_node` logs a second `judge_node.delayed_retry` with
+`after_immediate_retry=true`, waits the full delay and tries one last
+time (on 2026-10-07 an AMZN analysis failed because the immediate retry
+was its only one).
 
 **Late side repair.** Before each Judge call (the first one and the one
 after the delayed-retry wait), when a latest side is missing for capacity

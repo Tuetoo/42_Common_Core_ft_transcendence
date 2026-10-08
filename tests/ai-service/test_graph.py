@@ -658,6 +658,24 @@ class TestJudgeNode:
         assert retry["delay_seconds"] == 0.0
         assert retry["free_model"] == "gemini-3.5-flash"
 
+        full = judge_module.settings.JUDGE_DELAYED_RETRY_SECONDS
+        for failures, failed, calls in (
+                (2, False, 3), (3, True, 3)):
+            router, sleeps, state = _judge_with_failures(
+                monkeypatch,
+                [LLMServerOverloadedError("503") for _ in range(failures)])
+            _set_free_model(monkeypatch, "gemini-3.7-flash")
+            with capture_logs() as logs:
+                update = await judge_node(state)
+            assert update["debate"].verdicts[0].judge_failed is failed
+            assert router.calls == calls and sleeps.delays == [full]
+            retries = [
+                e for e in logs if e["event"] == "judge_node.delayed_retry"
+            ]
+            assert [e["delay_seconds"] for e in retries] == [0.0, full]
+            assert retries[1]["after_immediate_retry"] is True
+            assert update["judge_delayed_retry_used"] is True
+
         router, sleeps, state = _judge_with_failures(
             monkeypatch, [LLMServerOverloadedError("503")])
         state = state.model_copy(update={"judge_delayed_retry_used": True})
