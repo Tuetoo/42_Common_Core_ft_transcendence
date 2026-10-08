@@ -433,6 +433,12 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
                         state.debate, DebateState(arguments=repaired))
                 })
 
+    async def _judge_after(delay: float) -> JudgeVerdict:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await _repair_before_judge()
+        return await JudgeAgent().assess_round(judge_state)
+
     try:
         await _repair_before_judge()
         try:
@@ -447,10 +453,21 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
                 "judge_node.delayed_retry", error=str(first_exc),
                 failure_kind=_failure_kind_of(first_exc), delay_seconds=delay,
                 free_model=free_model)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            await _repair_before_judge()
-            verdict = await JudgeAgent().assess_round(judge_state)
+            try:
+                verdict = await _judge_after(delay)
+            except LLMRateLimitError as immediate_exc:
+                # A model that only looked free (its cooldown had just
+                # ended) answered nothing: the immediate retry does not use
+                # up the delayed retry, which now waits the full delay.
+                full_delay = settings.JUDGE_DELAYED_RETRY_SECONDS
+                if delay > 0 or full_delay <= 0:
+                    raise
+                logger.warning(
+                    "judge_node.delayed_retry", error=str(immediate_exc),
+                    failure_kind=_failure_kind_of(immediate_exc),
+                    delay_seconds=full_delay, free_model=None,
+                    after_immediate_retry=True)
+                verdict = await _judge_after(full_delay)
     except Exception as exc:
         logger.warning(
             "judge_node.failed", error=str(exc),
