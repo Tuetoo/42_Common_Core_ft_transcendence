@@ -144,9 +144,7 @@ def _keys() -> list[tuple[str, str]]:
 _HEALTH_MODEL_SETTINGS = (
     "LLM_GOOGLE_MODEL_CHEAP", "LLM_GOOGLE_MODEL_CHEAP_FALLBACK",
     "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY",
-    "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK",
-    "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2",
-    "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3")
+    "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK")
 
 
 async def _ping(client: Any, model: str) -> str | None:
@@ -241,12 +239,12 @@ async def _one(client: Any, model: str, config: Any,
     }
 
 
-DESCRIPTION = "Owner-run probe: how long does gemini-3.7-flash take on a"
+DESCRIPTION = "Owner-run probe: Gemini latency on Judge-sized requests"
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument("--model", default="gemini-3.7-flash")
+    parser.add_argument("--model", default=None)
     parser.add_argument("--per-key", type=int, default=2)
     parser.add_argument("--cap", type=float, default=120.0)
     parser.add_argument(
@@ -260,24 +258,27 @@ async def main() -> None:
 
     from ai.agents.judge import _build_system_prompt
     from ai.llm.google_provider import _thinking_config_for
+    from config import settings
     from google import genai
     from google.genai import types
+
+    model = args.model or settings.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY
 
     config = types.GenerateContentConfig(
         system_instruction=_build_system_prompt(False, False,
                                                 False), temperature=0.2,
         max_output_tokens=1024, response_mime_type="application/json",
-        thinking_config=_thinking_config_for(args.model))
+        thinking_config=_thinking_config_for(model))
     keys = _keys()
     total = len(keys) * max(1, args.per_key)
     print(
-        f"{args.model}: {total} request(s) over {len(keys)} key(s), "
+        f"{model}: {total} request(s) over {len(keys)} key(s), "
         f"cap {args.cap:.0f}s\n")
     results: list[dict[str, Any]] = []
     for _round in range(max(1, args.per_key)):
         for slot, key in keys:
             result = await _one(
-                genai.Client(api_key=key), args.model, config, args.cap)
+                genai.Client(api_key=key), model, config, args.cap)
             result["key"] = slot
             results.append(result)
             extra = ""

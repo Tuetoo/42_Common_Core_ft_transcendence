@@ -464,7 +464,8 @@ class AnalysisState(BaseModel):
     reflection_history: Annotated[list[ReflectionVerdict],
                                   append_list] = (Field(default_factory=list))
     reflection_retry_count: int = 0
-    judge_delayed_retry_used: bool = False
+    judge_retry_attempts: int = 0
+    judge_retry_seconds: float = 0.0
     debate_side_repair_used: bool = False
     debate_late_side_repair_used: bool = False
     pending_retry_agents: list[AgentRole] = Field(

@@ -212,9 +212,9 @@ backup-check:
 restore-drill:
 	bash scripts/backups.sh drill $(BACKUP)
 
-# make probe [MODEL=gemini-3.7-flash] [ARGS="--per-key 1"]
+# make probe [MODEL=gemini-3.6-flash] [ARGS="--per-key 1"]
 probe:
-	bash scripts/probe.sh $(or $(MODEL),gemini-3.7-flash) $(ARGS)
+	bash scripts/probe.sh $(MODEL) $(ARGS)
 
 smoke:
 	bash scripts/smoke.sh $(ARGS)

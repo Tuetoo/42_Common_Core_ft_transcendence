@@ -32,8 +32,7 @@ from ai.llm.base import (ConcurrencyGate, LLMConfigError,
                          LLMRequestError, LLMRequestTimeoutError, LLMResponse,
                          LLMServerOverloadedError, LLMTier, LLMUsage,
                          RequestPacer, released_while_waiting, request_pacer)
-from ai.llm.router import (LLMRouter, _highest_rescue_candidate,
-                           router_retry_limit)
+from ai.llm.router import LLMRouter, router_retry_limit
 from ai.providers.base import PriceQuote
 from ai.recommendation.position_sizing import (BudgetBlockedNote,
                                                _validated_sizing,
@@ -242,20 +241,8 @@ def _set_google_highest_accuracy_chain(monkeypatch) -> None:
     _set_settings(
         monkeypatch, {
             "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY": "gemini-3.8-flash",
-            "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK": "gemini-3.7-flash",
-            "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2": "",
-            "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3": ""
+            "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK": "gemini-3.6-flash"
         })
-
-
-def _chain_with_recorded_sleep(monkeypatch) -> _RecordingSleep:
-    prefix = "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY"
-    for suffix, model in (("", "m1"), ("_FALLBACK", "m2"),
-                          ("_FALLBACK_2", "m3"), ("_FALLBACK_3", "m4")):
-        monkeypatch.setattr(config.settings, prefix + suffix, model)
-    sleep = _RecordingSleep()
-    monkeypatch.setattr("ai.llm.router.asyncio.sleep", sleep)
-    return sleep
 
 
 def _quota_api_error(kind: str):
@@ -437,11 +424,6 @@ def _clean(text: str = '{"finish_answer": "ok"}') -> Any:
 async def _complete_lite(max_tokens: int = 4096) -> LLMResponse:
     return await google_module.GoogleAdapter().complete(
         _msgs(), model=_LITE, max_tokens=max_tokens)
-
-
-def _answered(model: str, seconds_ago: float) -> None:
-    request_pacer.set_stamp(("google", "last_success", model),
-                            time.monotonic() - seconds_ago)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -842,20 +824,19 @@ class TestGoogleAdapter:
         assert not await google_module.google_model_confirmed_overloaded(
             "gemini-3.8-flash")
 
-    async def _terminal_flag_uses_the_terminal_timeout(self, monkeypatch):
+    async def _fallback_flag_uses_the_fallback_timeout(self, monkeypatch):
         monkeypatch.setattr(
             config.settings, "LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS",
             3600.0)
         monkeypatch.setattr(
             config.settings,
-            "LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS", 0.05)
+            "LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS", 0.05)
         hanging_pool = _ScriptedOutcomePool(["primary"], ["hang"])
         monkeypatch.setattr(google_module, "_pool", hanging_pool)
         with pytest.raises(LLMRequestTimeoutError):
             await asyncio.wait_for(
                 google_module.GoogleAdapter().complete(
-                    _msgs(), model="gemini-3.5-flash",
-                    terminal_chain_model=True), 5)
+                    _msgs(), model="gemini-3.6-flash", fallback=True), 5)
 
     async def _server_error_wait_escalates_and_success_resets(
             self, monkeypatch):
@@ -863,20 +844,16 @@ class TestGoogleAdapter:
         monkeypatch.setattr(
             google_module, "_pool", _ScriptedOutcomePool(["primary"], ["503"]))
         waits = []
-        for expected in (1, 2, 3, 4):
+        for _ in range(4):
             with pytest.raises(LLMServerOverloadedError):
                 await google_module.GoogleAdapter().complete(
                     _msgs(), model=model)
-            assert (
-                google_module.google_model_server_error_streak(model) ==
-                expected)
             waits.append(await google_module.google_server_error_wait(model))
         for got, cap in zip(waits, (20.0, 60.0, 180.0, 300.0), strict=True):
             assert cap - 5.0 < got <= cap
         monkeypatch.setattr(
             google_module, "_pool", _ScriptedOutcomePool(["primary"], ["ok"]))
         await google_module.GoogleAdapter().complete(_msgs(), model=model)
-        assert google_module.google_model_server_error_streak(model) == 0
         assert not await google_module.google_model_confirmed_overloaded(model)
         monkeypatch.setattr(
             google_module, "_pool", _ScriptedOutcomePool(["primary"], ["503"]))
@@ -921,7 +898,7 @@ class TestGoogleAdapter:
         await _run_steps(
             self._wait_beyond_one_interval_fails_fast_without_sleeping,
             self._zero_min_interval_pool_is_never_exhausted,
-            self._terminal_flag_uses_the_terminal_timeout,
+            self._fallback_flag_uses_the_fallback_timeout,
             self._a_rate_limit_mark_during_the_pacing_wait_still_skips)
 
 
@@ -1035,8 +1012,30 @@ class TestGoogleServerErrors:
         assert await google_module.google_model_confirmed_overloaded(
             "gemini-3.8-flash")
 
+    async def _flash_fallback_tries_three_keys_on_503(self, monkeypatch):
+        labels = ["primary", "key_2", "key_3", "key_4"]
+        pool = _ScriptedOutcomePool(labels, ["503", "503", "ok"])
+        monkeypatch.setattr(google_module, "_pool", pool)
+        response = await google_module.GoogleAdapter().complete(
+            _msgs(), model="gemini-3.6-flash", fallback=True)
+        assert response.content == "ok"
+        assert len(pool.used) == 3
+        pool = _ScriptedOutcomePool(labels, ["503"])
+        monkeypatch.setattr(google_module, "_pool", pool)
+        with pytest.raises(LLMServerOverloadedError):
+            await google_module.GoogleAdapter().complete(
+                _msgs(), model="gemini-3.6-flash", fallback=True)
+        assert len(pool.used) == 3
+        pool = _ScriptedOutcomePool(labels, ["503"])
+        monkeypatch.setattr(google_module, "_pool", pool)
+        with pytest.raises(LLMServerOverloadedError):
+            await google_module.GoogleAdapter().complete(
+                _msgs(), model="gemini-3.8-flash")
+        assert len(pool.used) == 1
+
     async def test_server_overload_handling(self):
         await _run_steps(
+            self._flash_fallback_tries_three_keys_on_503,
             self._lite_503_gives_up_after_three_keys_without_cooldown,
             self._lite_pool_smaller_than_budget_raises_server_overloaded,
             self._503_then_429_pool_exhaustion_is_a_plain_rate_limit,
@@ -1120,8 +1119,22 @@ class TestRunawayThinkingRetry:
             await _complete_lite()
         assert gen.thinking_configs == []
 
+    async def _caller_thinking_budget_on_the_first_call(self, monkeypatch):
+        gen = _ThinkingRecordingGenerate(
+            [_clean(), _invalid_argument_error(400),
+             _clean(), _clean()])
+        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        adapter = google_module.GoogleAdapter()
+        await adapter.complete(_msgs(), model=_LITE, thinking_budget=512)
+        await adapter.complete(_msgs(), model=_LITE, thinking_budget=512)
+        await adapter.complete(_msgs(), model=_LITE, thinking_budget=512)
+        budgets = [c.thinking_budget for c in gen.thinking_configs]
+        assert budgets == [512, 512, None, None]
+        assert _LITE in google_module._THINKING_BUDGET_REJECTED_MODELS
+
     async def test_runaway_thinking_retry(self):
         await _run_steps(
+            self._caller_thinking_budget_on_the_first_call,
             self._runaway_is_retried_once_with_a_thinking_budget,
             self._a_400_returns_the_original_and_disables_the_model,
             self._other_retry_failures_return_the_original,
@@ -1129,43 +1142,31 @@ class TestRunawayThinkingRetry:
 
 
 @pytest.mark.usefixtures("unpaced_llm")
-class TestRouterFallbackChain:
+class TestRouterFallback:
 
-    async def _skips_known_exhausted_google_models(self, monkeypatch):
-        cases = {
-            "cascades-past-two-exhausted": (
-                "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.6-flash"),
-            "final-entry-always-attempted": ("", "", "gemini-3.7-flash")
-        }
-        for case_id, (fallback_2, fallback_3, expected) in cases.items():
-            request_pacer.reset()
-            await self._skip_exhausted_case(
-                monkeypatch, case_id, fallback_2, fallback_3, expected)
-
-    async def _skip_exhausted_case(
-            self, monkeypatch, case_id, fallback_2, fallback_3, expected):
-        _set_settings(
-            monkeypatch, {
-                "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY": "gemini-3.8-flash",
-                "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK": (
-                    "gemini-3.7-flash"),
-                "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2": fallback_2,
-                "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3": fallback_3,
-                "LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS": 12.0
-            })
+    async def _exhausted_primary_goes_straight_to_the_fallback(
+            self, monkeypatch):
+        _set_google_highest_accuracy_chain(monkeypatch)
+        monkeypatch.setattr(
+            config.settings,
+            "LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS", 12.0)
         monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
         fake_pool = _FakeGooglePool(
             {"primary": _FakeGoogleClient(_FakeGoogleGenerateContent())})
         monkeypatch.setattr(google_module, "_pool", fake_pool)
         far_future = time.monotonic() + _FAR_FUTURE_DAY_SCALE_SECONDS
-        for exhausted_model in ("gemini-3.8-flash", "gemini-3.7-flash"):
-            await request_pacer.mark_unavailable_until(
-                ("google", exhausted_model, "primary"), far_future)
-        adapter = _FakeAdapter("google", fail_times=0)
-        resp = await _router_with(google=adapter).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=1)
-        assert resp.content == f"response from google/{expected}", case_id
-        assert adapter.calls == 1, case_id
+        for exhausted in (("gemini-3.8-flash", ),
+                          ("gemini-3.8-flash", "gemini-3.6-flash")):
+            request_pacer.reset()
+            for model in exhausted:
+                await request_pacer.mark_unavailable_until(
+                    ("google", model, "primary"), far_future)
+            adapter = _FakeAdapter("google")
+            resp = await _router_with(google=adapter).complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
+                retries=1)
+            assert resp.content == "response from google/gemini-3.6-flash"
+            assert adapter.calls == 1
 
     async def _overloaded_skip_is_reported_as_server_overloaded(
             self, monkeypatch):
@@ -1175,15 +1176,12 @@ class TestRouterFallbackChain:
             ("google", "server_error", "gemini-3.8-flash"),
             time.monotonic() + 20.0)
         adapter = _FailingModelsAdapter(
-            failing={
-                "gemini-3.7-flash": LLMRateLimitError,
-                "gemini-3.8-flash": LLMRateLimitError
-            })
+            failing={"gemini-3.6-flash": LLMRateLimitError})
         with pytest.raises(LLMRateLimitError) as exc_info:
             await _router_with(google=adapter).complete(
                 LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
                 retries=1)
-        assert adapter.calls == ["gemini-3.7-flash", "gemini-3.8-flash"]
+        assert adapter.calls == ["gemini-3.6-flash"]
         assert isinstance(exc_info.value.__cause__, LLMServerOverloadedError)
         assert "skipped 'gemini-3.8-flash'" in str(exc_info.value.__cause__)
 
@@ -1210,101 +1208,77 @@ class TestRouterFallbackChain:
                 LLMTier.CHEAP, _msgs(), provider="google",
                 response_format="json_object")
 
-    async def _ignoring_cooldown_tries_each_model_once_on_503(
-            self, monkeypatch):
-        _chain_with_recorded_sleep(monkeypatch)
-        for m in ("m1", "m2", "m3", "m4"):
-            await request_pacer.mark_unavailable_until(
-                ("google", "server_error", m),
-                time.monotonic() + 20.0)
-        adapter = _PerModelAdapter({
-            "m1": ["503"],
-            "m2": ["503", "ok"],
-            "m3": ["503"],
-            "m4": ["503"]
-        })
+    async def _fallback_call_has_the_flag_and_no_schema(self, monkeypatch):
+        _chain(monkeypatch)
+        adapter = _PerModelAdapter({"m1": ["503"], "m2": ["ok"]})
+        schema = {"type": "object"}
         resp = await LLMRouter(providers={
             "google": adapter
         }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4,
-            ignore_server_error_cooldown=True,
-            terminal_server_error_retry_delay=10.0)
-        assert resp.content == "answer from m2"
-        assert adapter.models == ["m1", "m2", "m3", "m4", "m1", "m2"]
-
-    async def _terminal_timeout_is_not_retried(self, monkeypatch):
-        sleep = _chain_with_recorded_sleep(monkeypatch)
-        adapter = _FormatRecordingAdapter({
-            "m1": "timeout",
-            "m2": "503",
-            "m3": "503",
-            "m4": "timeout"
-        })
-        router = LLMRouter(providers={"google": adapter})
-        with pytest.raises(LLMRequestTimeoutError):
-            await router.complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=0, terminal_server_error_retry_delay=10.0,
-                ignore_server_error_cooldown=True)
-        called = [m for m, _ in adapter.calls]
-        assert called.count("m4") == 1
-        assert called == ["m1", "m2", "m3", "m4", "m1"]
-        assert 10.0 not in sleep.delays
-
-    async def _fallback_model_gets_json_mode_but_no_schema(self, monkeypatch):
-        _chain_with_recorded_sleep(monkeypatch)
-        adapter = _FormatRecordingAdapter({
-            "m1": "503",
-            "m2": "ok",
-            "m3": "ok",
-            "m4": "ok"
-        })
-        router = LLMRouter(providers={"google": adapter})
-        schema = {"type": "object"}
-        resp = await router.complete(
             LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=0,
-            response_format="json_object", response_schema=schema,
-            ignore_server_error_cooldown=True)
-        assert resp.model == "m2"
-        assert adapter.calls[0] == (
-            "m1", {
-                "response_format": "json_object",
-                "response_schema": schema
-            })
-        assert adapter.calls[1] == (
-            "m2", {
-                "response_format": "json_object",
-                "response_schema": None
-            })
+            response_format="json_object", response_schema=schema)
+        assert resp.content == "answer from m2"
+        assert adapter.calls == [("m1", {}), ("m2", {"fallback": True})]
 
-    async def _terminal_primary_keeps_a_larger_caller_budget(
-            self, monkeypatch):
-        _chain(monkeypatch, ("m1", "", "", ""))
-        adapter = _PerModelAdapter({"m1": ["ok"]})
+    async def _thinking_budget_goes_to_both_google_calls(self, monkeypatch):
+        _set_google_cheap_chain(monkeypatch)
+        monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
+        adapter = _PerModelAdapter({
+            "gemini-3.5-flash-lite": ["503"],
+            "gemini-3.1-flash-lite": ["ok"]
+        })
         await LLMRouter(providers={
             "google": adapter
         }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=0,
-            primary_extra_server_error_keys=3)
-        assert adapter.calls == [(
-            "m1", {
-                "terminal_chain_model": True,
-                "extra_server_error_retries": 3
-            })]
+            LLMTier.CHEAP, _msgs(), provider="google", retries=0,
+            thinking_budget=512)
+        assert [extra.get("thinking_budget")
+                for _, extra in adapter.calls] == [512, 512]
+
+    async def _a_failed_fallback_is_raised_without_more_calls(
+            self, monkeypatch):
+        _chain(monkeypatch)
+        adapter = _FormatRecordingAdapter({"m1": "timeout", "m2": "timeout"})
+        with pytest.raises(LLMRequestTimeoutError):
+            await LLMRouter(providers={
+                "google": adapter
+            }).complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
+                retries=0)
+        assert [m for m, _ in adapter.calls] == ["m1", "m2"]
+
+    async def _day_exhausted_fallback_is_skipped(self, monkeypatch):
+        _chain(monkeypatch)
+
+        async def _exhausted(model: str) -> bool:
+            return model == "m2"
+
+        monkeypatch.setattr(
+            router_module, "google_model_pool_exhausted", _exhausted)
+        adapter = _PerModelAdapter({"m1": ["503"], "m2": ["ok"]})
+        with pytest.raises(LLMRateLimitError) as exc_info:
+            await LLMRouter(providers={
+                "google": adapter
+            }).complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
+                retries=0)
+        assert adapter.models == ["m1"]
+        assert "skipped 'm2'" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, LLMServerOverloadedError)
 
     async def test_skips_and_non_english_answers(self):
         await _run_steps(
-            self._skips_known_exhausted_google_models,
+            self._exhausted_primary_goes_straight_to_the_fallback,
             self._overloaded_skip_is_reported_as_server_overloaded,
             self._non_english_fallback_response_raises,
             self._json_escaped_non_english_is_rejected)
 
-    async def test_terminal_retries_and_formats(self):
+    async def test_fallback_calls(self):
         await _run_steps(
-            self._ignoring_cooldown_tries_each_model_once_on_503,
-            self._terminal_timeout_is_not_retried,
-            self._fallback_model_gets_json_mode_but_no_schema,
-            self._terminal_primary_keeps_a_larger_caller_budget)
+            self._fallback_call_has_the_flag_and_no_schema,
+            self._thinking_budget_goes_to_both_google_calls,
+            self._a_failed_fallback_is_raised_without_more_calls,
+            self._day_exhausted_fallback_is_skipped)
 
 
 def test_router_retry_limit():
@@ -1447,76 +1421,6 @@ class TestRouterLiteCooldownRetry:
             self._also_without_a_fallback_model,
             self._a_second_failure_is_raised,
             self._not_made_when_it_cannot_help_or_is_off)
-
-
-@pytest.mark.usefixtures("fresh_pacer")
-class TestHighestAccuracyRescue:
-
-    async def _exhausted_and_timed_out_models_are_left_out(self, monkeypatch):
-
-        async def _exhausted(model: str) -> bool:
-            return model == "m1"
-
-        async def _timed_out(model: str) -> bool:
-            return model == "m2"
-
-        monkeypatch.setattr(
-            router_module, "google_model_pool_exhausted", _exhausted)
-        monkeypatch.setattr(
-            router_module, "google_model_recently_timed_out", _timed_out)
-        _answered("m1", 1)
-        _answered("m2", 2)
-        assert (
-            await _highest_rescue_candidate(["m1", "m2", "m3", "m4"],
-                                            "m4") == "m3")
-        assert await _highest_rescue_candidate(["m1", "m2"], None) is None
-
-    async def _goes_to_the_model_that_answered_most_recently(
-            self, monkeypatch):
-        _chain(monkeypatch)
-        _answered("m2", 30)
-        _answered("m4", 600)
-        adapter = _PerModelAdapter({
-            "m1": ["503"],
-            "m2": ["503", "ok"],
-            "m3": ["503"],
-            "m4": ["503"]
-        })
-        resp = await LLMRouter(providers={
-            "google": adapter
-        }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=0)
-        assert resp.content == "answer from m2"
-        assert [m for m, _ in adapter.calls] == ["m1", "m2", "m3", "m4", "m2"]
-        assert adapter.calls[-1][1] == {"terminal_chain_model": True}
-
-    async def _day_exhausted_terminal_is_skipped_for_a_model_with_quota(
-            self, monkeypatch):
-        _chain(monkeypatch)
-
-        async def _exhausted(model: str) -> bool:
-            return model == "m4"
-
-        monkeypatch.setattr(
-            router_module, "google_model_pool_exhausted", _exhausted)
-        adapter = _PerModelAdapter({
-            "m1": ["503", "ok"],
-            "m2": ["503"],
-            "m3": ["503"],
-            "m4": ["ok"]
-        })
-        resp = await LLMRouter(providers={
-            "google": adapter
-        }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=0)
-        assert resp.content == "answer from m1"
-        assert [m for m, _ in adapter.calls] == ["m1", "m2", "m3", "m1"]
-
-    async def test_rescue_model_choice(self):
-        await _run_steps(
-            self._exhausted_and_timed_out_models_are_left_out,
-            self._goes_to_the_model_that_answered_most_recently,
-            self._day_exhausted_terminal_is_skipped_for_a_model_with_quota)
 
 
 class _TierRouter:

@@ -41,9 +41,9 @@ _MAX_MALFORMED_RETRIES = 2
 
 _MAX_QUOTA_EXCEEDED_RETRIES = 2
 
-_MAX_SERVER_ERROR_RETRIES = 0
+_FLASH_PRIMARY_SERVER_ERROR_RETRIES = 0
 
-_MAX_SERVER_ERROR_RETRIES_LITE = 2
+_SERVER_ERROR_RETRIES = 2
 
 _INVALID_REQUEST_CODES = frozenset({400, 404})
 
@@ -52,10 +52,10 @@ def google_is_lite_model(model: str) -> bool:
     return "lite" in model.lower()
 
 
-def _max_server_error_retries_for(model: str) -> int:
-    return (
-        _MAX_SERVER_ERROR_RETRIES_LITE
-        if google_is_lite_model(model) else _MAX_SERVER_ERROR_RETRIES)
+def _max_server_error_retries_for(model: str, *, fallback: bool) -> int:
+    if fallback or google_is_lite_model(model):
+        return _SERVER_ERROR_RETRIES
+    return _FLASH_PRIMARY_SERVER_ERROR_RETRIES
 
 
 _THINKING_DISABLED = types.ThinkingConfig(thinking_budget=0)
@@ -191,10 +191,6 @@ def _server_error_streak_key(model: str) -> tuple[str, str, str]:
     return ("google", "server_error_streak", model)
 
 
-def google_model_server_error_streak(model: str) -> int:
-    return request_pacer.counter(_server_error_streak_key(model))
-
-
 def _server_error_cooldown_for_streak(streak: int) -> float:
     base = settings.LLM_GOOGLE_SERVER_ERROR_COOLDOWN_SECONDS
     cap = max(base, settings.LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS)
@@ -212,14 +208,6 @@ async def _record_server_error_give_up(model: str) -> tuple[int, float]:
 
 def _reset_server_error_streak(model: str) -> int:
     return request_pacer.reset_counter(_server_error_streak_key(model))
-
-
-def _last_success_key(model: str) -> tuple[str, str, str]:
-    return ("google", "last_success", model)
-
-
-def google_model_last_success_at(model: str) -> float | None:
-    return request_pacer.stamp(_last_success_key(model))
 
 
 def _timeout_marker(model: str) -> tuple[str, str, str]:
@@ -240,8 +228,6 @@ async def _record_timeout_cooldown(model: str, key_label: str) -> float:
 
 async def _record_success(model: str, key_label: str) -> None:
     old_streak = _reset_server_error_streak(model)
-    if not google_is_lite_model(model):
-        request_pacer.set_stamp(_last_success_key(model), time.monotonic())
     if await request_pacer.clear(("google", "server_error", model)):
         logger.info(
             "google.server_error_cooldown_cleared_on_success", model=model,
@@ -260,14 +246,11 @@ async def google_model_recently_timed_out(model: str) -> bool:
     return await google_model_timeout_wait(model) > 0.0
 
 
-def _default_request_timeout(model: str, *, terminal: bool = False) -> float:
+def _default_request_timeout(model: str, *, fallback: bool = False) -> float:
     if google_is_lite_model(model):
         return REQUEST_TIMEOUT_SECONDS
-    if terminal:
-        return settings.LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS
-    per_model = settings.LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS.get(model)
-    if per_model is not None:
-        return per_model
+    if fallback:
+        return settings.LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS
     return settings.LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS
 
 
@@ -432,14 +415,31 @@ class GoogleAdapter(LLMProviderAdapter):
             response_format: str | None = None,
             timeout_seconds: float | None = None,
             response_schema: dict[str, Any] | None = None,
-            extra_server_error_retries: int = 0,
-            terminal_chain_model: bool = False) -> LLMResponse:
-        response = await self._complete_on_pool(
-            messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, response_format=response_format,
-            timeout_seconds=timeout_seconds, response_schema=response_schema,
-            extra_server_error_retries=extra_server_error_retries,
-            terminal_chain_model=terminal_chain_model)
+            fallback: bool = False,
+            thinking_budget: int | None = None) -> LLMResponse:
+        budget_config = (
+            types.ThinkingConfig(thinking_budget=thinking_budget)
+            if thinking_budget and google_is_lite_model(model)
+            and model not in _THINKING_BUDGET_REJECTED_MODELS else None)
+        try:
+            response = await self._complete_on_pool(
+                messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, response_format=response_format,
+                timeout_seconds=timeout_seconds,
+                response_schema=response_schema, fallback=fallback,
+                thinking_config_override=budget_config)
+        except LLMInvalidRequestError as exc:
+            if budget_config is None:
+                raise
+            _THINKING_BUDGET_REJECTED_MODELS.add(model)
+            logger.warning(
+                "google.thinking_budget_rejected", model=model,
+                thinking_budget=thinking_budget, error=str(exc))
+            response = await self._complete_on_pool(
+                messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, response_format=response_format,
+                timeout_seconds=timeout_seconds,
+                response_schema=response_schema, fallback=fallback)
         if not _is_runaway_thinking(response, model=model,
                                     max_tokens=max_tokens):
             return response
@@ -447,14 +447,14 @@ class GoogleAdapter(LLMProviderAdapter):
             response, messages, model=model, temperature=temperature,
             max_tokens=max_tokens, response_format=response_format,
             timeout_seconds=timeout_seconds, response_schema=response_schema,
-            terminal_chain_model=terminal_chain_model)
+            fallback=fallback)
 
     async def _runaway_thinking_retry(
             self, original: LLMResponse, messages: list[LLMMessage], *,
             model: str, temperature: float, max_tokens: int,
             response_format: str | None, timeout_seconds: float | None,
             response_schema: dict[str, Any] | None,
-            terminal_chain_model: bool) -> LLMResponse:
+            fallback: bool) -> LLMResponse:
         budget = settings.LLM_GOOGLE_LITE_RUNAWAY_RETRY_THINKING_BUDGET
         logger.warning(
             "google.thinking_runaway_retrying_with_budget", model=model,
@@ -467,8 +467,7 @@ class GoogleAdapter(LLMProviderAdapter):
                 messages, model=model, temperature=temperature,
                 max_tokens=max_tokens, response_format=response_format,
                 timeout_seconds=timeout_seconds,
-                response_schema=response_schema,
-                terminal_chain_model=terminal_chain_model,
+                response_schema=response_schema, fallback=fallback,
                 thinking_config_override=types.ThinkingConfig(
                     thinking_budget=budget))
         except LLMInvalidRequestError as exc:
@@ -495,8 +494,7 @@ class GoogleAdapter(LLMProviderAdapter):
         response_format: str | None = None,
         timeout_seconds: float | None = None,
         response_schema: dict[str, Any] | None = None,
-        extra_server_error_retries: int = 0,
-        terminal_chain_model: bool = False,
+        fallback: bool = False,
         thinking_config_override: types.ThinkingConfig | None = None
     ) -> LLMResponse:
         system, contents = _split_system_and_contents(messages)
@@ -513,7 +511,7 @@ class GoogleAdapter(LLMProviderAdapter):
         default_timeout = timeout_seconds is None
         real_timeout = (
             timeout_seconds if timeout_seconds is not None else
-            _default_request_timeout(model, terminal=terminal_chain_model))
+            _default_request_timeout(model, fallback=fallback))
 
         tried_labels: set[str] = set()
         last_exc: Exception | None = None
@@ -614,9 +612,8 @@ class GoogleAdapter(LLMProviderAdapter):
                         server_error_count=server_error_count,
                         raw_error=str(exc))
                     is_lite = google_is_lite_model(model)
-                    if server_error_count > (
-                            _max_server_error_retries_for(model) +
-                            extra_server_error_retries):
+                    if server_error_count > _max_server_error_retries_for(
+                            model, fallback=fallback):
                         streak, cooldown = 0, 0.0
                         if not is_lite:
                             streak, cooldown = (
@@ -851,7 +848,7 @@ class GoogleAdapter(LLMProviderAdapter):
                         raw_error=str(exc))
                     is_lite = google_is_lite_model(model)
                     if server_error_count > _max_server_error_retries_for(
-                            model):
+                            model, fallback=False):
                         streak, cooldown = 0, 0.0
                         if not is_lite:
                             streak, cooldown = (

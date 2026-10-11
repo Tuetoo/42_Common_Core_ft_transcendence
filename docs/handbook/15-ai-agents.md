@@ -119,6 +119,9 @@ llm_router.complete(LLMTier.CHEAP, messages,
                     response_schema=<built from the tools' parameters>)
 ```
 
+A loop built with `thinking_budget=N` also passes `thinking_budget=N` on
+every call. Only Sentiment does this (3.12; chapter 14, 3.11).
+
 The model must answer with one JSON object:
 
 ```json
@@ -391,7 +394,8 @@ answers of eight batches, the counts and the note exclusion flag exactly
 the four TSLA News answers with 496,579 and nothing else (the note
 exclusion alone changes no "$"/"%" result). Matching of "$" and "%" figures is `debate_common.find_ungrounded_figures` (3.16): scale
 normalized ($17.8B = $17,800 million), 1.5% relative tolerance for scaled
-figures and percentages, 1% for plain dollar amounts. With no evidence at
+figures and percentages, 1% for plain dollar amounts; a figure with three
+or more significant digits must instead match at its own precision (3.16). With no evidence at
 all the check is silent (the zero-evidence gate handles it); an internal
 error is logged (`finish_checks.own_evidence_check_failed`) and never
 rejects. Wired for Market, Technical, Fundamental (extra: fresh filing and
@@ -758,7 +762,11 @@ the tolerance of one allowed value.
   `require_tool_evidence` is off and the anchor check uses News's summary
   as the fallback reference (`loosely_anchored`). Without this,
   Sentiment can make no tool call, run its Lite model to the token cap
-  and answer about the wrong product.
+  and answer about the wrong product. The loop also gets
+  `thinking_budget=SENTIMENT_THINKING_BUDGET` (1024): on a Lite model each
+  ReAct turn may think for at most 1024 tokens, from the first call
+  (chapter 14, 3.11). Without the cap, long thinking cost about 148 s per
+  batch; budgeted calls answered in 1.9-10.3 s.
 - **Validator:** no base check; reject-once: internal tokens and
   `label_without_evidence` (a "Sentiment:" line although neither News nor
   its own search returned a relevant article). No own-evidence figure
@@ -988,8 +996,8 @@ the tolerance of one allowed value.
 
 - **Purpose:** the strongest honest case for (Bull) and against (Bear),
   3-6 sentences, from the agents' evidence only.
-- **Tier:** `HIGHEST_ACCURACY`, `retries=4`, plus
-  `LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS` (0) extra keys. No tools.
+- **Tier:** `HIGHEST_ACCURACY`, `retries=4` (the primary model, then
+  the fallback model, chapter 14). No tools.
   One class, `DebateSideAgent(side)`; the sides differ only in their system
   prompt. They run concurrently each round, so each sees the other side's
   latest COMPLETED argument from an earlier round
@@ -1084,7 +1092,15 @@ the tolerance of one allowed value.
   is reported as the whole range. Scaled figures and percentages match by
   value after scale normalization or within 1.5% relative; plain "$" amounts match any number in the evidence within 1%
   (`NUMBER_MATCH_REL_TOLERANCE`; "close=151.23" grounds "$151.23"), and a
-  plain "$7.46" never grounds "7.46%". Known blind spot: a correct sum,
+  plain "$7.46" never grounds "7.46%". These relative tolerances apply only
+  to rounded figures (one or two significant digits, such as "$600 million"
+  or "$2.3B"). A precise figure (three or more significant digits) must
+  agree with an evidence number to within one unit in the last digit of
+  the coarser of the two (`_figure_matches`): "$27.5B" matches 27.46 and
+  "$15.84B" matches "$15,848 million", but "$593 million" does not match
+  598 (a made-up sum that once passed the 1.5% rule). Replayed on 289
+  stored analyses (2026-10-02 to 10-11): 6 new firings, 4 correct and 2
+  caused only by an older evidence layout. Known blind spot: a correct sum,
   difference or midpoint of two evidence figures is flagged.
 - **Typical failure:** invented figures. Caught by the figure check and,
   later, Reflection.
@@ -1149,10 +1165,9 @@ quotes, tool values), never from re-parsed model prose.
   `rationale`, as JSON.
 - **Tier:** `HIGHEST_ACCURACY`, `response_format="json_object"`,
   `max_tokens` 3072 (`_JUDGE_MAX_TOKENS`: a truncated answer does not
-  parse and costs a whole extra debate round), with
-  `ignore_server_error_cooldown=True`, the terminal 503 retry
-  (`JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS`) and the rescue attempt
-  (chapter 14). One call path, `JudgeAgent._complete`, used by both calls
+  parse and costs a whole extra debate round), `retries=4`, through the
+  same primary and fallback model as every HIGHEST call (chapter 14).
+  One call path, `JudgeAgent._complete`, used by both calls
   below.
 - **Short-cuts without an LLM call:** every agent failed -> `judge_failed`
   with `no_evidence`; both latest debate sides unavailable ->
@@ -1240,7 +1255,9 @@ quotes, tool values), never from re-parsed model prose.
   analysis id with `judge.deciding_factor` and `judge.opposing_points`.
 - **Failure handling:** the answer is read with
   `json_fence.parse_json_object`: code fence removed; if strict JSON fails,
-  the first JSON object is decoded from the first "{", with line breaks
+  a comma directly before a closing brace or bracket (outside strings) is
+  dropped first (`json.trailing_comma_removed`; every 3.8 Judge re-ask in
+  the batches of 2026-10-11 was this slip), then the first JSON object is decoded from the first "{", with line breaks
   and other control characters allowed inside strings; text before or
   after that object (including a second object) is ignored. Any of these
   general slips is logged (`judge.json_parsed_leniently`: ignored leading
@@ -1265,7 +1282,7 @@ quotes, tool values), never from re-parsed model prose.
   (`judge.non_english_rationale`). The confidence is clamped to 0-1, an
   unknown leaning becomes HOLD, and `converged` counts only a real boolean
   or the string "true" (so the string `"false"` cannot end a debate). The graph's
-  delayed retry and no-verdict handling are in chapter 16.
+  availability retries and no-verdict handling are in chapter 16.
 - **The rationale is stored as written:** a regex that removes "debate
   process" sentences also removes investment text, so only the prompt
   rule asks the Judge to leave them out.
@@ -1287,10 +1304,10 @@ quotes, tool values), never from re-parsed model prose.
   same cached data on a retry, and the own-evidence check runs in each
   agent's loop (3.5).
 - **LLM part:** a `HIGHEST_ACCURACY` citation review (`max_tokens` 2048,
-  JSON mode, `ignore_server_error_cooldown=True`, one delayed retry after
+  JSON mode, one delayed retry after
   `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60) on a 429/503 after the
-  whole chain; the wait is skipped when a chain model is free now,
-  chapter 14, 3.10, logged `free_model` on
+  primary and the fallback model both failed; the wait is skipped when
+  one of the two models is free now, chapter 14, 3.10, logged `free_model` on
   `reflection.citation_review_delayed_retry`). It checks four things:
   citation integrity, argument quality (did the winning side engage the
   other side's strongest point; does its certainty match its evidence),
@@ -1368,7 +1385,6 @@ quotes, tool values), never from re-parsed model prose.
 | `ARCHIVAL_RECYCLED_SHARE_MAX` | 0.5 | `config.py` | Skip archiving a note at least this recycled. |
 | `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | None (0.90) | `config.py` | Cosine similarity for superseding an older note. |
 | `MIN_USABLE_AGENTS_FOR_DEBATE` | 4 | `config.py` | Fewer usable agents: no debate (chapter 16). |
-| `LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS` | 0 | `config.py` | Extra keys for Bull/Bear/Judge after a 503. |
 | `_REACT_LOOP_MAX_TOKENS` | 4096 | `ai/agents/loop.py` | Output budget of one ReAct turn. |
 | `_MAX_CORRECTION_RETRIES` | 2 | `loop.py` | Bad-response corrections before giving up. |
 | `_MAX_ZERO_EVIDENCE_RETRIES` | 2 | `loop.py` | `no_tool_evidence` rejections. |
@@ -1380,8 +1396,8 @@ quotes, tool values), never from re-parsed model prose.
 | `PRIOR_NOTE_MAX_SIMILARITY` | 0.9 | `config.py` | Word-sequence similarity at which a Risk or News answer is a copy of a prior note (News: rejected once; both: recycled, not archived). |
 | `NEWS_WEB_FALLBACK_DAYS` | 7 | `config.py` | Look-back of News's Tavily news-mode fallback. |
 | `JUDGE_STATE_QUARTER_DECLINE_PCT` | 15.0 | `config.py` | Latest-quarter decline (or a swing to a loss) the Judge must state. |
-| `JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS` | 10.0 | `config.py` | Delay before the Judge's second last-resort attempt (chapter 14). |
 | `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` | 60.0 | `config.py` | Reflection review's one delayed retry after 429/503; 0 = off. |
+| `SENTIMENT_THINKING_BUDGET` | 1024 | `config.py` | Thinking budget of Sentiment's ReAct turns on Lite models; 0 = off. |
 | `_SCORE_*`, `_PENALTY_*` | see 3.4 | `loop.py` | The graded score. |
 | `CONFIDENCE_CHANGE_TO_EXPLAIN` | 0.05 | `ai/agents/judge.py` | Confidence move against the Judge's own earlier verdict that needs `change_since_previous`. |
 | `_JUDGE_MAX_TOKENS` / `_REVIEW_MAX_TOKENS` | 3072 / 2048 | `judge.py` / `reflection.py` | Output budgets. |

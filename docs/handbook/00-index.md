@@ -165,7 +165,7 @@ There is no user interface yet (section 8).
 | [11 auth-service](11-auth-service.md) | Registration and email verification, login, access and refresh tokens, sessions and reuse detection, 2FA, Google/GitHub sign-in, roles, organizations, friends, presence, rate limits. |
 | [12 core-service](12-core-service.md) | Portfolios and the transaction ledger, holdings and cash, NAV snapshots, watchlists, research notes and documents, notifications, API keys and the public API, WebSockets, job heartbeats. |
 | [13 ai-service overview](13-ai-service.md) | Folder layout, public and internal API, the serial analysis queue, startup, data providers and caches, settings, scripts. |
-| [14 The LLM layer](14-ai-llm-layer.md) | Gemini model chains, the key pool, pacing, 503 and 429 handling, timeouts, rescue attempts, retries, thinking budgets, JSON parsing, embeddings. |
+| [14 The LLM layer](14-ai-llm-layer.md) | Gemini models and their fallback models, the key pool, pacing, 503 and 429 handling, timeouts, retries, thinking budgets, JSON parsing, embeddings. |
 | [15 The agents](15-ai-agents.md) | The ReAct loop, each data agent with its tools and validators, Bull, Bear, Judge and Reflection, evidence grounding. |
 | [16 The analysis pipeline](16-ai-analysis-pipeline.md) | The LangGraph graph, the debate, the Judge, the recommendation engine's caps and penalties, position sizing, tiers, decisions. |
 | [17 RAG](17-ai-rag.md) | Parsing, chunking, embeddings, hybrid search (vectors + BM25 with RRF), visibility, the ask endpoint, ingestion and deletion, auto-ingestion, evaluation. |
@@ -233,7 +233,7 @@ slot, show a finished run folder and start a new analysis only as a live
 | Tier monitoring | The daily job that executes accepted tiers whose price was reached and expires old ones. | [19](19-ai-workflows-backtest.md) |
 | Ledger | The list of a portfolio's transactions; holdings and cash are computed by replaying it. | [12](12-core-service.md) |
 | NAV snapshot | The portfolio's total value at the end of a trading day. | [12](12-core-service.md) |
-| HIGHEST / CHEAP tier | The two LLM quality levels: a chain of Gemini Flash models, and the Lite models. | [14](14-ai-llm-layer.md) |
+| HIGHEST / CHEAP tier | The two LLM quality levels: two Gemini Flash models (a primary and a fallback), and two Lite models. | [14](14-ai-llm-layer.md) |
 | RAG | Retrieval-augmented generation: search the document library first, then let the LLM answer from what was found. | [17](17-ai-rag.md) |
 | Embedding | A list of numbers that represents the meaning of a text; similar texts get similar lists. | [21](21-qdrant.md) |
 | BM25 | A classic keyword-ranking formula, used next to vectors for hybrid search. | [17](17-ai-rag.md) |

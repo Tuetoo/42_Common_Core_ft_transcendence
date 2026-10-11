@@ -422,10 +422,11 @@ fires it.
 `LLMProviderErrorsHigh` (more than 30 errors of one provider and kind in
 15 minutes) is expected during waves of Google 503 answers on the
 HIGHEST-tier models (on bad days about 70% of first attempts on the newest
-Flash model fail). The retry and rescue chain usually still completes
-every analysis, so first check whether analyses complete
+Flash model fail). The fallback model and the step retries usually still
+complete every analysis, so first check whether analyses complete
 (`alphamind_analyses_total{status="completed"}`) before treating it as an
-outage. The chain is described in [14-ai-llm-layer.md](14-ai-llm-layer.md).
+outage. The fallback model and the retries are described in
+[14-ai-llm-layer.md](14-ai-llm-layer.md).
 
 `ServiceDown` names the target by its scrape `job` and `instance`;
 `PostgresDown` and `RedisDown` mean the exporter runs but cannot reach the
@@ -779,8 +780,8 @@ it is configured in files under infra/ and tested where it can be."
 
 10. **`LLMProviderErrorsHigh` fires during a batch. Is it an outage?**
     Not necessarily. Google's HIGHEST-tier models often answer 503 on
-    first attempts, and the router's retries and rescue usually still
-    finish every analysis. Check `alphamind_analyses_total{status="completed"}`
+    first attempts, and the router's fallback model and the step retries
+    usually still finish every analysis. Check `alphamind_analyses_total{status="completed"}`
     and `AnalysisFailureRateHigh` first.
 
 </details>

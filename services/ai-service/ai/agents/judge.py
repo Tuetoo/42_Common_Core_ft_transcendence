@@ -466,12 +466,7 @@ class JudgeAgent:
     async def _complete(self, messages: list[LLMMessage]) -> LLMResponse:
         return await self.llm_router.complete(
             self.llm_tier, messages, retries=AGENT_LLM_CALL_RETRIES,
-            primary_extra_server_error_keys=(
-                settings.LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS),
-            response_format="json_object", max_tokens=_JUDGE_MAX_TOKENS,
-            terminal_server_error_retry_delay=(
-                settings.JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS),
-            ignore_server_error_cooldown=True)
+            response_format="json_object", max_tokens=_JUDGE_MAX_TOKENS)
 
     async def _reask_for_json(
             self, messages: list[LLMMessage], response: LLMResponse,

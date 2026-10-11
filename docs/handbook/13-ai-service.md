@@ -101,7 +101,7 @@ All paths are relative to `services/ai-service/`.
 | `domains/analysis/queue.py` | The serial analysis queue and the admission check. |
 | `ai/agents/` | The nine data agents, Bull, Bear, Judge, Reflection, the Supervisor, the ReAct loop and the evidence checks (chapter 15). |
 | `ai/graph/` | The LangGraph graph: `builder.py` (wiring), `nodes.py` (node functions), `edges.py` (routing decisions and node names per role), `state.py` (the shared `AnalysisState`). Chapter 16. |
-| `ai/llm/` | LLM adapters (Google, Mistral, OpenAI, Anthropic), the router with tiers and fallback chains, request pacing, JSON fence helper. Chapter 14. |
+| `ai/llm/` | LLM adapters (Google, Mistral, OpenAI, Anthropic), the router with tiers and one fallback model per tier, request pacing, JSON fence helper. Chapter 14. |
 | `ai/providers/` | Clients for external data: Yahoo Finance, FRED, NewsAPI (with its source catalog), SEC EDGAR (fundamentals, filing periods, the XBRL latest-quarter line), Tavily; a small retry helper; `news_filters.py` (query building, structural pre-drops, consent-link relinking) and `news_relevance.py` (the LLM relevance classifier with its subject/kind enums). |
 | `ai/tools/` | Agent tools that wrap providers, the RAG retriever, core-service and the knowledge graph; the cache-first price store (`market_data_cache.py`); indicator math. |
 | `ai/rag/` | Chunking, embeddings, Qdrant + BM25 indexing, hybrid retrieval with Reciprocal Rank Fusion, visibility rules. Chapter 17. |
@@ -425,7 +425,7 @@ folder call some of them for you.
 | Script | Purpose | Writes data? |
 |---|---|---|
 | `analysis_cli.py` | Tiny standard-library client for the internal analysis routes: `create TICKER [--portfolio ID] [--user ID]`, `status ID`, `get ID`. Used by `scripts/run_analysis.sh`. | `create` queues an analysis |
-| `probe_model_latency.py` | Sends Judge-sized requests to one Gemini model per pooled key and reports latency and what a 30/60/90 s timeout would keep. Used by `scripts/probe.sh`. `--health` instead sends one tiny request per key and per configured model ID. | No, but spends daily quota |
+| `probe_model_latency.py` | Sends Judge-sized requests to one Gemini model (default: the configured HIGHEST primary model) per pooled key and reports latency and what a 30/60/90 s timeout would keep. Used by `scripts/probe.sh`. `--health` instead sends one tiny request per key and per configured model ID. | No, but spends daily quota |
 | `smoke_check.py` | One line per non-analysis feature check (RAG, KG, filing records, market, FX, FRED, core reads, auth, backtests). The `filing_records` check fails and lists the filing documents without an `ai.filing_records` row (a records call that failed at ingestion), with the backfill command. Used by `scripts/smoke.sh`. | Small, deliberate writes only: refreshes AAPL price bars and creates then deletes one scratch backtest (see its header) |
 | `e2e_tier_check.py` | Deterministic real-environment test of the tier chain with a synthetic recommendation. Used by `scripts/e2e.sh`. | Yes (test data, cleaned up unless `--keep`) |
 | `delete_analyses.py` | Deletes whole analyses and everything they wrote, then sweeps orphans (including knowledge-graph entities left without relations). Walks the live foreign-key tree first. | **Yes, destructive** |
@@ -458,8 +458,8 @@ groups below summarise them. Chapter 14 has the full LLM table.
 | LLM keys | `GOOGLE_API_KEY`, `GOOGLE_API_KEY_2` .. `_10`, `MISTRAL_API_KEY`, `MISTRAL_API_KEY_2` .. `_7`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (all empty) | Provider credentials. Chapter 14. |
 | LLM routing and resilience | `LLM_DEFAULT_PROVIDER` (`google`), `LLM_GOOGLE_MODEL_*`, pacing, timeouts, cooldowns | Chapter 14, section 4. |
 | Analysis queue | `ANALYSIS_TIMEOUT_SECONDS` (2700.0), `ANALYSIS_MAX_ACTIVE_PER_USER` (3), `ANALYSIS_QUEUE_MAX_PENDING` (50) | Section 3.4. |
-| Debate and verdict resilience | `JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS` (10.0), `JUDGE_DELAYED_RETRY_SECONDS` (120.0), `DEBATE_SIDE_REPAIR_DELAY_SECONDS` (60.0), `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60.0), `MIN_USABLE_AGENTS_FOR_DEBATE` (4), `JUDGE_STATE_QUARTER_DECLINE_PCT` (15.0) | Chapter 16. |
-| Agents | `AGENT_PREFETCH_ENABLED` (True), `FALLBACK_ANCHOR_MIN_WORD_SHARE` (0.3) | Fixed first tool calls run in code; word-share similarity of the fallback evidence anchor. Chapter 15. |
+| Debate and verdict resilience | `JUDGE_RETRY_BUDGET_SECONDS` (240.0), `JUDGE_RETRY_MAX_ATTEMPTS` (4), `DEBATE_SIDE_REPAIR_DELAY_SECONDS` (60.0), `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60.0), `MIN_USABLE_AGENTS_FOR_DEBATE` (4), `JUDGE_STATE_QUARTER_DECLINE_PCT` (15.0) | Chapter 16. |
+| Agents | `AGENT_PREFETCH_ENABLED` (True), `FALLBACK_ANCHOR_MIN_WORD_SHARE` (0.3), `SENTIMENT_THINKING_BUDGET` (1024) | Fixed first tool calls run in code; word-share similarity of the fallback evidence anchor; thinking budget of Sentiment's ReAct turns on Lite models (0 = off). Chapters 14 and 15. |
 | Recommendation and tiers | `TIER_MIN_NOTIONAL_USD` (100.0), `TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION` (0.01), `MAX_POSITION_WEIGHT_PCT` (50.0), `MIN_BUY_TIER_CONFIDENCE` (0.5), `TIER_WINDOW_DAYS_MAX` (30) | Chapter 16. There is no per-recommendation BUY cap (owner decision). |
 | Memory and review | `EPISODIC_CONTEXT_LIMIT` (3), `AI_ACCURACY_EVALUATION_DAYS` (30) | Chapters 18 and 19. |
 | Data providers | `SEC_EDGAR_USER_AGENT`, `FRED_API_KEY`, `NEWSAPI_API_KEY`, `TAVILY_API_KEY` (empty), `NEWSAPI_SEARCH_IN` (`title,description`), `NEWSAPI_SORT_BY` (`relevancy`), `NEWSAPI_RECENT_EXTRA_LIMIT` (10), `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600.0) | Section 3.6. |
@@ -563,7 +563,7 @@ how to decline them.
    ```
    On a Mac wrap long batches in `caffeinate -i`. The script prints
    `Output directory: runs/run_<YYYYMMDD_HHMMSS>`, then `AAPL ->
-   analysis_id=<uuid>`, then a status line every 15 seconds
+   analysis_id=<uuid>`, then a status line every 5 seconds
    (`[AAPL] elapsed=30s status=running`).
    Say: "The script calls `POST /internal/analyses` from inside the
    container through `scripts/analysis_cli.py`; the row is created as
@@ -582,7 +582,7 @@ how to decline them.
    - debate, Judge and Reflection events (chapter 16);
    - finally `analysis_queue_job_finished`.
    Say: "Every LLM call is one line. Lite models serve the nine data
-   agents; the Flash chain serves Bull, Bear, Judge and Reflection."
+   agents; the two Flash models serve Bull, Bear, Judge and Reflection."
 
 5. **Check the row in the database (read-only).**
    ```bash

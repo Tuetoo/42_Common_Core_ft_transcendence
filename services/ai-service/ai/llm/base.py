@@ -114,7 +114,6 @@ class RequestPacer:
         self._lock = asyncio.Lock()
         self._next_allowed_at: dict[tuple[str, ...], float] = {}
         self._counters: dict[tuple[str, ...], int] = {}
-        self._stamps: dict[tuple[str, ...], float] = {}
         self._marks: dict[tuple[str, ...], int] = {}
 
     async def reserve_slot(
@@ -203,7 +202,6 @@ class RequestPacer:
     def reset(self) -> None:
         self._next_allowed_at.clear()
         self._counters.clear()
-        self._stamps.clear()
         self._marks.clear()
 
     def increment_counter(self, key: tuple[str, ...]) -> int:
@@ -211,17 +209,8 @@ class RequestPacer:
         self._counters[key] = value
         return value
 
-    def counter(self, key: tuple[str, ...]) -> int:
-        return self._counters.get(key, 0)
-
     def reset_counter(self, key: tuple[str, ...]) -> int:
         return self._counters.pop(key, 0)
-
-    def set_stamp(self, key: tuple[str, ...], value: float) -> None:
-        self._stamps[key] = value
-
-    def stamp(self, key: tuple[str, ...]) -> float | None:
-        return self._stamps.get(key)
 
 
 request_pacer = RequestPacer()

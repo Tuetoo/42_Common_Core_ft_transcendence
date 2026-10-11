@@ -106,7 +106,10 @@ On the Mac (host):
      `GITHUB_CLIENT_ID`/`_SECRET` (blank disables a provider). Register
      the callback `https://localhost:8443/api/v1/auth/oauth/<google|github>/callback`
      with each provider; `OAUTH_REDIRECT_BASE_URL` is the gateway's
-     public base URL.
+     public base URL. Set `FRONTEND_BASE_URL` to the frontend origin
+     (`https://localhost:8443` locally): the callback answers 303 to
+     `<FRONTEND_BASE_URL>/oauth/complete` with the tokens, a 2FA
+     challenge or `error=oauth_failed` in the URL fragment.
    - `QDRANT_API_KEY`: leave empty for the local Qdrant; set it only for
      a Qdrant server that requires a key.
    - If you change `POSTGRES_PASSWORD`, change the password inside
@@ -246,7 +249,7 @@ Variables: `S` = service(s), `T` = tickers, `A` = analysis id(s), `ARGS`
 | `make backups` | `bash scripts/backups.sh list` | list backups and sizes |
 | `make backup-check [BACKUP=<stamp>]` | `bash scripts/backups.sh check` | restore dry run (default: newest) |
 | `make restore-drill [BACKUP=<stamp>]` | `bash scripts/backups.sh drill` | restore into a throwaway project and verify (default: newest) |
-| `make probe [MODEL=...] [ARGS=...]` | `bash scripts/probe.sh` (default `gemini-3.7-flash`) | Gemini latency probe (uses quota) |
+| `make probe [MODEL=...] [ARGS=...]` | `bash scripts/probe.sh` (default: the configured HIGHEST primary model) | Gemini latency probe (uses quota) |
 | `make smoke [ARGS=...]` | `bash scripts/smoke.sh` | smoke check of non-analysis features |
 
 For SQL, this handbook writes the script form (`bash scripts/psql.sh -c
@@ -514,11 +517,13 @@ A real restore is only `make restore BACKUP=<stamp> CONFIRM=yes`
 #### `scripts/probe.sh` - LLM latency probe
 
 ```sh
-bash scripts/probe.sh                                   # gemini-3.7-flash, 2 requests per key
-bash scripts/probe.sh gemini-3.8-flash --per-key 1 --cap 90
+bash scripts/probe.sh                                   # HIGHEST primary model, 2 requests per key
+bash scripts/probe.sh gemini-3.6-flash --per-key 1 --cap 90
 ```
 
-Runs `python -m scripts.probe_model_latency` in ai-service. It sends
+Runs `python -m scripts.probe_model_latency` in ai-service. Without a
+model name it probes the configured HIGHEST primary model
+(`LLM_GOOGLE_MODEL_HIGHEST_ACCURACY`, `gemini-3.8-flash`). It sends
 Judge-sized requests, one key at a time, 5 seconds apart, with one long
 time limit (`--cap`, default 120 s), and records each real latency, so one
 run shows how many answers a 30, 60 or 90 second timeout would keep. The
@@ -532,18 +537,19 @@ batch is seeing timeouts.
 **Key and model health (`--health`).**
 
 ```sh
-bash scripts/probe.sh gemini-3.7-flash --health
+bash scripts/probe.sh --health
 make probe ARGS=--health
 ```
 
 This checks every configured Google key with one tiny "pong" request on
 the CHEAP model (a broken Google project, typically one without the
-Generative Language API enabled, is named by its key slot), then every
-distinct configured model id (`LLM_GOOGLE_MODEL_*`) once on the first
+Generative Language API enabled, is named by its key slot), then each
+distinct configured model id (`LLM_GOOGLE_MODEL_CHEAP`, `..._CHEAP_FALLBACK`,
+`..._HIGHEST_ACCURACY`, `..._HIGHEST_ACCURACY_FALLBACK`) once on the first
 healthy key, so a model id that does not resolve shows up. Exit code 1
 when anything failed. Cost: one request per key plus one per model.
-`bash scripts/probe.sh --health` also works: a first argument starting
-with `--` is passed through, and the default model is used.
+A first argument that starts with `--` is passed through as an option,
+so no model name is needed.
 
 #### `scripts/smoke.sh` - smoke check
 
@@ -875,7 +881,7 @@ What it does, per ticker, one after another (`scripts/run_analysis.sh`):
    only; the image has no curl). If creation fails (for example `503`
    when 50 analyses are already pending), the error is written to
    `<T>_create_ERROR.txt` and the batch moves on.
-2. **Poll** `analysis_cli status <id>` every 15 seconds, for up to 3600
+2. **Poll** `analysis_cli status <id>` every 5 seconds, for up to 3600
    seconds. The wide limit allows for a ticker whose newest filing is
    not summarised yet: it is summarised inline first (up to 300 s per
    attempt, `_FILING_SUMMARY_TIMEOUT_SECONDS` in
@@ -1233,7 +1239,7 @@ disappears on a server.
 | `SINCE` | `10m` | how far back `logs.sh` starts following | `scripts/logs.sh` |
 | `PROMETHEUS_LOCAL_URL` | `http://127.0.0.1:9090` | Prometheus for `health.sh` | `scripts/health.sh` |
 | `QDRANT_LOCAL_URL` | `http://127.0.0.1:6333` | Qdrant for `qdrant.sh` | `scripts/qdrant.sh` |
-| `POLL_INTERVAL_SECONDS` / `MAX_WAIT_SECONDS` | `15` / `3600` | polling of one analysis (fixed in the script, not environment variables) | `scripts/run_analysis.sh` |
+| `POLL_INTERVAL_SECONDS` / `MAX_WAIT_SECONDS` | `5` / `3600` | polling of one analysis (fixed in the script, not environment variables) | `scripts/run_analysis.sh` |
 | `LOGS_DIR` (log cleanup) | `/logs` | folder `logs-cleanup.sh` prunes; on the host `LOGS_DIR=./logs sh infra/scheduler/logs-cleanup.sh` | `infra/scheduler/logs-cleanup.sh` |
 | `BACKUP_RETENTION_DAYS` | `7` | days of backups kept (newest 3 always kept) | `.env.example`, `infra/scheduler/backup.sh` |
 | `BACKUP_DIR` | `/backups` | backup folder inside scheduler/restore (host `./backups`) | `docker-compose.yaml` |

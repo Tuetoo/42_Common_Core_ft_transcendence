@@ -867,6 +867,18 @@ class TestJudgeJsonRecovery:
             assert lenient[0][field] == value, case_id
             assert not _events(logs, "judge.unparseable_response"), case_id
 
+        comma_raw = _answer(_UNIT_FIXED)
+        comma_raw = comma_raw[:comma_raw.rindex("}")] + ",\n}"
+        router = _Router(comma_raw)
+        verdict, logs = await _run_judge(router, monkeypatch)
+        assert len(router.calls) == 1
+        assert not verdict.judge_failed and verdict.leaning.value == "buy"
+        assert not _events(logs, "judge.json_reask")
+
+        comma = parse_json_object('{"a": [1, 2,], "b": "x,}",\n}')
+        assert comma.data == {"a": [1, 2], "b": "x,}"}
+        assert parse_json_object('{"a": 1,, }').data is None
+
         fenced = parse_json_object('```json\n{"a": 1}\n```')
         assert fenced.data == {"a": 1} and not fenced.trailing_text
         listed = parse_json_object("[1, 2]")
@@ -1055,6 +1067,28 @@ class TestFigures:
                 "$500 to $1.2 billion; revenue $10,365 -4%", {"$500 billion"})
         }
         for case_id, (claim, evidence, expected) in ungrounded.items():
+            got = dc.find_ungrounded_figures(claim, evidence)
+            assert got == expected, case_id
+
+    def test_precise_figures_must_match_at_their_own_precision(self) -> None:
+        cases = {
+            "made-up-sum-near-a-real-line": (
+                "$593 million year-to-date", "other income was $598 million",
+                {"$593 million"}),
+            "rounded-to-figure-precision": (
+                "$27.5 billion, 62.7% and $1.13B",
+                "$27.46 billion, 62.65% and $1.128 billion", set()),
+            "truncated-either-way": (
+                "$15.84B and $3,466 million",
+                "$15,848 million and $3.47B", set()),
+            "rounded-figures-keep-relative-tolerance": (
+                "about $600 million and $2.3B",
+                "$598 million and $2.31 billion", set()),
+            "exact-match": ("$593 million", "a $593 million gain", set()),
+            "precise-percent": ("41.2%", "margin 41.6%", {"41.2%"}),
+            "precise-plain-dollar": ("$151.9", "close=151.23", {"$151.9"})
+        }
+        for case_id, (claim, evidence, expected) in cases.items():
             got = dc.find_ungrounded_figures(claim, evidence)
             assert got == expected, case_id
 
@@ -1314,8 +1348,6 @@ class TestDebateSides:
                 _both_sides_flagged_state())
             assert argument.argument == "Still 25% [market].", side
             assert len(router.calls) == 2, side
-            assert "primary_extra_server_error_keys" in router.kwargs[0], side
-            assert "primary_extra_server_error_keys" in router.kwargs[1], side
             assert "25%" in router.calls[1][-1].content, side
             assert argument.citations == ["market"], side
 
@@ -1718,60 +1750,50 @@ class TestHighestAccuracyModels:
     @pytest.mark.asyncio
     async def test_default_timeouts_and_timeouts_without_cooldown(
             self, monkeypatch):
-        defaults = {
-            "gemini-3.8-flash": 30.0,
-            "gemini-3.7-flash": 60.0,
-            "gemini-3.5-flash-lite": 60.0
-        }
-        for model, seconds in defaults.items():
-            got = google_module._default_request_timeout(model)
-            assert got == seconds, model
+        assert google_module._default_request_timeout(
+            "gemini-3.8-flash") == 30.0
+        assert google_module._default_request_timeout(
+            "gemini-3.6-flash", fallback=True) == 60.0
+        assert google_module._default_request_timeout(
+            "gemini-3.5-flash-lite", fallback=True) == 60.0
         monkeypatch.setattr(
             google_module, "_pool", _ScriptedKeyPool(["primary"], ["hang"]))
         with pytest.raises(LLMRequestError) as info:
             await google_module.GoogleAdapter().complete(
-                _hi(), model="gemini-3.7-flash", timeout_seconds=0.05)
+                _hi(), model="gemini-3.8-flash", timeout_seconds=0.05)
         assert not isinstance(info.value, LLMRequestTimeoutError)
         assert not await google_module.google_model_recently_timed_out(
-            "gemini-3.7-flash")
+            "gemini-3.8-flash")
         monkeypatch.setattr(
             config.settings, "LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS",
             0.05)
         monkeypatch.setattr(
             config.settings, "LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS", 0.0)
         monkeypatch.setattr(
-            config.settings, "LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS", {})
-        monkeypatch.setattr(
             google_module, "_pool", _ScriptedKeyPool(["primary"], ["hang"]))
         with pytest.raises(LLMRequestTimeoutError):
             await google_module.GoogleAdapter().complete(
-                _hi(), model="gemini-3.7-flash")
+                _hi(), model="gemini-3.8-flash")
         assert not await google_module.google_model_recently_timed_out(
-            "gemini-3.7-flash")
+            "gemini-3.8-flash")
 
     @pytest.mark.asyncio
     async def test_timed_out_model_is_skipped_by_later_calls(
             self, monkeypatch):
-        prefix = "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY"
-        for suffix, model in (("", "m1"), ("_FALLBACK", "m2"),
-                              ("_FALLBACK_2", "m3"), ("_FALLBACK_3", "m4")):
-            monkeypatch.setattr(config.settings, prefix + suffix, model)
+        monkeypatch.setattr(
+            config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY", "m1")
+        monkeypatch.setattr(
+            config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK",
+            "m2")
         monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
-        adapter = _ChainAdapter({
-            "m1": ["503"],
-            "m2": ["timeout"],
-            "m3": ["ok"],
-            "m4": ["ok"]
-        })
+        adapter = _ChainAdapter({"m1": ["timeout"], "m2": ["ok"]})
         router = LLMRouter(providers={"google": adapter})
         first = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4,
-            ignore_server_error_cooldown=True)
+            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4)
         second = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4,
-            ignore_server_error_cooldown=True)
-        assert first.content == second.content == "answer from m3"
-        assert adapter.models == ["m1", "m2", "m3", "m1", "m3"]
+            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4)
+        assert first.content == second.content == "answer from m2"
+        assert adapter.models == ["m1", "m2", "m2"]
 
 
 @pytest.mark.usefixtures("clean_pacer")

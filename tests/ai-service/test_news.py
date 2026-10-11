@@ -2237,9 +2237,6 @@ class TestAnalysisPlumbing:
         assert verdict.llm_review_ran is True
         assert review_sleeps == [60.0]
         assert len(router.kwargs) == 2
-        assert all(
-            k.get("ignore_server_error_cooldown") is True
-            for k in router.kwargs)
 
         router = _FailingReviewRouter(
             [LLMRateLimitError("429"),
@@ -2255,7 +2252,7 @@ class TestAnalysisPlumbing:
         review_sleeps = _review_sleeps(monkeypatch)
 
         async def _free(tier):
-            return "gemini-3.5-flash"
+            return "gemini-3.6-flash"
 
         monkeypatch.setattr(capacity_module, "free_chain_model", _free)
         router = _FailingReviewRouter([LLMServerOverloadedError("503")])
@@ -2268,7 +2265,7 @@ class TestAnalysisPlumbing:
             e for e in logs
             if e["event"] == "reflection.citation_review_delayed_retry")
         assert retry["delay_seconds"] == 0.0
-        assert retry["free_model"] == "gemini-3.5-flash"
+        assert retry["free_model"] == "gemini-3.6-flash"
 
     async def test_review_retry_after_server_errors(self):
         await _run_steps(

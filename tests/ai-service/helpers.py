@@ -319,11 +319,12 @@ async def _no_sleep(seconds: float) -> None:
     return None
 
 
-def _chain(monkeypatch, models=("m1", "m2", "m3", "m4")) -> None:
-    prefix = "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY"
-    for suffix, model in zip(("", "_FALLBACK", "_FALLBACK_2", "_FALLBACK_3"),
-                             models, strict=True):
-        monkeypatch.setattr(config.settings, prefix + suffix, model)
+def _chain(monkeypatch, primary: str = "m1", fallback: str = "m2") -> None:
+    monkeypatch.setattr(
+        config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY", primary)
+    monkeypatch.setattr(
+        config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK",
+        fallback)
     monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
 
 

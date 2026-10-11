@@ -20,11 +20,11 @@
      v
  +--------------------------- LLMRouter (ai/llm/router.py) ---------------------------+
  |  tier -> model           CHEAP  -> gemini-3.5-flash-lite  (fallback 3.1-flash-lite) |
- |                          HIGHEST_ACCURACY -> 3.8-flash -> 3.7 -> 3.6 -> 3.5-flash   |
+ |                          HIGHEST_ACCURACY -> 3.8-flash  (fallback 3.6-flash)       |
  |  Lite concurrency cap (2 requests in flight)                                       |
  |  skip models known to be exhausted / overloaded / timed out                        |
  |  same-model retries with backoff (limited per error type)                          |
- |  walk the fallback chain, then one "rescue" or one cooldown retry                  |
+ |  try the fallback model once, then (Lite only) one cooldown retry                  |
  |  reject non-English output                                                         |
  +-------------------------------------------------------------------------------------+
      |  adapter.complete(model=...)
@@ -34,7 +34,8 @@
  |  RequestPacer: reserve the earliest free (model, key) slot; Lite pool-wide gate     |
  |  per request: timeout, then classify the answer                                     |
  |     429 -> bench this key (65 s, or until Pacific midnight) and try another key      |
- |     503 -> HIGHEST: give up at once and mark the model; Lite: try 2 more keys        |
+ |     503 -> HIGHEST primary: give up at once and mark the model;                     |
+ |            HIGHEST fallback and Lite: try 2 more keys                               |
  |     timeout -> HIGHEST: skip this model for 300 s                                   |
  |  thinking config per model; usage, finish_reason, latency in the log               |
  +-------------------------------------------------------------------------------------+
@@ -44,8 +45,8 @@
 ```
 
 There are two layers on purpose. The **adapter** knows about keys and
-HTTP answers for one model. The **router** knows about tiers, model
-chains and which models to avoid right now. The adapter tries the keys of
+HTTP answers for one model. The **router** knows about tiers, the one
+fallback model of each tier and which models to avoid right now. The adapter tries the keys of
 one model; only when it gives up does the router move to another model.
 
 ## 2. Concepts you need
@@ -54,7 +55,7 @@ one model; only when it gives up does the router move to another model.
 |---|---|
 | Tier | A quality/cost class a caller asks for: `CHEAP` or `HIGHEST_ACCURACY` (`ai/llm/base.py::LLMTier`). The router maps it to a model. |
 | Lite model | Google's smaller "Flash-Lite" models. The code decides "Lite" by the substring `lite` in the model name (`google_is_lite_model`). Higher free quota, used by the nine data agents. |
-| Flash chain | The non-Lite models for `HIGHEST_ACCURACY`, in quality order: 3.8, 3.7, 3.6, 3.5 Flash. Used by Bull, Bear, Judge, Reflection's review, the filing summary and records calls at ingestion, and position sizing. |
+| Flash models | The two non-Lite models for `HIGHEST_ACCURACY`: `gemini-3.8-flash` (primary) and `gemini-3.6-flash` (fallback). Used by Bull, Bear, Judge, Reflection's review, the filing summary and records calls at ingestion, and position sizing. |
 | Adapter | A class that speaks one vendor's API and returns a normalised `LLMResponse` (`content`, `provider`, `model`, `usage`, `finish_reason`, `rate_limited`). |
 | Key pool | Up to ten Google API keys. Gemini's free limits count per Google Cloud **project**, so each key must come from a separate project to add capacity. |
 | RPM / RPD / TPM | Requests per minute, requests per day, tokens per minute: the three free-tier limits. |
@@ -63,7 +64,7 @@ one model; only when it gives up does the router move to another model.
 | Timeout | No answer within the request time limit; the adapter cancels the request with `asyncio.wait_for`. Google sends no status code. |
 | Pacing | Spacing request starts so we never send faster than the quota allows. Proactive, unlike retries. |
 | Cooldown | A period during which a key (or a whole model) is not used because it just failed. |
-| Fallback chain | The ordered list of other models the router tries after the first one fails for availability reasons. |
+| Fallback model | The one other model of a tier that the router tries once after the primary model fails for availability reasons. A tier's primary and its fallback form the tier's **chain** (`tier_model_chain`): one or two models. |
 | Backoff | Waiting before a retry, often longer each time. Jitter is a small random change of that wait so parallel callers do not retry in the same instant. |
 | Thinking tokens | Hidden reasoning tokens some Gemini models spend before writing the answer. They come out of the same `max_output_tokens` budget. |
 | `finish_reason` | Why the model stopped: `STOP` (normal), `MAX_TOKENS` (budget used up), `MALFORMED_RESPONSE`, and others. |
@@ -98,15 +99,18 @@ in September 2026. Gemini's free tier covers both chat and embeddings
 ### 3.2 Tiers and models
 
 `ai/llm/router.py::_tier_model_map` reads the models from settings on
-every call, and `_tier_fallback_model_map` builds the chains:
+every call, and `_tier_fallback_model_map` gives each tier at most one
+fallback model:
 
-| Tier | First model (setting) | Fallback chain (settings, in order) |
+| Tier | Primary model (setting) | Fallback model (setting) |
 |---|---|---|
 | `CHEAP` | `gemini-3.5-flash-lite` (`LLM_GOOGLE_MODEL_CHEAP`) | `gemini-3.1-flash-lite` (`LLM_GOOGLE_MODEL_CHEAP_FALLBACK`) |
-| `HIGHEST_ACCURACY` | `gemini-3.8-flash` (`LLM_GOOGLE_MODEL_HIGHEST_ACCURACY`) | `gemini-3.7-flash` (`..._FALLBACK`), `gemini-3.6-flash` (`..._FALLBACK_2`), `gemini-3.5-flash` (`..._FALLBACK_3`) |
+| `HIGHEST_ACCURACY` | `gemini-3.8-flash` (`LLM_GOOGLE_MODEL_HIGHEST_ACCURACY`) | `gemini-3.6-flash` (`LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK`) |
 
-An empty setting removes that step. The last model of a chain is called
-the **terminal** model; it has nothing after it.
+An empty fallback setting, or a fallback equal to the primary, means the
+tier has no fallback (`_fallback_model`). So `tier_model_chain(tier)`
+returns `[primary]` or `[primary, fallback]`, never more. Mistral has the
+same shape (`LLM_MISTRAL_MODEL_*_FALLBACK`).
 
 Who uses which tier (from the call sites):
 
@@ -120,7 +124,7 @@ Who uses which tier (from the call sites):
   the filing-records backfill (`scripts/backfill_filing_records.py`,
   tier `FILING_RECORDS_BACKFILL_LLM_TIER`, `cheap` by default, overridable
   with `--tier`).
-- `HIGHEST_ACCURACY` (Flash chain): Bull and Bear arguments, the Judge,
+- `HIGHEST_ACCURACY` (Flash models): Bull and Bear arguments, the Judge,
   Reflection's citation review, position sizing's first try, and the two
   filing calls made at ingestion (`ai/ingestion/sec_edgar_filings.py`):
   the filing summary and the separate records-only call
@@ -131,7 +135,7 @@ Google's published free-tier limits as shown on the Google AI Studio
 rate-limit page on 2026-09-08, and Google can change them:
 
 - the two Lite models: 15 RPM, 250,000 TPM, 500 RPD per project;
-- the four Flash models: 5 RPM, 250,000 TPM, 20 RPD per project;
+- the two Flash models: 5 RPM, 250,000 TPM, 20 RPD per project;
 - Pro models: not available on this account.
 
 The code never reads these numbers. It has its own pacing numbers,
@@ -141,7 +145,7 @@ key every 13.5 s (about 4.4 RPM), and at most one Lite request every
 3.0 s across the whole pool.
 There is no daily counter in code. A per-day 429 from Google is the only
 signal that a daily quota is used up (section 3.7). Capacity check:
-4 chain models x 10 projects x 20 RPD = 800 Flash
+2 Flash models x 10 projects x 20 RPD = 400 Flash
 requests per day at most. With the 9 keys in use, each Flash model has
 about 180 requests per day.
 
@@ -221,8 +225,8 @@ of the two Lite slots only while a request is being sent. Whenever the
 call only waits, it gives the slot back and queues for a slot again
 before its next request:
 
-- In the router, through `gate.released()`: the retry backoff, the delay
-  before the terminal-server-error retry, the Lite cooldown retry's wait,
+- In the router, through `gate.released()`: the retry backoff, the Lite
+  cooldown retry's wait,
   and the router's own pacing wait.
 - In the Google adapter, through `released_while_waiting()`: the per-key
   pacing sleep (`if effective_wait > 0`) in both `GoogleAdapter.complete`
@@ -259,9 +263,9 @@ with a timeout, and classifies the result:
 
 | Result | Action | Limit per call |
 |---|---|---|
-| Success | Log `google.completion_succeeded` with `model`, `key`, token counts, `thinking_tokens`, `finish_reason`, `latency_ms`. Reset the model's 503 streak, record "last success" time (Flash only), clear the 503 marker. | - |
+| Success | Log `google.completion_succeeded` with `model`, `key`, token counts, `thinking_tokens`, `finish_reason`, `latency_ms`. Reset the model's 503 streak and clear its 503 marker. | - |
 | 429 | Classify per day or per minute (`_classify_quota_violation`: "perday" in the error text means day). Bench this key for this model: 65 s (`_MINUTE_COOLDOWN_SECONDS`) or until the next midnight in America/Los_Angeles plus 60 s (`_seconds_until_pacific_midnight`). Log `google.quota_exceeded_failing_over`. Try another key. | After the 3rd 429 (`_MAX_QUOTA_EXCEEDED_RETRIES = 2`), raise `LLMRateLimitError` (`google.quota_exceeded_giving_up_early`). |
-| 503 / other 5xx | Log `google.server_error_failing_over`. No per-key cooldown (it is not a per-project problem). | Flash: give up at the first one (`_MAX_SERVER_ERROR_RETRIES = 0`); record the model's overload streak and marker (section 3.6). Lite: give up at the 3rd (`_MAX_SERVER_ERROR_RETRIES_LITE = 2`). Raise `LLMServerOverloadedError` (`google.server_error_giving_up_early`). |
+| 503 / other 5xx | Log `google.server_error_failing_over`. No per-key cooldown (it is not a per-project problem). | Flash primary call: give up at the first one (`_FLASH_PRIMARY_SERVER_ERROR_RETRIES = 0`). Flash fallback call (`fallback=True`) and Lite: give up at the 3rd (`_SERVER_ERROR_RETRIES = 2`). A Flash give-up records the model's overload streak and marker (section 3.6). Raise `LLMServerOverloadedError` (`google.server_error_giving_up_early`). |
 | Timeout | Log `google.request_timed_out`. For a Flash model on its default timeout: mark the model for `LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS = 300.0` and raise `LLMRequestTimeoutError`. Otherwise (Lite, or a caller-supplied timeout) raise `LLMProviderTimeoutError`. | Immediately. |
 | 400 / 404 | `LLMInvalidRequestError`: the request itself is wrong; never retried. | Immediately. |
 | Other 4xx, or an unexpected exception | `LLMRequestError` (`google.request_failed_non_retryable` or `google.request_failed_unexpected_error`); no other key is tried. The router may still retry it. | Immediately. |
@@ -288,18 +292,20 @@ LLMError
  +-- LLMRequestError                generic request failure
       +-- LLMInvalidRequestError    400/404
       +-- LLMProviderTimeoutError   Lite or caller-supplied timeout
-      +-- LLMRateLimitError         429 (quota)  -> triggers the fallback chain
+      +-- LLMRateLimitError         429 (quota)  -> triggers the fallback model
            +-- LLMServerOverloadedError    503 give-up, or a skipped overloaded model
                 +-- LLMRequestTimeoutError Flash timeout on the default limit
 ```
 
 ### 3.6 503 overload handling
 
-A 503 means Google is overloaded for that model, for everyone. Trying
-other keys rarely helps, and each 503 still uses one of the 20 daily
+A 503 means Google is overloaded for that model, for everyone. On the
+primary model, trying other keys rarely helps, and each 503 still uses one of the 20 daily
 requests. So for Flash models:
 
-1. The adapter gives up on the first 503 of a call.
+1. The adapter gives up on the first 503 of a call to the primary
+   model. A call to the fallback model tries up to 2 more keys first
+   (see below).
 2. It increments the model's **overload streak**
    (`("google", "server_error_streak", model)`) and sets the **confirmed
    overloaded marker** `("google", "server_error", model)` for an
@@ -308,29 +314,24 @@ requests. So for Flash models:
    `LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS`: **20 s, 60 s, 180 s,
    then 300 s**.
 3. While the marker is set, `google_model_confirmed_overloaded(model)` is
-   true and the router skips that model (it moves straight to the next
-   chain model).
-4. One successful completion of that model resets the streak, clears
-   the marker (`google.server_error_cooldown_cleared_on_success`) and,
-   for a Flash model, stamps its last-success time. `complete` and a
+   true. When the model is a primary with a fallback, the router skips
+   it and goes straight to the fallback model. The fallback model itself
+   is never skipped for a marker (section 3.10).
+4. One successful completion of that model resets the streak and clears
+   the marker (`google.server_error_cooldown_cleared_on_success`). `complete` and a
    `stream` that ran to its end share this bookkeeping
    (`google_provider._record_success`).
 
 Lite models never get the marker; their 503s use the extra keys and then
 the Lite fallback model.
 
-Two callers are special: the **Judge** and **Reflection's review** pass
-`ignore_server_error_cooldown=True`. For them the marker is ignored, so
-each chain model gets one real try, unless the model's streak is 2 or
-more (`_IGNORE_COOLDOWN_HONOUR_MIN_STREAK = 2`). Why: Bull and Bear
-run seconds before the Judge and often set markers on several chain
-models; honouring those markers would make the Judge skip most of its
-chain on the strength of one 503 each.
-
-`LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS` (default 0) can give Judge,
-Bull and Bear extra keys on the first chain model after a 503. It is 0
-because with 1 the extra key answered only about 23% of the time and
-spent most of 3.8's daily quota.
+The fallback model's call is different. The router calls the adapter
+with `fallback=True` (section 3.10). On a 503 the adapter then moves to
+the next pooled key at once, with no delay, up to 2 more keys
+(`_SERVER_ERROR_RETRIES = 2`, 3 tries in all, the same budget a Lite call
+has). Only when the third try also answers 503 does it give up and set the
+marker. Reason: right after a 503, a new request on `gemini-3.6-flash`
+usually succeeds, while one on `gemini-3.8-flash` rarely does (section 5).
 
 ### 3.7 429 handling: minute versus day
 
@@ -382,26 +383,27 @@ always wins):
 | Model | Timeout | Setting |
 |---|---|---|
 | Lite models | 60 s | `google_provider.REQUEST_TIMEOUT_SECONDS` |
-| Flash models (non-terminal) | 30 s | `LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS` |
-| `gemini-3.7-flash` (non-terminal) | 60 s | `LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS = {"gemini-3.7-flash": 60.0}` |
-| The terminal chain model (`terminal_chain_model=True`, set by the router) and every rescue attempt | 90 s | `LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS` |
+| Flash primary model | 30 s | `LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS` |
+| Flash fallback model (`fallback=True`, set by the router) | 60 s | `LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS` |
 | Filing summary and records-only calls | 300 s (caller-supplied) | `ai/knowledge/filing_summary.py::_FILING_SUMMARY_TIMEOUT_SECONDS` |
 
-The measurements behind these numbers (logs of 2026-09-25 to
-2026-10-01):
+The measurements behind these numbers (batches of 2026-10-09 and
+2026-10-10):
 
-- Successful 3.8 and 3.6 calls have a p99 latency of about 15 s, so
-  30 s is enough for Flash on the Judge/Bull/Bear critical path.
-- 3.7 has a long tail (p50 5.3 s, p90 28.9 s, p95 45.9 s, max 56.2 s)
-  and caused 27 of 50 timeouts; with a 60 s limit, 4 of its 25 requests
-  that ran past 30 s still answered. So 3.7 gets 60 s.
-- A 30 s timeout on the terminal model 3.5 has nothing behind it: losing
-  it costs a debate argument or all position tiers. So the terminal
-  model gets 90 s.
+- No successful `gemini-3.8-flash` answer took more than 29.8 s (13
+  answers), so 30 s is enough for the primary on the Judge/Bull/Bear
+  critical path. A 60 s limit on 3.8 was also measured: all 9 answers
+  came in under 30 s, so the longer limit saved no call and only added
+  waiting.
+- `gemini-3.6-flash` answers: p50 about 4.5 s, p90 about 10 s, max
+  31.3 s (124 answers). The fallback model has nothing behind it in the
+  router: losing it costs a debate argument or a whole step retry. So it
+  gets 60 s, about twice its slowest answer.
 
 A Flash timeout on the default limit also marks the model as "timed out"
-for 300 s (`google_model_recently_timed_out`). Every caller skips it during
-that time, even the Judge; the last chain model is still always tried.
+for 300 s (`google_model_recently_timed_out`). During that time the router
+skips it when it is a primary model; a fallback model is still always
+tried (section 3.10).
 A Flash stream that does not start within its timeout sets the same
 marker (`google_provider._record_timeout_cooldown`, shared by `complete`
 and `stream`) and raises `LLMProviderTimeoutError`.
@@ -425,74 +427,74 @@ rate-limit errors: the schedule `[1, 2, 4, 8, 60]` seconds
 (`RATE_LIMIT_BACKOFF_SCHEDULE`) with +/-20% jitter; with 4 retries only 1,
 2, 4 and 8 s are used. Other errors wait `0.5 s x (attempt + 1)`.
 
-For Google with a fallback chain, a rate-limit failure **breaks out of the
-retries early** (`llm_router.confirmed_exhausted_mid_retry_loop_skipping_remaining_attempts`)
-when the adapter sent nothing, the pool is exhausted, the model has a
-503 marker or a timeout marker, or (Judge/Reflection) the error was a
-503. In practice a Flash 503 or timeout moves to the next model at once.
+For Google with a fallback model, a rate-limit failure **breaks out of the
+retries early** (`llm_router.primary_unavailable_skipping_remaining_attempts`)
+when the adapter sent nothing, the pool is exhausted, or (Flash) the
+model has a 503 marker or a timeout marker. A Flash 503 or timeout always
+sets one of these markers, so in practice it moves to the fallback model
+at once. An immediate new try of `gemini-3.8-flash` after its own 503
+succeeded only 2 of 18 times in the batches of 2026-10-09 and 2026-10-10.
 Measured in the logs of 2026-09-24 to 2026-09-30: of 184 retries after
 a cooled-down pool 157 met the same cooldown again, and of 117 retries
 after a Lite 503 only 1 succeeded.
 
-### 3.10 The fallback chain and the HIGHEST rescue attempt
+### 3.10 The fallback model
 
-If the last error is in the `LLMRateLimitError` family (429, 503,
-Flash timeout) and the tier has a chain, the router walks it. For each
-chain model:
+Each tier has at most one fallback model (section 3.2).
+`tier_model_chain(tier)` returns the primary model followed by its
+fallback, for the default provider. The router, the capacity checks in
+`ai/llm/capacity.py` and Reflection's retry gate (chapter 16, section
+3.10) use this same chain, so the gate never drops a retry that the
+router could still serve with the fallback model.
 
-- Skip it (`llm_router.skipping_known_exhausted_model`, with
-  `chain_step` and a `reason`) if its pool is day-exhausted, or, except
-  for the last step, if it has a 503 marker or a timeout marker.
-- The last step is skipped for day quota only if some earlier chain model
-  still has quota (`any_chain_model_with_quota`).
+If the primary's last error is in the `LLMRateLimitError` family (429,
+503, Flash timeout), or the primary was skipped (section 3.9 and 3.15),
+the router calls the fallback model **once**:
 
-`tier_model_chain(tier)` returns the primary model followed by its chain
-for the default provider. The router and Reflection's retry gate
-(chapter 16, section 3.10) use the same chain and the same
-`any_chain_model_with_quota` check, so the gate never drops a retry that
-the router could still serve with a fallback model.
-- Otherwise call it once (`llm_router.falling_back_to_alternate_model`);
-  the last step gets the 90 s terminal timeout.
+- It logs `llm_router.falling_back_to_alternate_model` (with
+  `primary_model` and `fallback_model`).
+- It passes `fallback=True` to `GoogleAdapter.complete`. The adapter
+  then uses the 60 s fallback timeout (section 3.8) and, on a 503, tries
+  up to 2 more pooled keys at once (3 tries in all, section 3.6). A
+  timeout is not retried: it raises at once and sets the model's timeout
+  marker. For a Lite fallback the flag changes nothing, because a Lite
+  call already has 60 s and 3 tries.
+- A 503 marker or a timeout marker on the fallback model does not skip
+  it. Those markers only decide whether the primary is skipped. The
+  fallback is skipped (`llm_router.skipping_known_exhausted_model`) only
+  when its pool is day-exhausted while the primary still has quota. When
+  both are day-exhausted, the fallback is still tried once.
+- It gets JSON mode without the schema (section 3.12), and its answer
+  has `rate_limited=True`.
 
-If the whole chain fails, the router makes the **HIGHEST rescue attempt**
-(`_highest_rescue`, Flash tier only): one more request on the chain model
-that **answered most recently** in this process
-(`_highest_rescue_candidate`, using `google_model_last_success_at`),
-excluding the model that just failed, day-exhausted models and models in
-their timeout cooldown. Models that never answered come last, in chain
-order. 503 markers are ignored for this single request. Log events:
-`llm_router.highest_rescue_attempt` (with `model`, `after_model`,
-`last_success_seconds_ago`), then `..._succeeded`, `..._failed` or
-`..._no_candidate`.
-
-The Judge passes `terminal_server_error_retry_delay =
-JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS = 10.0`. That gives it a second
-rescue attempt after a 10 s pause (`llm_router.terminal_server_error_retry`),
-but only if the first rescue failed with a 503 (not a timeout).
-
-Why "the model that answered most recently": during Google's peak-hour
-503 periods, which model gets through changes from day to day and during
-the day. Sending every extra attempt to the terminal model 3.5 instead
-wears that model out: in a measured 15-ticker batch it received 97
-requests (44 from extra keys, rescuing 12 calls) and was the first to
-run out of its 20 daily requests, while 3.6 and 3.7 still had most of
-theirs.
+If the fallback also fails, the router makes the Lite cooldown retry
+(CHEAP only, section 3.7) or raises the fallback's error, chained to the
+primary's error. An error outside the rate-limit family (for example a
+400, or a timeout on a caller-supplied limit) never goes to the fallback
+model; it is raised after the same-model retries.
 
 Above the router, the graph has its own slower retries for whole steps
-(the Judge waits `JUDGE_DELAYED_RETRY_SECONDS = 120.0` and runs once more,
-a failed debate side is re-run after `DEBATE_SIDE_REPAIR_DELAY_SECONDS =
+(a failed debate side is re-run after `DEBATE_SIDE_REPAIR_DELAY_SECONDS =
 60.0`, Reflection's review after `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS
-= 60.0`). Each of these waits first asks
+= 60.0`, and the Judge retries within a budget of
+`JUDGE_RETRY_BUDGET_SECONDS = 240.0` and `JUDGE_RETRY_MAX_ATTEMPTS = 4`).
+The side repair and the review retry first ask
 `ai/llm/capacity.py::capacity_aware_delay`: when a model of the step's
 chain is free now, the wait is skipped and the step retries at once;
-otherwise the full wait runs. "Free" (`free_chain_model`, the same test as
-`chain_capacity`, which the Reflection retry gate uses) means: the model's
+otherwise the full wait runs. The Judge asks
+`chain_capacity` instead (the same test, which the Reflection retry gate
+also uses): it returns no wait when a model is free now, otherwise the
+shortest time until a model's cooldown ends, and it tells the Judge to
+stop when every model is out of its daily quota. "Free"
+(`free_chain_model`) means: the model's
 pooled keys are not out of their daily quota, and the model has no 429
-pool cooldown, no 503 cooldown and no request-timeout cooldown (the
-router skips a model with any of these). A success clears a model's 503
+pool cooldown, no 503 cooldown and no request-timeout cooldown (a
+primary model with any of these is skipped, or its adapter call fails
+fast). A success clears a model's 503
 cooldown, so a model that has just answered another call counts as free.
-For a provider other than Google there is no capacity data and the full
-wait always runs. Those steps are explained in chapter 16.
+For a provider other than Google there is no capacity data: the side
+repair and the review retry always wait in full, and the Judge retries at
+once. Those steps are explained in chapter 16.
 
 ### 3.11 Thinking budgets and MAX_TOKENS
 
@@ -505,9 +507,9 @@ structured answers and has no use for hidden thinking, so
 
 | Model | Thinking config sent |
 |---|---|
-| `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash` | `thinking_budget=0` (disabled) |
+| `gemini-3.8-flash` (and any other non-Lite model without its own entry) | `thinking_budget=0` (disabled) |
 | `gemini-3.6-flash` | `thinking_level=MINIMAL` (it rejects `thinking_budget` with 400; with no config it thinks without limit) |
-| `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` | `thinking_level=MINIMAL` (both reject `thinking_budget=0`; a positive budget is sent only by the runaway retry below) |
+| `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` | `thinking_level=MINIMAL` (both reject `thinking_budget=0`; a positive budget is sent only for Sentiment's ReAct turns and by the runaway retry below) |
 | Any other Lite model | nothing (the field is omitted) |
 
 Output budgets (`max_tokens`; thinking tokens come out of the same
@@ -588,6 +590,30 @@ The retry runs inside the adapter, so the router does not see it: it is
 not a router retry and does not move to a fallback model. In a live
 check, 3 of 3 retries answered in 1.6-2.9 s.
 
+**Sentiment thinking budget.** Sentiment's ReAct turns often think for a
+long time on Lite models; without a cap this cost about 148 s per batch.
+So Sentiment caps thinking from the first call. `ReActAgentLoop(thinking_budget=SENTIMENT_THINKING_BUDGET)`
+(1024) passes the budget to `LLMRouter.complete(thinking_budget=...)`.
+The router passes it to every Google call of that request: the primary
+model and the fallback model. `GoogleAdapter.complete(thinking_budget=...)`
+then sends `thinking_budget=1024` instead of `thinking_level=MINIMAL`,
+but only on a Lite model that is not in
+`_THINKING_BUDGET_REJECTED_MODELS`. Other models keep their normal
+thinking config. When the model answers 400 to the budget, the adapter:
+
+- logs `google.thinking_budget_rejected` (warning, with `model` and
+  `thinking_budget`);
+- adds the model to `_THINKING_BUDGET_REJECTED_MODELS` (the same set the
+  runaway retry uses, so that model also stops getting the runaway
+  retry);
+- sends the call once more without the budget.
+
+A budget of 1024 is below half of the 4096 ReAct cap, so a budgeted call
+is never a runaway. Setting `SENTIMENT_THINKING_BUDGET` to 0 turns the
+budget off. Every other caller passes no budget and keeps
+`thinking_level=MINIMAL` and the runaway retry. In a live check, budgeted
+calls answered in 1.9-10.3 s.
+
 ### 3.12 JSON answers and code fences
 
 `ai/llm/json_fence.py` has the shared helpers. `strip_json_code_fence(raw)`
@@ -612,17 +638,15 @@ one schema per agent with `_build_react_step_schema`
 Without it Gemini decoded an open `{"type": "object"}` as `{}`, and the
 tool got no arguments. A tool without a `parameters` schema falls back
 to an open object, so one missing schema does not break the whole agent.
-The router passes the schema to the tier's first model only (the
-primary attempts and the Lite cooldown retry). Fallback chain models and
-the HIGHEST rescue attempt get JSON mode (`response_format`) without the
-schema,
+The router passes the schema to the tier's primary model only (the
+primary attempts and the Lite cooldown retry). The fallback model gets
+JSON mode (`response_format`) without the schema,
 because a schema this specific was checked only with the first model.
 
 ### 3.13 Non-English output
 
 Every successful completion passes `_reject_non_english` in the router:
-each request (primary attempt, fallback step, HIGHEST rescue, Lite
-cooldown retry) goes through one inner helper, `_call`, which calls the
+each request (primary attempt, fallback call, Lite cooldown retry) goes through one inner helper, `_call`, which calls the
 adapter, sets `rate_limited` when the call is a recovery, and then runs
 the check.
 It runs `non_english_reason_in_output` (`ai/agents/evidence_grounding.py`),
@@ -671,15 +695,16 @@ good example: tier `HIGHEST_ACCURACY`, `retries=4`.
 ```
 complete(tier, messages, retries=4)
  |
- |-- resolve: model = 3.8-flash, chain = [3.7, 3.6, 3.5]
+ |-- resolve: model = 3.8-flash, fallback = 3.6-flash
  |-- Lite tier? -> wait for one of 2 Lite slots (not for Flash);
  |                 the slot is given back during every sleep below (router
  |                 and adapter) and taken again before the next request
  |
- |-- skip the first model?  (only when a chain exists)
+ |-- skip the primary?  (only when a fallback exists)
  |     pool day-exhausted?            -> skip (as a 429)
- |     503 marker set? (Judge/Reflection: only if streak >= 2) -> skip (as a 503)
- |     timeout marker set?            -> skip (as a 503)
+ |     Flash: 503 marker set?         -> skip (as a 503)
+ |     Flash: timeout marker set?     -> skip (as a 503)
+ |     (log llm_router.skipping_known_exhausted_model)
  |
  |-- else: attempt loop on 3.8 (up to retries+1)
  |     GoogleAdapter.complete(3.8)
@@ -687,8 +712,8 @@ complete(tier, messages, retries=4)
  |         reserve earliest (3.8, key) slot, 13.5 s apart   [Lite: + pool gate 3 s]
  |         wait > one interval?          -> fail fast, stop
  |         sleep, recheck key not benched meanwhile
- |         send, timeout 30 s (3.7: 60 s, terminal: 90 s)
- |           OK        -> reset streak, stamp success, clear marker -> RETURN
+ |         send, timeout 30 s
+ |           OK        -> reset streak, clear marker -> RETURN
  |           429       -> bench key 65 s / until Pacific midnight; 3rd 429 -> raise RateLimit
  |           503       -> streak+1, marker 20/60/180/300 s -> raise Overloaded
  |           timeout   -> model timeout marker 300 s -> raise RequestTimeout
@@ -697,20 +722,30 @@ complete(tier, messages, retries=4)
  |     answer non-English? -> raise NonEnglish (caller decides)
  |     error:
  |       retry limit 0 (400/404; Lite 429/503) -> stop
- |       Google + chain and (sent nothing | exhausted | marker | timed out) -> stop
+ |       fallback exists and (sent nothing | exhausted | marker | timed out) -> stop
  |       else sleep 1/2/4/8 s (+-20%) and retry 3.8
  |
- |-- last error is 429/503/timeout family and a chain exists?
- |     for 3.7, 3.6, 3.5:
- |        skip if day-exhausted, or (not last) marker / timed out
- |        call once (3.5 is terminal: 90 s)        -> success -> RETURN (rate_limited=True)
- |     HIGHEST rescue: 1 request on the chain model that answered most recently
- |        (Judge: a 2nd one after 10 s if the 1st met a 503)  -> success -> RETURN
- |     Lite tier and the first error was a 429?
- |        wait for the earliest key cooldown (<= 70 s, not a day quota), try once -> RETURN
+ |-- no fallback, or the error is not in the 429/503/timeout family?
+ |     -> Lite cooldown retry (below) or raise this error
  |
- '-- raise the last error  -> the caller's own policy (agent fails, Judge delayed retry, ...)
+ |-- fallback day-exhausted while 3.8 still has quota?  -> skip it
+ |   else call 3.6 once with fallback=True (markers do not skip it):
+ |     GoogleAdapter.complete(3.6, fallback=True)
+ |       same key loop, but timeout 60 s and a 503 moves to the next key
+ |       at once (up to 3 keys); a timeout is not retried
+ |                                                -> success -> RETURN (rate_limited=True)
+ |
+ |-- Lite tier and the first error was a 429?
+ |     wait for the earliest key cooldown (<= 70 s, not a day quota), try once -> RETURN
+ |
+ '-- raise the fallback's error -> the caller's own policy (agent fails, Judge retry, ...)
 ```
+
+How long one call can take on the HIGHEST tier: a Flash request waits at
+most one pacing interval (13.5 s) before it is sent. The worst case is
+about 155 s: 3.8 waits and times out (about 43.5 s), then 3.6 meets two
+503s (about 37 s) and then times out after its own wait (about 73.5 s).
+A 3.8 timeout followed by a quick 3.6 answer takes about 35 s.
 
 ## 4. Configuration
 
@@ -722,23 +757,21 @@ All in `services/ai-service/config.py` unless stated otherwise.
 | `GOOGLE_API_KEY`, `GOOGLE_API_KEY_2` .. `_10` | empty | The key pool, one Google Cloud project each. |
 | `LLM_GOOGLE_MODEL_CHEAP` | `gemini-3.5-flash-lite` | Lite model. |
 | `LLM_GOOGLE_MODEL_CHEAP_FALLBACK` | `gemini-3.1-flash-lite` | CHEAP fallback. |
-| `LLM_GOOGLE_MODEL_HIGHEST_ACCURACY` | `gemini-3.8-flash` | First Flash model. |
-| `LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK` / `_2` / `_3` | `gemini-3.7-flash` / `gemini-3.6-flash` / `gemini-3.5-flash` | Flash chain. |
+| `LLM_GOOGLE_MODEL_HIGHEST_ACCURACY` | `gemini-3.8-flash` | Flash primary model. |
+| `LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK` | `gemini-3.6-flash` | Flash fallback model. |
 | `LLM_GOOGLE_CHEAP_MIN_INTERVAL_SECONDS` | 5.0 | Spacing per (Lite model, key). |
 | `LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS` | 13.5 | Spacing per (Flash model, key). |
 | `LLM_GOOGLE_LITE_MAX_CONCURRENT_REQUESTS` | 2 | Lite requests in flight at once (a slot is not held while the call waits between attempts). |
 | `LLM_GOOGLE_LITE_POOL_MIN_DISPATCH_INTERVAL_SECONDS` | 3.0 | Spacing of all Lite dispatches, pool-wide. |
 | `LLM_GOOGLE_LITE_POOL_MAX_WAIT_SECONDS` | 30.0 | Fail fast above this pool wait when the Lite cooldown retry is off (and always for `stream()`). With the retry on (default) the effective limit is 60 s (section 3.4). |
 | `LLM_GOOGLE_LITE_RUNAWAY_RETRY_THINKING_BUDGET` | 1024 | Thinking budget of the Lite runaway retry; 0 turns the retry off (section 3.11). |
+| `SENTIMENT_THINKING_BUDGET` | 1024 | Thinking budget of Sentiment's ReAct turns on Lite models, from the first call; 0 turns it off (section 3.11). |
 | `LLM_GOOGLE_SERVER_ERROR_COOLDOWN_SECONDS` | 20.0 | First 503 marker duration (then x3). |
 | `LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS` | 300.0 | Cap of the escalating marker. |
-| `LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS` | 30.0 | Flash default timeout. |
-| `LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS` | `{"gemini-3.7-flash": 60.0}` | Per-model override (non-terminal). |
-| `LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS` | 90.0 | Terminal model and rescue timeout. |
+| `LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS` | 30.0 | Timeout of a Flash primary call. |
+| `LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS` | 60.0 | Timeout of a Flash fallback call (`fallback=True`). |
 | `LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS` | 300.0 | Skip a Flash model this long after a timeout (0 = off). |
-| `LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS` | 0 | Extra keys for Judge/Bull/Bear on the first model after a 503. |
 | `LLM_GOOGLE_LITE_COOLDOWN_RETRY_MAX_SECONDS` | 70.0 | Longest wait for the Lite cooldown retry (0 = off). |
-| `JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS` | 10.0 | Pause before the Judge's second rescue attempt. |
 | `LLM_MISTRAL_*`, `MISTRAL_API_KEY*` | see `config.py` | Mistral models, fallbacks, pacing (15.0 / 22.0 s), 7-key pool. |
 | `LLM_OPENAI_*`, `LLM_ANTHROPIC_*`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | see `config.py` | Dormant providers. |
 | `EMBEDDING_PROVIDER`, `GOOGLE_EMBEDDING_MODEL`, `GOOGLE_EMBEDDING_DIMENSIONS` | `google`, `gemini-embedding-2`, 1536 | Embeddings. |
@@ -754,13 +787,12 @@ Constants in code (not settings):
 | `_MINUTE_COOLDOWN_SECONDS` | 65.0 | `google_provider.py` |
 | `_DAY_COOLDOWN_MARGIN_SECONDS` | 60.0 | `google_provider.py` |
 | `_MAX_QUOTA_EXCEEDED_RETRIES` | 2 | `google_provider.py` |
-| `_MAX_SERVER_ERROR_RETRIES` / `_LITE` | 0 / 2 | `google_provider.py` |
+| `_FLASH_PRIMARY_SERVER_ERROR_RETRIES` / `_SERVER_ERROR_RETRIES` | 0 / 2 | `google_provider.py` (extra keys after a 503: Flash primary call / fallback call and Lite) |
 | `_MAX_MALFORMED_RETRIES` | 2 | `google_provider.py` |
 | `_POOL_EXHAUSTION_FRACTION_THRESHOLD` | 0.7 | `google_provider.py` |
 | `RATE_LIMIT_BACKOFF_SCHEDULE` | `[1.0, 2.0, 4.0, 8.0, 60.0]`, +/-20% jitter | `ai/llm/base.py` |
 | `AGENT_LLM_CALL_RETRIES` | 4 | `ai/llm/base.py` |
 | `_RETRY_BACKOFF_SECONDS` | 0.5 | `ai/llm/router.py` |
-| `_IGNORE_COOLDOWN_HONOUR_MIN_STREAK` | 2 | `router.py` |
 | `_GOOGLE_LITE_TIMEOUT_RETRIES` | 1 | `router.py` |
 | `GOOGLE_LITE_COOLDOWN_DEFAULT_WAIT_SECONDS` | 60.0 | `google_provider.py` (Lite cooldown retry wait when no cooldown is recorded) |
 | `_RUNAWAY_THINKING_SHARE` | 0.5 | `google_provider.py` |
@@ -803,7 +835,7 @@ not calls that are only waiting: a call that sleeps between attempts
 gives its slot back, so a long cooldown wait does not starve the other
 agents.
 
-**Flash 503: give up at once and mark the model.**
+**Flash primary 503: give up at once and mark the model.**
 Alternative: try other keys, like a 429. Reason: a 503 is about the
 model, not the project, and each one still counts against the 20 daily
 requests (Google staff confirmed this on Google's developer forum).
@@ -822,10 +854,19 @@ cooldown ends.**
 Reason: the log measurement in section 3.9 shows that short waits
 almost never succeed while a minute cooldown is still running.
 
-**Rescue on the model that answered most recently, not on the terminal
-model.**
-Reason: the terminal model absorbed every failure and ran out of daily
-quota first (section 3.10).
+**The fallback model gets three keys on a 503; the primary gets one.**
+Alternative: give up at the first 503 on both models, or list more
+Flash model names as extra fallbacks. Reason: Google routes
+`gemini-3.7-flash` to `gemini-3.8-flash` and `gemini-3.5-flash` to
+`gemini-3.6-flash` (since 2026-10-08), so more names add no new model.
+In the batches of 2026-10-09 and 2026-10-10, an immediate new try of 3.6
+after a 3.6 503 succeeded 35 of 49 times (71%); one of 3.8 after a 3.8
+503 succeeded 2 of 18 times (11%). So the extra tries go to 3.6, inside
+one adapter call, with no delay. A 60 s limit on 3.8 never saved a call
+(all 9 answers came in under 30 s), so 3.8 keeps 30 s. One router call
+now takes at most about 155 s, and a 3.8 timeout followed by a 3.6
+answer about 35 s. Longer outages are left to the slower step retries
+in chapter 16.
 
 **Thinking disabled or minimal.**
 Reason: hidden thinking silently used up the output budget (empty
@@ -845,12 +886,13 @@ cannot be fixed by client-side retries, only survived.
 | `quota_window: "day"`, then `llm_router.skipping_known_exhausted_model` | A model's daily quota is used up on most keys. | Count today's requests per model; quota returns at midnight Pacific (03:00 New York, usually 08:00 London). |
 | Many `google.server_error_failing_over` / `server_error_giving_up_early` with rising `overload_streak` | Google-side overload for that model. | Is it all models or one? Check Google's status/community before changing code. |
 | `google.request_timed_out` then `google.model_timeout_cooldown_recorded` | A Flash model is slow; it is skipped for 300 s. | `latency_ms` distribution of recent successes (demo step 3); `make probe`. |
-| `llm_router.highest_rescue_no_candidate` | Every chain model failed, is day-exhausted or timed out. | The analysis may end with `judge_unavailable` (chapter 16). |
+| `llm_router.falling_back_to_alternate_model`, then `google.server_error_giving_up_early` on `gemini-3.6-flash` with `server_error_count: 3` | Both Flash models are overloaded. | The step retries of chapter 16 take over (side repair, Judge retry); the analysis may end with `judge_unavailable`. |
 | `google.non_stop_finish_reason` with `MAX_TOKENS` | Output budget too small, or thinking used it. | `thinking_tokens` in the event; the model's thinking config. |
 | `llm_router.non_english_output_rejected` | The model answered in another script. | The caller's correction or fallback; repeated cases go to the agent's failure. |
 | `LLMConfigError` "GOOGLE_API_KEY is not configured" | No key in the environment. | `.env.docker` values (do not print them); container restart after changes. |
 | `google.pool_pacing_wait_exceeds_threshold_failing_fast` | The Lite pool queue is longer than the gate limit (60 s by default, 30 s for streams). | How many Lite calls run at once; whether two batches overlap. |
 | `google.thinking_runaway_retrying_with_budget` | A Lite call thought until its output cap. | The following `_retry_done` / `_retry_failed`; a `thinking_budget_rejected_disabling_runaway_retry` means the model refused the budget and no longer gets the retry until restart. |
+| `google.thinking_budget_rejected` | A Lite model answered 400 to Sentiment's thinking budget. | The call was sent again without the budget. That model gets no budget and no runaway retry until restart. |
 | `filing_summary.output_limit_retry` / `filing_summary.output_truncated` | A filing call reached its output budget; the retry at 16384 also stopped. | Chapter 18 (filing summaries). |
 | Day-quota 429s right after a restart | The cooldown table is in memory, so each day-exhausted key is tried once more. | Expected; each key is benched again after one 429. |
 | Metric `alphamind_llm_errors_total{kind="server_overload"}` rising | Same as 503 storms. | Grafana panel (chapter 27). |
@@ -861,7 +903,7 @@ Useful log searches (today's file, New York date):
 bash scripts/logs.sh ai-service grep google.server_error_giving_up_early
 bash scripts/logs.sh ai-service grep llm_router.skipping_known_exhausted_model
 bash scripts/logs.sh ai-service grep '"quota_window": "day"'
-bash scripts/logs.sh ai-service grep llm_router.highest_rescue_attempt
+bash scripts/logs.sh ai-service grep llm_router.falling_back_to_alternate_model
 ```
 
 ## 7. Demo walkthrough
@@ -870,12 +912,12 @@ Goal: show how fast each Gemini model answers right now, and show the
 resilience events in a real log. Steps 1-3 are read-only. Step 4 sends
 real requests and spends daily quota.
 
-1. **Show the configured chain (read-only).**
+1. **Show the configured models (read-only).**
    ```bash
-   docker compose --env-file .env.docker exec -T ai-service python -c "from config import settings as s; print(s.LLM_GOOGLE_MODEL_CHEAP, s.LLM_GOOGLE_MODEL_CHEAP_FALLBACK); print(s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY, s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK, s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2, s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3)"
+   docker compose --env-file .env.docker exec -T ai-service python -c "from config import settings as s; print(s.LLM_GOOGLE_MODEL_CHEAP, s.LLM_GOOGLE_MODEL_CHEAP_FALLBACK); print(s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY, s.LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK)"
    ```
-   Say: "CHEAP is the Lite pair; HIGHEST is a four-step Flash chain in
-   quality order."
+   Say: "CHEAP is the Lite pair; HIGHEST is a Flash primary model with
+   one Flash fallback model."
 
 2. **Count successful calls per model today (read-only).**
    ```bash
@@ -899,14 +941,15 @@ real requests and spends daily quota.
    ```
    Each line of the daily log file is `<New York timestamp> stdout
    <JSON>`, so the script cuts at the first `{`. Say: "This is why the
-   Flash timeout is 30 s but 3.7 gets 60 s."
+   Flash primary has a 30 s timeout and the fallback model 60 s."
 
 4. **Run the latency probe (spends quota).**
    ```bash
-   make probe                                   # gemini-3.7-flash, 2 requests per key
-   make probe MODEL=gemini-3.8-flash ARGS="--per-key 1 --cap 90"
+   make probe                                   # HIGHEST primary model, 2 requests per key
+   make probe MODEL=gemini-3.6-flash ARGS="--per-key 1 --cap 90"
    ```
-   The probe (`services/ai-service/scripts/probe_model_latency.py`) sends
+   The probe (`services/ai-service/scripts/probe_model_latency.py`)
+   uses the configured HIGHEST primary model when no model is given. It sends
    Judge-sized requests, one key after another, 5 s apart. Each request
    may run up to `--cap` seconds (default 120 s), so even slow answers
    are measured. It prints one
@@ -920,7 +963,7 @@ real requests and spends daily quota.
    ```bash
    bash scripts/logs.sh ai-service grep google.server_error_failing_over
    bash scripts/logs.sh ai-service grep llm_router.falling_back_to_alternate_model
-   bash scripts/logs.sh ai-service grep llm_router.highest_rescue_attempt
+   bash scripts/logs.sh ai-service grep llm_router.skipping_known_exhausted_model
    bash scripts/logs.sh ai-service grep llm_router.lite_cooldown_retry
    ```
    An older day: add the date, e.g.
@@ -928,8 +971,8 @@ real requests and spends daily quota.
    Walk the audience through one sequence: a 503 on 3.8
    (`server_error_failing_over`, `server_error_giving_up_early` with
    `overload_streak` and `cooldown_seconds`), then
-   `falling_back_to_alternate_model` to 3.7, then
-   `completion_succeeded` on 3.7 with its `latency_ms`.
+   `falling_back_to_alternate_model` to 3.6, then
+   `completion_succeeded` on 3.6 with its `latency_ms`.
 
 6. **Watch live during an analysis (read-only).**
    ```bash
@@ -948,25 +991,27 @@ real requests and spends daily quota.
 2. **What happens on the first 503 from gemini-3.8-flash?**
    The adapter gives up for this call, raises the overload streak and
    sets a 20 s marker (then 60, 180, 300 s on further give-ups); the
-   router moves to 3.7.
+   router moves to the fallback model 3.6. Later calls skip 3.8 while
+   the marker is set.
 
-3. **Why does the Judge ignore the 503 marker, and when does it not?**
-   So each chain model gets one real try even if Bull/Bear just set
-   markers; it honours the marker once the streak is 2 or more.
+3. **Is the fallback model skipped when it has a 503 marker?**
+   No. Markers only decide whether the primary is skipped. The fallback
+   is skipped only when its pool is day-exhausted while the primary
+   still has quota.
 
 4. **How long is a key benched after a per-day 429?**
    Until the next midnight in America/Los_Angeles plus 60 s.
 
-5. **What is the HIGHEST rescue attempt?**
-   After the whole Flash chain failed: one request on the chain model
-   that answered most recently (two for the Judge, the second after 10 s
-   if the first met a 503).
+5. **What does `fallback=True` change in the adapter?**
+   A 60 s timeout instead of 30 s, and up to 3 keys on a 503 instead of
+   1. A timeout is still not retried.
 
 6. **Why is `thinking_budget=0` not sent to gemini-3.6-flash?**
    That model rejects it with 400; it gets `thinking_level=MINIMAL`.
 
-7. **Which timeouts apply to a call on gemini-3.5-flash as the last chain
-   model?** 90 s (terminal), unless the caller passed its own timeout.
+7. **Which timeout applies to a call on gemini-3.6-flash as the fallback
+   model?** 60 s (`LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS`),
+   unless the caller passed its own timeout.
 
 8. **Why are Lite 429s not retried after 1-2-4-8 s?**
    The logs showed those retries almost always met the same cooldown;
@@ -987,7 +1032,8 @@ real requests and spends daily quota.
 11. **What happens when a Lite answer stops at MAX_TOKENS with most of
     the budget spent on thinking?**
     The adapter sends it once more with `thinking_budget=1024`. The
-    router never sees this retry.
+    router never sees this retry. Sentiment's ReAct turns send this
+    budget from the first call (`SENTIMENT_THINKING_BUDGET`).
 
 12. **Which model gets the ReAct JSON schema?**
     Only the tier's first model. Fallback models get JSON mode without
@@ -1000,13 +1046,13 @@ real requests and spends daily quota.
 | File | What it holds |
 |---|---|
 | `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. |
-| `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and chain maps, `router_retry_limit`, skip logic, fallback walk, `_highest_rescue`, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets). |
-| `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config, timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`, `google_model_last_success_at`). |
+| `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets). |
+| `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config (and the caller's `thinking_budget` on Lite models), timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`); the `fallback` flag (60 s timeout, 3 keys on a 503). |
 | `services/ai-service/ai/llm/mistral_provider.py` | `MistralAdapter` and its key pool. |
 | `services/ai-service/ai/llm/openai_provider.py`, `anthropic_provider.py` | Dormant adapters. |
 | `services/ai-service/ai/llm/json_fence.py` | `strip_json_code_fence`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
-| `services/ai-service/ai/llm/capacity.py` | `chain_model_wait`, `chain_capacity` (Reflection retry gate), `free_chain_model` and `capacity_aware_delay` (side repair, Judge delayed retry, citation-review retry, late side repair): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
-| `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`. |
+| `services/ai-service/ai/llm/capacity.py` | `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
+| `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
 | `services/ai-service/ai/providers/news_relevance.py` | `verify_with_cheap_tier` (the relevance classifiers' CHEAP call, fail-open and echo check) and `parsed_with_retry` (their JSON retry at 8192 tokens). |
 | `services/ai-service/ai/rag/embedding.py` | Gemini and Mistral embeddings, batching, key rotation. |
 | `services/ai-service/ai/agents/evidence_grounding.py` | `non_english_reason`, `non_english_reason_in_output`. |

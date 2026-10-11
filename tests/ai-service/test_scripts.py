@@ -1628,12 +1628,12 @@ class TestOperatorShellScripts:
         assert not re.search(r"round\d", text, re.IGNORECASE)
 
         cases = {
-            "default-model": ([], "--model gemini-3.7-flash"),
-            "health-flag": (["--health"], "--model gemini-3.7-flash --health"),
-            "model-and-per-key": (["gemini-3.8-flash", "--per-key", "1"],
-                                  "--model gemini-3.8-flash --per-key 1"),
-            "model-and-health": (["gemini-3.8-flash", "--health"],
-                                 "--model gemini-3.8-flash --health")
+            "default-model": ([], ""),
+            "health-flag": (["--health"], " --health"),
+            "model-and-per-key": (["gemini-3.6-flash", "--per-key", "1"],
+                                  " --model gemini-3.6-flash --per-key 1"),
+            "model-and-health": (["gemini-3.6-flash", "--health"],
+                                 " --model gemini-3.6-flash --health")
         }
         env = _fake_docker(tmp_path)
         for case_id, (args, tail) in cases.items():
@@ -1641,7 +1641,7 @@ class TestOperatorShellScripts:
                 ["bash", str(ROOT / "scripts" / "probe.sh"), *args], env=env,
                 capture_output=True, text=True, check=True).stdout.strip()
             assert probe.endswith(
-                "python -m scripts.probe_model_latency " + tail), case_id
+                "python -m scripts.probe_model_latency" + tail), case_id
 
     @pytest.mark.skipif(
         Path("/scripts/heartbeat.sh").exists(),

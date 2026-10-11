@@ -10,6 +10,7 @@ from ai.llm.json_fence import parse_json_dict
 from ai.llm.router import LLMRouter
 from ai.tools.news_tool import (SearchNewsTool, live_search_yield,
                                 ran_live_search)
+from config import settings
 from shared.enums import AgentRole, AgentStatus
 
 logger = structlog.get_logger(__name__)
@@ -235,7 +236,8 @@ class SentimentAgent(BaseAgent):
                 else None), finish_answer_validator=InternalTokenValidator(
                     self.role.value, once_checks=[
                         ("label_without_evidence", _label_without_evidence)
-                    ]), finish_validation_suffix=_SENTIMENT_VALIDATION_SUFFIX)
+                    ]), finish_validation_suffix=_SENTIMENT_VALIDATION_SUFFIX,
+            thinking_budget=settings.SENTIMENT_THINKING_BUDGET)
         result = await loop.run(
             f"Characterize current market sentiment for {state.ticker} "
             "qualitatively.", extra_context=_build_extra_context(

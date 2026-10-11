@@ -353,6 +353,16 @@ def _debate_side_node(side: DebateSide) -> _StateNode:
             await asyncio.sleep(_DEBATE_SIDE_STAGGER_SECONDS)
         argument = await _side_argument(
             side, state, failed_event=f"{name}.failed")
+        previous = state.debate.latest_argument(side)
+        if (not argument.available
+                and argument.unavailable_kind in _REPAIRABLE_UNAVAILABLE_KINDS
+                and _is_single_side_correction_pass(state)
+                and previous is not None and previous.available):
+            logger.warning(
+                f"{name}.correction_failed_kept_previous",
+                failure_kind=argument.unavailable_kind,
+                kept_round_number=previous.round_number)
+            return {}
         logger.debug(
             f"debate_debug.{name}.exit",
             argument_round_number=argument.round_number)
@@ -399,6 +409,22 @@ async def _late_side_repair(
     return repaired
 
 
+async def _judge_retry_wait(
+        attempts: int, seconds_used: float) -> float | None:
+    remaining = settings.JUDGE_RETRY_BUDGET_SECONDS - seconds_used
+    chain = tier_model_chain(LLMTier.HIGHEST_ACCURACY)
+    if (not chain or attempts >= settings.JUDGE_RETRY_MAX_ATTEMPTS
+            or remaining <= 0):
+        return None
+    capacity = await chain_capacity(chain)
+    if capacity is None:
+        return 0.0
+    wait, scale, _ = capacity
+    if scale == "day":
+        return None
+    return min(wait, remaining)
+
+
 async def judge_node(state: AnalysisState) -> dict[str, Any]:
     logger.debug(
         "debate_debug.judge_node.enter",
@@ -408,7 +434,8 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
         argument_rounds=[a.round_number for a in state.debate.arguments],
         pending_retry_agents_in=[r.value for r in state.pending_retry_agents])
     is_correction_pass = _is_single_side_correction_pass(state)
-    delayed_retry_used = state.judge_delayed_retry_used
+    retry_attempts = state.judge_retry_attempts
+    retry_seconds = state.judge_retry_seconds
     late_repair_used = state.debate_late_side_repair_used
     repaired: list[DebateArgument] = []
     judge_state = state
@@ -433,41 +460,25 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
                         state.debate, DebateState(arguments=repaired))
                 })
 
-    async def _judge_after(delay: float) -> JudgeVerdict:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await _repair_before_judge()
-        return await JudgeAgent().assess_round(judge_state)
-
     try:
         await _repair_before_judge()
-        try:
-            verdict = await JudgeAgent().assess_round(judge_state)
-        except LLMRateLimitError as first_exc:
-            if delayed_retry_used:
-                raise
-            delayed_retry_used = True
-            delay, free_model = await capacity_aware_delay(
-                LLMTier.HIGHEST_ACCURACY, settings.JUDGE_DELAYED_RETRY_SECONDS)
-            logger.warning(
-                "judge_node.delayed_retry", error=str(first_exc),
-                failure_kind=_failure_kind_of(first_exc), delay_seconds=delay,
-                free_model=free_model)
+        while True:
             try:
-                verdict = await _judge_after(delay)
-            except LLMRateLimitError as immediate_exc:
-                # A model that only looked free (its cooldown had just
-                # ended) answered nothing: the immediate retry does not use
-                # up the delayed retry, which now waits the full delay.
-                full_delay = settings.JUDGE_DELAYED_RETRY_SECONDS
-                if delay > 0 or full_delay <= 0:
+                verdict = await JudgeAgent().assess_round(judge_state)
+                break
+            except LLMRateLimitError as exc:
+                wait = await _judge_retry_wait(retry_attempts, retry_seconds)
+                if wait is None:
                     raise
+                retry_attempts += 1
+                retry_seconds += wait
                 logger.warning(
-                    "judge_node.delayed_retry", error=str(immediate_exc),
-                    failure_kind=_failure_kind_of(immediate_exc),
-                    delay_seconds=full_delay, free_model=None,
-                    after_immediate_retry=True)
-                verdict = await _judge_after(full_delay)
+                    "judge_node.delayed_retry", error=str(exc),
+                    failure_kind=_failure_kind_of(exc), attempt=retry_attempts,
+                    delay_seconds=round(wait, 1))
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                await _repair_before_judge()
     except Exception as exc:
         logger.warning(
             "judge_node.failed", error=str(exc),
@@ -492,7 +503,8 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
             arguments=repaired, verdicts=[verdict],
             converged=verdict.converged),
         "pending_retry_agents": [],
-        "judge_delayed_retry_used": delayed_retry_used,
+        "judge_retry_attempts": retry_attempts,
+        "judge_retry_seconds": retry_seconds,
         "debate_late_side_repair_used": late_repair_used
     }
 

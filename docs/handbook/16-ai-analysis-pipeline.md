@@ -57,7 +57,7 @@ The full flow, including what happens after the graph:
  |             \        /                                                |
  |          debate_join_node     (one-time side repair after 60 s)       |
  |                 |                                                     |
- |             judge_node        (one delayed retry after 120 s)         |
+ |             judge_node        (retries up to 4 times, 240 s)          |
  |                 | should_continue_debate_round                        |
  |                 +-- not converged and < 3 rounds --> bull + bear      |
  |                 v                                                     |
@@ -393,6 +393,22 @@ with no verdict. The delay is 60 s because after 30 s only 2 of 6
 measured repairs succeeded; it is skipped when a chain model is free,
 because then the router has a model to send the retry to at once.
 
+**A failed correction keeps the earlier argument.** The side repair runs
+only in the first round. In a *single-side correction pass* (3.9:
+Reflection asked only Bull, or only Bear, to fix its argument), the
+retried side can also fail for availability (`server_overload` or
+`rate_limit`). If that side already has an earlier available argument,
+`bull_node` / `bear_node` keeps it: the node adds nothing to the debate
+and logs `<side>_node.correction_failed_kept_previous` (fields
+`failure_kind` and `kept_round_number`). The Judge then reads the earlier
+argument as the side's latest one. Why: an unavailable placeholder would
+make the Judge treat the side as missing, which caps the confidence at
+0.30 (3.12). Example: on 2026-10-10 the Bull correction pass of an AMZN
+analysis failed on both models; with a placeholder, a debate that had two
+real sides would get the one-side cap of 0.30. A side with no earlier
+available argument still gets the placeholder, as with any other
+failure.
+
 ### 3.8 judge_node: the verdict
 
 `judge_node` calls `ai/agents/judge.py::JudgeAgent.assess_round` on the
@@ -507,20 +523,32 @@ sentences also deletes investment text, so only the prompt rule asks
 the Judge to leave debate-process text out.
 
 **Delayed retry.** If the call fails for availability
-(`LLMRateLimitError`, which includes 503s and strong-model timeouts),
-`judge_node` logs `judge_node.delayed_retry`, waits
-`JUDGE_DELAYED_RETRY_SECONDS` (120 s; skipped when a strong-chain model is
-free now, logged `delay_seconds=0` and `free_model`) and tries once more,
-at most once per analysis (`judge_delayed_retry_used`). A model counts as
-free as soon as its cooldown ends, even if it would fail again at once;
-so when that immediate retry fails for availability too, it does not use
-up the retry: `judge_node` logs a second `judge_node.delayed_retry` with
-`after_immediate_retry=true`, waits the full delay and tries one last
-time (on 2026-10-07 an AMZN analysis failed because the immediate retry
-was its only one).
+(`LLMRateLimitError`, which includes 429s, 503s and strong-model
+timeouts), `judge_node` asks `_judge_retry_wait` how long to wait. It
+reads the cooldowns of the strong chain
+(`ai/llm/capacity.py::chain_capacity` over
+`tier_model_chain(HIGHEST_ACCURACY)`, chapter 14, 3.10):
 
-**Late side repair.** Before each Judge call (the first one and the one
-after the delayed-retry wait), when a latest side is missing for capacity
+- a model has no 429, 503 or timeout cooldown: wait 0 s;
+- every model is in a cooldown: wait until the earliest cooldown ends;
+- every model is out of its daily quota: no retry.
+
+`judge_node` logs `judge_node.delayed_retry` (fields `error`,
+`failure_kind`, `attempt` and `delay_seconds`), waits, runs the late side
+repair below and calls the Judge again. It repeats this after each
+availability failure, within a budget per analysis:
+`JUDGE_RETRY_MAX_ATTEMPTS` (4) retries and `JUDGE_RETRY_BUDGET_SECONDS`
+(240 s) of waiting in total. Each wait is capped by the rest of the
+budget. The state keeps the count and the seconds used
+(`judge_retry_attempts`, `judge_retry_seconds`). When the budget is used
+up or no retry is possible, the error is raised. Why: in
+run_20261011_130633 one fixed 120 s wait was too short for NVDA
+(gemini-3.6-flash answered again about 4 minutes after the first
+failure) and too long for UNH and BA (their cooldowns ended 40-100 s
+before the wait did).
+
+**Late side repair.** Before each Judge call (the first one and each one
+after a retry wait), when a latest side is missing for capacity
 (`server_overload` or `rate_limit`) and a strong-chain model is free now
 (a model that has answered since counts, as its 503 cooldown is cleared),
 `judge_node` regenerates the missing side(s) once per analysis
@@ -531,18 +559,16 @@ pass. A repaired argument is added to the debate (the Judge reads it as
 the side's latest argument; the placeholder is then dropped from the
 stored debate, 3.7); a failed attempt adds nothing and the side stays
 missing. Why: on 2026-10-05 MSFT's Bull failed on every model, its 60 s
-repair failed too, and the Judge's 120 s retry then succeeded on
+repair failed too, and the Judge's retry then succeeded on
 gemini-3.6-flash; the Bull stayed missing and the verdict was capped at
 0.30. Replayed on that log: no chain model was free at the first Judge
-call (08:36:02, all four in 503 cooldown), and gemini-3.6-flash was free
-after the 120 s wait (08:38:15), so the Bull would have been regenerated
-once before the Judge's second call. Inside the router the Judge also
-gets one extra last-resort attempt after a terminal 503
-(`JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS`, 10 s) and ignores other calls'
-503 cool-downs. If it still fails, the verdict is
-`judge_failed=True, failure_reason="judge_unavailable"`. The 120 s comes
-from log measurements (September 2026): a model's success rate after a
-503 is about 40% within 20-60 s and about 53% after 1-3 minutes.
+call (08:36:02, every chain model in 503 cooldown), and gemini-3.6-flash
+was free at the Judge's retry (08:38:15), so the Bull would have been
+regenerated once before the Judge's second call. Inside the router the
+Judge's call is an ordinary HIGHEST call: the primary model, then the
+fallback model with up to 3 keys on a 503 (chapter 14, 3.10). If it
+still fails, the verdict is
+`judge_failed=True, failure_reason="judge_unavailable"`.
 
 ### 3.9 Rounds and convergence
 
@@ -557,7 +583,8 @@ There are two counters in `DebateState`:
 - `mutual_rounds_completed`: bumped only for a real two-sided round. A
   *single-side correction pass* (Reflection asked only Bull, or only Bear,
   to fix its argument) does not count against the cap
-  (`_is_single_side_correction_pass`).
+  (`_is_single_side_correction_pass`). If the corrected side fails for
+  availability, its earlier argument is kept (3.7).
 
 A debate that ends without convergence still produces a verdict; it is
 just penalized (3.12).
@@ -607,12 +634,11 @@ fails for availability, it waits `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS`
 (60 s; skipped when a strong-chain model is free now) and tries once more
 (0 turns this off).
 
-**Capacity-aware waits, replayed.** Of the 12 fixed waits in the stored
-batches (side repair 4, Judge delayed retry 4, citation-review retry 4),
-a strong-chain model was free when 6 started (2026-10-05: AMZN review,
-GOOGL, JPM, MSFT and NVDA side repairs; 2026-10-04 DIS Judge): 420 s of
-sleep that the new rule skips. The other 6 (AMZN and MSFT Judge, JPM and
-TSLA review on 2026-10-05; UNH review and META Judge on 2026-10-03) had
+**Capacity-aware waits, replayed.** Of the 8 fixed waits in the stored
+batches (side repair 4, citation-review retry 4), a strong-chain model
+was free when 5 started (2026-10-05: AMZN review, GOOGL, JPM, MSFT and
+NVDA side repairs): 300 s of sleep that the capacity check skips. The
+other 3 (JPM and TSLA review on 2026-10-05; UNH review on 2026-10-03) had
 every chain model in a 503, timeout or daily-quota cooldown and keep
 their wait. The cooldowns were rebuilt from each batch's merged log
 (`google.server_error_giving_up_early` cooldowns, cleared by
@@ -637,7 +663,8 @@ usable_agents=N/M` (`ReflectionVerdict.review_meta_line`).
    for data agents, the HIGHEST chain for Bull/Bear), not only the
    primary model:
    - If some chain model has quota and no cooldown, the retry goes ahead
-     at once; the router will skip the busy models itself.
+     at once; the router skips a busy primary model itself and goes to
+     the fallback model.
    - If every chain model is out of its daily quota
      (`google_model_pool_exhausted`, the same check the router uses), the
      retry is dropped (`reflection_node.rate_limit_skip`), with the note
@@ -966,10 +993,9 @@ All settings are in `services/ai-service/config.py` (class
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | review window named in the track record |
 | `MIN_USABLE_AGENTS_FOR_DEBATE` | 4 | usable agents needed for a debate; 0 = off |
 | `DEBATE_SIDE_REPAIR_DELAY_SECONDS` | 60.0 | pause before re-running an unavailable first-round side; skipped when a strong-chain model is free |
-| `JUDGE_DELAYED_RETRY_SECONDS` | 120.0 | pause before the Judge's one delayed retry; skipped when a strong-chain model is free |
-| `JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS` | 10.0 | router-level extra attempt for the Judge after a terminal 503 |
+| `JUDGE_RETRY_BUDGET_SECONDS` | 240.0 | total wait of the Judge's availability retries in one analysis; each wait lasts until the earliest strong-chain cooldown ends (0 s when a model is free) |
+| `JUDGE_RETRY_MAX_ATTEMPTS` | 4 | most availability retries of the Judge in one analysis |
 | `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` | 60.0 | pause before the citation review's retry; skipped when a strong-chain model is free; 0 = off |
-| `LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS` | 0 | extra pooled keys for Bull/Bear/Judge after a 503 on the first chain model |
 | `MAX_POSITION_WEIGHT_PCT` | 50.0 | single-position limit, percent of net value |
 | `JUDGE_STATE_QUARTER_DECLINE_PCT` | 15.0 | a latest-quarter decline beyond this (or a swing to a loss) is named in the Judge's user message ("state this change") |
 | `MIN_BUY_TIER_CONFIDENCE` | 0.5 | a BUY below this gets no tiers |
@@ -1010,8 +1036,9 @@ costs only News's run time.
 everything that failed. Reason: blind retries turn one 429 into a storm
 (28 Gemini attempts in 54 seconds were measured in one run).
 Instead there are a few bounded, delayed retries at the points that
-matter most: the side repair (60 s), the Judge (120 s) and the citation
-review (60 s), each at most once.
+matter most: the side repair (60 s, once), the Judge (until the earliest
+model cooldown ends, at most 4 times and 240 s in all) and the citation
+review (60 s, once).
 
 **No verdict means no recommendation.** Alternative: save a HOLD 0.0.
 Reason: a fake hold is indistinguishable from a real one and pollutes
@@ -1106,7 +1133,7 @@ new one at the beginning of the session.
    ```
 
    Say: "This creates a system analysis bound to the test portfolio
-   through the internal API, polls every 15 seconds, and saves everything
+   through the internal API, polls every 5 seconds, and saves everything
    in a `runs/run_<timestamp>/` folder." The terminal shows
    `elapsed=...s status=running` lines, then `final status=completed`.
 
@@ -1214,8 +1241,11 @@ tier can only become a trade after the owner accepts it."
    grounding reference (`find_ungrounded_figures`). With an ungrounded
    figure the side writes once more (one extra strong-model call); a
    regenerated draft that is still flagged is accepted and logged.
-4. After the first availability failure `judge_node` waits 120 s and
-   retries once. The second failure gives `judge_failed`,
+4. After each availability failure `judge_node` waits until the
+   earliest strong-chain cooldown ends (0 s when a model is free) and
+   tries again, so a second 503 leads to another retry. It stops after 4
+   retries, after 240 s of waiting, or at once when every chain model is
+   out of its daily quota. The last failure gives `judge_failed`,
    `judge_unavailable`; the debate stops, Reflection skips its review,
    retries are dropped, and the analysis fails with no recommendation.
 5. 0.85 - 0.15 (not converged) = 0.70; ratio 4/9 = 0.44 < 0.5, so it is
@@ -1237,7 +1267,7 @@ tier can only become a trade after the owner accepts it."
 | File | What it holds |
 |---|---|
 | `services/ai-service/ai/graph/builder.py` | `build_analysis_graph`: nodes and edges |
-| `services/ai-service/ai/graph/nodes.py` | every node; `_run_agent_safely`, the Supervisor's guarded enrichments, side repair, Judge delayed retry and late side repair (`_late_side_repair`), Reflection retry gating (`_rate_limit_gate_for_retry`, using `ai/llm/capacity.py::chain_capacity`) |
+| `services/ai-service/ai/graph/nodes.py` | every node; `_run_agent_safely`, the Supervisor's guarded enrichments, side repair, Judge retry (`_judge_retry_wait`, using `ai/llm/capacity.py::chain_capacity`) and late side repair (`_late_side_repair`), Reflection retry gating (`_rate_limit_gate_for_retry`, using `ai/llm/capacity.py::chain_capacity`) |
 | `services/ai-service/ai/graph/edges.py` | routing functions, `node_name` (node names per role), `MAX_DEBATE_ROUNDS`, `MAX_REFLECTION_RETRIES` |
 | `services/ai-service/ai/graph/state.py` | `AnalysisState`, reducers, `DebateState`, `JudgeVerdict`, `ReflectionVerdict`, `confidence_adjustment_note` |
 | `services/ai-service/ai/agents/supervisor.py` | `AGENT_REGISTRY`, agent selection table |
