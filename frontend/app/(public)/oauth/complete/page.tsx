@@ -96,13 +96,12 @@ function TwoFactorStep({ challengeToken }: { challengeToken: string }) {
       <form action={formAction} className="form">
         <div className="field">
           <label htmlFor="code">Authentication code</label>
-          <input id="code" name="code" type="text" inputMode="numeric" maxLength={6} required autoFocus />
+          <input id="code" name="code" type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={6} required autoFocus />
         </div>
-        {state.error && (
-          <p aria-live="polite" className="form-message error">
-            {state.error}
-          </p>
-        )}
+        {/* Always mounted so screen readers announce the error when it appears. */}
+        <p aria-live="polite" className="form-message error">
+          {state.error}
+        </p>
         <button type="submit" disabled={pending} className="btn btn-primary">
           {pending ? "Verifying…" : "Verify"}
         </button>

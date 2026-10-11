@@ -1,15 +1,19 @@
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { formatNumber } from "@/app/lib/format";
+import { can, getMe } from "@/app/lib/me";
+import { Pager, pageParam } from "../../pager";
+import { LocalTime } from "@/app/(protected)/local-time";
 import { AddHoldingForm } from "./add-holding-form";
 import { AddTransactionForm } from "./add-transaction-form";
+import { PortfolioSettingsForm } from "./portfolio-settings-form";
 
 type Portfolio = {
   id: string;
   name: string;
   currency: string;
   visibility: string;
-  owner: { username: string };
+  organization_id: string | null;
+  owner: { id: string; username: string };
 };
 
 type Holding = {
@@ -28,18 +32,26 @@ type Transaction = {
   transaction_date: string;
 };
 
+const PAGE_SIZE = 20;
+
+type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
 export default async function PortfolioDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: SearchParams;
 }) {
   const { id } = await params;
-  const accessToken = await getAccessToken();
+  const page = pageParam((await searchParams).page);
+  const { me, accessToken } = await getMe();
+  const path = `/portfolios/${encodeURIComponent(id)}`;
 
   const [portfolioRes, holdingsRes, transactionsRes] = await Promise.all([
-    backendFetch(`/portfolios/${id}`, accessToken!, { cache: "no-store" }),
-    backendFetch(`/portfolios/${id}/holdings`, accessToken!, { cache: "no-store" }),
-    backendFetch(`/portfolios/${id}/transactions`, accessToken!, { cache: "no-store" }),
+    backendFetch(path, accessToken, { cache: "no-store" }),
+    backendFetch(`${path}/holdings`, accessToken, { cache: "no-store" }),
+    backendFetch(`${path}/transactions?page=${page}&page_size=${PAGE_SIZE}`, accessToken, { cache: "no-store" }),
   ]);
 
   requireOk(portfolioRes, "Failed to load portfolio");
@@ -48,15 +60,35 @@ export default async function PortfolioDetailPage({
 
   const { data: portfolio }: { data: Portfolio } = await portfolioRes.json();
   const { data: holdings }: { data: Holding[] } = await holdingsRes.json();
-  const { items: transactions }: { items: Transaction[] } = await transactionsRes.json();
+  const { items: transactions, total }: { items: Transaction[]; total: number } = await transactionsRes.json();
+
+  // Organization members may read a shared portfolio, but only its owner
+  // may change it (the backend answers 403 otherwise), and only with the
+  // portfolio:write permission (a guest has none).
+  const isOwner = portfolio.owner.id === me.id;
+  const canEdit = isOwner && can(me, "portfolio:write");
+  const readOnlyNote = !isOwner
+    ? `This portfolio belongs to ${portfolio.owner.username}; you can view it but not change it.`
+    : `Your role (${me.system_role}) is read-only.`;
+
+  let organizationName: string | null = null;
+  if (portfolio.organization_id) {
+    const orgRes = await backendFetch(`/organizations/${portfolio.organization_id}`, accessToken, {
+      cache: "no-store",
+    });
+    organizationName = orgRes.ok ? (await orgRes.json()).data.name : "the organization";
+  }
 
   return (
     <div className="page">
       <div>
         <p className="page-eyebrow">Portfolio</p>
-        <h1 className="page-title">{portfolio.name}</h1>
+        <h1 className="page-title break-words">{portfolio.name}</h1>
         <p className="page-subtitle">
-          {portfolio.currency} · owned by {portfolio.owner.username}
+          {portfolio.currency} · owned by {portfolio.owner.username} ·{" "}
+          {portfolio.visibility === "organization" && organizationName
+            ? `shared with ${organizationName}`
+            : "private"}
         </p>
       </div>
 
@@ -90,7 +122,7 @@ export default async function PortfolioDetailPage({
 
       <div className="section">
         <h2 className="section-title">Add a holding</h2>
-        <AddHoldingForm portfolioId={portfolio.id} />
+        {canEdit ? <AddHoldingForm portfolioId={portfolio.id} /> : <p className="empty-state">{readOnlyNote}</p>}
       </div>
 
       <div className="section">
@@ -112,7 +144,9 @@ export default async function PortfolioDetailPage({
               <tbody>
                 {transactions.map((t) => (
                   <tr key={t.id}>
-                    <td className="mono">{new Date(t.transaction_date).toLocaleDateString()}</td>
+                    <td className="mono">
+                      <LocalTime iso={t.transaction_date} dateOnly />
+                    </td>
                     <td>
                       <span
                         className={`pill ${
@@ -131,12 +165,29 @@ export default async function PortfolioDetailPage({
             </table>
           </div>
         )}
+        <Pager basePath={`/portfolios/${portfolio.id}`} params={{}} page={page} pageSize={PAGE_SIZE} total={total} />
       </div>
 
       <div className="section">
         <h2 className="section-title">Record a transaction</h2>
-        <AddTransactionForm portfolioId={portfolio.id} />
+        {canEdit ? (
+          <AddTransactionForm portfolioId={portfolio.id} />
+        ) : (
+          <p className="empty-state">{readOnlyNote}</p>
+        )}
       </div>
+
+      {canEdit && (
+        <div className="section">
+          <h2 className="section-title">Settings</h2>
+          <PortfolioSettingsForm
+            portfolioId={portfolio.id}
+            name={portfolio.name}
+            visibility={portfolio.visibility}
+            organizationName={organizationName}
+          />
+        </div>
+      )}
     </div>
   );
 }

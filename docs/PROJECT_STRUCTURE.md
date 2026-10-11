@@ -11,6 +11,8 @@ the tree is in `docs/DESIGN.md`; the handbook explains each part.
 ```
 alphamind/
 ├── services/                the three FastAPI services (§2-§4)
+├── frontend/                the Next.js web app, served by the gateway
+│                            at / (§10)
 ├── shared/                  code every service imports (§5)
 ├── tests/                   one test suite per service + integration (§6)
 ├── infra/                   gateway, Postgres init, scheduler, object
@@ -25,8 +27,9 @@ alphamind/
 │   ├── filing/
 │   ├── macro_research/
 │   └── news/
-├── .github/workflows/       one CI workflow per service, stack smoke and
-│                            deploy (cloud host, docs/DEPLOYMENT.md)
+├── .github/workflows/       one CI workflow per service, frontend CI,
+│                            stack smoke and deploy (cloud host,
+│                            docs/DEPLOYMENT.md)
 ├── docker-compose.yaml      the whole stack
 ├── docker-compose.override.yml  local development (source mounted into the
 │                            containers, development image stage)
@@ -252,7 +255,10 @@ process cannot import two of them.
 ## 7. `infra/`
 
 ```
-├── gateway/                 nginx.conf, gen-certs.sh (self-signed TLS),
+├── gateway/                 nginx.conf (HTTPS server and the internal
+│                            8080 listener), api_locations.conf (API and
+│                            health locations of both), gen-certs.sh
+│                            (self-signed TLS),
 │                            status.html + csp_hashes.py (its CSP hashes),
 │                            certs/ (generated, only README.md tracked)
 ├── postgres/init-schemas.sql   the three schemas
@@ -303,4 +309,40 @@ process cannot import two of them.
                              (01-02 overview and operations, 10-19
                              services and AI, 20-31 data stores,
                              infrastructure, shared code, testing)
+```
+
+## 10. `frontend/`
+
+```
+├── Dockerfile               Node 24, Next.js standalone build, port 3000
+├── package.json, package-lock.json   Next.js 16, React 19, yjs
+├── next.config.ts, tsconfig.json, eslint.config.mjs, postcss.config.mjs
+├── .env.example             settings for `npm run dev` (API through
+│                            https://localhost:8443)
+├── proxy.ts                 refreshes an access token that is about to
+│                            expire before a page runs
+├── public/                  static images
+└── app/
+    ├── layout.tsx, page.tsx, globals.css, site-footer.tsx (Privacy
+    │                        Policy and Terms links), not-found.tsx,
+    │                        global-error.tsx
+    ├── healthz/route.ts     GET /healthz: 200 only when the API answers
+    ├── lib/                 backend.ts (API calls), session.ts and
+    │   │                    session-cookies.ts (httpOnly cookies), me.ts
+    │   │                    (permissions), ws-url.ts, api-error.ts,
+    │   │                    format.ts
+    │   └── actions/         Server Actions per area (auth, profile,
+    │                        twofa, portfolios, research, documents,
+    │                        organizations, admin, moderation, ...)
+    ├── (public)/            pages without login: login, register,
+    │                        forgot-password, reset-password,
+    │                        verify-email, invitations/accept,
+    │                        oauth/complete
+    └── (protected)/         pages that need a login (layout.tsx checks the
+                             session; sidebar and mobile navigation):
+                             portfolios, watchlists, analyses, analytics,
+                             research (notes, collaborative editor, ask,
+                             documents), notifications, friends,
+                             organizations, profile, admin (users,
+                             moderation)
 ```

@@ -37,23 +37,28 @@ function secondsLeft(token: string): number | null {
 
 // null: the backend refused the refresh token (expired, revoked).
 // undefined: the backend couldn't be reached — leave the session alone.
-async function callRefresh(refreshToken: string): Promise<TokenPair | null | undefined> {
+// A 429 (rate limited) is also "try again later", not a dead session.
+// clientIp is the browser's address (see app/lib/backend.ts).
+async function callRefresh(refreshToken: string, clientIp: string | null): Promise<TokenPair | null | undefined> {
   let res: Response;
   try {
     res = await fetch(`${process.env.BACKEND_API_URL}/auth/refresh`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(clientIp ? { "X-Forwarded-For": clientIp } : {}),
+      },
       body: JSON.stringify({ refresh_token: refreshToken }),
     });
   } catch {
     return undefined;
   }
-  if (!res.ok) return res.status >= 500 ? undefined : null;
+  if (!res.ok) return res.status >= 500 || res.status === 429 ? undefined : null;
   const { data } = await res.json();
   return { access_token: data.access_token, refresh_token: data.refresh_token };
 }
 
-function refreshOnce(refreshToken: string): Promise<TokenPair | null | undefined> {
+function refreshOnce(refreshToken: string, clientIp: string | null): Promise<TokenPair | null | undefined> {
   const now = Date.now();
   for (const [key, entry] of recent) {
     if (entry.expiresAt <= now) recent.delete(key);
@@ -63,7 +68,7 @@ function refreshOnce(refreshToken: string): Promise<TokenPair | null | undefined
 
   let pending = inFlight.get(refreshToken);
   if (!pending) {
-    pending = callRefresh(refreshToken)
+    pending = callRefresh(refreshToken, clientIp)
       .then((pair) => {
         if (pair) recent.set(refreshToken, { pair, expiresAt: Date.now() + RECENT_TTL_MS });
         return pair;
@@ -83,7 +88,7 @@ export async function proxy(request: NextRequest) {
   const left = accessToken ? secondsLeft(accessToken) : null;
   if (left !== null && left > REFRESH_MARGIN_SECONDS) return NextResponse.next();
 
-  const pair = await refreshOnce(refreshToken);
+  const pair = await refreshOnce(refreshToken, request.headers.get("x-real-ip"));
 
   if (pair === undefined) return NextResponse.next();
 

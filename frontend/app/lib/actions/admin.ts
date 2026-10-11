@@ -1,0 +1,204 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { getAccessToken } from "@/app/lib/session";
+import { backendFetch } from "@/app/lib/backend";
+import { extractErrorMessage } from "@/app/lib/api-error";
+
+// Result of a one-click action (a button or a small select form).
+// Only types may be shared from a "use server" file; every exported
+// function here is a server action.
+export type ActionResult = {
+  error?: string;
+  message?: string;
+};
+
+// Same values as SystemRole in shared/enums.py.
+const SYSTEM_ROLES = ["guest", "user", "moderator", "admin"];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Same limits as AdminUserUpdate / MeUpdate in the auth service.
+const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+type CallResult = { ok: true; res: Response } | { ok: false; error: string };
+
+async function call(path: string, init: RequestInit, fallback: string): Promise<CallResult> {
+  const accessToken = await getAccessToken();
+  if (!accessToken) {
+    return { ok: false, error: "You're not logged in" };
+  }
+  let res: Response;
+  try {
+    res = await backendFetch(path, accessToken, init);
+  } catch {
+    return { ok: false, error: "Could not reach the server. Is the backend running?" };
+  }
+  if (res.status === 401) {
+    return { ok: false, error: "Your session expired. Please log in again." };
+  }
+  if (!res.ok) {
+    return { ok: false, error: await extractErrorMessage(res, fallback) };
+  }
+  return { ok: true, res };
+}
+
+function jsonInit(method: string, body: unknown): RequestInit {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function refresh(userId: string) {
+  revalidatePath("/admin/users");
+  revalidatePath(`/admin/users/${userId}`);
+}
+
+// PATCH /admin/users/{id} with { role } (user:manage).
+export async function changeUserRole(
+  userId: string,
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const role = formData.get("role");
+  if (!UUID_RE.test(userId)) return { error: "Invalid user id" };
+  if (typeof role !== "string" || !SYSTEM_ROLES.includes(role)) {
+    return { error: "Choose one of: guest, user, moderator, admin" };
+  }
+  const result = await call(`/admin/users/${userId}`, jsonInit("PATCH", { role }), "Could not change the role");
+  if (!result.ok) return { error: result.error };
+  refresh(userId);
+  return { message: `Role changed to ${role}` };
+}
+
+// POST /admin/users/{id}/deactivate or /reactivate (user:deactivate).
+export async function setUserActive(userId: string, active: boolean): Promise<ActionResult> {
+  if (!UUID_RE.test(userId)) return { error: "Invalid user id" };
+  const result = await call(
+    `/admin/users/${userId}/${active ? "reactivate" : "deactivate"}`,
+    { method: "POST" },
+    active ? "Could not reactivate the user" : "Could not deactivate the user"
+  );
+  if (!result.ok) return { error: result.error };
+  refresh(userId);
+  return {};
+}
+
+// DELETE /admin/users/{id} (user:manage), 204. The account is anonymised
+// and kept as "deleted"; from the detail page we go back to the list.
+export async function deleteUser(userId: string, backToList: boolean): Promise<ActionResult> {
+  if (!UUID_RE.test(userId)) return { error: "Invalid user id" };
+  const result = await call(`/admin/users/${userId}`, { method: "DELETE" }, "Could not delete the user");
+  if (!result.ok) return { error: result.error };
+  refresh(userId);
+  if (backToList) redirect("/admin/users");
+  return {};
+}
+
+// DELETE /admin/users/{id}/2fa (user:manage), 204.
+export async function resetUserTwoFactor(userId: string): Promise<ActionResult> {
+  if (!UUID_RE.test(userId)) return { error: "Invalid user id" };
+  const result = await call(`/admin/users/${userId}/2fa`, { method: "DELETE" }, "Could not reset two-factor authentication");
+  if (!result.ok) return { error: result.error };
+  refresh(userId);
+  return { message: "Two-factor authentication removed" };
+}
+
+// Moderators cannot list users (GET /admin/users needs user:manage), so
+// they act on an account by its id.
+export type AccountByIdState = ActionResult & { userId?: string };
+
+export async function setUserActiveById(_prev: AccountByIdState, formData: FormData): Promise<AccountByIdState> {
+  const userId = String(formData.get("user_id") ?? "").trim();
+  const intent = formData.get("intent");
+  if (!UUID_RE.test(userId)) {
+    return { userId, error: "Enter a user id (a UUID such as 3f2b…-…)" };
+  }
+  if (intent !== "deactivate" && intent !== "reactivate") {
+    return { userId, error: "Unknown action" };
+  }
+  const result = await call(`/admin/users/${userId}/${intent}`, { method: "POST" }, `Could not ${intent} the user`);
+  if (!result.ok) return { userId, error: result.error };
+  const { data } = (await result.res.json()) as { data: { username: string; is_active: boolean } };
+  revalidatePath("/admin/users");
+  return { userId, message: `${data.username} is now ${data.is_active ? "active" : "inactive"}.` };
+}
+
+export type EditUserValues = {
+  username: string;
+  email: string;
+  is_verified: boolean;
+  first_name: string;
+  last_name: string;
+  bio: string;
+  timezone: string;
+  country: string;
+};
+
+export type EditUserState = {
+  error?: string;
+  success?: boolean;
+  values?: EditUserValues;
+};
+
+function isTimezone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// PATCH /admin/users/{id} (user:manage) with the account and profile
+// fields. Username, email and is_verified are only sent when they changed:
+// a new email without is_verified makes the backend send a new
+// verification email, which an unchanged checkbox must not suppress.
+export async function updateUserByAdmin(
+  userId: string,
+  original: { username: string; email: string; is_verified: boolean },
+  _prev: EditUserState,
+  formData: FormData
+): Promise<EditUserState> {
+  const text = (name: string) => String(formData.get(name) ?? "").trim();
+  const values: EditUserValues = {
+    username: text("username"),
+    email: text("email"),
+    is_verified: formData.get("is_verified") === "on",
+    first_name: text("first_name"),
+    last_name: text("last_name"),
+    bio: text("bio"),
+    timezone: text("timezone"),
+    country: text("country"),
+  };
+
+  if (!UUID_RE.test(userId)) return { values, error: "Invalid user id" };
+  if (!USERNAME_RE.test(values.username)) {
+    return { values, error: "Username: 3-32 characters, letters, digits, _ . - only" };
+  }
+  if (values.email.length > 254 || !EMAIL_RE.test(values.email)) {
+    return { values, error: "Enter a valid email address" };
+  }
+  if (values.first_name.length > 100 || values.last_name.length > 100) {
+    return { values, error: "First and last name: at most 100 characters each" };
+  }
+  if (values.bio.length > 500) return { values, error: "Bio: at most 500 characters" };
+  if (values.timezone && (values.timezone.length > 64 || !isTimezone(values.timezone))) {
+    return { values, error: "Timezone must be an IANA name such as Europe/Paris" };
+  }
+  if (values.country.length > 100) return { values, error: "Country: at most 100 characters" };
+
+  const body: Record<string, unknown> = {
+    first_name: values.first_name || null,
+    last_name: values.last_name || null,
+    bio: values.bio || null,
+    timezone: values.timezone || null,
+    country: values.country || null,
+  };
+  if (values.username !== original.username) body.username = values.username;
+  if (values.email.toLowerCase() !== original.email.toLowerCase()) body.email = values.email;
+  if (values.is_verified !== original.is_verified) body.is_verified = values.is_verified;
+
+  const result = await call(`/admin/users/${userId}`, jsonInit("PATCH", body), "Could not save the user");
+  if (!result.ok) return { values, error: result.error };
+  refresh(userId);
+  return { success: true };
+}

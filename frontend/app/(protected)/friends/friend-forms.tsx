@@ -19,7 +19,17 @@ export function AddFriendForm() {
       <div className="flex items-end gap-2 flex-wrap">
         <div className="field">
           <label htmlFor="username">Username</label>
-          <input id="username" name="username" type="text" required minLength={3} maxLength={32} />
+          <input
+            id="username"
+            name="username"
+            type="text"
+            required
+            minLength={3}
+            maxLength={32}
+            pattern="[A-Za-z0-9_.\-]{3,32}"
+            title="3-32 characters: letters, digits, underscore, dot or hyphen"
+            defaultValue={state.username ?? ""}
+          />
         </div>
         <button type="submit" disabled={pending} className="btn btn-primary">
           {pending ? "Sending…" : "Send request"}

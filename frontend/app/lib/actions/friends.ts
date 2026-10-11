@@ -8,20 +8,28 @@ import { readApiError } from "@/app/lib/api-error";
 export type FriendActionState = {
   error?: string;
   success?: boolean;
+  username?: string;
 };
+
+// Same rule as USERNAME_PATTERN in the auth service; the backend checks
+// 3-32 characters (ConnectionCreate) and then looks the user up.
+const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 
 export async function sendFriendRequest(
   _prevState: FriendActionState,
   formData: FormData
 ): Promise<FriendActionState> {
-  const username = formData.get("username");
-  if (typeof username !== "string" || username.trim().length < 3) {
-    return { error: "Enter the other person's username (at least 3 characters)" };
+  const username = String(formData.get("username") ?? "").trim();
+  if (!USERNAME_RE.test(username)) {
+    return {
+      username,
+      error: "Usernames are 3-32 characters: letters, digits, underscore, dot or hyphen",
+    };
   }
 
   const accessToken = await getAccessToken();
   if (!accessToken) {
-    return { error: "You're not logged in" };
+    return { username, error: "You're not logged in" };
   }
 
   let res: Response;
@@ -29,14 +37,14 @@ export async function sendFriendRequest(
     res = await backendFetch("/connections", accessToken, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ addressee_username: username.trim() }),
+      body: JSON.stringify({ addressee_username: username }),
     });
   } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
+    return { username, error: "Could not reach the server. Is the backend running?" };
   }
 
   if (!res.ok) {
-    return { error: (await readApiError(res, "Could not send the request")).message };
+    return { username, error: (await readApiError(res, "Could not send the request")).message };
   }
 
   revalidatePath("/friends");
@@ -53,12 +61,7 @@ const RESPONSES = {
 
 export type ConnectionResponse = keyof typeof RESPONSES;
 
-export async function respondToConnection(
-  connectionId: string,
-  kind: ConnectionResponse,
-  _prevState: FriendActionState,
-  _formData: FormData
-): Promise<FriendActionState> {
+export async function respondToConnection(connectionId: string, kind: ConnectionResponse): Promise<FriendActionState> {
   const response = RESPONSES[kind];
   if (!response) {
     return { error: "Unknown action" };

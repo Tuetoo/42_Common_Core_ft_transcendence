@@ -1,8 +1,8 @@
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { removeWatchlistItem } from "@/app/lib/actions/watchlists";
+import { can, getMe } from "@/app/lib/me";
 import { CreateWatchlistForm } from "./create-watchlist-form";
 import { AddTickerForm } from "./add-ticker-form";
+import { RemoveTickerButton } from "./remove-ticker-button";
 
 type WatchlistItem = {
   id: string;
@@ -15,9 +15,13 @@ type Watchlist = {
   items: WatchlistItem[];
 };
 
+// GET /watchlists returns all of the user's watchlists in one list (it is
+// not paginated), so there is no pager here.
 export default async function WatchlistsPage() {
-  const accessToken = await getAccessToken();
-  const res = await backendFetch("/watchlists", accessToken!, { cache: "no-store" });
+  const { me, accessToken } = await getMe();
+  // Every watchlist change needs portfolio:write (domains/portfolio/api.py).
+  const canWrite = can(me, "portfolio:write");
+  const res = await backendFetch("/watchlists", accessToken, { cache: "no-store" });
 
   requireOk(res, "Failed to load watchlists");
 
@@ -36,28 +40,25 @@ export default async function WatchlistsPage() {
         ) : (
           watchlists.map((wl) => (
             <div key={wl.id} className="panel flex flex-col gap-3">
-              <h2 className="section-title">{wl.name}</h2>
+              <h2 className="section-title break-words">{wl.name}</h2>
 
               {wl.items.length === 0 ? (
                 <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>No tickers yet.</p>
               ) : (
                 <div className="flex flex-wrap gap-2">
-                  {wl.items.map((item) => (
-                    <form key={item.id} action={removeWatchlistItem.bind(null, wl.id, item.ticker)}>
-                      <button
-                        type="submit"
-                        title={`Remove ${item.ticker}`}
-                        className="pill pill-accent mono"
-                        style={{ border: "none", cursor: "pointer" }}
-                      >
-                        {item.ticker} ×
-                      </button>
-                    </form>
-                  ))}
+                  {wl.items.map((item) =>
+                    canWrite ? (
+                      <RemoveTickerButton key={item.id} watchlistId={wl.id} ticker={item.ticker} />
+                    ) : (
+                      <span key={item.id} className="pill pill-accent mono">
+                        {item.ticker}
+                      </span>
+                    )
+                  )}
                 </div>
               )}
 
-              <AddTickerForm watchlistId={wl.id} />
+              {canWrite && <AddTickerForm watchlistId={wl.id} />}
             </div>
           ))
         )}
@@ -65,7 +66,11 @@ export default async function WatchlistsPage() {
 
       <div className="section">
         <h2 className="section-title">Create a new watchlist</h2>
-        <CreateWatchlistForm />
+        {canWrite ? (
+          <CreateWatchlistForm />
+        ) : (
+          <p className="empty-state">Your role ({me.system_role}) is read-only.</p>
+        )}
       </div>
     </div>
   );

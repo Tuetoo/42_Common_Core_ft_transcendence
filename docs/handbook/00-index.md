@@ -161,7 +161,7 @@ There is no user interface yet (section 8).
 |---|---|
 | [01 System architecture](01-architecture.md) | Every container and port, who owns which data, internal HTTP vs events, the path of a request, the life of an analysis, startup order, the development override, the tech stack and why. |
 | [02 Running and operating the stack](02-operations.md) | Setup on a Mac, `make` targets, every operator script, deploying a change (restart vs rebuild), health checks, real analyses, tokens, end-to-end checks, backups, logs, troubleshooting. |
-| [10 The gateway](10-gateway.md) | nginx routing, TLS and certificates, security headers and CSP, WebSocket upgrade, rate limits, the status page, why `/internal/*` is closed. |
+| [10 The gateway](10-gateway.md) | nginx routing, TLS and certificates, security headers and CSP, WebSocket upgrade, rate limits, the status page, why `/internal/*` is closed, the frontend at `/` and the internal listener for its server side. |
 | [11 auth-service](11-auth-service.md) | Registration and email verification, login, access and refresh tokens, sessions and reuse detection, 2FA, Google/GitHub sign-in, roles, organizations, friends, presence, rate limits. |
 | [12 core-service](12-core-service.md) | Portfolios and the transaction ledger, holdings and cash, NAV snapshots, watchlists, research notes and documents, notifications, API keys and the public API, WebSockets, job heartbeats. |
 | [13 ai-service overview](13-ai-service.md) | Folder layout, public and internal API, the serial analysis queue, startup, data providers and caches, settings, scripts. |
@@ -270,9 +270,9 @@ not finished; the chapters give the details.
 
 | Item | State | Chapter |
 |---|---|---|
-| Frontend | No frontend code in the repository. The `frontend` service in `docker-compose.yaml` is commented out; the API contract a frontend must follow is ready, and every route can be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) sections 3.6b and 3.11 |
+| Frontend | Built: the Next.js app in `frontend/`, served by the gateway at `/`; its server side calls the API on the gateway's internal listener (port 8080). The Privacy Policy and Terms of Service pages are not written yet (the Frontend Lead's part; the footer links to `/privacy` and `/terms` exist). Every route can also be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) section 3.11, [10](10-gateway.md) section 3.3 |
 | Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main`. The first deployment waits for the new `infra/` to reach `main`. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
-| Top-level README | None. The only READMEs are `tests/README.md` and `infra/gateway/certs/README.md`. | - |
+| Top-level README | None. The only READMEs are `tests/README.md`, `infra/gateway/certs/README.md` and `frontend/README.md` (the default text of `create-next-app`). | - |
 | Calibration of the confidence rules | The penalties and caps in `ai/recommendation/engine.py`, the HOLD flat band of the accuracy score (`review_workflow.py::_HOLD_FLAT_BAND`) and the procedural-memory score bar (`_MIN_SCORE_TO_REMEMBER`) are fixed constants. Nothing derives them from scored outcomes yet; that needs enough rows in `ai.recommendation_metrics`. | [16](16-ai-analysis-pipeline.md) section 3.12, [19](19-ai-workflows-backtest.md) section 3.11 |
 | Debate and Reflection quality signals | Debate convergence and Reflection retries are stored per analysis but not aggregated into a metric. | [19](19-ai-workflows-backtest.md) section 3.11 |
 | Restore drill | `make restore-drill` restores a backup into a throwaway compose project and verifies every part, but it has not yet been run against a real nightly backup of the object-storage format written by the S3 copy. | [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 6 |

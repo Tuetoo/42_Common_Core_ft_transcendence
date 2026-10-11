@@ -1,0 +1,41 @@
+# Lint, type check and production build of the Next.js frontend, on every
+# pull request that touches frontend/ and on main. The stack smoke test in
+# integration-ci.yml then checks the built image behind the gateway.
+name: frontend CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Same major version as the Docker image (frontend/Dockerfile).
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        # `next typegen` writes the route types (LayoutProps, PageProps)
+        # that tsc needs; `next build` would generate them too.
+        run: npx next typegen && npx tsc --noEmit
+      - name: Build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build

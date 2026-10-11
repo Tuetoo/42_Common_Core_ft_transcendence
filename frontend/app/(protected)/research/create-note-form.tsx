@@ -1,26 +1,67 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useState } from "react";
 import { createNote, type CreateNoteState } from "@/app/lib/actions/research";
+import { MAX_TAGS, NOTE_CONTENT_MAX, NOTE_TITLE_MAX, TAG_MAX_CHARS, parseTags } from "./limits";
+import type { Organization } from "./types";
 
 const initialState: CreateNoteState = {};
 
-export function CreateNoteForm() {
+export function CreateNoteForm({ organizations }: { organizations: Organization[] }) {
   const [state, formAction, pending] = useActionState(createNote, initialState);
+  const [tagError, setTagError] = useState<string | null>(null);
+
+  function checkTags(e: React.ChangeEvent<HTMLInputElement>) {
+    const { error } = parseTags(e.target.value);
+    setTagError(error);
+    e.target.setCustomValidity(error ?? "");
+  }
 
   return (
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="title">Title</label>
-        <input id="title" name="title" type="text" required />
+        <input id="title" name="title" type="text" required maxLength={NOTE_TITLE_MAX} />
       </div>
       <div className="field">
         <label htmlFor="content">Content</label>
-        <textarea id="content" name="content" rows={4} />
+        <textarea id="content" name="content" rows={4} maxLength={NOTE_CONTENT_MAX} />
       </div>
       <div className="field">
         <label htmlFor="tags">Tags (comma-separated)</label>
-        <input id="tags" name="tags" type="text" placeholder="e.g. AAPL, tech" />
+        <input
+          id="tags"
+          name="tags"
+          type="text"
+          placeholder="e.g. AAPL, tech"
+          onChange={checkTags}
+          aria-describedby="tags-help"
+          aria-invalid={tagError ? true : undefined}
+        />
+        <span id="tags-help" className="text-xs text-[var(--text-faint)]">
+          Up to {MAX_TAGS} tags, each at most {TAG_MAX_CHARS} characters.
+        </span>
+        {tagError && (
+          <span role="alert" className="form-message error">
+            {tagError}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label htmlFor="note-organization">Share with</label>
+        <select id="note-organization" name="organization_id" defaultValue="" aria-describedby="share-help">
+          <option value="">Nobody (private note)</option>
+          {organizations.map((org) => (
+            <option key={org.id} value={org.id}>
+              Organization: {org.name}
+            </option>
+          ))}
+        </select>
+        <span id="share-help" className="text-xs text-[var(--text-faint)]">
+          {organizations.length === 0
+            ? "Join or create an organization to edit notes together."
+            : "Members of the organization can read the note; owners, admins and members can also edit it live. This cannot be changed later."}
+        </span>
       </div>
       {state?.error && (
         <p aria-live="polite" className="form-message error">

@@ -11,7 +11,10 @@
 > `services/<svc>`, `shared` and `tests/<svc>`, and the integration
 > workflow lints `infra/`), and all code in `shared/` and `services/` is
 > type-checked with `mypy --strict`, locally (Makefile) and in CI (GitHub
-> Actions). The test files are linted but not type-checked. This chapter
+> Actions). The test files are linted but not type-checked. The Next.js
+> frontend has its own CI workflow (ESLint, TypeScript check, production
+> build), and the stack smoke test checks its pages through the gateway.
+> This chapter
 > explains each layer, why it is set up the way it is, how to run it, and
 > how to write a new test in the project's style (section 3.0 has the
 > code-style rules).
@@ -39,7 +42,9 @@
    .github/workflows/{auth,core,ai}-service-ci.yml  pull requests: flake8, mypy, tests, image build
    .github/workflows/integration-ci.yml ........ infra/scripts/compose pull requests and main:
                                                  flake8 infra, CSP, compose, shell syntax, promtool;
-                                                 main only: full stack smoke
+                                                 main only: full stack smoke (+ /login, /healthz)
+   .github/workflows/frontend-ci.yml ........... frontend/ pull requests and main:
+                                                 npm ci, lint, typegen + tsc, build
    make e2e / make smoke / make test-integration  your machine, against the live stack
 ```
 
@@ -149,7 +154,7 @@ what a service covers. Where things live:
 | Registration, login, tokens, sessions, 2FA, OAuth, profile, connections, emails | `tests/auth-service/test_accounts.py` |
 | Organizations, admin users, system roles, user state, auth events | `tests/auth-service/test_organizations.py` |
 | Internal token, HTTP surface, rate limits, migrations | `tests/auth-service/test_platform.py` |
-| Health, internal access, service clients, job health, user state, ownership rules, `e2e_check` helpers, migrations | `tests/core-service/test_platform.py` |
+| Health, internal access, service clients, job health, user state, ownership rules, `e2e_check` helpers, migrations, gateway config (`X-Forwarded-For` replaced, never appended, in 4 places: http level, `/ws`, `/grafana/`, internal listener) | `tests/core-service/test_platform.py` |
 | Notes, documents, research content, document ingestion, API keys, sentiment | `tests/core-service/test_research.py` |
 | Portfolio access, transactions, ledger adjustments, snapshots, scheduled jobs, exports | `tests/core-service/test_portfolio.py` |
 | Connection manager, WebSockets, notifications, event listener, cross-service events, Yjs collaboration | `tests/core-service/test_realtime.py` |
@@ -494,8 +499,9 @@ lint:
 | `auth-service-ci.yml` | pull request touching `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, the shared test helpers (`tests/alembic_contract.py`, `tests/auth_tokens.py`), `Makefile`, `pyproject.toml`, `uv.lock` or the workflow | `uv sync --frozen` (uv 0.8.17); `uv run flake8 --extend-exclude mistral_provider.py services/auth-service shared tests/auth-service`; `make mypy-shared mypy-auth`; `make test-auth` (testcontainers on the runner's Docker); `docker build ... --target production` |
 | `core-service-ci.yml` | same, for core, plus `infra/scheduler/**` and `infra/gateway/nginx.conf` (read by its tests) | same with `services/core-service`, `tests/core-service`, `mypy-core`, `test-core` |
 | `ai-service-ci.yml` | same, for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example` and `.gitignore` (read by `test_scripts.py`) | same with `services/ai-service`, `tests/ai-service`, `mypy-ai`, `test-ai` |
-| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | pull request touching `infra/**`, `scripts/**`, the compose files, `Makefile`, `.env.example` or the workflow; push to `main` | `uv run flake8 infra`; `csp_hashes.py --check`; `docker compose config -q` of the stack and of the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` |
-| `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404; `down -v` (always, also after a failure) |
+| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | pull request touching `infra/**`, `scripts/**`, the compose files, `frontend/Dockerfile`, `Makefile`, `.env.example` or the workflow; push to `main` | `uv run flake8 infra`; `csp_hashes.py --check`; `docker compose config -q` of the stack and of the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` |
+| `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` and the frontend's `/healthz` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404, `/login` = 200, `/healthz` = 200; `down -v` (always, also after a failure) |
+| `frontend-ci.yml` ("frontend CI") | pull request touching `frontend/**` or the workflow; push to `main` touching the same | in `frontend/`, Node 24: `npm ci`; `npm run lint` (ESLint); `npx next typegen && npx tsc --noEmit`; `npm run build` |
 
 | `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand | SSH to the cloud host with a key that may only run `scripts/deploy.sh` (fast-forward to `origin/main`, `docker compose up -d --build --wait`); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 

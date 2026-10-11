@@ -5,36 +5,43 @@ import { inviteMember, type InviteMemberState } from "@/app/lib/actions/organiza
 
 const initialState: InviteMemberState = {};
 
-const ROLES = ["member", "admin", "viewer"];
-
-export function InviteMemberForm({ orgId }: { orgId: string }) {
+// `roles` lists what this member may grant: only the owner invites admins.
+export function InviteMemberForm({ orgId, roles }: { orgId: string; roles: readonly string[] }) {
   const inviteForOrg = inviteMember.bind(null, orgId);
   const [state, formAction, pending] = useActionState(inviteForOrg, initialState);
 
   return (
     <form action={formAction} className="form">
       <div className="field">
-        <label htmlFor="email">Email</label>
-        <input id="email" name="email" type="email" required />
+        <label htmlFor="invite-email">Email</label>
+        <input
+          id="invite-email"
+          name="email"
+          type="email"
+          required
+          maxLength={254}
+          defaultValue={state.values?.email ?? ""}
+          placeholder="name@example.com"
+        />
       </div>
       <div className="field">
-        <label htmlFor="role">Role</label>
-        <select id="role" name="role" defaultValue="member">
-          {ROLES.map((r) => (
+        <label htmlFor="invite-role">Role</label>
+        <select id="invite-role" name="role" defaultValue={state.values?.role ?? "member"}>
+          {roles.map((r) => (
             <option key={r} value={r}>
               {r}
             </option>
           ))}
         </select>
       </div>
-      {state?.error && (
+      {state.error && (
         <p aria-live="polite" className="form-message error">
           {state.error}
         </p>
       )}
-      {state?.success && (
+      {state.success && (
         <p aria-live="polite" className="form-message success">
-          Invitation sent.
+          {state.success}
         </p>
       )}
       <button type="submit" disabled={pending} className="btn btn-primary">

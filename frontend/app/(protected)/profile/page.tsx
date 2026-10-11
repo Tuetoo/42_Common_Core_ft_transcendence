@@ -1,3 +1,4 @@
+import { LocalTime } from "@/app/(protected)/local-time";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { Avatar } from "../avatar";
@@ -9,6 +10,7 @@ type Me = {
   email: string;
   username: string;
   system_role: string;
+  permissions: string[];
   is_verified: boolean;
   created_at: string;
   profile: {
@@ -16,7 +18,17 @@ type Me = {
     last_name: string | null;
     bio: string | null;
     avatar_url: string | null;
+    timezone: string | null;
+    country: string | null;
   } | null;
+};
+
+// What each system role means for this user, in plain words.
+const ROLE_SUMMARY: Record<string, string> = {
+  guest: "Read-only: you can view shared content but not create or change anything.",
+  user: "You can create portfolios, notes, comments, analyses, documents and organizations.",
+  moderator: "Everything a user can do, plus moderating research content and deactivating accounts.",
+  admin: "Full access, including managing users, roles and site statistics.",
 };
 
 export default async function ProfilePage() {
@@ -30,20 +42,38 @@ export default async function ProfilePage() {
 
   return (
     <div className="page">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
         <Avatar url={me.profile?.avatar_url} username={me.username} size={64} />
-        <div>
+        <div className="min-w-0">
           <p className="page-eyebrow">Account</p>
-          <h1 className="page-title">{me.username}</h1>
+          <h1 className="page-title flex flex-wrap items-center gap-2">
+            <span className="break-all">{me.username}</span>
+            <span className="pill pill-accent">{me.system_role}</span>
+          </h1>
         </div>
       </div>
 
       <div className="panel">
         <dl style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "8px 20px", margin: 0, fontSize: 13 }}>
           <dt style={{ color: "var(--text-faint)" }}>Email</dt>
-          <dd style={{ margin: 0 }}>{me.email}</dd>
+          <dd style={{ margin: 0 }} className="break-all">{me.email}</dd>
           <dt style={{ color: "var(--text-faint)" }}>Role</dt>
-          <dd style={{ margin: 0 }}>{me.system_role}</dd>
+          <dd style={{ margin: 0 }}>
+            <span className="pill pill-accent">{me.system_role}</span>
+            <span className="block mt-1 text-[var(--text-secondary)]">{ROLE_SUMMARY[me.system_role] ?? ""}</span>
+          </dd>
+          <dt style={{ color: "var(--text-faint)" }}>Permissions</dt>
+          <dd style={{ margin: 0 }} className="flex flex-wrap gap-1">
+            {me.permissions.length === 0 ? (
+              <span style={{ color: "var(--text-faint)" }}>None</span>
+            ) : (
+              me.permissions.map((p) => (
+                <span key={p} className="pill">
+                  {p}
+                </span>
+              ))
+            )}
+          </dd>
           <dt style={{ color: "var(--text-faint)" }}>Email verified</dt>
           <dd style={{ margin: 0 }}>
             <span className={`pill ${me.is_verified ? "pill-up" : "pill-down"}`}>
@@ -52,7 +82,7 @@ export default async function ProfilePage() {
           </dd>
           <dt style={{ color: "var(--text-faint)" }}>Member since</dt>
           <dd style={{ margin: 0 }} className="mono">
-            {new Date(me.created_at).toLocaleDateString()}
+            <LocalTime iso={me.created_at} dateOnly />
           </dd>
         </dl>
       </div>
@@ -67,9 +97,11 @@ export default async function ProfilePage() {
         <EditProfileForm
           defaults={{
             username: me.username,
-            first_name: me.profile?.first_name ?? null,
-            last_name: me.profile?.last_name ?? null,
-            bio: me.profile?.bio ?? null,
+            first_name: me.profile?.first_name ?? "",
+            last_name: me.profile?.last_name ?? "",
+            bio: me.profile?.bio ?? "",
+            timezone: me.profile?.timezone ?? "",
+            country: me.profile?.country ?? "",
           }}
         />
       </div>

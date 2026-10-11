@@ -3,19 +3,34 @@
 import { redirect } from "next/navigation";
 import { clearSession, getRefreshToken, setSession } from "@/app/lib/session";
 import { extractErrorMessage, readApiError } from "@/app/lib/api-error";
+import { publicFetch } from "@/app/lib/backend";
 
 // Only same-site paths: "/x" yes, "//evil.com" or "https://evil.com" no —
 // otherwise a crafted ?next= link could bounce a user to another site
-// right after they log in (an open redirect).
+// right after they log in (an open redirect). Browsers drop tabs and
+// newlines and treat "\\" like "/", so "/\t/evil.com" would also leave the
+// site; the value is therefore resolved like a browser does and must stay
+// on the same origin.
 function safeNext(next: FormDataEntryValue | null): string {
-  if (typeof next === "string" && next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/\\")) {
-    return next;
+  if (typeof next !== "string" || !next.startsWith("/")) {
+    return "/portfolios";
+  }
+  const base = "http://same-origin.invalid";
+  try {
+    const url = new URL(next, base);
+    if (url.origin === base) {
+      return url.pathname + url.search + url.hash;
+    }
+  } catch {
+    // not a usable path
   }
   return "/portfolios";
 }
 
 export type LoginState = {
   error?: string;
+  // The backend error code, e.g. "email_not_verified".
+  code?: string;
   needsTwoFactor?: boolean;
 };
 
@@ -33,7 +48,7 @@ export async function login(
 
   let res: Response;
   try {
-    res = await fetch(`${process.env.BACKEND_API_URL}/auth/login`, {
+    res = await publicFetch(`/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -55,7 +70,7 @@ export async function login(
     }
     // A wrong code should keep the code field on screen for another try.
     const wasTwoFactorStep = typeof totpCode === "string" && totpCode !== "";
-    return { error: err.message, needsTwoFactor: wasTwoFactorStep };
+    return { error: err.message, code: err.code ?? undefined, needsTwoFactor: wasTwoFactorStep };
   }
 
   const { data } = await res.json();
@@ -86,7 +101,7 @@ export async function register(
 
   let res: Response;
   try {
-    res = await fetch(`${process.env.BACKEND_API_URL}/auth/register`, {
+    res = await publicFetch(`/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, username, password }),
@@ -107,7 +122,7 @@ export async function logout() {
 
   if (refreshToken) {
     try {
-      await fetch(`${process.env.BACKEND_API_URL}/auth/logout`, {
+      await publicFetch(`/auth/logout`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: refreshToken }),

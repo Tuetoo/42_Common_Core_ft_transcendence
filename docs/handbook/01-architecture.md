@@ -3,8 +3,9 @@
 > AlphaMind is a set of Docker containers started by one Compose file. Three
 > Python services do the real work: `auth-service` (accounts and tokens),
 > `core-service` (portfolios, research, notifications, WebSockets) and
-> `ai-service` (the analysis agents, RAG, recommendations). An nginx gateway
-> is the only door from the outside. Behind it sit the data stores
+> `ai-service` (the analysis agents, RAG, recommendations). A Next.js
+> `frontend` serves the web pages. An nginx gateway is the only door from
+> the outside. Behind it sit the data stores
 > (PostgreSQL, Redis, Qdrant, S3 object storage), a cron scheduler, and a
 > monitoring stack (Prometheus, Alertmanager, Grafana, exporters, a log
 > collector). This chapter shows every container, who owns which data, how
@@ -18,6 +19,9 @@ Think of AlphaMind as a small company building:
 - The **gateway** is the reception desk. Every visitor comes through it.
   It checks nothing about who you are; it only decides which office you go
   to (by URL path) and makes sure the connection is encrypted (TLS).
+- The **frontend** (Next.js) is the shop window: the web pages a visitor
+  sees. The gateway sends every page request to it, and its server side
+  calls the offices through the gateway's internal entrance (port 8080).
 - The three **services** are the offices. Each office has its own filing
   cabinet (its own PostgreSQL schema) and never opens another office's
   cabinet. When it needs something from another office, it phones that
@@ -83,7 +87,7 @@ all interfaces of the host; a few developer tools are published on
 | Term | What it is | Why it matters here |
 |---|---|---|
 | Container | A running, isolated process with its own file system, made from an image. | Every part of AlphaMind is one container. |
-| Image | A frozen file system plus a start command. Either pulled (e.g. `postgres:16-alpine`) or built from a `Dockerfile`. | The three services and the scheduler are built from this repository; everything else is pulled. |
+| Image | A frozen file system plus a start command. Either pulled (e.g. `postgres:16-alpine`) or built from a `Dockerfile`. | The three services, the frontend and the scheduler are built from this repository; everything else is pulled. |
 | Docker Compose | A tool that starts many containers from one YAML file (`docker-compose.yaml`). | `docker compose --env-file .env.docker up` starts the whole system. |
 | Service (Compose) | One entry under `services:` in the Compose file. Its name is also its host name on the internal network. | `core-service` can call `http://ai-service:8000`. |
 | Volume | Storage that survives when a container is deleted. | Database files, vectors, uploads, Grafana data live in named volumes (`postgres_data`, `qdrant_data`, ...). |
@@ -104,13 +108,14 @@ all interfaces of the host; a few developer tools are published on
 
 ### 3.1 Every container
 
-The table lists all 18 Compose services (16 start with a normal `up`; two
+The table lists all 19 Compose services (17 start with a normal `up`; two
 are behind profiles). Source: `docker-compose.yaml` and
 `docker-compose.override.yml`.
 
 | Service | Image or build | Job | Internal port | Host port | Starts after | Health check | Volumes |
 |---|---|---|---|---|---|---|---|
-| `gateway` | `nginx:1.27-alpine` | TLS, routing, `/status`, `/grafana/` | 443, 80 | `8443:443`, `8000:80` (all interfaces) | auth, core, ai **healthy** | none | `nginx.conf`, `certs/`, `status.html` (all read-only) |
+| `gateway` | `nginx:1.27-alpine` | TLS, routing, `/status`, `/grafana/`, internal API listener for the frontend | 443, 80, 8080 (internal listener) | `8443:443`, `8000:80` (all interfaces); 8080 not published | auth, core, ai **healthy** | none | `nginx.conf`, `api_locations.conf`, `certs/`, `status.html` (all read-only) |
+| `frontend` | built, `frontend/Dockerfile` (Node 24, Next.js standalone) | the web pages, served by the gateway at `/` | 3000 | none (through the gateway) | - | `wget http://127.0.0.1:3000/login` | - |
 | `auth-service` | built, `services/auth-service/Dockerfile` | users, login, tokens, 2FA, OAuth, organizations, friends, admin | 8000 | none | postgres, redis healthy | `GET /health` = 200 | `avatar_data` at `/app/data/avatars` |
 | `core-service` | built, `services/core-service/Dockerfile` | portfolios, watchlists, research notes and documents, notifications, WebSockets, public API, market-open/close jobs | 8000 | none | postgres, redis, objectstore healthy | `GET /health` = 200 | - |
 | `ai-service` | built, `services/ai-service/Dockerfile` | analysis graph, LLM router, RAG, memory, tiers, backtests, analytics | 8000 | none | postgres, redis, qdrant, objectstore healthy | `GET /health` = 200 (start period 90 s) | - |
@@ -135,9 +140,9 @@ and `max-file: 5`, so Docker keeps at most 5 x 20 MB of log per container.
 The long-term copy of the logs is vector's job
 ([chapter 27](27-observability.md)).
 
-A commented-out `frontend` service sits at the top of the Compose file.
-It is not built yet (section 3.11). When it exists it is served through
-the gateway, with no host port of its own.
+The `frontend` service sits at the top of the Compose file (section
+3.11). It is served through the gateway, with no host port of its own,
+and gets only `BACKEND_API_URL`, not `.env.docker`.
 
 Pulled images are pinned to exact tags. Two pins carry a constraint:
 `qdrant/qdrant:v1.18.3` matches the minor version of `qdrant-client` in
@@ -174,14 +179,16 @@ There are three levels of reachability:
    - Alertmanager: `http://127.0.0.1:9093`
    - Adminer (only when started): `http://127.0.0.1:8080`
 3. **Internal only (Docker network):** PostgreSQL 5432, Redis 6379, the
-   three services on 8000, SeaweedFS 9000, Grafana 3000, the exporters.
+   three services on 8000, the frontend on 3000, the gateway's internal
+   listener on 8080, SeaweedFS 9000, Grafana 3000, the exporters.
    You reach them with `docker compose exec` (for example
    `bash scripts/psql.sh`) or through the gateway (Grafana).
 
-Inside the gateway, any path that is not listed is a `404`
-(`location / { return 404; }`). `/internal/` and `/metrics` have their own
-explicit `404` blocks, so service-to-service routes and Prometheus
-metrics can never be called from outside.
+Inside the gateway, any path that is not listed goes to the frontend
+(`location /`), which answers `404` for a page it does not have.
+`/internal/` and `/metrics` have their own explicit `404` blocks, so
+service-to-service routes and Prometheus metrics can never be called from
+outside.
 
 The public paths, grouped by backend (`infra/gateway/nginx.conf`):
 
@@ -194,6 +201,7 @@ The public paths, grouped by backend (`infra/gateway/nginx.conf`):
 | gateway itself | `/status` (static page that polls `/health/auth`, `/health/core`, `/health/ai` every 15 seconds) |
 | Swagger | `/docs/auth/`, `/docs/core/`, `/docs/ai/` and their spec files `/api/openapi-auth.json`, `/api/openapi-core.json`, `/api/openapi-ai.json` |
 | health | `/health/auth`, `/health/core`, `/health/ai` (each proxied to that service's `/health`) |
+| frontend | `/` and every other path (pages, `/healthz`) |
 
 Details of the gateway (TLS settings, security headers, the access log
 without query strings) are in [chapter 10](10-gateway.md).
@@ -421,7 +429,7 @@ log file.
 ### 3.6b API response shapes (the client contract)
 
 All three services use the same building blocks from `shared/`, so a
-client sees the same shapes everywhere. A client (the future frontend,
+client sees the same shapes everywhere. A client (the frontend,
 a script) must be ready for every shape below.
 
 **Request id.** `shared/request_id.py::RequestIdMiddleware` runs in every
@@ -718,16 +726,25 @@ What still needs an image **rebuild** (`up -d --build`, or
   avatars) when one is missing, instead of silently backing up an empty
   folder inside the container.
 
-### 3.11 Frontend status
+### 3.11 Frontend
 
-There is no frontend in this repository yet; the Frontend Lead builds it
-separately. The `frontend` service in `docker-compose.yaml` is commented
-out (its build context `./frontend` does not exist yet), and nginx's
-`location /` returns `404` until a frontend takes it over. The contract
-it must follow is in section 3.6b.
-Settings that already exist for it: `FRONTEND_BASE_URL` and
-`BACKEND_CORS_ORIGINS` (both `http://localhost:3000` in `.env.example`).
-Everything in this handbook is driven through the API, Swagger
+The frontend is a Next.js 16 app in `frontend/` (owned by the Frontend
+Lead). The gateway's `location /` proxies every page to `frontend:3000`.
+The browser only talks to the HTTPS listener. The frontend's server side
+(pages, Server Actions, route handlers) calls the API at
+`BACKEND_API_URL=http://gateway:8080/api/v1`: the gateway's internal
+plain-HTTP listener, reachable only on the Docker network. So no
+certificate has to name `gateway`. The frontend copies the browser's
+address (the `X-Real-IP` the HTTPS listener set) into `X-Forwarded-For`,
+and the internal listener trusts it from private Docker addresses, so
+per-IP rate limits and session records see each user
+([chapter 10](10-gateway.md)). `GET /healthz` returns 200 only when the
+frontend reaches `/health/auth` through that listener. It follows the
+contract in section 3.6b. `FRONTEND_BASE_URL` is the public gateway
+address (`https://localhost:8443` in `.env.example`), because the pages
+are served there. Pages and API share one origin, so CORS is not needed
+for them.
+Everything in this handbook can also be driven through the API, Swagger
 (`/docs/<service>/`), the `/status` page, Grafana and the operator
 scripts.
 
@@ -747,6 +764,7 @@ scripts.
 | bm25s | Keyword (BM25) search, fused with Qdrant's vector search for hybrid retrieval. |
 | y-py | Python bindings for Yrs, the Rust implementation of the Yjs CRDT, for collaborative note editing in core-service. |
 | nginx | Mature reverse proxy: TLS, WebSocket upgrade, path routing, rate limiting, static status page. |
+| Next.js 16 + React 19 (Node 24) | The frontend: server-rendered pages and Server Actions, so the tokens stay in httpOnly cookies on the frontend's server; `yjs` for the collaborative note editor. |
 | Prometheus + Alertmanager + Grafana + exporters | Standard open-source metrics, alert rules with unit tests, email alerts, dashboards. |
 | vector | Copies every compose container's output to dated files on disk, independent of the application code, so logs survive container recreation. |
 | MailHog | Catches all email locally, so verification and reset emails can be read without a real mail provider. |
@@ -797,7 +815,7 @@ cannot leak into a test run.
 | `ANALYSIS_MAX_ACTIVE_PER_USER` | `3` | Per-user cap on the public create route (429). | `services/ai-service/config.py` |
 | `LOG_LEVEL` | `INFO` (`DEBUG` for ai-service in the override) | Log verbosity. | `.env.example`, `docker-compose.override.yml` |
 | `LOG_JSON` | `True` | JSON log lines (structlog). | `shared/config.py` |
-| `FRONTEND_BASE_URL`, `BACKEND_CORS_ORIGINS` | `http://localhost:3000` | For the future frontend: the base of user-facing links in emails (verification, password reset, invitations), and the comma-separated list of origins CORS allows. | `.env.example`, `shared/config.py` |
+| `FRONTEND_BASE_URL`, `BACKEND_CORS_ORIGINS` | `http://localhost:3000` | For the frontend: the base of user-facing links in emails (verification, password reset, invitations), and the comma-separated list of origins CORS allows. | `.env.example`, `shared/config.py` |
 | Gateway external HTTPS port | `8443` | In the port mapping and in nginx's `$external_https_port`. | `docker-compose.yaml`, `infra/gateway/nginx.conf` |
 | `OAUTH_REDIRECT_BASE_URL` | `https://localhost:8443` | Public gateway address: OAuth callback base and Grafana's root URL (section 3.2). | `.env.example`, `services/auth-service/config.py`, `docker-compose.yaml` |
 
@@ -872,7 +890,7 @@ fixed-size Docker disk that holds PostgreSQL and the backups.
 | `docker compose up` stops with `set GRAFANA_ADMIN_PASSWORD in .env.docker` (or `S3_ACCESS_KEY`) | Compose refuses to interpolate a required value. | You ran Compose without `--env-file .env.docker`, or the value is empty in `.env.docker`. |
 | Gateway does not start: "dependency failed to start" / a service is `unhealthy` | The gateway waits for all three services to be healthy. | `docker compose --env-file .env.docker ps`, then `bash scripts/logs.sh <service>`. Look for `SchemaBootstrapError` (schema in an unknown or archived state), an embedding/vector-size mismatch from `check_embedding_configuration`, or a dependency check failing in `/health`. |
 | `/health/<service>` answers 503 with `"status": "degraded"` | One dependency check is `false`. | The JSON body names it: `database`, `redis`, `storage`, `qdrant`. |
-| A browser call returns 404 although the route exists | nginx only forwards listed prefixes; everything else (and all `/internal/*`) is 404 at the gateway. | Check the path against the table in section 3.2. Internal routes must be called from inside a container. |
+| A browser call returns 404 although the route exists | nginx only forwards listed API prefixes to the services; any other path goes to the frontend, which answers 404 for a page it does not have, and all `/internal/*` is 404 at the gateway. | Check the path against the table in section 3.2. Internal routes must be called from inside a container. |
 | An internal call fails with 401 `Missing or invalid internal token` | The receiver's `INTERNAL_API_TOKEN` differs from the caller's. | After editing `.env.docker`, recreate the containers (a `restart` keeps the old environment); see [chapter 02](02-operations.md). |
 | A code change has no effect | No `--reload`; the old process still runs. | Restart the service; check a log line that only the new code writes. |
 | Analyses show `failed` with `failure_reason = service_restart` or `cancelled` | ai-service was stopped or restarted while they were queued or running. | `bash scripts/psql.sh -c "SELECT id, ticker, status, failure_reason, created_at FROM ai.analyses ORDER BY created_at DESC LIMIT 10;"` |
@@ -887,8 +905,8 @@ Run from the repository root with the stack already up (see
 
 1. **Show the containers.**
    `docker compose --env-file .env.docker ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}\t{{.Ports}}'`
-   The audience sees 16 running containers. The three services and the
-   four data stores (postgres, redis, qdrant, objectstore) are marked
+   The audience sees 17 running containers. The three services, the
+   frontend and the four data stores (postgres, redis, qdrant, objectstore) are marked
    `(healthy)`; only the gateway with
    `0.0.0.0:8443` and `0.0.0.0:8000`; the developer UIs with
    `127.0.0.1:...`. Say: "Only the gateway is a public door."

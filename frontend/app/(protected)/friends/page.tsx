@@ -15,7 +15,7 @@ type Connection = {
 function PersonRow({ connection, children }: { connection: Connection; children?: React.ReactNode }) {
   const user = connection.other_user;
   return (
-    <div className="row-item" style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+    <div className="row-item" style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 }}>
       <Avatar
         url={user.avatar_url}
         username={user.username}

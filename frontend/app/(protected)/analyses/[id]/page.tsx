@@ -1,8 +1,8 @@
 import Link from "next/link";
-import { notFound } from "next/navigation";
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { formatNumber } from "@/app/lib/format";
+import { can, getMe } from "@/app/lib/me";
+import { LocalTime } from "@/app/(protected)/local-time";
 import { isFinished, statusPillClass } from "../status";
 import { LiveStatus } from "./live-status";
 import { DecisionForm } from "./decision-form";
@@ -75,14 +75,11 @@ function percent(value: number | null | undefined): string {
 
 export default async function AnalysisDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const accessToken = await getAccessToken();
+  const { me, accessToken } = await getMe();
 
-  const res = await backendFetch(`/analyses/${id}`, accessToken!, { cache: "no-store" });
-  // Someone else's analysis is "forbidden", a wrong id is "not found" — to
-  // the user both just mean there's nothing here to see.
-  if (res.status === 404 || res.status === 403 || res.status === 422) {
-    notFound();
-  }
+  const res = await backendFetch(`/analyses/${encodeURIComponent(id)}`, accessToken, { cache: "no-store" });
+  // Someone else's analysis is "forbidden", a wrong id is "not found" or
+  // 422: requireOk shows the not-found page for all three.
   requireOk(res, "Failed to load analysis");
 
   const { data: analysis }: { data: AnalysisDetail } = await res.json();
@@ -103,14 +100,16 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
           </Link>{" "}
           / Analysis
         </p>
-        <h1 className="page-title flex items-center gap-3">
+        <h1 className="page-title flex flex-wrap items-center gap-3">
           <span className="mono">{analysis.ticker}</span>
           <span className={statusPillClass(analysis.status)}>{analysis.status}</span>
         </h1>
-        <p className="page-subtitle">Started {new Date(analysis.created_at).toLocaleString()}</p>
+        <p className="page-subtitle">
+          Started <LocalTime iso={analysis.created_at} />
+        </p>
       </div>
 
-      {!isFinished(analysis.status) && <LiveStatus analysisId={analysis.id} accessToken={accessToken!} />}
+      {!isFinished(analysis.status) && <LiveStatus analysisId={analysis.id} accessToken={accessToken} />}
 
       {analysis.status === "failed" && (
         <div className="panel" style={{ fontSize: 13 }}>
@@ -125,8 +124,8 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
       {rec && (
         <div className="section">
           <h2 className="section-title">Recommendation</h2>
-          <div className="panel flex flex-col gap-2">
-            <div className="flex items-center gap-2">
+          <div className="panel flex flex-col gap-2 min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
               <span className={actionPillClass(rec.recommendation)} style={{ fontSize: 13, padding: "4px 12px" }}>
                 {rec.recommendation}
               </span>
@@ -134,7 +133,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
                 {percent(rec.confidence)} confidence
               </span>
             </div>
-            <p style={{ margin: 0, fontSize: 13, whiteSpace: "pre-wrap" }}>{rec.reasoning}</p>
+            <p style={{ margin: 0, fontSize: 13, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{rec.reasoning}</p>
             {rec.confidence_adjustment_note && (
               <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-faint)" }}>{rec.confidence_adjustment_note}</p>
             )}
@@ -173,7 +172,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
                       <td className="mono">{formatNumber(t.quantity)}</td>
                       <td className="mono">{t.status.replaceAll("_", " ")}</td>
                       <td className="mono">
-                        {t.window_expires_at ? new Date(t.window_expires_at).toLocaleString() : "—"}
+                        {t.window_expires_at ? <LocalTime iso={t.window_expires_at} /> : "—"}
                       </td>
                     </tr>
                   ))}
@@ -189,14 +188,19 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
           <h2 className="section-title">Your decision</h2>
           {rec.accepted_at && (
             <p style={{ fontSize: 12.5, color: "var(--text-faint)", margin: 0 }}>
-              You accepted this recommendation on {new Date(rec.accepted_at).toLocaleString()}.
+              You accepted this recommendation on <LocalTime iso={rec.accepted_at} />.
             </p>
           )}
-          <DecisionForm
-            analysisId={analysis.id}
-            portfolioId={analysis.portfolio_id}
-            hasTiers={rec.tiers.length > 0}
-          />
+          {/* Recording a decision needs analysis:create (get_analysis_writer). */}
+          {can(me, "analysis:create") ? (
+            <DecisionForm
+              analysisId={analysis.id}
+              portfolioId={analysis.portfolio_id}
+              hasTiers={rec.tiers.length > 0}
+            />
+          ) : (
+            <p className="empty-state">Your role ({me.system_role}) is read-only.</p>
+          )}
         </div>
       )}
 
@@ -206,7 +210,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
           <div className="row-list">
             {analysis.agent_runs.map((run) => (
               <div key={run.id} className="row-item">
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <span className="row-title mono" style={{ textTransform: "uppercase" }}>
                     {run.agent_name}
                   </span>
@@ -218,7 +222,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
                     <span className={statusPillClass(run.status)}>{run.status}</span>
                   </span>
                 </div>
-                {run.result?.summary && <div className="row-meta">{run.result.summary}</div>}
+                {run.result?.summary && <div className="row-meta break-words">{run.result.summary}</div>}
               </div>
             ))}
           </div>
@@ -235,7 +239,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
                   ROUND {round}
                 </div>
                 {args.map((arg, i) => (
-                  <p key={i} style={{ margin: 0, fontSize: 13, whiteSpace: "pre-wrap" }}>
+                  <p key={i} style={{ margin: 0, fontSize: 13, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
                     <strong style={{ color: arg.side === "bull" ? "var(--up)" : "var(--down)" }}>
                       {arg.side === "bull" ? "Bull" : "Bear"}:
                     </strong>{" "}
@@ -254,7 +258,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
           <div className="row-list">
             {analysis.reflections.map((r) => (
               <div key={r.id} className="row-item">
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <span className="row-title">Check {r.round_number}</span>
                   <span className={r.verified ? "pill pill-up" : "pill pill-accent"}>
                     {r.verified ? "verified" : "issues found"}
@@ -264,13 +268,13 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
                 {r.issues
                   ?.filter((issue) => !issue.startsWith("REVIEW_META:"))
                   .map((issue, i) => (
-                  <div key={i} className="row-meta">
+                  <div key={i} className="row-meta break-words">
                     • {issue}
                   </div>
                 ))}
                 {r.retry_agents &&
                   Object.entries(r.retry_agents).map(([agent, reason]) => (
-                    <div key={agent} className="row-meta">
+                    <div key={agent} className="row-meta break-words">
                       Re-ran <span className="mono">{agent}</span>: {reason}
                     </div>
                   ))}

@@ -151,12 +151,16 @@ change their email (`MeUpdate` has no email field), so that route sends
 nothing.
 
 The links point at pages of the web frontend (`/verify-email`,
-`/reset-password`, `/invitations/accept`). The frontend in this repository
-does not provide those pages yet, so during development you finish each
-flow by sending the token from the link to the API yourself:
+`/reset-password`, `/invitations/accept`, in `frontend/app/(public)/`).
+Each page reads `token` from the link and posts it to the API:
 `POST /api/v1/auth/verify-email {"token"}`,
 `POST /api/v1/auth/password-reset/confirm {"token", "new_password"}`,
-`POST /api/v1/organizations/invitations/accept {"token"}`. The token is
+`POST /api/v1/organizations/invitations/accept {"token"}`. The invitation
+page needs a logged-in user, so it sends a visitor to `/login` first and
+back afterwards. `/verify-email` also has a resend form
+(`POST /api/v1/auth/verify-email/resend`), and the login page offers it
+when a login fails with `email_not_verified`. You can still finish each
+flow without the frontend by posting the token yourself. The token is
 always posted in the body, never put into an API path, so it does not
 reach access or error logs (chapter 29, section 3.1).
 
@@ -392,7 +396,7 @@ private to your machine.
 
 | Symptom | What the system does | How to diagnose |
 |---|---|---|
-| Registration answers 201 but no email arrives | The user row is committed; the background send failed. | `make service-logs S=auth-service` and look for `email_send_failed` and `verification_email_failed`. Is `mailhog` running (`make health`)? Is `SMTP_HOST` right? The user can call `POST /api/v1/auth/verify-email/resend`. |
+| Registration answers 201 but no email arrives | The user row is committed; the background send failed. | `make service-logs S=auth-service` and look for `email_send_failed` and `verification_email_failed`. Is `mailhog` running (`make health`)? Is `SMTP_HOST` right? The user can use the resend form on `/verify-email` (or call `POST /api/v1/auth/verify-email/resend`). |
 | Reset request answers 200 but nothing arrives | Same answer for unknown accounts, by design. | Check the address has an account; check for `password_reset_email_failed`; check the per-email limit (3 per hour). |
 | A notification email never arrives | Email is opt-in. | Check the user's `notification_preferences` (`bash scripts/psql.sh -c "SELECT notification_preferences FROM auth.user_settings WHERE user_id = '<id>'"`); look for `notification_email_send_failed` in core-service logs. |
 | `email_send_failed ... Connection refused` | SMTP server not reachable. | `docker compose --env-file .env.docker ps mailhog`; in production check host and port. |

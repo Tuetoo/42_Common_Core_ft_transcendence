@@ -1,10 +1,12 @@
 "use client";
 
 import { useActionState } from "react";
-import { createOrganization, type CreateOrganizationState } from "@/app/lib/actions/organizations";
+import { createOrganization, type OrganizationFormState } from "@/app/lib/actions/organizations";
 
-const initialState: CreateOrganizationState = {};
+const initialState: OrganizationFormState = {};
 
+// On success the action opens the new organization. After an error it
+// returns what was typed, and the reset form shows it again.
 export function CreateOrganizationForm() {
   const [state, formAction, pending] = useActionState(createOrganization, initialState);
 
@@ -12,13 +14,19 @@ export function CreateOrganizationForm() {
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="name">Name</label>
-        <input id="name" name="name" type="text" required />
+        <input id="name" name="name" type="text" required maxLength={128} defaultValue={state.values?.name ?? ""} />
       </div>
       <div className="field">
         <label htmlFor="description">Description (optional)</label>
-        <input id="description" name="description" type="text" />
+        <textarea
+          id="description"
+          name="description"
+          rows={3}
+          maxLength={1000}
+          defaultValue={state.values?.description ?? ""}
+        />
       </div>
-      {state?.error && (
+      {state.error && (
         <p aria-live="polite" className="form-message error">
           {state.error}
         </p>

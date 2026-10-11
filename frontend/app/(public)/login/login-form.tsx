@@ -3,6 +3,7 @@
 import { useActionState, useState } from "react";
 import Link from "next/link";
 import { login, type LoginState } from "@/app/lib/actions/auth";
+import { EMAIL_MAX, PASSWORD_MAX_BYTES } from "../field-rules";
 
 const initialState: LoginState = {};
 
@@ -23,7 +24,9 @@ export function LoginForm({ next }: { next: string }) {
           id="email"
           name="email"
           type="email"
+          autoComplete="email"
           required
+          maxLength={EMAIL_MAX}
           autoFocus
           value={email}
           onChange={(e) => setEmail(e.target.value)}
@@ -35,7 +38,9 @@ export function LoginForm({ next }: { next: string }) {
           id="password"
           name="password"
           type="password"
+          autoComplete="current-password"
           required
+          maxLength={PASSWORD_MAX_BYTES}
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
@@ -48,21 +53,28 @@ export function LoginForm({ next }: { next: string }) {
             name="totp_code"
             type="text"
             inputMode="numeric"
+            autoComplete="one-time-code"
             maxLength={6}
             autoFocus
             required
           />
         </div>
       )}
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
+      {/* Always mounted so screen readers announce the error when it appears. */}
+      <p aria-live="polite" className="form-message error">
+        {state?.error}
+      </p>
+      {/* The backend refuses an unverified email with this code; offer a
+          way to get a fresh verification link. */}
+      {state?.code === "email_not_verified" && (
+        <Link href="/verify-email" className="link-btn">
+          Resend the verification link
+        </Link>
       )}
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Logging in…" : "Log in"}
       </button>
-      <div className="flex justify-between">
+      <div className="flex flex-wrap justify-between gap-x-4 gap-y-2">
         <Link href="/register" className="link-btn">
           Need an account? Register
         </Link>

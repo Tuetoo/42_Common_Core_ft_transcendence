@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { VerifyEmailForm } from "../link-forms";
+import { ResendVerificationForm, VerifyEmailForm } from "../link-forms";
 
 export default async function VerifyEmailPage({
   searchParams,
@@ -13,17 +13,25 @@ export default async function VerifyEmailPage({
       <div>
         <p className="page-eyebrow">Account</p>
         <h1 className="page-title">Verify your email</h1>
+        {!token && (
+          <p className="page-subtitle">
+            Open the link in the email we sent you. Didn&apos;t get it, or has it expired? Enter your email to get
+            a new one.
+          </p>
+        )}
       </div>
       {token ? (
-        <VerifyEmailForm token={token} />
-      ) : (
         <>
-          <p className="form-message error">This link is missing its verification token.</p>
-          <Link href="/login" className="link-btn">
-            Back to login
-          </Link>
+          <VerifyEmailForm token={token} />
+          <div className="divider">link expired?</div>
+          <ResendVerificationForm />
         </>
+      ) : (
+        <ResendVerificationForm autoFocus />
       )}
+      <Link href="/login" className="link-btn">
+        Back to login
+      </Link>
     </div>
   );
 }

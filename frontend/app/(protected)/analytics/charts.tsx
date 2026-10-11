@@ -7,6 +7,9 @@ import {
   BarChart,
   CartesianGrid,
   LabelList,
+  Legend,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -22,6 +25,15 @@ const SERIES = "#3987e5";
 const SURFACE = "#12151b";
 const GRID = "#232833";
 const MUTED_TEXT = "#8b94a3";
+
+// Analysis outcomes use the page's status colors: --up (completed),
+// --down (failed), --accent (running) and --text-secondary (pending).
+export const STATUS_COLORS: Record<string, string> = {
+  completed: "#35c46b",
+  failed: "#e5484d",
+  running: "#e0a83d",
+  pending: "#8b94a3",
+};
 
 function shortDate(iso: string): string {
   return new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
@@ -140,6 +152,63 @@ export function ActionDistributionChart({ distribution }: { distribution: { acti
           <LabelList dataKey="count" position="right" fill={MUTED_TEXT} fontSize={12} />
         </Bar>
       </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+type StatusSlice = { status: string; count: number };
+
+function StatusTooltip({ active, payload, total }: TooltipProps & { total: number }) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0].payload as unknown as StatusSlice;
+  return (
+    <div className="chart-tooltip">
+      <div className="chart-tooltip-label">{row.status}</div>
+      <div>
+        {row.count.toLocaleString("en-US")} {row.count === 1 ? "analysis" : "analyses"} (
+        {Math.round((row.count / total) * 100)}%)
+      </div>
+    </div>
+  );
+}
+
+// Donut of analyses by status. Statuses with no analyses are left out of
+// the ring (a zero slice can't be seen or hovered); the page's data table
+// still lists them.
+export function StatusDonutChart({ slices }: { slices: StatusSlice[] }) {
+  const data = slices
+    .filter((s) => s.count > 0)
+    .map((s) => ({ ...s, fill: STATUS_COLORS[s.status] ?? SERIES }));
+  const total = data.reduce((sum, s) => sum + s.count, 0);
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+        <Pie
+          data={data}
+          dataKey="count"
+          nameKey="status"
+          innerRadius="55%"
+          outerRadius="85%"
+          paddingAngle={data.length > 1 ? 2 : 0}
+          stroke={SURFACE}
+          strokeWidth={2}
+          isAnimationActive={false}
+        />
+        <Tooltip content={(props) => <StatusTooltip {...(props as TooltipProps)} total={total} />} />
+        <Legend
+          verticalAlign="bottom"
+          iconType="circle"
+          iconSize={8}
+          formatter={(value: string, entry) => {
+            const count = (entry.payload as unknown as StatusSlice | undefined)?.count ?? 0;
+            return (
+              <span style={{ color: MUTED_TEXT, fontSize: 12 }}>
+                {value} ({count.toLocaleString("en-US")})
+              </span>
+            );
+          }}
+        />
+      </PieChart>
     </ResponsiveContainer>
   );
 }

@@ -7,9 +7,12 @@
 > to HTTPS, sends each request path to the right backend service
 > (auth-service, core-service, ai-service or Grafana), upgrades WebSocket
 > connections, adds the security headers to every answer, rate-limits the
-> login API, and refuses everything it does not know, including the
-> service-to-service `/internal/*` routes. Its whole configuration is one
-> file: `infra/gateway/nginx.conf`.
+> login API, sends every other path to the Next.js frontend, and refuses
+> the service-to-service `/internal/*` routes and `/metrics`. A second,
+> internal listener on port 8080 (not published) serves only the API and
+> health routes, for the frontend's server side. The configuration is
+> `infra/gateway/nginx.conf` plus `infra/gateway/api_locations.conf` (the
+> API and health locations, included by both listeners).
 
 ---
 
@@ -26,7 +29,7 @@ network.
         |  https://localhost:8443  (TLS)        http://localhost:8000
         v                                              |
   +-------------------------------------------------------------+
-  | gateway  (nginx 1.27, container ports 443 and 80)           |
+  | gateway  (nginx 1.27, container ports 443, 80 and 8080)     |
   |                                                             |
   |  port 80  -> "301 Location: https://<host>:8443<uri>"       |
   |  port 443 -> TLS ends here, then match the path:            |
@@ -40,13 +43,18 @@ network.
   |     /health/{auth,core,ai}, /docs/{auth,core,ai}/,          |
   |     /api/openapi-{auth,core,ai}.json     -> each service    |
   |     /status                  -> static file (status.html)   |
-  |     /internal/*, /metrics, anything else -> 404             |
+  |     /internal/*, /metrics                -> 404             |
+  |     anything else (pages, /healthz)      -> frontend:3000   |
+  |  port 8080 (Docker network only, plain HTTP):               |
+  |     /api/v1/..., /health/{auth,core,ai} -> same as above    |
+  |     anything else                        -> 404             |
   +-------------------------------------------------------------+
         |   plain HTTP inside the Docker network
         v
-  auth-service   core-service   ai-service   grafana
+  auth-service   core-service   ai-service   grafana   frontend
   (uvicorn, port 8000, started with --proxy-headers
    --forwarded-allow-ips=*, so they trust X-Forwarded-*)
+  frontend server side --> http://gateway:8080/api/v1/...
 ```
 
 Three ideas explain almost everything in this chapter:
@@ -56,14 +64,17 @@ Three ideas explain almost everything in this chapter:
    `"8000:80"`). The three application services have no `ports:` at all.
    Developer tools (MailHog, Prometheus, Qdrant, Alertmanager, Adminer) are
    bound to `127.0.0.1` only.
-2. **Allow-list routing.** Every path the outside world may use is written
-   out as a `location` block. Everything else hits `location / { return
-   404; }`. This is why `/internal/*` and `/metrics` cannot be reached from
-   outside, even by accident.
+2. **Allow-list routing.** Every backend path the outside world may use
+   is written out as a `location` block. Everything else goes to the
+   frontend (`location /`), which serves only its own pages and answers
+   404 for the rest. `/internal/*` and `/metrics` have explicit 404
+   blocks, so they cannot be reached from outside, even by accident.
 3. **The gateway is the edge.** It is the first thing that sees a client,
    so it is the only place that knows the real client address and the real
    scheme (https). It writes that knowledge into `X-Forwarded-*` headers,
-   and the services are told to trust those headers.
+   and the services are told to trust those headers. The one exception is
+   the internal listener: there the frontend passes the browser's address
+   on, and nginx restores it (section 3.3).
 
 ---
 
@@ -84,6 +95,7 @@ Three ideas explain almost everything in this chapter:
 | **HSTS** (`Strict-Transport-Security`) | A header that tells a browser "use HTTPS only for this site for N seconds". | Sent for one year. |
 | **CSP** (`Content-Security-Policy`) | A header that tells the browser which scripts, styles and connections a page may use. | Only the `/status` page gets one, built from SHA-256 hashes of its inline script and style. |
 | **`limit_req`** | nginx's request rate limiter (a "leaky bucket": a steady rate plus a small burst allowance). | Protects `/api/v1/auth`. |
+| **`real_ip` module** (`set_real_ip_from`, `real_ip_header`) | Replaces `$remote_addr` with an address taken from a request header, but only when the peer is in a trusted range. | Used only on the internal listener, so the frontend's calls carry the browser's address. |
 | **Docker embedded DNS** | Inside a user-defined Docker network, the resolver at `127.0.0.11` turns service names (`auth-service`) into container IP addresses. | The gateway re-resolves backend names every 10 seconds through it. |
 
 ---
@@ -96,7 +108,8 @@ Three ideas explain almost everything in this chapter:
 
 | Mount (host -> container) | Purpose |
 |---|---|
-| `./infra/gateway/nginx.conf` -> `/etc/nginx/nginx.conf` (read-only) | the whole configuration |
+| `./infra/gateway/nginx.conf` -> `/etc/nginx/nginx.conf` (read-only) | the main configuration (`http` block and the servers) |
+| `./infra/gateway/api_locations.conf` -> `/etc/nginx/api_locations.conf` (read-only) | the API and `/health/*` locations, included by the HTTPS server and the internal listener |
 | `./infra/gateway/certs` -> `/etc/nginx/certs` (read-only) | `server.crt` and `server.key` |
 | `./infra/gateway/status.html` -> `/usr/share/nginx/status/status.html` (read-only) | the public status page |
 
@@ -104,6 +117,7 @@ Other facts from the same service block:
 
 - Image: `nginx:1.27-alpine`.
 - Ports: `"8443:443"` (HTTPS) and `"8000:80"` (HTTP that only redirects).
+  Port 8080 (the internal listener) is not published.
 - `depends_on`: auth-service, core-service and ai-service with
   `condition: service_healthy`. The gateway starts only after all three
   answer `/health` with 200 (see their `healthcheck` blocks).
@@ -160,7 +174,8 @@ the `http` block, in order:
 6. **`limit_req_zone $binary_remote_addr zone=auth_zone:10m rate=10r/s;`**
    and **`limit_req_status 429;`** A rate-limit memory zone of 10 MB, keyed
    by the client address, refilling at 10 requests per second. Rejected
-   requests get HTTP 429. The zone is used only in `location /api/v1/auth`.
+   requests get HTTP 429. The zone is used only in `location /api/v1/auth`
+   (in `api_locations.conf`, so on both listeners).
 7. **`map $http_upgrade $connection_upgrade`**: `Connection: upgrade` when
    the client sent an `Upgrade` header, `Connection: close` otherwise.
    Used by `/ws` and `/grafana/`.
@@ -218,7 +233,8 @@ the `http` block, in order:
 
     Like `add_header`, `proxy_set_header` has the "set one, lose all
     inherited" rule. That is why `/ws` and `/grafana/`, which must add
-    `Upgrade` and `Connection`, repeat all five headers.
+    `Upgrade` and `Connection`, repeat all five headers. The internal
+    listener repeats them too, with `X-Forwarded-Proto https`.
     `proxy_hide_header` follows the same rule separately: `/ws` sets no
     `proxy_hide_header` of its own, so it still inherits the three from
     the `http` level; `/grafana/` repeats them only for readability.
@@ -246,7 +262,7 @@ the `http` block, in order:
     | `.github/workflows/integration-ci.yml` | health and route checks against `https://localhost:8443` |
     | `infra/gateway/gen-certs.sh` | certificate names `localhost` and `127.0.0.1` (the host, not the port) |
 
-### 3.3 The two servers
+### 3.3 The three servers
 
 **Port 80 (published as 8000):**
 
@@ -283,11 +299,49 @@ Every request, whatever the path, gets a 301 to the same path and query on
 - Backend names are stored in variables:
 
   ```
-  set $auth_service    auth-service:8000;
-  set $core_service    core-service:8000;
-  set $ai_service      ai-service:8000;
-  set $grafana_service grafana:3000;
+  # api_locations.conf (both listeners)
+  set $auth_service     auth-service:8000;
+  set $core_service     core-service:8000;
+  set $ai_service       ai-service:8000;
+  # HTTPS server only
+  set $grafana_service  grafana:3000;
+  set $frontend_service frontend:3000;
   ```
+
+**Port 8080 (internal, not published):**
+
+The frontend's server side (pages, Server Actions, route handlers) calls
+`BACKEND_API_URL=http://gateway:8080/api/v1`. Only containers on the
+Docker network reach this port. Connections inside the backend may be
+unencrypted; every browser connection still uses the HTTPS server. Plain
+HTTP here means the frontend needs no certificate that names `gateway`
+(the cloud certificate names only the public domain).
+
+```
+server {
+    listen 8080;
+    set_real_ip_from 10.0.0.0/8;
+    set_real_ip_from 172.16.0.0/12;
+    set_real_ip_from 192.168.0.0/16;
+    real_ip_header X-Forwarded-For;
+    proxy_set_header X-Forwarded-Proto https;   # plus the other four
+    include /etc/nginx/api_locations.conf;
+    location / { return 404; }
+}
+```
+
+- The HTTPS server sets `X-Real-IP` to the browser's address. The frontend
+  copies it into `X-Forwarded-For` on its calls
+  (`frontend/app/lib/backend.ts`, and the token refresh in
+  `frontend/proxy.ts`).
+- This listener trusts that header, and only from private Docker
+  addresses, so `$remote_addr` becomes the browser's address. The gateway
+  `auth_zone` limit, auth-service's per-IP limits and the session records
+  then see each user, not the frontend container.
+- It forwards `X-Forwarded-Proto https`, because the browser's own
+  connection was HTTPS.
+- Everything except the included API and health locations is `404`:
+  no pages, no `/ws`, no `/internal/*`, no `/metrics`.
 
 ### 3.4 Why variables in `proxy_pass` (the stale-IP problem)
 
@@ -323,6 +377,10 @@ to the backend, replacing the client's path. That is what makes
 
 The order below is the order in `nginx.conf`. nginx does not pick the
 first match; it picks exact matches (`=`) first, then the longest prefix.
+The API locations of auth-service, core-service and ai-service and the
+health aliases are in `api_locations.conf`, which both the HTTPS server
+and the internal listener include. `/static/avatars`, `/ws`, `/status`,
+Grafana and the Swagger locations are on the HTTPS server only.
 
 **Refused (404) at the gateway:**
 
@@ -331,7 +389,12 @@ first match; it picks exact matches (`=`) first, then the longest prefix.
 | `location ^~ /internal/` | `return 404` | Service-to-service routes (see 3.7). `^~` means no regex location can override it. |
 | `location = /internal` | `return 404` | The bare path without slash. |
 | `location = /metrics` | `return 404` | Prometheus scrapes each service's `/metrics` directly inside the Docker network. |
-| `location /` | `return 404` | The catch-all. When the frontend exists, it will take over this location. |
+
+**Frontend (`$frontend_service`):**
+
+| Location | Behaviour |
+|---|---|
+| `location /` | `proxy_buffering off; proxy_pass http://$frontend_service;` The catch-all: every path not matched above is a frontend page (including `/healthz`). Unknown pages get the frontend's 404 page. `proxy_buffering off` lets streamed pages reach the browser chunk by chunk. |
 
 **Static:**
 
@@ -488,8 +551,9 @@ section 3.13).
 So they are protected in two layers:
 
 1. **Not reachable from outside.** The gateway answers 404 for
-   `/internal` and everything under `/internal/`. There is no host port on
-   any service, so the gateway is the only way in.
+   `/internal` and everything under `/internal/`. The internal listener
+   answers 404 for everything except the API and health locations. There
+   is no host port on any service, so the gateway is the only way in.
 2. **A shared secret inside the network.** Every `/internal` router has
    `dependencies=[Depends(require_internal_token)]`
    (`shared/security.py`). It compares the `X-Internal-Token` header with
@@ -542,6 +606,9 @@ What the script does, step by step:
    `chmod 600 server.key` (owner only; nginx's master process reads it as
    root before dropping privileges).
 
+The certificate does not name `gateway`: the frontend reaches the API
+on the internal plain-HTTP listener (section 3.3), not over TLS.
+
 `make certs` runs the script, and `make up` depends on `certs`, so a fresh
 checkout gets a certificate automatically (`Makefile`). The certificate
 files are not committed (`infra/gateway/certs/README.md`: everything in
@@ -592,6 +659,13 @@ client would choose its own address: it could dodge every per-IP limit
 in auth-service or aim a lockout at someone else's address. Replacing
 the header closes that hole.
 
+The internal listener is the one place where a forwarded address is
+kept: `set_real_ip_from` trusts `X-Forwarded-For` from private Docker
+addresses only, and nginx then writes the restored address as the single
+`X-Forwarded-For` entry. A browser cannot reach that listener; on the
+HTTPS server, `X-Real-IP` is always overwritten with the real peer, so
+the address the frontend passes on cannot be chosen by the client.
+
 The remaining trust is "anything on the Docker network can claim any
 address". That is the same trust boundary as `/internal/*`, and it is
 accepted for this deployment.
@@ -604,6 +678,9 @@ accepted for this deployment.
 |---|---|---|---|
 | HTTPS host port | `8443` (`"8443:443"`) | public HTTPS port | `docker-compose.yaml` (gateway `ports`) |
 | HTTP host port | `8000` (`"8000:80"`) | redirect-only port | `docker-compose.yaml` |
+| Internal listener | `8080`, plain HTTP, not published | API and health routes for the frontend's server side | `nginx.conf` (third `server`) |
+| `set_real_ip_from` / `real_ip_header` | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` / `X-Forwarded-For` | trusted forwarders on the internal listener only | `nginx.conf` |
+| `BACKEND_API_URL` (frontend) | `http://gateway:8080/api/v1` | where the frontend's server side sends API calls | `docker-compose.yaml` (frontend) |
 | `$external_https_port` | `8443` | port written into redirects; keep equal to the HTTPS host port | `infra/gateway/nginx.conf` (`map $host ...`) |
 | `client_max_body_size` | `25m` | largest request body the gateway forwards | `nginx.conf` |
 | `resolver` | `127.0.0.11 valid=10s ipv6=off` | Docker DNS, 10 s cache | `nginx.conf` |
@@ -634,9 +711,21 @@ service".**
 *Alternative:* a few broad rules such as "everything under `/api/` to the
 service that owns it" plus a pass-through default.
 *Reason:* with an allow-list, a new internal or debug route is private by
-default. The catch-all 404 is what keeps `/internal/*`, `/metrics` and each
-service's raw `/health` and `/api/docs` unreachable from outside, and the
-explicit `/internal` 404 blocks document the intent.
+default. The catch-all goes to the frontend, which has no route to any
+backend path, so `/internal/*`, `/metrics` and each service's raw
+`/health` and `/api/docs` stay unreachable from outside. The explicit
+`/internal` and `/metrics` 404 blocks document the intent.
+
+**An internal plain-HTTP listener for the frontend's server side.**
+*Alternative:* the frontend calls `https://gateway` with a certificate
+that names `gateway` and a trusted CA in Node (`NODE_EXTRA_CA_CERTS`).
+*Reason:* the cloud certificate (Let's Encrypt) names only
+`alphamind-research.duckdns.org`, so `https://gateway` fails TLS there.
+Connections inside the backend may be unencrypted; every browser
+connection is HTTPS. One shared `api_locations.conf` keeps both listeners
+routing the same paths the same way. For local `npm run dev` the frontend
+still uses `https://localhost:8443/api/v1` with `NODE_EXTRA_CA_CERTS`
+(`frontend/.env.example`).
 
 **TLS at the gateway, plain HTTP inside.**
 *Alternative:* TLS on every service.
@@ -669,7 +758,9 @@ seconds costs almost nothing.
 it whose entries should be kept. Appending would let a client choose its
 own address for auth-service's per-IP limits (section 3.9). If a trusted
 load balancer is ever put in front of the gateway, this decision must be
-revisited (nginx's `real_ip` module would then be the right tool).
+revisited (nginx's `real_ip` module would then be the right tool). The
+`real_ip` module is used today only on the internal listener, where the
+trusted forwarder is the frontend.
 
 **Security headers only at `http` level, per-path values with `map`.**
 *Alternative:* `add_header` inside each location.
@@ -727,6 +818,9 @@ script with no dependencies except `openssl` works on Linux and macOS.
 | redirect goes to `https://localhost/...` (no port) | a backend built an absolute URL from `Host` without port, or `$external_https_port` does not match the compose mapping | check `map $http_host $proxy_host_header` and `map $host $external_https_port` |
 | WebSocket closes after exactly one hour of silence | `proxy_read_timeout 3600s` on `/ws` | clients should send pings or reconnect (the project's end-to-end script uses a 20 s ping interval) |
 | RAG stream arrives in one lump at the end | buffering somewhere | `/api/v1/rag` must keep `proxy_buffering off` |
+| every page is `502 Bad Gateway` | the `frontend` container is down or still starting | `docker compose --env-file .env.docker ps frontend`; `make service-logs S=frontend` |
+| `/healthz` answers 503 | the frontend cannot reach `/health/auth` on the internal listener | `BACKEND_API_URL` must be `http://gateway:8080/api/v1`; check `curl -k https://localhost:8443/health/auth` |
+| all users share one rate limit after logging in through the pages | the frontend did not pass `X-Forwarded-For`, or the internal listener lost its `real_ip` lines | `frontend/app/lib/backend.ts` (`clientIpHeaders`) and the third `server` in `nginx.conf` |
 | all users seem to share one rate-limit bucket in auth-service | uvicorn started without `--proxy-headers`, so `request.client.host` is the gateway | check the running command: `docker compose --env-file .env.docker exec -T auth-service cat /proc/1/cmdline \| tr '\0' ' '` |
 
 Useful log sources:
@@ -806,6 +900,15 @@ Expected:
 Say: "The gateway maps `/health/core` to core-service's own `/health`.
 The raw `/health` of a service is not reachable from outside."
 
+The frontend's own check goes through the internal listener:
+
+```
+curl -k -sS https://localhost:8443/healthz
+```
+
+Expected: `{"status":"ok"}`. A 503 means the frontend cannot reach the
+API.
+
 **Step 4: `/internal/...` and `/metrics` are refused.**
 
 ```
@@ -815,8 +918,9 @@ curl -k -sS -o /dev/null -w '%{http_code}\n' https://localhost:8443/metrics
 curl -k -sS -o /dev/null -w '%{http_code}\n' https://localhost:8443/anything-else
 ```
 
-All three print `404`. Say: "Unknown paths are 404 at the gateway. The
-internal routes exist, but only inside the Docker network."
+All three print `404`. Say: "`/internal/*` and `/metrics` are 404 at the
+gateway; an unknown path is the frontend's 404 page. The internal routes
+exist, but only inside the Docker network."
 
 Then show the second layer, inside the network but without the secret:
 
@@ -925,6 +1029,8 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 8. Why is `/api/v1/rag` the only location with `proxy_buffering off`?
 9. Why does the access log use `$uri` instead of `$request`?
 10. How long is the development certificate valid and for which names?
+11. Why does the frontend call `http://gateway:8080` and not
+    `https://gateway`?
 
 <details>
 <summary>Answers</summary>
@@ -953,6 +1059,9 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 9. `$request` contains the query string, which can hold a WebSocket access
    token or an OAuth code.
 10. 825 days, for `DNS:localhost` and `IP:127.0.0.1`.
+11. The cloud certificate names only the public domain, so TLS to the
+    name `gateway` would fail. The internal listener is on the Docker
+    network only, where unencrypted connections are allowed.
 
 </details>
 
@@ -962,7 +1071,8 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 
 | File | What it holds |
 |---|---|
-| `infra/gateway/nginx.conf` | the whole gateway configuration: TLS, redirects, routing, headers, rate limit, log format |
+| `infra/gateway/nginx.conf` | the main gateway configuration: TLS, redirects, routing, headers, rate limit, log format, the internal listener |
+| `infra/gateway/api_locations.conf` | API and `/health/*` locations, included by the HTTPS server and the internal listener |
 | `infra/gateway/gen-certs.sh` | creates the self-signed certificate and key (`--force`, `--out`) |
 | `infra/gateway/certs/README.md` | what belongs in the (git-ignored) certificate directory |
 | `infra/gateway/status.html` | the public status page (one inline script, one inline style) |
@@ -975,14 +1085,17 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 | `shared/http_client.py` | adds `X-Internal-Token` to service-to-service `/internal/` calls |
 | `shared/config.py` | `INTERNAL_API_TOKEN` and its start-up check |
 | `Makefile` | `make certs`, `make up` (depends on `certs`) |
-| `.github/workflows/integration-ci.yml` | runs `csp_hashes.py --check` |
+| `.github/workflows/integration-ci.yml` | runs `csp_hashes.py --check`; the stack smoke test checks `/login` and `/healthz` through the gateway |
+| `frontend/app/lib/backend.ts`, `frontend/proxy.ts` | pass the browser's address (`X-Real-IP`) as `X-Forwarded-For` to the internal listener |
+| `frontend/app/healthz/route.ts` | `GET /healthz`: 200 only when the frontend reaches `/health/auth` through the internal listener |
+| `tests/core-service/test_platform.py` | checks that `X-Forwarded-For` is replaced, never appended (4 places: http level, `/ws`, `/grafana/`, internal listener) |
 
 ---
 
 ## 10. Related chapters
 
 - [01-architecture.md](01-architecture.md): where the gateway sits in the
-  whole system.
+  whole system; section 3.11 for the frontend.
 - [02-operations.md](02-operations.md): starting the stack, `make up`,
   `make rebuild`.
 - [11-auth-service.md](11-auth-service.md): the per-IP and per-email

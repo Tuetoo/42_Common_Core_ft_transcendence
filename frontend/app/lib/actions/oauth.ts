@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { setSession } from "@/app/lib/session";
 import { readApiError } from "@/app/lib/api-error";
+import { publicFetch } from "@/app/lib/backend";
 
 // Called by /oauth/complete once it has read the tokens from the URL
 // fragment. Setting the session cookies has to happen on the server
@@ -31,7 +32,7 @@ export async function completeOAuthTwoFactor(
 
   let res: Response;
   try {
-    res = await fetch(`${process.env.BACKEND_API_URL}/auth/oauth/2fa`, {
+    res = await publicFetch("/auth/oauth/2fa", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ challenge_token: challengeToken, code }),
