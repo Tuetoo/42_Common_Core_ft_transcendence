@@ -121,7 +121,10 @@ Then the app is built:
   `OAuthProviderError` (`oauth_provider_error`) is 502;
   `OAuthAccountLinkError` (`oauth_link_refused`) is 409. An unregistered
   `AppError` is 400. Any other exception is logged as
-  `unhandled_exception` and answered 500 `internal_server_error`.
+  `unhandled_exception` and answered 500 `internal_server_error`. The
+  OAuth callback route does not use these statuses: it catches every
+  `AppError` itself and redirects to the frontend with the error in the
+  URL fragment (section 3.9).
   `RateLimitedError` (in `rate_limit.py`, code `rate_limited`) has its
   own handler that adds `Retry-After`; it is more specific than the
   `AppError` handler (FastAPI picks the handler of the nearest class), so
@@ -590,7 +593,7 @@ and send the victim the link `.../callback?code=<attacker code>&state=<attacker 
 the victim's browser would then be signed in to the attacker's account
 (and, for example, upload documents into it). With the cookie, the
 victim's browser has no nonce (or a different one), so the callback
-answers 401 `oauth_failed` ("This sign-in was not started in this
+fails with `oauth_failed` ("This sign-in was not started in this
 browser") and logs `oauth_browser_binding_failed`. The state is consumed
 by that failed attempt, so it cannot be retried. `SameSite=Lax` is
 required (not `Strict`): the provider's redirect back is a cross-site
@@ -614,18 +617,21 @@ and GitHub both accept PKCE with `S256` for web applications.
    |  user agrees                                                               |
    |<-- redirect to .../oauth/google/callback?code=..&state=.. ------------------|
    | GET /oauth/google/callback  (cookie alphamind_oauth_nonce sent)            |
-   |---------------------------->| error param? -> 401 oauth_failed              |
+   |---------------------------->| error param? -> oauth_failed                  |
    |                             | GETDEL oauth:state:<state>; provider matches? |
-   |                             |   (single use, else 401) ---->|                 |
+   |                             |   (single use, else oauth_failed)             |
    |                             | sha256(cookie nonce) == stored hash?          |
-   |                             |   (else 401, sign-in from another browser)    |
+   |                             |   (else oauth_failed, other browser)          |
    |                             | POST token_url (code, code_verifier) -------->|
    |                             | GET userinfo (+ /user/emails for GitHub) ---->|
    |                             | resolve local user (see below)                |
-   |                             | inactive or deleted -> 401                    |
+   |                             | inactive or deleted -> invalid_credentials    |
    |                             | 2FA enabled?                                  |
-   |<-- 200 {two_factor_required: true, challenge_token, expires_in: 300}        |
-   |      or 200 {access_token, refresh_token}; the nonce cookie is deleted      |
+   |<-- 303 Location: FRONTEND_BASE_URL/oauth/complete#<fragment>                |
+   |      fragment: challenge_token=..&expires_in=300 (2FA account)              |
+   |             or access_token=..&refresh_token=..                             |
+   |             or error=oauth_failed&message=.. (any failure above)            |
+   |      the nonce cookie is deleted in every case                              |
    |                             |                                               |
    | POST /oauth/2fa {challenge_token, code}                                     |
    |---------------------------->| decode (type oauth_2fa), user still active    |
@@ -669,15 +675,37 @@ The session created by an OAuth sign-in records the client IP address
 and the `User-Agent`, like a password login (`device_info` falls back to
 `oauth:<provider>` when the request has no `User-Agent`).
 
-Failure mapping: the provider says no or rejects the code -> 401
-`oauth_failed`; the provider is down or answers garbage -> 502
-`oauth_provider_error`; an unknown provider name -> 422
-`unsupported_oauth_provider`; a concurrent callback for the same identity
--> 409.
+Errors inside the sign-in: the provider says no or rejects the code ->
+`oauth_failed`; the provider is down or answers garbage ->
+`oauth_provider_error`; an unknown provider name ->
+`unsupported_oauth_provider`; an unverified side when linking ->
+`oauth_link_refused`; a deactivated account -> `invalid_credentials`; a
+concurrent callback for the same identity -> `conflict`.
 
-The callback returns JSON (there is no frontend yet to redirect to). The
-OAuth 2FA challenge exists because otherwise "Sign in with Google" would
-have bypassed 2FA entirely.
+The callback route (`oauth_callback` in `domains/auth/api.py`) never
+answers JSON. It always answers **303 See Other** to
+`${FRONTEND_BASE_URL}/oauth/complete#<fragment>`; `_oauth_complete_url`
+builds the fragment with `urllib.parse.urlencode`:
+
+| Outcome | Fragment |
+|---|---|
+| signed in | `access_token=...&refresh_token=...` |
+| the account has 2FA | `challenge_token=...&expires_in=300`; the frontend then calls `POST /api/v1/auth/oauth/2fa` |
+| any `AppError` listed above | `error=oauth_failed&message=<the error message>` |
+
+On an error the route rolls back the request's database work, logs
+`oauth_callback_failed` with `provider`, the error `code` and `message`,
+and publishes no events. The nonce cookie is deleted on every outcome.
+The result travels in the fragment (the part after `#`) because browsers
+never send a fragment to any server and never put it in the `Referer`
+header, so the tokens do not reach the frontend's server, the gateway
+log or another site. The frontend page `/oauth/complete` reads
+`window.location.hash`, removes it from the address bar with
+`history.replaceState`, and then stores the tokens, asks for the 2FA
+code, or shows the message. `FRONTEND_BASE_URL` must therefore be the
+frontend origin (for example `https://localhost:8443` locally, the cloud
+URL on the server). The OAuth 2FA challenge exists because otherwise
+"Sign in with Google" would have bypassed 2FA entirely.
 
 With empty `GOOGLE_CLIENT_ID` / `GITHUB_CLIENT_ID` the flow fails at the
 provider with `invalid_client`, which is the intended behaviour for an
@@ -1200,7 +1228,7 @@ From `services/auth-service/config.py` unless noted. Set them in
 | `TOTP_ENCRYPTION_KEY` | empty | Fernet key that encrypts stored TOTP secrets; must be a valid Fernet key when set; required (startup refuses) when `APP_ENV` is not development/test; when empty, a key derived from `JWT_SECRET` is used |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | empty | OAuth apps |
 | `OAUTH_REDIRECT_BASE_URL` | `https://localhost:8443` | base of the callback URL registered with providers |
-| `FRONTEND_BASE_URL` | `http://localhost:3000` (`shared/config.py`) | base of links in emails |
+| `FRONTEND_BASE_URL` | `http://localhost:3000` (`shared/config.py`) | base of links in emails and of the OAuth result page `/oauth/complete`; must be the frontend origin |
 | `AVATAR_STORAGE_DIR` | `/app/data/avatars` | volume `avatar_data` |
 | `AVATAR_MAX_SIZE_MB` | `5` | |
 | `AVATAR_ALLOWED_CONTENT_TYPES` | png, jpeg, webp, gif | |
@@ -1291,7 +1319,15 @@ this browser started it, so an attacker's own callback link would sign a
 victim into the attacker's account (login CSRF). An HttpOnly nonce cookie
 whose hash is stored with the state closes that gap without a frontend
 session; PKCE makes a leaked authorization code useless. The callback
-stays a JSON route.
+ends with a 303 redirect to the frontend, with the result in the URL
+fragment.
+
+**The OAuth result travels in the URL fragment of a redirect.**
+*Alternative:* answer JSON, or put the tokens in the query string.
+*Reason:* the provider sends the browser to the callback as a top-level
+navigation, so the browser must land on a frontend page. A query string
+is sent to servers and written to logs; a fragment is never sent to any
+server and never appears in the `Referer` header.
 
 **Invitation tokens travel in the request body.**
 *Alternative:* `POST /invitations/{token}/accept`.
@@ -1313,10 +1349,11 @@ a body is not.
 | refresh 401 and the user is logged out on every device | reuse detection fired | log event `refresh_token_reuse_detected` (`bash scripts/logs.sh auth-service grep refresh_token_reuse_detected`); sessions show `revoked_reason = 'reuse'` |
 | a demoted admin still has admin rights | the mirror was not written | `bash scripts/redis-cli.sh -n 2 GET auth:user_state:<id>`; logs `user_state.mirror_failed`, `user_state.startup_sync_failed`; core/ai logs `user_state.redis_read_failed`, `user_state.auth_lookup_failed` |
 | verification or reset email never arrives | SMTP problem; the request still succeeded | log events `verification_email_failed`, `password_reset_email_failed`, `invitation_email_failed`, `email_send_failed`; MailHog UI |
-| OAuth callback 401 "Invalid or expired OAuth state" | the state is older than 300 s, was already used, or was for another provider | start again from `/oauth/<provider>/authorize` |
-| OAuth callback 401 "This sign-in was not started in this browser" (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
-| OAuth 409 `oauth_link_refused` | a local account with that email exists but one side is unverified | log in with the password first |
-| OAuth 502 `oauth_provider_error` | provider unreachable or odd answer | log events `oauth_provider_http_error`, `oauth_github_emails_unavailable` |
+| OAuth ends at `/oauth/complete#error=oauth_failed&message=...` | any sign-in error; the `message` says which one (rows below) | log `oauth_callback_failed` (`bash scripts/logs.sh auth-service grep oauth_callback_failed`) shows the error code |
+| OAuth message "Invalid or expired OAuth state." | the state is older than 300 s, was already used, or was for another provider | start again from `/oauth/<provider>/authorize` |
+| OAuth message "This sign-in was not started in this browser. Start the sign-in again." (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
+| OAuth `oauth_callback_failed` code `oauth_link_refused` | a local account with that email exists but one side is unverified | log in with the password first |
+| OAuth `oauth_callback_failed` code `oauth_provider_error` | provider unreachable or odd answer | log events `oauth_provider_http_error`, `oauth_github_emails_unavailable` |
 | auth-service does not start, log says the schema was refused | old migration chain or tables without `alembic_version` | follow the command in the log (`python -m scripts.alembic_convert`) after a backup |
 | auth-service refuses to start: "JWT_SECRET must be set..." | weak secret with `APP_ENV` not development/test | set a random secret of 32+ characters |
 | 2FA login answers 409 "Your 2FA settings cannot be read..." | the stored secret cannot be decrypted with `TOTP_ENCRYPTION_KEY` or the `JWT_SECRET`-derived key (both changed, or a damaged row); log `totp_secret_unreadable` with `user_id` | an admin resets the user's 2FA: `DELETE /api/v1/admin/users/{id}/2fa`; the user then sets it up again |

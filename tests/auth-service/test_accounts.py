@@ -2,7 +2,7 @@ import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 from uuid import UUID, uuid4
 import httpx
 import pyotp
@@ -125,12 +125,21 @@ async def oauth_callback(client, provider_name, state, nonce, **params):
         }, headers=headers)
 
 
+def oauth_result(response) -> dict[str, str]:
+    from config import settings
+
+    assert response.status_code == 303, response.text
+    target, _, fragment = response.headers["location"].partition("#")
+    assert target == f"{settings.FRONTEND_BASE_URL}/oauth/complete"
+    return dict(parse_qsl(fragment))
+
+
 async def oauth_login(client, provider_name="google", **params):
     query, nonce, _ = await oauth_start(client, provider_name)
     state = query["state"][0]
     response = await oauth_callback(
         client, provider_name, state, nonce, **params)
-    return response, state
+    return oauth_result(response), state
 
 
 class TestRegistration:
@@ -489,10 +498,8 @@ class TestOAuth:
             "email": "oauth2fa@example.com",
             "email_verified": True
         }
-        r, _ = await oauth_login(client)
-        assert r.status_code == 200
-        data = r.json()["data"]
-        assert data["two_factor_required"] is True
+        data, _ = await oauth_login(client)
+        assert data["expires_in"] == "300"
         assert "access_token" not in data
         bad = await client.post(
             "/api/v1/auth/oauth/2fa", json={
@@ -513,24 +520,21 @@ class TestOAuth:
             })
         assert again.status_code == 401
 
-        denied = await client.get(
+        denied = oauth_result(await client.get(
             "/api/v1/auth/oauth/google/callback",
-            params={"error": "access_denied"})
-        assert denied.status_code == 401
+            params={"error": "access_denied"}))
+        assert denied["error"] == "oauth_failed"
+        assert "access_denied" in denied["message"]
         missing = await client.get("/api/v1/auth/oauth/google/callback")
-        assert missing.status_code == 401
+        assert oauth_result(missing)["error"] == "oauth_failed"
 
         provider.token_body = {"error": "bad_verification_code"}
-        r, _ = await oauth_login(client, "github")
-        assert r.status_code == 401
-
+        failures = [(await oauth_login(client, "github"))[0]]
         provider.token_status, provider.token_body = 500, {"x": 1}
-        r, _ = await oauth_login(client)
-        assert r.status_code == 502
-
+        failures.append((await oauth_login(client))[0])
         provider.raise_network = True
-        r, _ = await oauth_login(client)
-        assert r.status_code == 502
+        failures.append((await oauth_login(client))[0])
+        assert [r["error"] for r in failures] == ["oauth_failed"] * 3
 
         provider.raise_network = False
         provider.token_status = 200
@@ -541,13 +545,13 @@ class TestOAuth:
             "email_verified": True
         }
         first, state = await oauth_login(client)
-        assert first.status_code == 200
+        assert first["access_token"] and first["refresh_token"]
         replay = await client.get(
             "/api/v1/auth/oauth/google/callback", params={
                 "code": "c",
                 "state": state
             })
-        assert replay.status_code == 401
+        assert oauth_result(replay)["error"] == "oauth_failed"
 
     async def test_browser_binding_and_new_account_verification(
             self, client, provider, db_session):
@@ -569,18 +573,17 @@ class TestOAuth:
 
         state = query["state"][0]
         missing = await oauth_callback(client, "google", state, None)
-        assert missing.status_code == 401
         burned = await oauth_callback(client, "google", state, nonce)
-        assert burned.status_code == 401
         query, _, _ = await oauth_start(client)
         foreign = await oauth_callback(
             client, "google", query["state"][0], "nonce-of-another-browser")
-        assert foreign.status_code == 401
+        for failed in (missing, burned, foreign):
+            assert oauth_result(failed)["error"] == "oauth_failed"
         assert provider.token_requests == []
 
         query, nonce, _ = await oauth_start(client)
         ok = await oauth_callback(client, "google", query["state"][0], nonce)
-        assert ok.status_code == 200, ok.text
+        tokens = oauth_result(ok)
         assert "max-age=0" in ok.headers["set-cookie"].lower()
         verifier = provider.token_requests[-1]["code_verifier"][0]
         digest = hashlib.sha256(verifier.encode()).digest()
@@ -589,7 +592,7 @@ class TestOAuth:
 
         session_row = await UserRepository(
             db_session).get_session_by_refresh_token(
-                ok.json()["data"]["refresh_token"])
+                tokens["refresh_token"])
         assert session_row.ip_address
         assert session_row.device_info.startswith("python-httpx")
 
@@ -600,7 +603,7 @@ class TestOAuth:
             "verified": True
         }]
         r, _ = await oauth_login(client, "github")
-        token = r.json()["data"]["access_token"]
+        token = r["access_token"]
         me = await client.get(
             "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
         assert me.json()["data"]["email"] == "gh@example.com"
@@ -612,7 +615,7 @@ class TestOAuth:
             "email_verified": False
         }
         r, _ = await oauth_login(client)
-        token = r.json()["data"]["access_token"]
+        token = r["access_token"]
         me = await client.get(
             "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
         assert me.json()["data"]["is_verified"] is False
@@ -811,12 +814,12 @@ class TestRecentLogin:
             "email_verified": True
         }
         r, _ = await oauth_login(client)
-        token = r.json()["data"]["access_token"]
+        token = r["access_token"]
         assert _claims(token)["auth_time"]
         headers = {"Authorization": f"Bearer {token}"}
         secret = await enable_2fa(client, headers)
         r, _ = await oauth_login(client)
-        challenge = r.json()["data"]["challenge_token"]
+        challenge = r["challenge_token"]
         ok = await client.post(
             "/api/v1/auth/oauth/2fa", json={
                 "challenge_token": challenge,
