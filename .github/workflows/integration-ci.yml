@@ -3,7 +3,7 @@
 # (and on main): flake8 of infra/, the gateway status page's CSP hashes,
 # the compose file, the shell scripts' syntax and the Prometheus alert
 # rule tests. `stack-smoke` (main only) starts the full stack and
-# smoke-tests the gateway. Neither runs tests/integration (those need a
+# smoke-tests the gateway and the frontend. Neither runs tests/integration (those need a
 # seeded Qdrant corpus and a real embedding key, so
 # `make test-integration` is a local run).
 name: stack smoke CI
@@ -17,6 +17,7 @@ on:
       - "scripts/**"
       - "docker-compose.yaml"
       - "docker-compose.override.yml"
+      - "frontend/Dockerfile"
       - "Makefile"
       - ".env.example"
       - ".github/workflows/integration-ci.yml"
@@ -80,7 +81,8 @@ jobs:
           for i in $(seq 1 60); do
             if curl -skf https://localhost:8443/health/auth \
               && curl -skf https://localhost:8443/health/core \
-              && curl -skf https://localhost:8443/health/ai; then
+              && curl -skf https://localhost:8443/health/ai \
+              && curl -skf https://localhost:8443/healthz; then
               echo "stack is healthy"
               exit 0
             fi
@@ -96,5 +98,9 @@ jobs:
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/status)" = 200
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/internal/x)" = 404
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/metrics)" = 404
+          # The frontend serves its pages, and its server side reaches the
+          # API through the gateway's internal listener (/healthz).
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/login)" = 200
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/healthz)" = 200
       - if: always()
         run: docker compose --env-file .env.docker -f docker-compose.yaml down -v

@@ -1,19 +1,36 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useEffect, useRef } from "react";
 import { addComment, type AddCommentState } from "@/app/lib/actions/research";
+import { COMMENT_MAX } from "../limits";
 
 const initialState: AddCommentState = {};
 
 export function AddCommentForm({ noteId }: { noteId: string }) {
   const addCommentForNote = addComment.bind(null, noteId);
   const [state, formAction, pending] = useActionState(addCommentForNote, initialState);
+  const formRef = useRef<HTMLFormElement>(null);
+
+  // Clear the box after each successful post.
+  useEffect(() => {
+    if (state.posted) formRef.current?.reset();
+  }, [state.posted]);
 
   return (
-    <form action={formAction} className="form">
+    <form ref={formRef} action={formAction} className="form">
       <div className="field">
-        <label htmlFor="content">Comment</label>
-        <textarea id="content" name="content" rows={3} required />
+        <label htmlFor="comment-content">Comment</label>
+        <textarea
+          id="comment-content"
+          name="content"
+          rows={3}
+          required
+          maxLength={COMMENT_MAX}
+          aria-describedby="comment-help"
+        />
+        <span id="comment-help" className="text-xs text-[var(--text-faint)]">
+          Up to {COMMENT_MAX.toLocaleString("en-US")} characters. Sentiment is analysed after posting.
+        </span>
       </div>
       {state?.error && (
         <p aria-live="polite" className="form-message error">

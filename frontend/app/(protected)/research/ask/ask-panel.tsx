@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { QUESTION_MAX, TICKER_HINT, TICKER_HTML_PATTERN, tickerError } from "../limits";
 
 type Citation = {
   index: number;
@@ -58,6 +59,12 @@ export function AskPanel() {
   async function ask(e: React.FormEvent) {
     e.preventDefault();
     if (!question.trim() || status === "streaming") return;
+    const badTicker = tickerError(ticker);
+    if (badTicker) {
+      setError(badTicker);
+      setStatus("error");
+      return;
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -143,7 +150,7 @@ export function AskPanel() {
           <textarea
             id="question"
             rows={3}
-            maxLength={2000}
+            maxLength={QUESTION_MAX}
             required
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
@@ -168,6 +175,8 @@ export function AskPanel() {
               id="ask-ticker"
               type="text"
               maxLength={10}
+              pattern={TICKER_HTML_PATTERN}
+              title={TICKER_HINT}
               placeholder="All"
               value={ticker}
               onChange={(e) => setTicker(e.target.value)}

@@ -6,9 +6,9 @@ subject (v21.1).
 Scoring: a Major module is worth 2 points, a Minor module 1 point, and
 only fully working modules count at evaluation. "Backend ✅" below means
 every backend requirement of the module is implemented and tested and
-can be shown through the API (Swagger, curl, WebSocket client). Modules
-whose requirement is inherently something a user sees in the browser are
-marked "needs frontend" even when their backend is complete.
+can be shown through the API (Swagger, curl, WebSocket client). The
+frontend is the Next.js app in `frontend/`, served by the gateway at `/`;
+"Frontend:" in the evidence names its pages under `frontend/app/`.
 
 ---
 
@@ -16,9 +16,9 @@ marked "needs frontend" even when their backend is complete.
 
 | Role | Owns |
 |---|---|
-| **Backend Lead** | `auth-service` (auth, users, administration, organizations, social), `core-service` (portfolios and ledger, research notes/comments/documents, notifications, WebSocket and Yjs relay, public API), gateway, compose, CI |
-| **AI Lead** (Jenny) | `ai-service` (multi-agent analysis, RAG, LLM router, recommendations, decisions, backtests, analytics), monitoring, backups |
-| **Frontend Lead** | `frontend/` — consumes all three services through the gateway at https://localhost:8443 |
+| **Backend Lead** | `auth-service`, `core-service`, `ai-service`, `shared/`, database, tests, `docker-compose.yaml`, CI/CD, cloud deployment |
+| **Infra Lead** | `infra/` (gateway, monitoring, scheduler, backups, log collection) |
+| **Frontend Lead** | `frontend/` — the Next.js app, served by the gateway at https://localhost:8443/ |
 
 ---
 
@@ -57,15 +57,15 @@ protected by a shared token) and over Redis events
 
 | Requirement | Status |
 |---|---|
-| Frontend + backend + database, one-command Docker deployment | Backend ✅ (`make up`); frontend in progress |
+| Frontend + backend + database, one-command Docker deployment | ✅ (`make up` starts the `frontend` service with the backend; gateway `location /` -> `frontend:3000`) |
 | Several users at once, concurrent actions without corruption, real-time updates | ✅ (row locks and idempotency keys on the ledger and tiers, per-user queue limits, WebSocket fan-out) |
 | Credentials in an ignored env file, `.env.example` provided | ✅ (`.env.docker` ignored, `.env.example` complete) |
 | Clear database schema with relations | ✅ (`docs/ERD.md`, Alembic in every service) |
 | Secure sign-up and login, hashed and salted passwords | ✅ (bcrypt, email verification, rate limits) |
 | Input validation in the backend | ✅ (Pydantic on every route, 422 instead of 500 on bad input) |
-| Input validation in the frontend | Frontend |
-| HTTPS for every connection from outside | ✅ (TLS gateway on 8443; HTTP 8000 only redirects) |
-| Privacy Policy and Terms of Service pages | Frontend |
+| Input validation in the frontend | ✅ (every form has HTML limits mirroring the backend Pydantic limits; the Server Actions in `frontend/app/lib/actions/` check again) |
+| HTTPS for every connection from outside | ✅ (TLS gateway on 8443; HTTP 8000 only redirects; the frontend's server-side calls use the gateway's internal listener on the Docker network) |
+| Privacy Policy and Terms of Service pages | Frontend Lead, pending (footer links to `/privacy` and `/terms` exist in `frontend/app/site-footer.tsx`) |
 | README with the required sections | Not written yet |
 
 ---
@@ -76,24 +76,24 @@ protected by a shared token) and over Redis events
 
 | # | Module | Type | Pts | Status | Evidence |
 |---|---|---|---|---|---|
-| W1 | Framework for frontend and backend | Major | 2 | Needs frontend | FastAPI in all three services; the frontend framework is the Frontend Lead's part. |
+| W1 | Framework for frontend and backend | Major | 2 | ✅ | FastAPI in all three services; Next.js 16 (React 19) in `frontend/`. |
 | W2 | ORM | Minor | 1 | ✅ | SQLAlchemy 2.0 async (`shared/database.py`), Alembic per service. |
-| W3 | Real-time features | Major | 2 | Backend ✅, needs frontend | `core-service` WebSockets: per-channel authorization, reconnect-safe Redis relay across replicas, each message delivered once per socket, presence heartbeats, analysis/tier/decision events on `analysis:<id>`, notification pushes. |
+| W3 | Real-time features | Major | 2 | ✅ | `core-service` WebSockets: per-channel authorization, reconnect-safe Redis relay across replicas, each message delivered once per socket, presence heartbeats, analysis/tier/decision events on `analysis:<id>`, notification pushes. Frontend: live notification feed and unread count (`(protected)/notifications/live-feed.tsx`, `use-live-unread.ts`), live analysis status (`(protected)/analyses/[id]/live-status.tsx`), live analytics refresh. |
 | W4 | Public API | Major | 2 | ✅ | `/api/v1/public/*` with `X-API-Key`, per-key and per-user rate limits (429), GET/POST/PUT/DELETE, Swagger at `/docs/core/`; keys of deactivated owners stop working immediately. |
 | W5 | Notification system for all create/update/delete actions | Minor | 1 | ✅ | Every create, update and delete in core notifies the actor (and affected users); auth and ai actions arrive as events (`shared/enums.py` lists all types). In-app rows, live WebSocket push by default, optional email. |
-| W6 | File upload and management | Minor | 1 | Backend ✅ (upload progress is frontend) | Type, size and content checks (a `.pdf` must really be a PDF), access-controlled S3 storage, download, inline preview, rename, delete with index clean-up. |
-| W7 | Advanced search | Minor | 1 | ✅ | Notes: full-text search with filters, sort, pagination. Documents: filters (status, category, ticker, dates), sort, pagination. |
-| W8 | Real-time collaborative features | Minor | 1 | Backend ✅, needs frontend | Yjs live editing of research notes: the Yjs document is the source of truth and is written back to the note text and search index; REST body edits get 409 during a session; organization viewers and guests are read-only; malformed updates are isolated in worker processes so they cannot crash the service. |
+| W6 | File upload and management | Minor | 1 | ✅ | Type, size and content checks (a `.pdf` must really be a PDF), access-controlled S3 storage, download, inline preview, rename, delete with index clean-up. Frontend: `(protected)/research/documents/` (upload with progress bar, preview, download, delete, processing status). |
+| W7 | Advanced search | Minor | 1 | ✅ | Notes: full-text search with filters, sort, pagination. Documents: filters (status, category, ticker, dates), sort, pagination. Frontend: `(protected)/research/page.tsx` and `(protected)/research/documents/page.tsx`, filter values kept in the URL. |
+| W8 | Real-time collaborative features | Minor | 1 | ✅ | Yjs live editing of research notes: the Yjs document is the source of truth and is written back to the note text and search index; REST body edits get 409 during a session; organization viewers and guests are read-only; malformed updates are isolated in worker processes so they cannot crash the service. Frontend: `(protected)/research/[id]/collab-editor.tsx` (two users of one organization edit a shared note live). |
 
 ### 4.2 User management
 
 | # | Module | Type | Pts | Status | Evidence |
 |---|---|---|---|---|---|
-| U1 | Standard user management | Major | 2 | Backend ✅, needs frontend | Profile update, avatar upload with a default avatar, friends with online status, profile data. |
+| U1 | Standard user management | Major | 2 | ✅ | Profile update, avatar upload with a default avatar, friends with online status, profile data. Frontend: `(protected)/profile/`, `(protected)/friends/`. |
 | U2 | Remote authentication (OAuth 2.0) | Minor | 1 | Code ✅, not configured | Google and GitHub, with 2FA enforced on OAuth logins. No OAuth app is registered yet: register both with the real domain before the evaluation. |
 | U3 | Two-factor authentication | Minor | 1 | ✅ | TOTP, enforced on password and OAuth logins, lockout after repeated failures. |
-| U4 | Advanced permissions system | Major | 2 | ✅ (role-based UI is frontend) | System roles admin / moderator / user / guest (`shared/permissions.py`); admin user CRUD (`/api/v1/admin/users`), deactivate/reactivate/soft delete, site statistics; moderators hide/delete any note or comment and deactivate users; guests are read-only everywhere; `/me` returns `permissions` so the UI can adapt; a demotion or deactivation applies immediately to existing tokens. |
-| U5 | Organization system | Major | 2 | ✅ | Create/edit/delete organizations, invite, join, leave, remove, change roles; OWNER/ADMIN/MEMBER/VIEWER enforced (viewers are read-only in shared notes and documents); shared portfolios. |
+| U4 | Advanced permissions system | Major | 2 | ✅ | System roles admin / moderator / user / guest (`shared/permissions.py`); admin user CRUD (`/api/v1/admin/users`), deactivate/reactivate/soft delete, site statistics; moderators hide/delete any note or comment and deactivate users; guests are read-only everywhere; `/me` returns `permissions` so the UI can adapt; a demotion or deactivation applies immediately to existing tokens. Frontend: `lib/me.ts` reads the permissions; `(protected)/admin/users/`, `(protected)/admin/moderation/`; guests see read-only views. |
+| U5 | Organization system | Major | 2 | ✅ | Create/edit/delete organizations, invite, join, leave, remove, change roles; OWNER/ADMIN/MEMBER/VIEWER enforced (viewers are read-only in shared notes and documents); shared portfolios. Frontend: `(protected)/organizations/` (edit, delete, leave, members, invitations). |
 
 Not claimed: "User activity analytics" (Minor) — no dedicated activity
 dashboard.
@@ -125,7 +125,7 @@ Vector into files, not an Elasticsearch/Logstash/Kibana stack.
 
 | # | Module | Type | Pts | Status | Evidence |
 |---|---|---|---|---|---|
-| N1 | Advanced analytics dashboard | Major | 2 | Backend ✅, needs frontend | Overview and time series with date ranges and filters (`/api/v1/analytics/overview`, `/timeseries`), CSV export of analyses/recommendations/decisions, portfolio history and transaction CSVs; live updates can use the existing WebSocket events. Charts and PDF export are frontend work. |
+| N1 | Advanced analytics dashboard | Major | 2 | ✅ | Overview and time series with date ranges and filters (`/api/v1/analytics/overview`, `/timeseries`), CSV export of analyses/recommendations/decisions, portfolio history and transaction CSVs. Frontend: `(protected)/analytics/` (charts, live refresh from WebSocket events, CSV export, "Save as PDF" through the print dialog). |
 
 Not claimed: "Data export and import" (Minor) — export exists, import
 does not. GDPR (Minor) — not implemented.
@@ -168,7 +168,7 @@ production image build) plus an integration workflow.
 
 ## 5. Point total
 
-| Category | Shown through the API today | Needs the frontend to be shown |
+| Category | Shown through the API | Shown through the frontend only |
 |---|---|---|
 | Web | 6 (W2, W4, W5, W6, W7) | 5 (W1, W3, W8) |
 | User management | 6 (U2 after OAuth apps are registered, U3, U4, U5) | 2 (U1) |
@@ -181,13 +181,13 @@ production image build) plus an integration workflow.
 Every row was checked against the module list of the subject (v21.1):
 each module above exists there with the type shown. The minimum of 14
 points is covered by the API-demonstrable modules alone. With the
-frontend parts done the claim is 35 points. The subject counts at most 5
+frontend modules the claim is 35 points. The subject counts at most 5
 bonus points above the required 14 (each extra module must be fully
 working and justified in the README), so the extra modules are a margin
 for modules that fail at the evaluation, not a higher grade. Evaluators
 count only modules that fully work, so U2 needs its OAuth apps
-registered and every "needs frontend" module needs its screens before
-the evaluation.
+registered and the frontend screens named in section 4 must work at the
+evaluation.
 
 ---
 
@@ -206,7 +206,7 @@ the evaluation.
 
 ## 7. Evaluation demo checklist
 
-Items marked (frontend) need the frontend; everything else can be shown
+Items marked (frontend) are shown in the frontend; everything else can also be shown
 with Swagger (https://localhost:8443/docs/{auth,core,ai}/), curl or a
 WebSocket client.
 

@@ -2,6 +2,7 @@
 
 import { useActionState, useState } from "react";
 import { recordDecision, type RecordDecisionState } from "@/app/lib/actions/analyses";
+import { DECISION_NOTES_MAX_LENGTH } from "@/app/lib/format";
 
 const initialState: RecordDecisionState = {};
 
@@ -45,7 +46,14 @@ export function DecisionForm({
       )}
       <div className="field">
         <label htmlFor="notes">Notes (optional)</label>
-        <textarea id="notes" name="notes" rows={3} maxLength={2000} />
+        <textarea
+          id="notes"
+          name="notes"
+          rows={3}
+          maxLength={DECISION_NOTES_MAX_LENGTH}
+          defaultValue={state.notes}
+          className="w-full"
+        />
       </div>
       {state?.error && (
         <p aria-live="polite" className="form-message error">

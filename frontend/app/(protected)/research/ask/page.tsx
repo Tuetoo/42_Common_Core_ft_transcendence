@@ -1,7 +1,9 @@
 import Link from "next/link";
+import { can, getMe } from "@/app/lib/me";
 import { AskPanel } from "./ask-panel";
 
-export default function AskPage() {
+export default async function AskPage() {
+  const { me } = await getMe();
   return (
     <div className="page">
       <div>
@@ -16,7 +18,11 @@ export default function AskPage() {
           Answers come only from indexed filings, news, research and your own uploads, with numbered sources.
         </p>
       </div>
-      <AskPanel />
+      {can(me, "rag:ask") ? (
+        <AskPanel />
+      ) : (
+        <p className="empty-state">Your role ({me.system_role}) is read-only: asking questions is not available.</p>
+      )}
     </div>
   );
 }

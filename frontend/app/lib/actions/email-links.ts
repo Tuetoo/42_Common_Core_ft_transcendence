@@ -2,7 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { clearSession, getAccessToken } from "@/app/lib/session";
-import { backendFetch } from "@/app/lib/backend";
+import { backendFetch, publicFetch } from "@/app/lib/backend";
 import { readApiError } from "@/app/lib/api-error";
 
 // Actions behind the three links auth-service puts in emails
@@ -16,7 +16,7 @@ export type LinkActionState = {
 };
 
 function postJson(path: string, body: unknown) {
-  return fetch(`${process.env.BACKEND_API_URL}${path}`, {
+  return publicFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

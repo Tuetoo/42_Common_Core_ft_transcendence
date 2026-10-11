@@ -853,8 +853,9 @@ class TestSharedContracts:
 
         conf = (_REPO / "infra" / "gateway" / "nginx.conf").read_text()
         assert "$proxy_add_x_forwarded_for" not in conf
+        # http level, /ws, /grafana/ and the internal 8080 listener.
         assert (
-            conf.count("proxy_set_header X-Forwarded-For $remote_addr;") == 3)
+            conf.count("proxy_set_header X-Forwarded-For $remote_addr;") == 4)
 
 
 class TestE2eCheckScript:

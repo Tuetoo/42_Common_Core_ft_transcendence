@@ -1,6 +1,8 @@
 import Link from "next/link";
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
+import { can, getMe } from "@/app/lib/me";
+import { Pager, pageParam } from "../pager";
+import { LocalTime } from "@/app/(protected)/local-time";
 import { StartAnalysisForm } from "./start-analysis-form";
 import { statusPillClass } from "./status";
 
@@ -14,21 +16,33 @@ type Analysis = {
 type Portfolio = {
   id: string;
   name: string;
+  owner: { id: string };
 };
 
-export default async function AnalysesPage() {
-  const accessToken = await getAccessToken();
+const PAGE_SIZE = 20;
+
+type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
+export default async function AnalysesPage({ searchParams }: { searchParams: SearchParams }) {
+  const page = pageParam((await searchParams).page);
+  const { me, accessToken } = await getMe();
+  const canCreate = can(me, "analysis:create");
 
   const [analysesRes, portfoliosRes] = await Promise.all([
-    backendFetch("/analyses?page_size=50", accessToken!, { cache: "no-store" }),
-    backendFetch("/portfolios", accessToken!, { cache: "no-store" }),
+    backendFetch(`/analyses?page=${page}&page_size=${PAGE_SIZE}`, accessToken, { cache: "no-store" }),
+    // Only the start form needs portfolios; 100 is the backend's largest page.
+    canCreate ? backendFetch("/portfolios?page=1&page_size=100", accessToken, { cache: "no-store" }) : null,
   ]);
 
   requireOk(analysesRes, "Failed to load analyses");
-  requireOk(portfoliosRes, "Failed to load portfolios");
+  if (portfoliosRes) requireOk(portfoliosRes, "Failed to load portfolios");
 
-  const { items: analyses }: { items: Analysis[] } = await analysesRes.json();
-  const { items: portfolios }: { items: Portfolio[] } = await portfoliosRes.json();
+  const { items: analyses, total }: { items: Analysis[]; total: number } = await analysesRes.json();
+  // An analysis may only be tied to a portfolio the user owns (the backend
+  // checks ensure_portfolio_owner), so shared ones are left out.
+  const portfolios: Portfolio[] = portfoliosRes
+    ? ((await portfoliosRes.json()).items as Portfolio[]).filter((p) => p.owner.id === me.id)
+    : [];
 
   return (
     <div className="page">
@@ -42,7 +56,11 @@ export default async function AnalysesPage() {
 
       <div className="section">
         <h2 className="section-title">Run a new analysis</h2>
-        <StartAnalysisForm portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        {canCreate ? (
+          <StartAnalysisForm portfolios={portfolios.map((p) => ({ id: p.id, name: p.name }))} />
+        ) : (
+          <p className="empty-state">Your role ({me.system_role}) is read-only.</p>
+        )}
       </div>
 
       <div className="section">
@@ -55,18 +73,21 @@ export default async function AnalysesPage() {
               <Link
                 key={a.id}
                 href={`/analyses/${a.id}`}
-                className="row-item"
-                style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}
+                className="row-item min-w-0"
+                style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 12 }}
               >
-                <div>
+                <div className="min-w-0">
                   <span className="row-title mono">{a.ticker}</span>
-                  <div className="row-meta">{new Date(a.created_at).toLocaleString()}</div>
+                  <div className="row-meta">
+                    <LocalTime iso={a.created_at} />
+                  </div>
                 </div>
                 <span className={statusPillClass(a.status)}>{a.status}</span>
               </Link>
             ))}
           </div>
         )}
+        <Pager basePath="/analyses" params={{}} page={page} pageSize={PAGE_SIZE} total={total} />
       </div>
     </div>
   );

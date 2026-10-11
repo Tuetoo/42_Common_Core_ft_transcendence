@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
+import { can, getMe } from "@/app/lib/me";
 import { CreateOrganizationForm } from "./create-organization-form";
 
 type Organization = {
@@ -12,8 +12,8 @@ type Organization = {
 };
 
 export default async function OrganizationsPage() {
-  const accessToken = await getAccessToken();
-  const res = await backendFetch("/organizations", accessToken!, { cache: "no-store" });
+  const { me, accessToken } = await getMe();
+  const res = await backendFetch("/organizations", accessToken, { cache: "no-store" });
 
   requireOk(res, "Failed to load organizations");
 
@@ -33,8 +33,11 @@ export default async function OrganizationsPage() {
           <div className="row-list">
             {organizations.map((org) => (
               <Link key={org.id} href={`/organizations/${org.id}`} className="row-item">
-                <span className="row-title">{org.name}</span>
-                {org.description && <span className="row-meta">{org.description}</span>}
+                <span className="flex flex-wrap items-center gap-2">
+                  <span className="row-title">{org.name}</span>
+                  {org.owner_id === me.id && <span className="pill pill-accent">owner</span>}
+                </span>
+                {org.description && <span className="row-meta break-words">{org.description}</span>}
               </Link>
             ))}
           </div>
@@ -43,7 +46,14 @@ export default async function OrganizationsPage() {
 
       <div className="section">
         <h2 className="section-title">Create a new organization</h2>
-        <CreateOrganizationForm />
+        {can(me, "organization:create") ? (
+          <CreateOrganizationForm />
+        ) : (
+          <p className="empty-state">
+            Your role (<span className="pill">{me.system_role}</span>) can view organizations you are invited to, but
+            cannot create one. Ask an admin to upgrade your account.
+          </p>
+        )}
       </div>
     </div>
   );

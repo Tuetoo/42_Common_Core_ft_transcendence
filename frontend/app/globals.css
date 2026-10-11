@@ -9,7 +9,8 @@
 
   --text: #e4e7eb;
   --text-secondary: #8b94a3;
-  --text-faint: #565e6b;
+  /* 5.29:1 on --bg, 4.97:1 on --bg-raised, 4.59:1 on --bg-hover (WCAG AA) */
+  --text-faint: #7d8694;
 
   --accent: #e0a83d;
   --accent-strong: #f0be5e;
@@ -219,6 +220,23 @@ a.row-item:hover { background: var(--bg-hover); }
   margin: 0;
 }
 .form-message.error { color: var(--down); }
+
+/* Error lines stay mounted so screen readers announce them (aria-live).
+   While empty they are taken out of the layout, but not hidden from
+   assistive tech, so they add no gap to the form. */
+.form-message:empty {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* short rule under an input, e.g. allowed characters */
+.field-hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
 .form-message.success { color: var(--up); }
 
 .mono {
@@ -461,6 +479,11 @@ a.row-item:hover { background: var(--bg-hover); }
   line-height: 18px;
   text-align: center;
 }
+/* the badge on its own (mobile top bar), not after a link label */
+.nav-badge-standalone {
+  margin-left: 0;
+  display: inline-block;
+}
 
 /* blinking caret at the end of a streaming answer */
 .stream-caret {
@@ -484,5 +507,72 @@ a.row-item:hover { background: var(--bg-hover); }
 
 /* wide content never breaks the page layout sideways */
 .table-scroll {
+  max-width: 100%;
   overflow-x: auto;
+}
+
+/* Long unbroken text (emails, ids, URLs) wraps instead of overflowing. */
+main {
+  overflow-wrap: break-word;
+}
+.page-title,
+.page-subtitle,
+.row-title,
+.row-meta {
+  overflow-wrap: anywhere;
+}
+main pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+main img,
+main svg {
+  max-width: 100%;
+}
+
+/* ---- footer ---- */
+
+.site-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.site-footer a {
+  color: var(--text-secondary);
+  text-underline-offset: 2px;
+}
+.site-footer a:hover { color: var(--text); }
+@media (min-width: 768px) {
+  .site-footer { padding: 16px 40px; }
+}
+@media print {
+  .site-footer { display: none; }
+}
+
+/* ---- small screens (below Tailwind's md breakpoint, e.g. a 375px phone) ---- */
+
+@media (max-width: 767.98px) {
+  .page { gap: 28px; }
+  .panel { padding: 14px 16px; }
+  .row-item { padding: 12px 14px; }
+  .stat-value { font-size: 22px; }
+
+  /* Rows of buttons, inputs and headings wrap onto the next line when they
+     don't fit. Wrapping only happens on overflow, so short rows look the
+     same; add flex-nowrap to a row that must stay on one line. */
+  main .flex:not(.flex-col):not(.flex-nowrap) {
+    flex-wrap: wrap;
+  }
+
+  /* A table that isn't inside .table-scroll scrolls by itself. */
+  .data-table:not(.table-scroll > .data-table) {
+    display: block;
+    overflow-x: auto;
+  }
 }

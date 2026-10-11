@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { wsUrl } from "@/app/lib/ws-url";
+import { closeSocket } from "../../close-socket";
 
 type ConnectionStatus = "connecting" | "live" | "polling";
 
@@ -41,8 +42,7 @@ export function LiveStatus({ analysisId, accessToken }: { analysisId: string; ac
     // Runs when the page stops rendering this component (e.g. once the
     // analysis has finished) or the user navigates away.
     return () => {
-      ws.onclose = null;
-      ws.close();
+      closeSocket(ws);
       if (pollTimer) clearInterval(pollTimer);
     };
   }, [analysisId, accessToken, router]);
@@ -50,6 +50,7 @@ export function LiveStatus({ analysisId, accessToken }: { analysisId: string; ac
   return (
     <div className="panel flex items-center gap-3" style={{ fontSize: 13 }}>
       <span
+        aria-hidden="true"
         style={{
           width: 8,
           height: 8,

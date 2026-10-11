@@ -22,7 +22,9 @@
  +-------------------------------- gateway (nginx) -----------------------------+
  |  security headers (HSTS, nosniff, X-Frame-Options, Referrer-Policy, CSP)      |
  |  /api/v1/auth: 10 req/s per address, burst 20 -> 429                          |
- |  /internal/*, /metrics, unknown paths -> 404 (never proxied)                  |
+ |  /internal/*, /metrics -> 404 (never proxied)                                 |
+ |  other paths -> frontend pages (unknown page -> frontend 404)                 |
+ |  :8080 internal listener (not published): API + health only                   |
  |  X-Forwarded-For replaced with the real peer address                          |
  +-------------------------------------------------------------------------------+
         |  plain HTTP on the private Docker network
@@ -138,6 +140,18 @@ per-address rate limit. A location that sets any `proxy_set_header` of
 its own (`/ws`, `/grafana/`) loses the inherited ones, so those locations
 repeat all of them, including this replacement.
 
+The frontend's server side calls the API on the gateway's internal
+listener (`http://gateway:8080`, plain HTTP, not published, Docker network
+only). It copies the browser's address from `X-Real-IP` (always set by the
+HTTPS listener) into `X-Forwarded-For`. The internal listener trusts that
+header only from private Docker addresses (`set_real_ip_from`
+`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `real_ip_header
+X-Forwarded-For`), sends `X-Forwarded-Proto https`, and again forwards a
+single `X-Forwarded-For` entry. So the auth rate limits and the session
+records see each user's address, not the frontend container's. Every
+browser connection is HTTPS; only connections inside the backend are
+plain HTTP.
+
 For production you replace the self-signed certificate with a real one
 (for example from Let's Encrypt).
 
@@ -170,12 +184,15 @@ does not pin `localhost` to HTTPS unless you trusted it explicitly.
 
 ### 3.3 Which paths the gateway serves
 
-Anything not listed in `nginx.conf` returns 404 (`location / { return
-404; }`). Explicit 404 blocks exist for `/internal/`, `/internal` and
-`/metrics`. Public paths: `/api/v1/...` per service, `/ws`, `/grafana/`
-(Grafana's own login; anonymous access off), `/status`, `/health/{auth,
-core,ai}`, the Swagger pages `/docs/{auth,core,ai}/` and their OpenAPI
-JSON files, and `/static/avatars`.
+Explicit 404 blocks exist for `/internal/`, `/internal` and `/metrics`.
+Public paths: `/api/v1/...` per service (`api_locations.conf`), `/ws`,
+`/grafana/` (Grafana's own login; anonymous access off), `/status`,
+`/health/{auth,core,ai}`, the Swagger pages `/docs/{auth,core,ai}/` and
+their OpenAPI JSON files, and `/static/avatars`. Every other path goes to
+the frontend (`location /`), which serves its pages and answers 404 for a
+path it does not know. The frontend has no route to any backend path. The
+internal listener on port 8080 serves only the API and health locations
+and answers 404 for the rest.
 
 ### 3.4 JWT access and refresh tokens
 
@@ -262,6 +279,20 @@ everywhere.
 Access tokens are not revocable one by one; they simply expire within 15
 minutes. Deactivation and role changes still apply immediately through
 the live state (3.7).
+
+**In the frontend.** The access and refresh tokens are stored in cookies
+set by the frontend's server (`frontend/app/lib/session-cookies.ts`):
+`httpOnly`, `SameSite=Lax`, `path=/`, and `Secure` when
+`NODE_ENV=production` (the Docker image). Page JavaScript cannot read
+these cookies. `frontend/proxy.ts` swaps an access token that expires
+within 60 seconds for a new pair before the page runs. Known trade-off:
+the browser's WebSocket needs the token in `?token=`, so the server
+passes the access token to the client components that open sockets
+(live notifications, unread count, analysis status, analytics refresh,
+and the note editor, which also fetches a fresh one from
+`/research/collab-token`). So page JavaScript can see the access token,
+but not the refresh token. An XSS bug could steal an access token valid
+for at most 15 minutes.
 
 ### 3.5 Password hashing
 
@@ -677,7 +708,8 @@ is read by `BaseServiceSettings.cors_origins()` and passed to FastAPI's
 `CORSMiddleware` in each `main.py` with `allow_credentials=True` and all
 methods and headers. CORS only matters for browsers: it decides which
 other web origins may call the API from JavaScript. It is not an
-authentication control.
+authentication control. The frontend is served from the same origin as
+the API (the gateway), so its pages need no CORS entry.
 
 ### 3.16 Secrets handling
 
@@ -704,13 +736,13 @@ From `docker-compose.yaml`:
 
 | Port on the host | Service | Who can reach it |
 |---|---|---|
-| `8443`, `8000` (all interfaces) | gateway | anyone who can reach the machine |
+| `8443`, `8000` (all interfaces) | gateway | anyone who can reach the machine (the internal listener, container port 8080, is not published) |
 | `127.0.0.1:6333` | Qdrant REST API and dashboard | only this machine |
 | `127.0.0.1:8025` | MailHog UI/API | only this machine |
 | `127.0.0.1:9090` | Prometheus | only this machine |
 | `127.0.0.1:9093` | Alertmanager | only this machine |
 | `127.0.0.1:8080` | Adminer (only with `make adminer`) | only this machine |
-| none | auth/core/ai services, PostgreSQL, Redis, SeaweedFS, Grafana (through the gateway), exporters, scheduler | only containers on the Docker network |
+| none | auth/core/ai services, frontend and Grafana (both through the gateway), PostgreSQL, Redis, SeaweedFS, exporters, scheduler | only containers on the Docker network |
 
 SeaweedFS: its master, volume server and filer have no authentication, so
 they listen on the container's own loopback (`-ip=127.0.0.1
@@ -1122,6 +1154,12 @@ or if any container could be compromised, you would add `requirepass`.
   service health, not data.
 - Per-address limits see one address for all host traffic behind Docker
   Desktop, which makes them coarse in development.
+- The frontend passes the access token to the client components that
+  open WebSockets, so page JavaScript can read it (the refresh token stays
+  in an `httpOnly` cookie); see section 3.4.
+- The internal listener trusts `X-Forwarded-For` from any private Docker
+  address, so any container on the Docker network can claim any client
+  address there (the same trust boundary as `/internal/*`).
 - The scheduler and operator scripts can mint tokens (`scripts/token.sh`
   runs `_create_token` inside auth-service). Whoever can run
   `docker compose exec` on the host is effectively an administrator.
@@ -1132,7 +1170,9 @@ or if any container could be compromised, you would add `requirepass`.
 
 | File | What it holds |
 |---|---|
-| `infra/gateway/nginx.conf` | TLS, redirects, security headers, CSP, path allow-list, `/internal` 404, auth rate zone, `X-Forwarded-For` replacement, log format. |
+| `infra/gateway/nginx.conf` | TLS, redirects, security headers, CSP, path allow-list, `/internal` 404, auth rate zone, `X-Forwarded-For` replacement, log format, the internal listener with `real_ip`. |
+| `infra/gateway/api_locations.conf` | API and `/health/*` locations shared by both listeners; the `/api/v1/auth` rate limit. |
+| `frontend/app/lib/session-cookies.ts`, `frontend/proxy.ts` | session cookie options; token refresh before a page runs. |
 | `infra/gateway/gen-certs.sh`, `csp_hashes.py`, `status.html` | Development certificate; CSP hash tool; the status page. |
 | `shared/security.py` | `CurrentUser`, `decode_token`, `make_get_current_user`, `require_permission`, `ensure_permission`, `require_internal_token`, `is_uuid_claim`. |
 | `shared/exceptions.py` | The `{"error": {...}}` envelope and the application error classes. |

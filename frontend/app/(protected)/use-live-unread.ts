@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { wsUrl } from "@/app/lib/ws-url";
+import { closeSocket } from "./close-socket";
 
 // One WebSocket for as long as any signed-in page is open. It does two
 // jobs: the backend counts a user as online while they have an open socket
@@ -60,10 +61,7 @@ export function useLiveUnread({
     connect();
     return () => {
       if (retryTimer) clearTimeout(retryTimer);
-      if (ws) {
-        ws.onclose = null;
-        ws.close();
-      }
+      if (ws) closeSocket(ws);
     };
   }, [accessToken, userId, router]);
 

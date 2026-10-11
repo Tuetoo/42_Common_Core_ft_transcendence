@@ -8,12 +8,9 @@
 #
 # Output: <dir>/server.crt and <dir>/server.key (default dir:
 # infra/gateway/certs, mounted read-only into the gateway container at
-# /etc/nginx/certs). Valid 825 days, SAN DNS:localhost, DNS:gateway and
-# IP:127.0.0.1. DNS:gateway is for the frontend container, whose server
-# side calls https://gateway on the Docker network.
-# Idempotent: if both files already exist and cover DNS:gateway nothing is
-# done unless --force is given; an older certificate without it is
-# replaced. Run by `make certs` and automatically by `make up`.
+# /etc/nginx/certs). Valid 825 days, SAN DNS:localhost and IP:127.0.0.1.
+# Idempotent: if both files already exist nothing is done unless
+# --force is given. Run by `make certs` and automatically by `make up`.
 #
 # Uses an OpenSSL config file instead of `-addext` so it also works with
 # the LibreSSL that ships as /usr/bin/openssl on macOS.
@@ -47,18 +44,15 @@ done
 CRT="$OUT_DIR/server.crt"
 KEY="$OUT_DIR/server.key"
 
+if [ "$FORCE" -eq 0 ] && [ -s "$CRT" ] && [ -s "$KEY" ]; then
+    echo "gen-certs: $CRT already exists (use --force to regenerate)"
+    exit 0
+fi
+
 command -v openssl >/dev/null 2>&1 || {
     echo "gen-certs: openssl is required but was not found in PATH" >&2
     exit 1
 }
-
-if [ "$FORCE" -eq 0 ] && [ -s "$CRT" ] && [ -s "$KEY" ]; then
-    if openssl x509 -in "$CRT" -noout -text 2>/dev/null | grep -q "DNS:gateway"; then
-        echo "gen-certs: $CRT already exists (use --force to regenerate)"
-        exit 0
-    fi
-    echo "gen-certs: $CRT does not cover DNS:gateway (needed by the frontend container); regenerating"
-fi
 
 mkdir -p "$OUT_DIR"
 TMP_CONF=$(mktemp "${TMPDIR:-/tmp}/alphamind-cert.XXXXXX")
@@ -78,7 +72,7 @@ O = AlphaMind development
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:localhost, DNS:gateway, IP:127.0.0.1
+subjectAltName = DNS:localhost, IP:127.0.0.1
 subjectKeyIdentifier = hash
 EOF
 
@@ -99,4 +93,4 @@ mv -f "$CRT.tmp" "$CRT"
 chmod 644 "$CRT"
 chmod 600 "$KEY"
 
-echo "gen-certs: wrote $CRT and $KEY (self-signed, $DAYS days, localhost/gateway/127.0.0.1)"
+echo "gen-certs: wrote $CRT and $KEY (self-signed, $DAYS days, localhost/127.0.0.1)"

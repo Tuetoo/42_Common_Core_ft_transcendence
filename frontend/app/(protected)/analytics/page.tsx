@@ -1,8 +1,10 @@
 import Form from "next/form";
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { readApiError } from "@/app/lib/api-error";
-import { ActionDistributionChart, TimeseriesChart } from "./charts";
+import { getMe } from "@/app/lib/me";
+import { TICKER_PATTERN, TICKER_TITLE } from "@/app/lib/format";
+import { ActionDistributionChart, StatusDonutChart, TimeseriesChart } from "./charts";
+import { LiveRefresh } from "./live-refresh";
 import { formatMetric, type Metric, type TimeseriesPoint } from "./metrics";
 import { PrintButton } from "./print-button";
 
@@ -42,6 +44,8 @@ const METRICS: { value: Metric; label: string }[] = [
   { value: "accuracy", label: "Accuracy" },
 ];
 const ACTIONS = ["buy", "hold", "sell"];
+// shared/enums.py WorkflowStatus, in the order the donut and table use.
+const STATUSES = ["completed", "failed", "running", "pending"];
 
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
@@ -53,6 +57,11 @@ function percent(value: number | null): string {
   return value === null ? "—" : `${Math.round(value * 100)}%`;
 }
 
+// When this render fetched its data; the live bar shows it as "last updated".
+function renderedNow(): string {
+  return new Date().toISOString();
+}
+
 export default async function AnalyticsPage({ searchParams }: { searchParams: SearchParams }) {
   const params = await searchParams;
   // The URL is user input: keep only values the backend understands.
@@ -61,17 +70,20 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
     to: first(params.to),
     ticker: first(params.ticker).toUpperCase(),
     action: ACTIONS.includes(first(params.action)) ? first(params.action) : "",
+    status: STATUSES.includes(first(params.status)) ? first(params.status) : "",
   };
+  // Set by the CSV export route when the backend refused the export.
+  const exportError = first(params.export_error).slice(0, 300);
   const metric: Metric = METRICS.some((m) => m.value === first(params.metric))
     ? (first(params.metric) as Metric)
     : "analyses";
   const interval = first(params.interval) === "week" ? "week" : "day";
 
   const query = new URLSearchParams(Object.entries(filters).filter(([, v]) => v !== ""));
-  const accessToken = await getAccessToken();
+  const { me, accessToken } = await getMe();
   const [overviewRes, seriesRes] = await Promise.all([
-    backendFetch(`/analytics/overview?${query}`, accessToken!, { cache: "no-store" }),
-    backendFetch(`/analytics/timeseries?${query}&metric=${metric}&interval=${interval}`, accessToken!, {
+    backendFetch(`/analytics/overview?${query}`, accessToken, { cache: "no-store" }),
+    backendFetch(`/analytics/timeseries?${query}&metric=${metric}&interval=${interval}`, accessToken, {
       cache: "no-store",
     }),
   ]);
@@ -91,19 +103,23 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
   }
 
   const distribution = ACTIONS.map((action) => ({ action, count: overview?.action_distribution[action] ?? 0 }));
+  const statusSlices = STATUSES.map((status) => ({ status, count: overview?.status_counts[status] ?? 0 }));
   const exportQuery = (dataset: string) => `/analytics/export?${new URLSearchParams({ dataset, ...Object.fromEntries(query) })}`;
   const metricLabel = METRICS.find((m) => m.value === metric)!.label;
 
   return (
     <div className="page">
-      <div className="flex items-start justify-between gap-4">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
           <p className="page-eyebrow">Workspace</p>
           <h1 className="page-title">Analytics</h1>
           <p className="page-subtitle">
             How your AI analyses have performed
             {overview && ` · ${overview.range.from} to ${overview.range.to}`}
           </p>
+          <div className="print:hidden mt-2">
+            <LiveRefresh accessToken={accessToken} userId={me.id} renderedAt={renderedNow()} />
+          </div>
         </div>
         <div className="flex gap-2 print:hidden">
           <PrintButton />
@@ -122,7 +138,17 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
         </div>
         <div className="field">
           <label htmlFor="ticker">Ticker</label>
-          <input id="ticker" name="ticker" type="text" maxLength={10} placeholder="All" defaultValue={filters.ticker} />
+          <input
+            id="ticker"
+            name="ticker"
+            type="text"
+            maxLength={10}
+            pattern={TICKER_PATTERN}
+            title={TICKER_TITLE}
+            autoCapitalize="characters"
+            placeholder="All"
+            defaultValue={filters.ticker}
+          />
         </div>
         <div className="field">
           <label htmlFor="action">Recommendation</label>
@@ -131,6 +157,17 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
             {ACTIONS.map((a) => (
               <option key={a} value={a}>
                 {a}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="status">Status</label>
+          <select id="status" name="status" defaultValue={filters.status}>
+            <option value="">All</option>
+            {STATUSES.map((st) => (
+              <option key={st} value={st}>
+                {st}
               </option>
             ))}
           </select>
@@ -158,6 +195,11 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
       </Form>
 
       {filterError && <p className="form-message error">{filterError}</p>}
+      {exportError && (
+        <p role="alert" className="form-message error print:hidden">
+          CSV export failed: {exportError}
+        </p>
+      )}
 
       {overview && (
         <>
@@ -220,6 +262,41 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
                 </table>
               </div>
             </details>
+          </div>
+
+          <div className="section">
+            <h2 className="section-title" id="status-chart-title">
+              Analyses by status
+            </h2>
+            {overview.total_analyses === 0 ? (
+              <p className="empty-state">No analyses in this range.</p>
+            ) : (
+              <figure className="panel" aria-labelledby="status-chart-title" style={{ margin: 0 }}>
+                {/* The drawing is for sighted users; the table says the same to screen readers. */}
+                <div aria-hidden="true">
+                  <StatusDonutChart slices={statusSlices} />
+                </div>
+                <table className="sr-only">
+                  <caption>Analyses by status, {overview.total_analyses} in total</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Status</th>
+                      <th scope="col">Analyses</th>
+                      <th scope="col">Share</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {statusSlices.map((s) => (
+                      <tr key={s.status}>
+                        <th scope="row">{s.status}</th>
+                        <td>{s.count}</td>
+                        <td>{Math.round((s.count / overview.total_analyses) * 100)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </figure>
+            )}
           </div>
 
           <div className="section">

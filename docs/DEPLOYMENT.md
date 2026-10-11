@@ -65,6 +65,10 @@ These steps were done once; repeat them only for a new host.
    them again after every renewal and reloads nginx. certbot's systemd
    timer renews; the gateway uses host ports 8443 and 8000, so port 80
    stays free for the challenge. `sudo certbot renew --dry-run` tests it.
+   The certificate names only this domain. The frontend reaches the API
+   on the gateway's internal plain-HTTP listener
+   (`BACKEND_API_URL=http://gateway:8080/api/v1`, Docker network only),
+   so no certificate that names `gateway` is needed.
 6. `.env.docker`: copy the local file
    (`scp -i <key> .env.docker ubuntu@<host>:/home/ubuntu/alphamind/`),
    `chmod 600` it, then set on the host:
@@ -99,6 +103,11 @@ These steps were done once; repeat them only for a new host.
   run without `.env.docker` or the certificate. Compose restarts only
   services whose image or configuration changed; a restart of ai-service
   ends an analysis that is still running.
+- Quick check after a deploy, from any machine:
+  `curl -sk https://alphamind-research.duckdns.org:8443/healthz`. It
+  answers `{"status":"ok"}` only when the frontend runs and its server
+  side reaches the API through the gateway; otherwise 503 (or 502 when
+  the frontend is down).
 - The workflow's SSH key may only run the deploy script: its line in the
   host's `~/.ssh/authorized_keys` is
 
@@ -159,7 +168,7 @@ using the other address:
 | Task | Command |
 |---|---|
 | Log in | `ssh -i <key> ubuntu@alphamind-research.duckdns.org` |
-| Health | `make health` |
+| Health | `make health`; frontend: `curl -sk https://alphamind-research.duckdns.org:8443/healthz` |
 | Deploy by hand | `bash scripts/deploy.sh` |
 | Logs | `bash scripts/logs.sh <service>` or `logs/<service>/` |
 | Mail (MailHog, Prometheus, Qdrant UIs listen on the host's 127.0.0.1 only) | from your machine: `ssh -i <key> -L 8025:127.0.0.1:8025 ubuntu@<host>`, then open `http://127.0.0.1:8025` |

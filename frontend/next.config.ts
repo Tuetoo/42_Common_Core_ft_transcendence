@@ -12,6 +12,10 @@ const nextConfig: NextConfig = {
       // the multipart encoding around the file.
       bodySizeLimit: "6mb",
     },
+    // proxy.ts sees every request body first and cuts it at 10MB by
+    // default. Research documents may be up to 20MB (core-service's limit);
+    // they are uploaded through a route handler, not a Server Action.
+    proxyClientMaxBodySize: "21mb",
   },
 };
 

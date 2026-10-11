@@ -31,13 +31,15 @@
                                      core-service CI    flake8, mypy, tests, image build
                                      ai-service CI      flake8, mypy, tests, image build
                                      stack smoke CI     config checks (infra, compose, scripts)
+                                     frontend CI        lint, type check, production build
                                    reviewer reads the diff and the checks
    merge  ------------------------>  main moves forward
                                          |
                                          v
                                    stack smoke CI on main
                                      config checks + build and start the
-                                     whole stack, probe the gateway
+                                     whole stack, probe the gateway and
+                                     the frontend (/login, /healthz)
                                          | success (push to main)
                                          v
                                    deploy workflow  ---- SSH (key that may only
@@ -73,7 +75,7 @@ Three ideas explain almost everything:
 
 | Term | Meaning | In AlphaMind |
 |---|---|---|
-| **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The four `*-ci.yml` workflows on pull requests. |
+| **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The five `*-ci.yml` workflows on pull requests. |
 | **Continuous delivery** | Every change that passed CI is ready to be released by one action. | `main` is always deployable; the deploy can also be started by hand. |
 | **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`. |
 | **Pipeline** | The ordered chain of automated steps from a change to a running release. | Section 1. |
@@ -146,7 +148,7 @@ Three ideas explain almost everything:
 | `feature/backend` | `shared/`, auth-service, core-service, operator scripts, compose files, Makefile, backend CI, platform docs. |
 | `feature/ai` | ai-service, the AI handbook chapters, ai-service CI. |
 | `feature/tests` | `tests/`. |
-| `feature/frontend` | The frontend (another team member). |
+| `feature/frontend` | `frontend/` (the Frontend Lead). |
 | `feature/deploy` | The deploy workflow, `scripts/deploy.sh`, `docs/DEPLOYMENT.md`. |
 | `infra/` | Committed by the team member who owns it. |
 
@@ -179,7 +181,8 @@ itself, and any repository file a test inspects.
 | `auth-service-ci.yml` | `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, `tests/alembic_contract.py`, `tests/auth_tokens.py`, `Makefile`, `pyproject.toml`, `uv.lock`, the workflow | checkout; install uv 0.8.17; `uv sync --frozen`; flake8 of the service, `shared/` and its tests; `make mypy-shared mypy-auth`; `make test-auth`; `docker build ... --target production` |
 | `core-service-ci.yml` | the same for core, plus `infra/scheduler/**` and `infra/gateway/nginx.conf` (its tests read them) | the same with `mypy-core`, `test-core` |
 | `ai-service-ci.yml` | the same for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example`, `.gitignore` | the same with `mypy-ai`, `test-ai` |
-| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | `infra/**`, `scripts/**`, both compose files, `Makefile`, `.env.example`, the workflow (and every push to `main`) | flake8 of `infra/`; the status page's CSP hashes (`csp_hashes.py --check`); `docker compose config -q` for the stack and the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` (alert rules and their unit tests) |
+| `frontend-ci.yml` ("frontend CI") | `frontend/**`, the workflow (and pushes to `main` that touch them) | in `frontend/` with Node 24: `npm ci`; `npm run lint`; `npx next typegen && npx tsc --noEmit` (route types, then the type check); `npm run build` |
+| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | `infra/**`, `scripts/**`, both compose files, `frontend/Dockerfile`, `Makefile`, `.env.example`, the workflow (and every push to `main`) | flake8 of `infra/`; the status page's CSP hashes (`csp_hashes.py --check`); `docker compose config -q` for the stack and the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` (alert rules and their unit tests) |
 
 What each step protects against:
 
@@ -212,13 +215,15 @@ merge is. Its `stack-smoke` job runs only for pushes
 3. `docker compose --env-file .env.docker -f docker-compose.yaml up -d
    --build`: the whole stack, production image stages, no development
    override (the explicit `-f` skips it).
-4. Wait up to 5 minutes until `/health/auth`, `/health/core` and
-   `/health/ai` answer through the gateway. On timeout it prints the
+4. Wait up to 5 minutes until `/health/auth`, `/health/core`,
+   `/health/ai` and the frontend's `/healthz` answer through the gateway. On timeout it prints the
    container states and the last 100 log lines of every service, then
    fails.
 5. Gateway probes: `http://localhost:8000/status` -> 301 (redirect to
    HTTPS), `https://localhost:8443/status` -> 200, `/internal/x` -> 404
-   and `/metrics` -> 404 (both closed to the outside).
+   and `/metrics` -> 404 (both closed to the outside), `/login` -> 200
+   (the frontend serves its pages) and `/healthz` -> 200 (the frontend's
+   server side reaches the API through the gateway's internal listener).
 6. Always (also after a failure): `docker compose down -v`.
 
 This is the last gate. Unit tests prove each service alone; the smoke
@@ -346,6 +351,12 @@ replace its `authorized_keys` line and the `DEPLOY_SSH_KEY` secret.
   internet, and that proves the name points to this machine.
 - The gateway listens on host ports 8443 and 8000 (the same mapping as
   locally), so port 80 stays free for renewals while the stack runs.
+- The certificate names only `alphamind-research.duckdns.org`. The
+  frontend's server side therefore does not call `https://gateway`; it
+  uses the gateway's internal plain-HTTP listener
+  (`BACKEND_API_URL=http://gateway:8080/api/v1`, Docker network only), so
+  no certificate has to name `gateway`
+  ([10](10-gateway.md) section 3.3).
 - certbot's systemd timer checks twice a day and renews 30 days before
   expiry; the deploy hook copies the new files and runs `nginx -s
   reload` in the gateway container. `sudo certbot renew --dry-run`
@@ -452,7 +463,7 @@ on both at once.
 ## 7. Demo walkthrough
 
 1. **Show the pipeline definition.** Open `.github/workflows/` and explain
-   the four CI workflows and `deploy.yml` (sections 3.2-3.4).
+   the five CI workflows and `deploy.yml` (sections 3.2-3.4).
 2. **Make a harmless change.** On a new branch, edit one sentence in a
    handbook chapter, push and open a pull request. Show that only the
    workflows whose paths changed run (a doc change triggers none of the
@@ -464,9 +475,9 @@ on both at once.
    on `main` starting, then "deploy" starting after it; open the deploy
    log and read the commit line and the container table.
 5. **Show the result.** Open
-   `https://alphamind-research.duckdns.org:8443/status` and a Swagger
-   page (`/docs/core/`); show the valid certificate in the browser's
-   address bar.
+   `https://alphamind-research.duckdns.org:8443/` (the frontend's login
+   page), `/status` and a Swagger page (`/docs/core/`); show the valid
+   certificate in the browser's address bar.
 6. **Show the host.** `ssh -i ~/Downloads/alphamind-key.pem
    ubuntu@alphamind-research.duckdns.org`, then `cd ~/alphamind && git
    log --oneline -1` (the deployed commit) and `make health`.
@@ -519,7 +530,8 @@ on both at once.
 | File | What it holds |
 |---|---|
 | `.github/workflows/auth-service-ci.yml`, `core-service-ci.yml`, `ai-service-ci.yml` | Pull-request CI per service. |
-| `.github/workflows/integration-ci.yml` | Config checks on PRs; config checks and the full stack smoke on `main`. |
+| `.github/workflows/frontend-ci.yml` | Lint, type check and build of `frontend/`. |
+| `.github/workflows/integration-ci.yml` | Config checks on PRs; config checks and the full stack smoke (with `/login` and `/healthz`) on `main`. |
 | `.github/workflows/deploy.yml` | Continuous deployment over SSH. |
 | `scripts/deploy.sh` | The deploy on the host. |
 | `docker-compose.yaml` | The stack, used everywhere. |

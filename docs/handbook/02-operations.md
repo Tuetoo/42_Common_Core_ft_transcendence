@@ -807,6 +807,7 @@ Details of each job: [chapter 26](26-scheduler-jobs.md).
 | `docker compose --env-file .env.docker ps` | `(healthy)` / `(unhealthy)` per container | terminal |
 | `https://localhost:8443/status` | one row per service with its dependencies; refreshes every 15 s | browser, through the gateway |
 | `curl -sk https://localhost:8443/health/auth` (and `/core`, `/ai`) | `{"status":"ok", ...}` with HTTP 200, or `"degraded"` with 503 | terminal |
+| `curl -sk https://localhost:8443/healthz` | the frontend: `{"status":"ok"}` with 200 only when its server side reaches the API through the gateway's internal listener, else 503 | terminal |
 | Grafana `https://localhost:8443/grafana/` | dashboards "AlphaMind - Service Overview" and "AlphaMind - Infrastructure & AI pipeline" | browser; user `admin`, password `GRAFANA_ADMIN_PASSWORD` |
 | Prometheus `http://127.0.0.1:9090` | `/targets` (every scrape job up?), `/alerts` (rules and states), queries | browser, local only |
 | Alertmanager `http://127.0.0.1:9093` | alerts that were sent, silences | browser, local only |
@@ -1369,8 +1370,9 @@ command on its own line, from the repository root.
    ```sh
    docker compose --env-file .env.docker ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
    ```
-   They see 16 services `running`, with `(healthy)` on postgres, redis,
-   qdrant, objectstore, auth-service, core-service and ai-service. Say:
+   They see 17 services `running`, with `(healthy)` on postgres, redis,
+   qdrant, objectstore, auth-service, core-service, ai-service and
+   frontend. Say:
    "The gateway only starts when all three services pass their health
    checks; ai-service gets 90 seconds of start time because it rebuilds
    its keyword index from Qdrant."
@@ -1394,7 +1396,9 @@ command on its own line, from the repository root.
    ```
    They see `"status":"ok"` with `database`, `redis` (and `storage`,
    `qdrant`) all `true`. Say: "Any false here turns the answer into a 503
-   and the container into unhealthy."
+   and the container into unhealthy." The frontend has its own check,
+   `https://localhost:8443/healthz`, which answers `{"status":"ok"}` only
+   when the frontend reaches the API.
 
 8. **The status page.** Open `https://localhost:8443/status`. Three green
    rows, refreshing every 15 seconds.

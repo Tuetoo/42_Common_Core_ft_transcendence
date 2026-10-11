@@ -1,6 +1,7 @@
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch } from "@/app/lib/backend";
 import { readApiError } from "@/app/lib/api-error";
+import { QUESTION_MAX, tickerError } from "../../limits";
 
 const MODES = ["ask", "draft"];
 const CATEGORIES = ["filing", "analyst_report", "earnings_call", "news", "macro_research", "risk_analysis"];
@@ -25,6 +26,13 @@ export async function POST(request: Request) {
   const question = typeof input.question === "string" ? input.question.trim() : "";
   if (!question) {
     return Response.json({ message: "Please enter a question" }, { status: 400 });
+  }
+  if (question.length > QUESTION_MAX) {
+    return Response.json({ message: `The question must be at most ${QUESTION_MAX} characters` }, { status: 400 });
+  }
+  const badTicker = typeof input.ticker === "string" ? tickerError(input.ticker) : null;
+  if (badTicker) {
+    return Response.json({ message: badTicker }, { status: 400 });
   }
   // Forward only fields the backend expects, never the raw body.
   const body = {
