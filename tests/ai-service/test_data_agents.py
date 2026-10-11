@@ -1143,8 +1143,7 @@ class TestPromptsAndSettings:
         assert importlib.util.find_spec("ai.agents.source_credibility") is None
         settings = config.settings
         assert settings.MIN_BUY_TIER_CONFIDENCE == 0.5
-        assert settings.LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS == 0
-        assert settings.JUDGE_DELAYED_RETRY_SECONDS == 120.0
+        assert settings.JUDGE_RETRY_BUDGET_SECONDS == 240.0
         assert settings.DEBATE_SIDE_REPAIR_DELAY_SECONDS == 60.0
         assert dc.DEBATE_MAX_REGENERATIONS == 1
 

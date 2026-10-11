@@ -148,7 +148,7 @@ evidence and re-runs the agents that failed. *Challenge:* a cyclic
 LangGraph with concurrent agent writes, retries and failure states that
 are recorded honestly (no placeholder verdicts); a production LLM layer
 that survives provider rate limits and overloads (pooled keys, pacing,
-escalating cooldowns, fallback chains). *Why Major:* comparable in scope
+escalating cooldowns, fallback models). *Why Major:* comparable in scope
 to the official ML recommendation Major, implemented as auditable
 multi-agent reasoning.
 

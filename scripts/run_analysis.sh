@@ -38,7 +38,7 @@ TICKERS=("$@")
 . "$(dirname "$0")/lib.sh"
 
 AI_CLI=("${COMPOSE[@]}" exec -T ai-service python -m scripts.analysis_cli)
-POLL_INTERVAL_SECONDS=15
+POLL_INTERVAL_SECONDS=5
 # Wide on purpose: a ticker whose newest filing is not summarized yet is
 # summarized inline first (up to 300 s x 5 attempts, see
 # ai/knowledge/filing_summary.py _FILING_SUMMARY_TIMEOUT_SECONDS).

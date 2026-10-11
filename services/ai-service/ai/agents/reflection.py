@@ -348,8 +348,7 @@ class ReflectionAgent:
     async def _review_call(self, messages: list[Any]) -> Any:
         return await self.llm_router.complete(
             self.llm_tier, messages, retries=AGENT_LLM_CALL_RETRIES,
-            response_format="json_object", max_tokens=_REVIEW_MAX_TOKENS,
-            ignore_server_error_cooldown=True)
+            response_format="json_object", max_tokens=_REVIEW_MAX_TOKENS)
 
     async def _review_citations(
         self, state: AnalysisState, *, usable_count: int

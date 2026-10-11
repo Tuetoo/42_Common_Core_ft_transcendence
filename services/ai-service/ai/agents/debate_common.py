@@ -6,7 +6,6 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, AgentOutput, AnalysisState,
                             DebateArgument)
 from ai.llm.base import AGENT_LLM_CALL_RETRIES, LLMMessage, LLMTier
 from ai.llm.router import LLMRouter
-from config import settings
 from shared.enums import AgentRole, AgentStatus
 
 logger = structlog.get_logger(__name__)
@@ -162,9 +161,9 @@ def _figure_readings(text: str) -> list[tuple[str, str]]:
     return readings
 
 
-def _range_plain_values(text: str) -> list[float]:
+def _range_plain_values(text: str) -> list[tuple[float, float]]:
     return [
-        float(_numeral_core(figure)) for _, figure in _figure_readings(text)
+        _evidence_number(figure) for _, figure in _figure_readings(text)
         if _is_plain_dollar(figure)
     ]
 
@@ -207,17 +206,19 @@ _SCALE_MULTIPLIERS = {
 _SCALE_SUFFIX_RE = re.compile(rf"({_SCALE_WORDS})\b", re.IGNORECASE)
 
 
+def _scale_multiplier(figure: str) -> int | None:
+    scale_match = _SCALE_SUFFIX_RE.search(figure)
+    if scale_match is None:
+        return None
+    return _SCALE_MULTIPLIERS.get(scale_match.group(0).lower())
+
+
 def _numeral_core(figure: str) -> str:
     match = _NUMERAL_CORE_RE.search(figure)
     if match is None:
         return figure
     digits = match.group(0).replace(",", "")
-
-    scale_match = _SCALE_SUFFIX_RE.search(figure)
-    if scale_match is None:
-        return digits
-
-    multiplier = _SCALE_MULTIPLIERS.get(scale_match.group(0).lower())
+    multiplier = _scale_multiplier(figure)
     if multiplier is None:
         return digits
     try:
@@ -226,25 +227,107 @@ def _numeral_core(figure: str) -> str:
         return digits
 
 
+FIGURE_MATCH_REL_TOLERANCE = 0.015
+_PRECISE_MIN_SIGNIFICANT_DIGITS = 3
+
+# An evidence number as (value, one unit in its last shown decimal).
+_EvidenceNumber = tuple[float, float]
+
+
+def _whole_and_decimals(figure: str) -> tuple[str, str]:
+    match = _NUMERAL_CORE_RE.search(figure)
+    digits = match.group(0).replace(",", "") if match else ""
+    whole, _, decimals = digits.partition(".")
+    return whole, decimals
+
+
+def _precise_unit(figure: str) -> float | None:
+    """One unit in a stated figure's last significant digit.
+
+    Returns None for a rounded figure (one or two significant digits, such
+    as "$600 million" or "$2.3B"; trailing zeros of an integer are not
+    significant). A figure with three or more significant digits ("$593
+    million", "27.46%", "$1.13B") states its own precision.
+    """
+    whole, decimals = _whole_and_decimals(figure)
+    if decimals:
+        significant = (whole + decimals).lstrip("0")
+        unit = 10.0**-len(decimals)
+    else:
+        significant = whole.strip("0")
+        unit = 10.0**(len(whole) - len(whole.rstrip("0")))
+    if len(significant) < _PRECISE_MIN_SIGNIFICANT_DIGITS:
+        return None
+    return unit * (_scale_multiplier(figure) or 1)
+
+
+def _evidence_number(figure: str) -> _EvidenceNumber:
+    """Value of an evidence figure and how much its shown decimals round.
+
+    Only decimals mark display rounding ("$3.47B" may be 3,466 million); an
+    integer such as "$598 million" or "$600 million" is taken as exact.
+    """
+    _, decimals = _whole_and_decimals(figure)
+    unit = (
+        10.0**-len(decimals) * (_scale_multiplier(figure) or 1)
+        if decimals else 0.0)
+    return float(_numeral_core(figure)), unit
+
+
+def _figure_matches(figure: str, value: float, evidence: _EvidenceNumber,
+                    rel_tolerance: float) -> bool:
+    """Whether one evidence number supports a stated figure.
+
+    A precise figure must agree with the evidence number to within one
+    unit in the last digit of the coarser of the two, which allows either
+    side to be rounded or truncated: "$593 million" is not supported by 598
+    (a made-up sum once passed a plain 1.5% rule), while "$27.5B" is
+    supported by 27.46, "$15.84B" by "$15,848 million" and "$3,466 million"
+    by "$3.47B". A rounded figure keeps the relative tolerance, so "$600
+    million" still matches 598.
+    """
+    evidence_value, evidence_unit = evidence
+    if value == evidence_value:
+        return True
+    unit = _precise_unit(figure)
+    if unit is not None:
+        # The tiny factor absorbs float error at the exact edge.
+        return abs(value - evidence_value) <= max(
+            unit, evidence_unit) * (1 + 1e-9)
+    return evidence_value != 0 and abs(
+        value - evidence_value) <= rel_tolerance * abs(evidence_value)
+
+
 def find_ungrounded_figures(argument_text: str,
                             evidence_text: str) -> set[str]:
+    """Return the dollar and percent figures no evidence number supports.
+
+    A figure is grounded by an exact numeral match, or by an evidence
+    number that matches it at the figure's precision (_figure_matches).
+    """
     argument_figures = _figure_readings(argument_text)
     if not argument_figures:
         return set()
-    evidence_cores = {
-        _numeral_core(figure)
-        for _, figure in _figure_readings(evidence_text)
+    evidence_figures = [
+        figure for _, figure in _figure_readings(evidence_text)
         if not _is_plain_dollar(figure)
-    }
-    evidence_plain_values: list[float] | None = None
+    ]
+    evidence_cores = {_numeral_core(figure) for figure in evidence_figures}
+    evidence_numbers: list[_EvidenceNumber] = []
+    for figure in evidence_figures:
+        try:
+            evidence_numbers.append(_evidence_number(figure))
+        except ValueError:
+            continue
+    evidence_plain_numbers: list[_EvidenceNumber] | None = None
 
     def _is_grounded(fig: str) -> bool:
-        nonlocal evidence_plain_values
+        nonlocal evidence_plain_numbers
         if _is_plain_dollar(fig):
-            if evidence_plain_values is None:
-                evidence_plain_values = _plain_numbers(
+            if evidence_plain_numbers is None:
+                evidence_plain_numbers = _plain_numbers(
                     evidence_text) + _range_plain_values(evidence_text)
-            return _plain_dollar_grounded(fig, evidence_plain_values)
+            return _plain_dollar_grounded(fig, evidence_plain_numbers)
         core = _numeral_core(fig)
         if core in evidence_cores:
             return True
@@ -252,17 +335,9 @@ def find_ungrounded_figures(argument_text: str,
             value = float(core)
         except ValueError:
             return False
-        for evidence_core in evidence_cores:
-            try:
-                evidence_value = float(evidence_core)
-            except ValueError:
-                continue
-            if evidence_value == 0:
-                continue
-            relative_diff = abs(value - evidence_value) / abs(evidence_value)
-            if relative_diff <= 0.015:
-                return True
-        return False
+        return any(
+            _figure_matches(fig, value, evidence, FIGURE_MATCH_REL_TOLERANCE)
+            for evidence in evidence_numbers)
 
     return {shown for shown, fig in argument_figures if not _is_grounded(fig)}
 
@@ -275,28 +350,19 @@ def _is_plain_dollar(fig: str) -> bool:
     return fig.startswith("$") and _SCALE_SUFFIX_RE.search(fig) is None
 
 
-def _plain_numbers(text: str) -> list[float]:
-    values: list[float] = []
-    for raw in _PLAIN_NUMBER_RE.findall(text):
-        try:
-            values.append(float(raw.replace(",", "")))
-        except ValueError:
-            continue
-    return values
+def _plain_numbers(text: str) -> list[_EvidenceNumber]:
+    return [_evidence_number(raw) for raw in _PLAIN_NUMBER_RE.findall(text)]
 
 
-def _plain_dollar_grounded(fig: str, evidence_values: list[float]) -> bool:
+def _plain_dollar_grounded(fig: str,
+                           evidence_numbers: list[_EvidenceNumber]) -> bool:
     try:
         value = float(_numeral_core(fig))
     except ValueError:
         return False
-    for actual in evidence_values:
-        if value == actual:
-            return True
-        tolerance = NUMBER_MATCH_REL_TOLERANCE * abs(actual)
-        if actual != 0 and abs(value - actual) <= tolerance:
-            return True
-    return False
+    return any(
+        _figure_matches(fig, value, evidence, NUMBER_MATCH_REL_TOLERANCE)
+        for evidence in evidence_numbers)
 
 
 def _quote_is_grounded(quote: str, evidence_text: str) -> bool:
@@ -346,9 +412,7 @@ async def generate_debate_argument(
             llm_tier, [
                 LLMMessage(role="system", content=system_prompt),
                 LLMMessage(role="user", content=user_content)
-            ], retries=AGENT_LLM_CALL_RETRIES,
-            primary_extra_server_error_keys=(
-                settings.LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS))
+            ], retries=AGENT_LLM_CALL_RETRIES)
         return response.content.strip()
 
     grounding_text = format_grounding_reference(state)

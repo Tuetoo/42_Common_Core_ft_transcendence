@@ -481,8 +481,10 @@ class ReActAgentLoop:
             require_tool_evidence: bool = True, evidence_yield: (
                 Callable[[list[ScratchpadEntry]], int | None] | None) = None,
             anchor_fallback_reference: str | None = None,
-            finish_validation_suffix: str | None = None) -> None:
+            finish_validation_suffix: str | None = None,
+            thinking_budget: int | None = None) -> None:
         self.role = role
+        self.thinking_budget = thinking_budget
         self.finish_validation_suffix = (
             finish_validation_suffix if finish_validation_suffix is not None
             else _DEFAULT_FINISH_VALIDATION_SUFFIX)
@@ -545,7 +547,8 @@ class ReActAgentLoop:
                     self.llm_tier, messages, retries=AGENT_LLM_CALL_RETRIES,
                     max_tokens=_REACT_LOOP_MAX_TOKENS,
                     response_format="json_object",
-                    response_schema=self._response_schema)
+                    response_schema=self._response_schema,
+                    thinking_budget=self.thinking_budget)
             except LLMNonEnglishOutputError as exc:
                 correction_retries += 1
                 non_english_rejections += 1

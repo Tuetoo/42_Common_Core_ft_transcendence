@@ -533,13 +533,30 @@ class TestDebateNodes:
         assert merged.unavailable_latest_sides() == ["bear"]
 
     @pytest.mark.asyncio
+    async def test_failed_correction_keeps_the_previous_argument(
+            self, monkeypatch):
+        _patch_debate_sides(
+            monkeypatch, _RaisingRouter(LLMServerOverloadedError("503")),
+            _ReplyRouter("Bear case.", repeat=True))
+        state = _state(debate=DebateState(arguments=_args()))
+        correction = state.model_copy(
+            update={"pending_retry_agents": [AgentRole.BULL]})
+        with capture_logs() as logs:
+            assert await bull_node(correction) == {}
+        assert "bull_node.correction_failed_kept_previous" in [
+            entry["event"] for entry in logs
+        ]
+        update = await bull_node(state)
+        assert update["debate"].arguments[0].available is False
+
+    @pytest.mark.asyncio
     async def test_side_repair_wait_failure_and_skipped_cases(
             self, monkeypatch):
         monkeypatch.setattr(
             config.settings, "DEBATE_SIDE_REPAIR_DELAY_SECONDS", 60.0)
         cases = {
             "no-model-free-keeps-wait": (None, [60.0]),
-            "free-model-skips-wait": ("gemini-3.5-flash", [])
+            "free-model-skips-wait": ("gemini-3.6-flash", [])
         }
         for case_id, (free, slept) in cases.items():
             sleeps = _patch_debate_sides(
@@ -600,7 +617,7 @@ class TestJudgeNode:
     async def test_failed_verdict_stops_and_correction_keeps_mutual_rounds(
             self, monkeypatch):
         monkeypatch.setattr(
-            config.settings, "JUDGE_DELAYED_RETRY_SECONDS", 0.0)
+            config.settings, "JUDGE_RETRY_BUDGET_SECONDS", 0.0)
         cases = {
             "config-error": (_AlwaysFailsRouter(), _state()),
             "server-overloaded": (
@@ -632,53 +649,39 @@ class TestJudgeNode:
         assert update["pending_retry_agents"] == []
 
     @pytest.mark.asyncio
-    async def test_availability_failure_gets_one_delayed_retry(
+    async def test_retries_wait_for_the_chain_cooldown_within_a_budget(
             self, monkeypatch):
-        router, sleeps, state = _judge_with_failures(
-            monkeypatch, [LLMServerOverloadedError("503")])
-        _set_free_model(monkeypatch, None)
-        update = await judge_node(state)
-        verdict = update["debate"].verdicts[0]
-        assert not verdict.judge_failed
-        assert router.calls == 2
-        assert sleeps.delays == [
-            judge_module.settings.JUDGE_DELAYED_RETRY_SECONDS
-        ]
-        assert update["judge_delayed_retry_used"] is True
-
-        router, sleeps, state = _judge_with_failures(
-            monkeypatch, [LLMServerOverloadedError("503")])
-        _set_free_model(monkeypatch, "gemini-3.5-flash")
-        with capture_logs() as logs:
-            update = await judge_node(state)
-        assert not update["debate"].verdicts[0].judge_failed
-        assert router.calls == 2 and sleeps.delays == []
-        retry = next(
-            e for e in logs if e["event"] == "judge_node.delayed_retry")
-        assert retry["delay_seconds"] == 0.0
-        assert retry["free_model"] == "gemini-3.5-flash"
-
-        full = judge_module.settings.JUDGE_DELAYED_RETRY_SECONDS
-        for failures, failed, calls in (
-                (2, False, 3), (3, True, 3)):
+        cap = config.settings.JUDGE_RETRY_MAX_ATTEMPTS
+        cases = {
+            "waits-for-cooldown": (1, (30.0, "minute", "m"), [30.0], 1, False),
+            "model-free-retries-now": (1, None, [], 1, False),
+            "budget-ends-retries": (9, (100.0, "minute", "m"),
+                                    [100.0, 100.0, 40.0], 3, True),
+            "attempt-cap": (9, None, [], cap, True),
+            "day-quota-no-retry": (1, (0.0, "day", "m"), [], 0, True)
+        }
+        for case_id, case in cases.items():
+            failures, capacity, waits, attempts, failed = case
             router, sleeps, state = _judge_with_failures(
                 monkeypatch,
                 [LLMServerOverloadedError("503") for _ in range(failures)])
-            _set_free_model(monkeypatch, "gemini-3.7-flash")
-            with capture_logs() as logs:
-                update = await judge_node(state)
-            assert update["debate"].verdicts[0].judge_failed is failed
-            assert router.calls == calls and sleeps.delays == [full]
-            retries = [
-                e for e in logs if e["event"] == "judge_node.delayed_retry"
-            ]
-            assert [e["delay_seconds"] for e in retries] == [0.0, full]
-            assert retries[1]["after_immediate_retry"] is True
-            assert update["judge_delayed_retry_used"] is True
+
+            async def _capacity(chain, capacity=capacity):
+                return capacity
+
+            monkeypatch.setattr(nodes_module, "chain_capacity", _capacity)
+            update = await judge_node(state)
+            assert update["debate"].verdicts[0].judge_failed is failed, (
+                case_id)
+            assert sleeps.delays == waits, case_id
+            assert router.calls == attempts + 1, case_id
+            assert update["judge_retry_attempts"] == attempts, case_id
+            assert update["judge_retry_seconds"] == sum(waits), case_id
 
         router, sleeps, state = _judge_with_failures(
             monkeypatch, [LLMServerOverloadedError("503")])
-        state = state.model_copy(update={"judge_delayed_retry_used": True})
+        spent = config.settings.JUDGE_RETRY_BUDGET_SECONDS
+        state = state.model_copy(update={"judge_retry_seconds": spent})
         update = await judge_node(state)
         assert update["debate"].verdicts[0].judge_failed
         assert router.calls == 1 and sleeps.delays == []
@@ -728,16 +731,19 @@ class TestLateSideRepair:
         async def _free(tier):
             return free["model"]
 
+        async def _capacity(chain):
+            return None if free["model"] else (45.0, "minute", "m")
+
         async def _sleep(seconds):
             sleeps.delays.append(seconds)
             free["model"] = "gemini-3.6-flash"
 
         monkeypatch.setattr(nodes_module, "free_chain_model", _free)
-        monkeypatch.setattr(capacity_module, "free_chain_model", _free)
+        monkeypatch.setattr(nodes_module, "chain_capacity", _capacity)
         monkeypatch.setattr(nodes_module.asyncio, "sleep", _sleep)
         with capture_logs() as logs:
             update = await judge_node(state)
-        assert sleeps.delays == [config.settings.JUDGE_DELAYED_RETRY_SECONDS]
+        assert sleeps.delays == [45.0]
         assert [a.argument
                 for a in update["debate"].arguments] == ["Late bull case."]
         assert update["debate_late_side_repair_used"] is True
@@ -762,7 +768,7 @@ class TestLateSideRepair:
         side_router = _RaisingRouter(LLMServerOverloadedError("503"))
         judge, _, state = _missing_bull_after_repair(
             monkeypatch, [], side_router)
-        _set_free_model(monkeypatch, "gemini-3.5-flash")
+        _set_free_model(monkeypatch, "gemini-3.6-flash")
         update = await judge_node(state)
         assert update["debate"].arguments == []
         assert update["debate_late_side_repair_used"] is True
@@ -774,7 +780,7 @@ class TestLateSideRepair:
 
         judge, _, state = _missing_bull_after_repair(
             monkeypatch, [], _ReplyRouter("x", repeat=True))
-        asked = _set_free_model(monkeypatch, "gemini-3.5-flash")
+        asked = _set_free_model(monkeypatch, "gemini-3.6-flash")
         state = state.model_copy(
             update={"pending_retry_agents": [AgentRole.BEAR]})
         update = await judge_node(state)

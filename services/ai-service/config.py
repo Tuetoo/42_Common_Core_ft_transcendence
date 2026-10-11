@@ -1,5 +1,4 @@
 from functools import lru_cache
-from pydantic import Field
 from shared.config import BaseServiceSettings
 
 
@@ -50,9 +49,7 @@ class AIServiceSettings(BaseServiceSettings):
     LLM_GOOGLE_MODEL_CHEAP: str = "gemini-3.5-flash-lite"
     LLM_GOOGLE_MODEL_CHEAP_FALLBACK: str = "gemini-3.1-flash-lite"
     LLM_GOOGLE_MODEL_HIGHEST_ACCURACY: str = "gemini-3.8-flash"
-    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "gemini-3.7-flash"
-    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_2: str = "gemini-3.6-flash"
-    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK_3: str = "gemini-3.5-flash"
+    LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "gemini-3.6-flash"
     LLM_MISTRAL_MODEL_CHEAP: str = "mistral-small-2603"
     LLM_MISTRAL_MODEL_HIGHEST_ACCURACY: str = "mistral-medium-latest"
     LLM_MISTRAL_MODEL_HIGHEST_ACCURACY_FALLBACK: str = "mistral-large-2512"
@@ -74,11 +71,8 @@ class AIServiceSettings(BaseServiceSettings):
 
     LLM_GOOGLE_SERVER_ERROR_COOLDOWN_SECONDS: float = 20.0
     LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS: float = 30.0
+    LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS: float = 60.0
     LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS: float = 300.0
-    LLM_GOOGLE_MODEL_REQUEST_TIMEOUT_SECONDS: dict[str, float] = Field(
-        default_factory=lambda: {"gemini-3.7-flash": 60.0})
-    LLM_GOOGLE_DEBATE_PRIMARY_EXTRA_503_KEYS: int = 0
-    LLM_GOOGLE_HIGHEST_TERMINAL_REQUEST_TIMEOUT_SECONDS: float = 90.0
     LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS: float = 300.0
 
     SEC_EDGAR_USER_AGENT: str = ""
@@ -104,11 +98,11 @@ class AIServiceSettings(BaseServiceSettings):
     ANALYSIS_MAX_ACTIVE_PER_USER: int = 3
     ANALYSIS_QUEUE_MAX_PENDING: int = 50
 
-    JUDGE_TERMINAL_503_RETRY_DELAY_SECONDS: float = 10.0
-
     LLM_GOOGLE_LITE_COOLDOWN_RETRY_MAX_SECONDS: float = 70.0
 
-    JUDGE_DELAYED_RETRY_SECONDS: float = 120.0
+    JUDGE_RETRY_BUDGET_SECONDS: float = 240.0
+    JUDGE_RETRY_MAX_ATTEMPTS: int = 4
+    SENTIMENT_THINKING_BUDGET: int = 1024
     DEBATE_SIDE_REPAIR_DELAY_SECONDS: float = 60.0
     AGENT_PREFETCH_ENABLED: bool = True
     REFLECTION_REVIEW_DELAYED_RETRY_SECONDS: float = 60.0

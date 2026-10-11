@@ -1949,11 +1949,11 @@ class TestServiceScripts:
     async def test_latency_probe_records_time_or_cap_with_judge_prompt(
             self) -> None:
         probe = importlib.import_module("scripts.probe_model_latency")
-        ok = await probe._one(_FakeClient(0.01), "gemini-3.7-flash", None, 1.0)
+        ok = await probe._one(_FakeClient(0.01), "gemini-3.8-flash", None, 1.0)
         assert ok["status"] == "ok" and ok["output"] == 42
         assert ok["seconds"] < 1.0
         slow = await probe._one(
-            _FakeClient(1.0), "gemini-3.7-flash", None, 0.05)
+            _FakeClient(1.0), "gemini-3.8-flash", None, 0.05)
         assert slow["status"] == "no answer within 0s"
         content = probe._user_content()
         assert len(content) > 7000 and "Bull argument:" in content

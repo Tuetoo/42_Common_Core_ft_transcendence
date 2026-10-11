@@ -66,11 +66,59 @@ def _failed(text: str, exc: json.JSONDecodeError) -> JsonObjectParse:
         error_col=exc.colno, text=text)
 
 
+def _without_trailing_commas(text: str) -> str:
+    """Drops a comma that directly precedes a closing brace or bracket.
+
+    Models sometimes end an object with `"last": 1,}`. That comma is the
+    only syntax fault seen in real answers that otherwise parse, and a
+    re-ask costs a full model call. Only commas outside JSON strings are
+    touched, so string content is never changed.
+    """
+    out: list[str] = []
+    in_string = escaped = False
+    pending_comma: int | None = None
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            pending_comma = None
+        elif ch in "}]" and pending_comma is not None:
+            del out[pending_comma]
+            pending_comma = None
+        elif ch == ",":
+            pending_comma = len(out)
+        elif not ch.isspace():
+            pending_comma = None
+        out.append(ch)
+    return "".join(out)
+
+
 def parse_json_object(raw: str) -> JsonObjectParse:
     text = strip_json_code_fence(raw)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as strict_exc:
+        repaired = _without_trailing_commas(text)
+        if repaired != text:
+            logger.info("json.trailing_comma_removed")
+            text = repaired
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                strict_exc = exc
+            else:
+                if not isinstance(data, dict):
+                    return JsonObjectParse(
+                        data=None, error="not a JSON object", text=text)
+                return JsonObjectParse(data=data, text=text)
         start = text.find("{")
         if start < 0:
             return _failed(text, strict_exc)
