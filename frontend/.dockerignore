@@ -1,0 +1,12 @@
+# Installed on the host's OS; the image installs its own for Linux.
+node_modules
+# Build output is produced inside the image.
+.next
+# Development settings (they point at localhost:8443 and would be baked
+# into the browser code); the container gets its settings from compose.
+.env*
+*.tsbuildinfo
+Dockerfile
+.dockerignore
+*.md
+*.html

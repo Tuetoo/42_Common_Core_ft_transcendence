@@ -20,15 +20,31 @@ x-logging: &default-logging
     max-file: "5"
 
 services:
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
-  #   env_file: .env.docker
-  #   depends_on:
-  #     - gateway
-  #   restart: unless-stopped
-  # (Served through the gateway once it exists -- no host port.)
+  # Next.js frontend, served by the gateway at https://localhost:8443/
+  # (no host port of its own). Only the two settings it needs are passed,
+  # not .env.docker: the frontend has no use for the backend's secrets.
+  frontend:
+    logging: *default-logging
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      # Server-side calls go back through the gateway on the internal
+      # network. The certificate lists DNS:gateway for this, and Node
+      # trusts it through NODE_EXTRA_CA_CERTS. Known limitation: the
+      # backends then see the frontend container as the client address,
+      # so their per-IP limits treat all users as one.
+      BACKEND_API_URL: https://gateway/api/v1
+      NODE_EXTRA_CA_CERTS: /certs/server.crt
+    volumes:
+      - ./infra/gateway/certs/server.crt:/certs/server.crt:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/login"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
 
   gateway:
     logging: *default-logging
