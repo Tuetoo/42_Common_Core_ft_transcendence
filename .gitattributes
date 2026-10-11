@@ -1,0 +1,4 @@
+# These run inside Linux containers. A Windows checkout with
+# core.autocrlf=true would turn them into CRLF, which breaks sh and crond.
+*.sh text eol=lf
+infra/scheduler/crontab text eol=lf
