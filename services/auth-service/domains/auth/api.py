@@ -1,11 +1,13 @@
 from pathlib import Path
+from urllib.parse import urlencode
 from uuid import uuid4
 import rate_limit
+import structlog
 from config import settings
 from database import get_db
 from deps import get_current_user, require_recent_login
 from events_out import schedule_events
-from fastapi import (APIRouter, BackgroundTasks, Depends, Request, Response,
+from fastapi import (APIRouter, BackgroundTasks, Depends, Request,
                      UploadFile, status)
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,9 +27,11 @@ from domains.auth.service import (OAUTH_NONCE_COOKIE, OAUTH_STATE_TTL_SECONDS,
                                   send_password_reset_email_safely,
                                   send_verification_email_safely,
                                   sniff_image_type)
-from shared.exceptions import ValidationAppError
+from shared.exceptions import AppError, ValidationAppError
 from shared.schemas import APIResponse
 from shared.security import CurrentUser
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["auth"])
 
@@ -184,30 +188,56 @@ async def oauth_authorize(provider: str) -> RedirectResponse:
     return response
 
 
+def _oauth_complete_url(fields: dict[str, str | int]) -> str:
+    return f"{settings.FRONTEND_BASE_URL}/oauth/complete#{urlencode(fields)}"
+
+
 @router.get(
-    "/oauth/{provider}/callback",
-    response_model=APIResponse[TokenPair | OAuthTwoFactorChallenge],
-    description=(
+    "/oauth/{provider}/callback", status_code=status.HTTP_303_SEE_OTHER,
+    response_model=None, description=(
         "Complete an OAuth sign-in. Requires the cookie set by the authorize "
-        "step in the same browser. Returns a token pair, or a two-factor "
-        "challenge when the account has 2FA enabled (then call POST "
-        "/api/v1/auth/oauth/2fa)."))
+        "step in the same browser. Redirects (303) to "
+        "FRONTEND_BASE_URL/oauth/complete with the result in the URL "
+        "fragment: access_token and refresh_token; or challenge_token and "
+        "expires_in when the account has 2FA enabled (then call POST "
+        "/api/v1/auth/oauth/2fa); or error=oauth_failed and message."))
 async def oauth_callback(
-    provider: str, request: Request, response: Response,
-    code: str | None = None, state: str | None = None,
-    error: str | None = None, *, background_tasks: BackgroundTasks,
+    provider: str, request: Request, code: str | None = None,
+    state: str | None = None, error: str | None = None, *,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db, scope="function")
-) -> APIResponse[TokenPair | OAuthTwoFactorChallenge]:
+) -> RedirectResponse:
     service = AuthService(db)
-    result = await service.oauth_callback(
-        provider, code, state, error,
-        nonce=request.cookies.get(OAUTH_NONCE_COOKIE),
-        **_client_context(request))
+    fields: dict[str, str | int]
+    try:
+        result = await service.oauth_callback(
+            provider, code, state, error,
+            nonce=request.cookies.get(OAUTH_NONCE_COOKIE),
+            **_client_context(request))
+    except AppError as exc:
+        await db.rollback()
+        logger.warning(
+            "oauth_callback_failed", provider=provider, code=exc.code,
+            message=exc.message)
+        fields = {"error": "oauth_failed", "message": exc.message}
+    else:
+        if isinstance(result, OAuthTwoFactorChallenge):
+            fields = {
+                "challenge_token": result.challenge_token,
+                "expires_in": result.expires_in
+            }
+        else:
+            fields = {
+                "access_token": result.access_token,
+                "refresh_token": result.refresh_token
+            }
+        schedule_events(background_tasks, service.pending_events)
+    response = RedirectResponse(
+        _oauth_complete_url(fields), status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(
         OAUTH_NONCE_COOKIE, path=oauth_cookie_path(), secure=True,
         httponly=True, samesite="lax")
-    schedule_events(background_tasks, service.pending_events)
-    return APIResponse(data=result)
+    return response
 
 
 @router.post(

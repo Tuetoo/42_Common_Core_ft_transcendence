@@ -146,6 +146,9 @@ using the other address:
   `GATEWAY_URL=https://alphamind-research.duckdns.org:8443`.
 - OAuth: register both callback URLs with each provider
   (`<base>/api/v1/auth/oauth/google/callback` and `.../github/callback`).
+  The callback answers 303 to `<FRONTEND_BASE_URL>/oauth/complete` with
+  the result in the URL fragment, so `FRONTEND_BASE_URL` must be the
+  cloud URL (table above).
   Google's consent screen in testing mode only admits listed test users.
 - Operator commands (`make health`, `make e2e`, `bash scripts/psql.sh`,
   logs) run on the host after `ssh -i <key> ubuntu@<host>` and

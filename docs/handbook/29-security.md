@@ -102,7 +102,9 @@ private Docker network.
   the default `combined` format would write these secrets into the
   container logs (and through Vector into `./logs`). nginx's error log
   still prints the raw request line when an upstream fails; that rarer
-  path is accepted.
+  path is accepted. The callback's answer puts the tokens only in the
+  URL fragment of its redirect (section 3.7), which the browser never
+  sends to a server, so they reach no log.
 - The services behind the gateway log the same URLs: uvicorn's access
   line (`uvicorn.access`) contains the path with its query string, and
   its WebSocket line `'<client> - "WebSocket <path>" [accepted]'`
@@ -345,18 +347,18 @@ sign-in and stores them in Redis for 300 seconds under
   `alphamind_oauth_nonce` (`HttpOnly`, `Secure`, `SameSite=Lax`,
   `Path=/api/v1/auth/oauth`, `Max-Age=300`); Redis keeps only its
   SHA-256. The callback compares the hash of the cookie with the stored
-  hash (`hmac.compare_digest`) and answers 401 `oauth_failed` when the
+  hash (`hmac.compare_digest`) and fails with `oauth_failed` when the
   cookie is missing or different (log `oauth_browser_binding_failed`).
   This proves **this browser** started the sign-in, which is what stops
   login CSRF: an attacker who sends a victim their own
   `callback?code=...&state=...` link cannot also plant their cookie in
   the victim's browser, so the victim is never signed in to the
   attacker's account. `Lax` (not `Strict`) is needed because the
-  provider's redirect back is a cross-site top-level `GET`. A successful
-  callback deletes the cookie. Known limit: there is one nonce cookie per
+  provider's redirect back is a cross-site top-level `GET`. The
+  callback deletes the cookie on every outcome. Known limit: there is one nonce cookie per
   browser, so when two sign-ins are started in two tabs within 5 minutes,
   the second overwrites the first tab's nonce and the first tab's
-  callback gets 401 `oauth_failed`; the user simply starts the sign-in
+  callback ends with `error=oauth_failed`; the user simply starts the sign-in
   again (safe, never a wrong account).
 - **A PKCE `code_verifier`** stays on the server. The authorize URL
   carries `code_challenge = BASE64URL(SHA-256(verifier))` with
@@ -364,7 +366,26 @@ sign-in and stores them in Redis for 300 seconds under
   verifier, so an intercepted authorization code cannot be redeemed by
   anyone else. Google and GitHub both support PKCE with `S256`.
 
-The callback still answers JSON (a token pair or a 2FA challenge). Other
+The callback never answers JSON. It always answers **303 See Other** to
+`${FRONTEND_BASE_URL}/oauth/complete#<fragment>`, with the fragment built
+by `urlencode`:
+
+- success: `access_token=...&refresh_token=...`;
+- an account with 2FA: `challenge_token=...&expires_in=300` (the
+  frontend then calls `POST /api/v1/auth/oauth/2fa`);
+- any failure (provider error or denial, missing `code` or `state`,
+  invalid, expired or replayed state, missing or foreign nonce,
+  deactivated account, refused account link, provider token or user-info
+  errors, unknown provider): `error=oauth_failed&message=<the error
+  message>`. The request's database work is rolled back and
+  `oauth_callback_failed` is logged with the error code.
+
+The tokens travel in the fragment because a browser never sends the
+fragment to any server and never puts it in the `Referer` header. The
+frontend page reads it and then removes it from the address bar with
+`history.replaceState`, so it does not stay in the browser history.
+`FRONTEND_BASE_URL` must be the frontend origin (for example
+`https://localhost:8443` locally, the cloud URL on the server). Other
 rules in `oauth_callback` / `_resolve_oauth_user`:
 
 - an existing local account is linked by email only if **both** the
@@ -377,8 +398,9 @@ rules in `oauth_callback` / `_resolve_oauth_user`:
   5 minutes) instead of tokens, exchanged with a TOTP code at
   `POST /api/v1/auth/oauth/2fa`; the challenge's `jti` is marked used in
   Redis so it works once;
-- provider errors map to 401 (`oauth_failed`) or 502
-  (`oauth_provider_error`), never a crash.
+- provider errors raise `oauth_failed` or `oauth_provider_error`, never
+  a crash; like every other error they end in the `error=oauth_failed`
+  redirect.
 
 With the default empty `GOOGLE_CLIENT_ID` / `GITHUB_CLIENT_ID` the flow
 fails at the provider. To use OAuth you register an app with each
@@ -759,6 +781,7 @@ off-machine copies encrypted. See `../DISASTER_RECOVERY.md`.
 | `USER_STATE_CHECK_ENABLED` | `true` | Live role/active check on every request. | `shared/config.py` |
 | `USER_STATE_CACHE_TTL_SECONDS` | `300` | Cache time for a state fetched from auth-service after a Redis miss. | `shared/config.py` |
 | `BACKEND_CORS_ORIGINS` | `http://localhost:3000` | Allowed browser origins. | `shared/config.py` |
+| `FRONTEND_BASE_URL` | `http://localhost:3000` | Frontend origin: base of email links and of the OAuth result page `/oauth/complete`. | `shared/config.py` |
 | `PUBLIC_API_RATE_LIMIT_PER_MINUTE` | `60` | Default and maximum per-key limit, and per-owner budget. | `services/core-service/config.py` |
 | `MAX_ACTIVE_API_KEYS_PER_USER` | `10` | Live keys per user. | same |
 | `MAX_UPLOAD_SIZE_BYTES` | `20971520` (20 MB) | Research document size. | same |
@@ -834,6 +857,8 @@ pinning `bcrypt<4.1` keeps it working instead of rewriting hashing code.
 | Users logged out everywhere unexpectedly | A rotated refresh token was reused (`refresh_token_reuse_detected`). | Search auth-service logs; check the client does not reuse old refresh tokens. |
 | 503 "Portfolio ownership check is unavailable" | core-service or auth-service down. | `make health`. |
 | Public API always 401 `invalid_api_key` right after creating a key | Wrong header or a typo; the key is shown only once. | Header must be `X-API-Key`. |
+| OAuth sign-in ends at `/oauth/complete#error=oauth_failed&message=...` | The sign-in failed; the `message` says why (expired state, other browser, provider error, ...). | Log `oauth_callback_failed` in auth-service gives the error code. |
+| OAuth sign-in redirects to a page that does not exist | `FRONTEND_BASE_URL` is not the frontend origin. | Set it (for example `https://localhost:8443`) and recreate auth-service. |
 | Browser blocks API calls with a CORS error | Frontend origin not in `BACKEND_CORS_ORIGINS`. | Add it and recreate the services. |
 
 ---

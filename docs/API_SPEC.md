@@ -156,8 +156,8 @@ minutes."); a token issued before this rule existed has no `auth_time` and
 gets the same 403. The frontend should send the user through login again
 and then retry. `/2fa/disable` is not affected (it needs a valid code). The OAuth
 callback applies the same checks as password login: a deactivated account
-is refused, and when 2FA is enabled it returns `{two_factor_required,
-challenge_token, expires_in}` instead of tokens; `POST /auth/oauth/2fa`
+is refused, and when 2FA is enabled it gives a `challenge_token` instead of
+tokens (see OAuth callback result below); `POST /auth/oauth/2fa`
 exchanges `{challenge_token, code}` for the token pair (single use, 5 min).
 OAuth links to an existing account only when the provider verified the email
 and the local account is verified (else 409 `oauth_link_refused`). Password
@@ -175,8 +175,35 @@ a browser navigation. It sets the cookie `alphamind_oauth_nonce` (HttpOnly,
 Secure, SameSite=Lax, Path `/api/v1/auth/oauth`, 5 minutes) and redirects to
 the provider with a single-use `state` and a PKCE challenge (S256). The
 callback requires that cookie: a missing or foreign nonce burns the state
-and answers 401 `oauth_failed` without calling the provider. The callback
-still answers JSON and deletes the cookie on success.
+and fails with `oauth_failed` without calling the provider.
+
+OAuth callback result: `GET /auth/oauth/{provider}/callback` never answers
+JSON. It always answers **303 See Other** with
+`Location: ${FRONTEND_BASE_URL}/oauth/complete#<fragment>`, and deletes the
+nonce cookie on every outcome. The fragment is URL-encoded
+(`application/x-www-form-urlencoded`) and is one of:
+
+| Outcome | Fragment |
+|---|---|
+| signed in | `access_token=...&refresh_token=...` |
+| the account has 2FA | `challenge_token=...&expires_in=300`; then call `POST /auth/oauth/2fa` with `{challenge_token, code}` |
+| any failure | `error=oauth_failed&message=<error message>` |
+
+"Any failure" covers every error of the sign-in: the provider reported an
+error or the user said no, a missing `code` or `state`, an invalid,
+expired, replayed or other-provider state, a missing or foreign nonce
+cookie, a deactivated account, a refused account link, provider token or
+user-info errors, and an unknown provider. The `message` is the same text
+the error would carry in a JSON error body (for example "Invalid or
+expired OAuth state."). On failure the request's database work is rolled
+back and auth-service logs `oauth_callback_failed` with the error code.
+A fragment (the part after `#`) is never sent by the browser to any
+server and never appears in the `Referer` header. The frontend page
+`/oauth/complete` reads `window.location.hash`, removes it from the
+address bar with `history.replaceState`, and then stores the tokens,
+asks for the 2FA code, or shows the message. `FRONTEND_BASE_URL` must be
+the frontend origin (for example `https://localhost:8443` locally, the
+cloud URL on the server).
 
 A soft-deleted account (see Administration) cannot log in
 (401 invalid credentials), refresh a token, or reset its password (the
@@ -1142,7 +1169,7 @@ document_id, title, category, ticker, content_date, snippet}], "model",
    `llm_unavailable`, `internal_error`, `empty_answer`.
 
 If the LLM stream fails before its first token, the answer is produced once
-with the non-streaming path (router retries and fallback chain) and sent as
+with the non-streaming path (router retries and fallback model) and sent as
 a single `token`. The stream is cut after `RAG_ASK_STREAM_TIMEOUT_SECONDS`
 (120) with an `error` event, and stops without a final event when the
 client disconnects.
