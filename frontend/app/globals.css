@@ -555,6 +555,50 @@ main svg {
   .site-footer { display: none; }
 }
 
+/* ---- long-form text (Privacy Policy, Terms of Service) ---- */
+
+.legal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.legal h2 {
+  margin: 28px 0 0;
+  font-size: 17px;
+  color: var(--text);
+}
+.legal h3 {
+  margin: 12px 0 0;
+  font-size: 14.5px;
+  color: var(--text);
+}
+.legal p,
+.legal ul {
+  margin: 0;
+}
+.legal ul {
+  padding-left: 20px;
+  list-style: disc;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.legal strong {
+  color: var(--text);
+}
+.legal a {
+  color: var(--accent-strong);
+  text-underline-offset: 2px;
+}
+.legal code {
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 12.5px;
+}
+
 /* ---- small screens (below Tailwind's md breakpoint, e.g. a 375px phone) ---- */
 
 @media (max-width: 767.98px) {
