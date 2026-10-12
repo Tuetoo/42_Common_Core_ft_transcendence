@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { CONTACT_URL, LAST_UPDATED } from "../legal";
+import { LAST_UPDATED } from "../legal";
 
 export const metadata: Metadata = {
   title: "Terms of Service · AlphaMind",
@@ -49,7 +49,10 @@ export default function TermsOfServicePage() {
         <li>Give accurate information when you register.</li>
         <li>Keep your password safe; you are responsible for what happens under your account.</li>
         <li>Use one account per person, for ordinary personal use.</li>
-        <li>Accounts whose email address is not verified within 7 days of registering are deleted.</li>
+        <li>
+          Accounts that never verify their email address, never sign in and have no linked Google or GitHub account
+          are deleted 7 days after registering.
+        </li>
       </ul>
 
       <h2>5. Acceptable use</h2>
@@ -100,11 +103,7 @@ export default function TermsOfServicePage() {
 
       <h2>11. Contact</h2>
       <p>
-        Questions about these terms go to the team through the{" "}
-        <a href={CONTACT_URL} target="_blank" rel="noopener noreferrer">
-          project&apos;s GitHub Issues page
-        </a>
-        .
+        Questions about these terms go to the AlphaMind team, the students who build and run the project.
       </p>
     </article>
   );
