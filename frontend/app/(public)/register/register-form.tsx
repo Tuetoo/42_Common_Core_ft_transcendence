@@ -101,6 +101,10 @@ export function RegisterForm() {
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Registering…" : "Register"}
       </button>
+      <p className="field-hint" style={{ margin: 0 }}>
+        By registering you agree to the <Link href="/terms">Terms of Service</Link> and{" "}
+        <Link href="/privacy">Privacy Policy</Link>.
+      </p>
       <Link href="/login" className="link-btn">
         Already have an account? Log in
       </Link>
