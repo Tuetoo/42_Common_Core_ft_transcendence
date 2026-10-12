@@ -1,10 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Any
 import structlog
-from ai.ingestion.macro_ingestion import generate_macro_report
-from ai.ingestion.news_ingestion import generate_news_digest
+from ai.ingestion.digests import (generate_macro_report,
+                                  generate_news_digest, track_source_failures)
 from ai.ingestion.sec_edgar_filings import ingest_new_filings
-from ai.ingestion.source_failures import track_source_failures
 from ai.providers.base import ProviderQuotaError
 from clients.core_client import (create_system_document,
                                  get_existing_document_filenames,

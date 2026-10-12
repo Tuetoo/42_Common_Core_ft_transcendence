@@ -23,7 +23,7 @@ import pytest
 import pytest_asyncio
 import structlog
 from ai.agents.reflection import review_skip_reason_for
-from ai.graph.state import AnalysisState, ReflectionVerdict
+from ai.graph.state import ReflectionVerdict
 from ai.llm.anthropic_provider import _split_system_and_turns
 from ai.llm.base import (ConcurrencyGate, LLMConfigError,
                          LLMInvalidRequestError, LLMMessage,
@@ -41,7 +41,8 @@ from google.genai import errors as genai_errors
 from helpers import (_chain, _FakeEmbedModels, _FakeGeminiResponse,
                      _FakeGoogleClient, _FakeGoogleGenerateContent,
                      _FakeGooglePool, _install_google_pool, _msgs, _no_sleep,
-                     _PerModelAdapter, _RecordingSleep)
+                     _PerModelAdapter, _RecordingSleep, _run_steps,
+                     _scripted_pool, _server_503, _single_client_pool, _state)
 from mistralai.client.errors.sdkerror import SDKError
 from prometheus_client import REGISTRY
 from structlog.testing import capture_logs
@@ -67,7 +68,7 @@ _CHINESE = (
     "\u516c\u53f8\u5229\u6da6\u672c\u5b63\u5ea6\u589e\u957f\u4e86\u767e"
     "\u5206\u4e4b\u5341\uff0c\u524d\u666f\u826f\u597d\u3002")
 _OVERLOADED_TEXT = (
-    "Gemini completion for model 'gemini-3.5-flash' hit a real 503 3 times in "
+    "Gemini completion for model 'gemini-3.6-flash' hit a real 503 3 times in "
     "a row within this call -- giving up early instead of walking the rest of "
     "the pool, since a 503 reflects Google's shared infrastructure being "
     "overloaded for this model, not a per-project issue.")
@@ -93,18 +94,9 @@ def no_thinking_budget_rejections():
     google_module._THINKING_BUDGET_REJECTED_MODELS.clear()
 
 
-async def _run_steps(*steps: Callable[[pytest.MonkeyPatch], Any]) -> None:
-    for step in steps:
-        request_pacer.reset()
-        google_module._THINKING_BUDGET_REJECTED_MODELS.clear()
-        with pytest.MonkeyPatch.context() as mp:
-            await step(mp)
-
-
-def _run_sync_steps(*steps: Callable[[pytest.MonkeyPatch], Any]) -> None:
-    for step in steps:
-        with pytest.MonkeyPatch.context() as mp:
-            step(mp)
+def _reset_llm_state() -> None:
+    request_pacer.reset()
+    google_module._THINKING_BUDGET_REJECTED_MODELS.clear()
 
 
 def _ok_response(model: str, content: str = "ok") -> LLMResponse:
@@ -279,16 +271,6 @@ def _invalid_argument_error(code: int) -> Exception:
         })
 
 
-def _server_503() -> genai_errors.ServerError:
-    return genai_errors.ServerError(
-        503,
-        {"error": {
-            "code": 503,
-            "status": "UNAVAILABLE",
-            "message": "busy"
-        }})
-
-
 class _FakeStreamChunk:
 
     def __init__(self, text: str) -> None:
@@ -320,52 +302,6 @@ class _FakeGoogleStreamClient:
         self.aio = type("_Aio", (), {"models": models})()
 
 
-class _GeminiOk:
-
-    class _Usage:
-        prompt_token_count = 1
-        candidates_token_count = 1
-        thoughts_token_count = None
-
-    class _Candidate:
-        finish_reason = "STOP"
-
-    text = "ok"
-    usage_metadata = _Usage()
-    candidates = (_Candidate(), )
-
-
-class _ScriptedOutcomePool:
-
-    def __init__(self, labels: list[str], script: list[str]) -> None:
-        self.labels = labels
-        self.script = list(script)
-        self.used: list[str] = []
-
-        async def generate_content(*, model, contents, config):
-            outcome = (
-                self.script.pop(0) if len(self.script) > 1 else self.script[0])
-            if outcome == "503":
-                raise _server_503()
-            if outcome == "hang":
-                await asyncio.sleep(3600)
-            return _GeminiOk()
-
-        self._client = SimpleNamespace(
-            aio=SimpleNamespace(
-                models=SimpleNamespace(generate_content=generate_content)))
-
-    def key_count(self) -> int:
-        return len(self.labels)
-
-    def available_labels_excluding(self, excluded):
-        return [lbl for lbl in self.labels if lbl not in excluded]
-
-    def client_for(self, label):
-        self.used.append(label)
-        return self._client
-
-
 def _gemini_response(
         *, finish: str, thinking: int | None, completion: int, text: str):
     usage = SimpleNamespace(
@@ -389,25 +325,6 @@ class _ThinkingRecordingGenerate:
         if isinstance(item, Exception):
             raise item
         return item
-
-
-class _SingleClientPool:
-
-    def __init__(self, generate: Any,
-                 labels: tuple[str, ...] = ("primary", )) -> None:
-        self.generate = generate
-        self._labels = list(labels)
-        models = SimpleNamespace(generate_content=generate)
-        self._client = SimpleNamespace(aio=SimpleNamespace(models=models))
-
-    def key_count(self) -> int:
-        return len(self._labels)
-
-    def available_labels_excluding(self, excluded: set[str]) -> list[str]:
-        return [lbl for lbl in self._labels if lbl not in excluded]
-
-    def client_for(self, label: str):
-        return self._client
 
 
 def _runaway() -> Any:
@@ -503,7 +420,8 @@ class TestRouterBasics:
             self._stream_yields_chunks_from_resolved_adapter,
             self._concurrent_cheap_calls_get_paced_when_interval_set,
             self._rate_limit_falls_back_to_the_alternate_model,
-            self._failure_without_a_fallback_is_raised)
+            self._failure_without_a_fallback_is_raised,
+            reset=_reset_llm_state)
 
 
 def test_anthropic_system_messages_join_and_turns_stay_in_order():
@@ -571,7 +489,8 @@ class TestRequestPacer:
             self._empty_candidate_lists,
             self._fraction_reflects_exact_share_confirmed_exhausted,
             self._reserve_slot_waits_and_books_the_next_slot,
-            self._the_adapter_wait_frees_the_running_calls_slot)
+            self._the_adapter_wait_frees_the_running_calls_slot,
+            reset=_reset_llm_state)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -831,7 +750,7 @@ class TestGoogleAdapter:
         monkeypatch.setattr(
             config.settings,
             "LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS", 0.05)
-        hanging_pool = _ScriptedOutcomePool(["primary"], ["hang"])
+        hanging_pool = _scripted_pool(["primary"], ["hang"])
         monkeypatch.setattr(google_module, "_pool", hanging_pool)
         with pytest.raises(LLMRequestTimeoutError):
             await asyncio.wait_for(
@@ -842,7 +761,7 @@ class TestGoogleAdapter:
             self, monkeypatch):
         model = "gemini-3.8-flash"
         monkeypatch.setattr(
-            google_module, "_pool", _ScriptedOutcomePool(["primary"], ["503"]))
+            google_module, "_pool", _scripted_pool(["primary"], ["503"]))
         waits = []
         for _ in range(4):
             with pytest.raises(LLMServerOverloadedError):
@@ -852,11 +771,11 @@ class TestGoogleAdapter:
         for got, cap in zip(waits, (20.0, 60.0, 180.0, 300.0), strict=True):
             assert cap - 5.0 < got <= cap
         monkeypatch.setattr(
-            google_module, "_pool", _ScriptedOutcomePool(["primary"], ["ok"]))
+            google_module, "_pool", _scripted_pool(["primary"], ["ok"]))
         await google_module.GoogleAdapter().complete(_msgs(), model=model)
         assert not await google_module.google_model_confirmed_overloaded(model)
         monkeypatch.setattr(
-            google_module, "_pool", _ScriptedOutcomePool(["primary"], ["503"]))
+            google_module, "_pool", _scripted_pool(["primary"], ["503"]))
         with pytest.raises(LLMServerOverloadedError):
             await google_module.GoogleAdapter().complete(_msgs(), model=model)
         assert (
@@ -892,14 +811,46 @@ class TestGoogleAdapter:
             self._non_quota_client_error_raises_without_failover,
             self._gives_up_after_max_malformed_retries_with_a_big_pool,
             self._success_clears_the_models_overloaded_marker,
-            self._server_error_wait_escalates_and_success_resets)
+            self._server_error_wait_escalates_and_success_resets,
+            reset=_reset_llm_state)
+
+    async def _timeouts_without_a_cooldown_leave_no_marker(
+            self, monkeypatch):
+        assert google_module._default_request_timeout(
+            "gemini-3.8-flash") == 30.0
+        assert google_module._default_request_timeout(
+            "gemini-3.6-flash", fallback=True) == 60.0
+        assert google_module._default_request_timeout(
+            "gemini-3.5-flash-lite", fallback=True) == 60.0
+        monkeypatch.setattr(
+            google_module, "_pool", _scripted_pool(["primary"], ["hang"]))
+        with pytest.raises(LLMRequestError) as info:
+            await google_module.GoogleAdapter().complete(
+                _msgs(), model="gemini-3.8-flash", timeout_seconds=0.05)
+        assert not isinstance(info.value, LLMRequestTimeoutError)
+        assert not await google_module.google_model_recently_timed_out(
+            "gemini-3.8-flash")
+        monkeypatch.setattr(
+            config.settings, "LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS",
+            0.05)
+        monkeypatch.setattr(
+            config.settings, "LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS", 0.0)
+        monkeypatch.setattr(
+            google_module, "_pool", _scripted_pool(["primary"], ["hang"]))
+        with pytest.raises(LLMRequestTimeoutError):
+            await google_module.GoogleAdapter().complete(
+                _msgs(), model="gemini-3.8-flash")
+        assert not await google_module.google_model_recently_timed_out(
+            "gemini-3.8-flash")
 
     async def test_pacing_waits_and_timeouts(self):
         await _run_steps(
             self._wait_beyond_one_interval_fails_fast_without_sleeping,
             self._zero_min_interval_pool_is_never_exhausted,
             self._fallback_flag_uses_the_fallback_timeout,
-            self._a_rate_limit_mark_during_the_pacing_wait_still_skips)
+            self._timeouts_without_a_cooldown_leave_no_marker,
+            self._a_rate_limit_mark_during_the_pacing_wait_still_skips,
+            reset=_reset_llm_state)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -1014,19 +965,19 @@ class TestGoogleServerErrors:
 
     async def _flash_fallback_tries_three_keys_on_503(self, monkeypatch):
         labels = ["primary", "key_2", "key_3", "key_4"]
-        pool = _ScriptedOutcomePool(labels, ["503", "503", "ok"])
+        pool = _scripted_pool(labels, ["503", "503", "ok"])
         monkeypatch.setattr(google_module, "_pool", pool)
         response = await google_module.GoogleAdapter().complete(
             _msgs(), model="gemini-3.6-flash", fallback=True)
         assert response.content == "ok"
         assert len(pool.used) == 3
-        pool = _ScriptedOutcomePool(labels, ["503"])
+        pool = _scripted_pool(labels, ["503"])
         monkeypatch.setattr(google_module, "_pool", pool)
         with pytest.raises(LLMServerOverloadedError):
             await google_module.GoogleAdapter().complete(
                 _msgs(), model="gemini-3.6-flash", fallback=True)
         assert len(pool.used) == 3
-        pool = _ScriptedOutcomePool(labels, ["503"])
+        pool = _scripted_pool(labels, ["503"])
         monkeypatch.setattr(google_module, "_pool", pool)
         with pytest.raises(LLMServerOverloadedError):
             await google_module.GoogleAdapter().complete(
@@ -1041,7 +992,8 @@ class TestGoogleServerErrors:
             self._503_then_429_pool_exhaustion_is_a_plain_rate_limit,
             self._lite_stream_tries_three_keys_then_raises_no_cooldown,
             self._lite_stream_recovers_on_second_key,
-            self._highest_accuracy_stream_gives_up_on_first_503)
+            self._highest_accuracy_stream_gives_up_on_first_503,
+            reset=_reset_llm_state)
 
 
 @pytest.mark.usefixtures("unpaced_llm", "no_thinking_budget_rejections")
@@ -1050,7 +1002,7 @@ class TestRunawayThinkingRetry:
     async def _runaway_is_retried_once_with_a_thinking_budget(
             self, monkeypatch):
         gen = _ThinkingRecordingGenerate([_runaway(), _clean()])
-        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        monkeypatch.setattr(google_module, "_pool", _single_client_pool(gen))
         with capture_logs() as logs:
             response = await _complete_lite()
         assert response.content == '{"finish_answer": "ok"}'
@@ -1069,7 +1021,7 @@ class TestRunawayThinkingRetry:
         gen = _ThinkingRecordingGenerate(
             [_runaway(), _invalid_argument_error(400),
              _runaway()])
-        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        monkeypatch.setattr(google_module, "_pool", _single_client_pool(gen))
         with capture_logs() as logs:
             first = await _complete_lite()
             second = await _complete_lite()
@@ -1095,7 +1047,7 @@ class TestRunawayThinkingRetry:
                     model=model, contents=contents, config=config)
 
         gen = _RetryFails([original])
-        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        monkeypatch.setattr(google_module, "_pool", _single_client_pool(gen))
         response = await _complete_lite()
         assert response.finish_reason == "FinishReason.MAX_TOKENS"
         assert _LITE not in google_module._THINKING_BUDGET_REJECTED_MODELS
@@ -1111,7 +1063,7 @@ class TestRunawayThinkingRetry:
         monkeypatch.setattr(
             "ai.llm.google_provider.asyncio.sleep", _RecordingSleep())
         gen = _ThinkingRecordingGenerate([])
-        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        monkeypatch.setattr(google_module, "_pool", _single_client_pool(gen))
         await request_pacer.mark_unavailable_until(
             _LITE_POOL_GATE,
             time.monotonic() + 30.9)
@@ -1123,7 +1075,7 @@ class TestRunawayThinkingRetry:
         gen = _ThinkingRecordingGenerate(
             [_clean(), _invalid_argument_error(400),
              _clean(), _clean()])
-        monkeypatch.setattr(google_module, "_pool", _SingleClientPool(gen))
+        monkeypatch.setattr(google_module, "_pool", _single_client_pool(gen))
         adapter = google_module.GoogleAdapter()
         await adapter.complete(_msgs(), model=_LITE, thinking_budget=512)
         await adapter.complete(_msgs(), model=_LITE, thinking_budget=512)
@@ -1138,7 +1090,8 @@ class TestRunawayThinkingRetry:
             self._runaway_is_retried_once_with_a_thinking_budget,
             self._a_400_returns_the_original_and_disables_the_model,
             self._other_retry_failures_return_the_original,
-            self._lite_pool_gate_keeps_the_30_second_limit_without_retry)
+            self._lite_pool_gate_keeps_the_30_second_limit_without_retry,
+            reset=_reset_llm_state)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -1271,14 +1224,38 @@ class TestRouterFallback:
             self._exhausted_primary_goes_straight_to_the_fallback,
             self._overloaded_skip_is_reported_as_server_overloaded,
             self._non_english_fallback_response_raises,
-            self._json_escaped_non_english_is_rejected)
+            self._json_escaped_non_english_is_rejected,
+            reset=_reset_llm_state)
+
+    async def _timed_out_primary_goes_to_the_fallback(self, monkeypatch):
+        _chain(monkeypatch)
+        adapter = _PerModelAdapter({"m1": ["timeout"], "m2": ["ok"]})
+        router = LLMRouter(providers={"google": adapter})
+        first = await router.complete(
+            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+        second = await router.complete(
+            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+        assert first.content == second.content == "answer from m2"
+        assert adapter.models == ["m1", "m2", "m2"]
+
+        request_pacer.reset()
+        monkeypatch.setattr(
+            config.settings, "LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS", 0.0)
+        adapter = _PerModelAdapter({"m1": ["timeout"], "m2": ["ok"]})
+        await LLMRouter(providers={
+            "google": adapter
+        }).complete(
+            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+        assert adapter.models == ["m1", "m2"]
 
     async def test_fallback_calls(self):
         await _run_steps(
             self._fallback_call_has_the_flag_and_no_schema,
             self._thinking_budget_goes_to_both_google_calls,
             self._a_failed_fallback_is_raised_without_more_calls,
-            self._day_exhausted_fallback_is_skipped)
+            self._day_exhausted_fallback_is_skipped,
+            self._timed_out_primary_goes_to_the_fallback,
+            reset=_reset_llm_state)
 
 
 def test_router_retry_limit():
@@ -1291,6 +1268,10 @@ def test_router_retry_limit():
              (
                  "google-lite-timeout-one-retry", LLMProviderTimeoutError("t"),
                  "google", _LITE, 4, 1),
+             (
+                 "google-highest-explicit-timeout-one-retry",
+                 LLMProviderTimeoutError("t"), "google", "gemini-3.8-flash",
+                 4, 1),
              (
                  "google-lite-timeout-no-retries-asked",
                  LLMProviderTimeoutError("t"), "google", _LITE, 0, 0),
@@ -1420,7 +1401,8 @@ class TestRouterLiteCooldownRetry:
             self._no_recorded_cooldown_waits_one_quota_window,
             self._also_without_a_fallback_model,
             self._a_second_failure_is_raised,
-            self._not_made_when_it_cannot_help_or_is_off)
+            self._not_made_when_it_cannot_help_or_is_off,
+            reset=_reset_llm_state)
 
 
 class _TierRouter:
@@ -1558,17 +1540,6 @@ class TestBudgetTrim:
         assert result is None and isinstance(note, BudgetBlockedNote)
 
 
-def _state(**overrides: Any) -> AnalysisState:
-    defaults: dict[str, Any] = {
-        "analysis_id": "a1",
-        "user_id": "",
-        "ticker": "AMD",
-        "analysis_type": AnalysisType.FULL
-    }
-    defaults.update(overrides)
-    return AnalysisState(**defaults)
-
-
 class TestReflectionReviewSkip:
 
     def test_skip_reasons_and_review_not_run_note(self):
@@ -1577,7 +1548,7 @@ class TestReflectionReviewSkip:
         assert review_skip_reason_for(LLMRequestTimeoutError("timed out")) == (
             "LLMRequestTimeoutError: the LLM provider timed out")
         state = _state(
-            reflection_history=[
+            "AMD", user_id="", reflection_history=[
                 ReflectionVerdict(
                     round_number=1, verified=False, issues=[],
                     llm_review_ran=False,
@@ -1709,13 +1680,15 @@ class TestGoogleEmbedBatch:
     async def test_requests_and_dispatch(self):
         await _run_steps(
             self._embedding_2_uses_prompt_prefixes_not_task_type,
-            self._embed_texts_and_query_dispatch_to_google)
+            self._embed_texts_and_query_dispatch_to_google,
+            reset=_reset_llm_state)
 
     async def test_errors_waits_and_timeouts(self):
         await _run_steps(
             self._429_on_every_project_waits_then_gives_up,
             self._503_waits_and_retries, self._wrong_dimension_is_an_error,
-            self._an_embedding_that_never_answers_ends_as_a_timeout)
+            self._an_embedding_that_never_answers_ends_as_a_timeout,
+            reset=_reset_llm_state)
 
 
 class _FakeMistralHttpResponse:

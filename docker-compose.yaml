@@ -422,9 +422,7 @@ services:
   # Same image as the scheduler. Objects go back through the object
   # storage's S3 API, so objectstore must be running (the Makefile target
   # starts it). avatar_data is mounted READ-WRITE so restore.sh can put
-  # files back; objectstore_data is mounted READ-WRITE only for backups
-  # that hold a tarball of the SeaweedFS data directory (objectstore
-  # stopped for those).
+  # files back.
   restore:
     logging: *default-logging
     build:
@@ -434,13 +432,11 @@ services:
     env_file: .env.docker
     environment:
       BACKUP_DIR: /backups
-      OBJECTSTORE_DATA_DIR: /objectstore-data
       AVATAR_DATA_DIR: /avatar-data
     entrypoint: []
     command: ["/scripts/restore.sh", "--help"]
     volumes:
       - ./backups:/backups
-      - objectstore_data:/objectstore-data
       - avatar_data:/avatar-data
     depends_on:
       postgres:

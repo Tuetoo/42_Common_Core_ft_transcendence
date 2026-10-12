@@ -4,35 +4,36 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from typing import Any
 from uuid import UUID, uuid4
-import ai.agents.debate_side as side_module
+import ai.agents.debate_common as side_module
 import ai.agents.judge as judge_module
 import ai.graph.nodes as nodes_module
-import ai.llm.capacity as capacity_module
-import ai.memory.episodic as episodic_module
+import ai.llm.router as router_module
+import ai.memory.agent_memory as memory_module
 import config
 import pytest
 from ai.agents.reflection import ReflectionAgent
-from ai.agents.supervisor import select_agents
-from ai.graph.builder import build_analysis_graph
-from ai.graph.edges import (MAX_DEBATE_ROUNDS, route_after_news,
-                            route_after_reflection,
-                            should_continue_debate_round,
-                            should_continue_to_debate)
+from ai.graph.builder import (build_analysis_graph, route_after_news,
+                              route_after_reflection,
+                              should_continue_debate_round,
+                              should_continue_to_debate)
 from ai.graph.nodes import (_run_agent_safely, bear_node, bull_node,
                             debate_join_node, episodic_memory_node, judge_node,
-                            recommendation_node, reflection_node)
-from ai.graph.state import (AgentOutput, AnalysisState, DebateArgument,
-                            DebateState, EpisodicMemoryHit, JudgeVerdict,
-                            ReflectionVerdict, merge_debate_state,
-                            replace_reflection_feedback)
+                            recommendation_node, reflection_node,
+                            select_agents)
+from ai.graph.state import (MAX_DEBATE_ROUNDS, AgentOutput, AnalysisState,
+                            DebateArgument, DebateState, EpisodicMemoryHit,
+                            JudgeVerdict, ReflectionVerdict,
+                            merge_debate_state, replace_reflection_feedback)
 from ai.llm.base import (LLMConfigError, LLMResponse, LLMServerOverloadedError,
-                         LLMTier, LLMUsage, request_pacer)
+                         LLMTier, LLMUsage)
 from alembic import command
 from helpers import _ALL_ROLES, _BUY, _P
-from helpers import _amd_state as _amd
-from helpers import _args, _ok, _StubGraph, _tool_entry, _verdict
+from helpers import _args, _ok
+from helpers import _state as _base_state
+from helpers import _StubGraph, _tool_entry, _verdict
 from langgraph.graph import END
 from sqlalchemy import func, select, text, update
 from structlog.testing import capture_logs
@@ -54,7 +55,6 @@ _T0 = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
 
 @pytest.fixture
 def no_memory_io(monkeypatch):
-    import ai.memory.procedural as procedural_module
 
     async def _empty_episodic_context(ticker, *, user_id, limit=None):
         return []
@@ -63,20 +63,9 @@ def no_memory_io(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        episodic_module, "retrieve_episodic_context", _empty_episodic_context)
+        memory_module, "retrieve_episodic_context", _empty_episodic_context)
     monkeypatch.setattr(
-        procedural_module, "retrieve_procedural_hints", _no_procedural_hints)
-
-
-@pytest.fixture
-def clean_pacer(monkeypatch):
-    request_pacer.reset()
-    for name in ("LLM_GOOGLE_CHEAP_MIN_INTERVAL_SECONDS",
-                 "LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS",
-                 "LLM_GOOGLE_LITE_POOL_MIN_DISPATCH_INTERVAL_SECONDS"):
-        monkeypatch.setattr(config.settings, name, 0.0)
-    yield
-    request_pacer.reset()
+        memory_module, "retrieve_procedural_hints", _no_procedural_hints)
 
 
 @pytest.fixture
@@ -84,15 +73,8 @@ def alembic_schema() -> str:
     return "ai"
 
 
-def _state(**overrides: Any) -> AnalysisState:
-    defaults: dict[str, Any] = {
-        "analysis_id": "a1",
-        "user_id": "u1",
-        "ticker": "TSLA",
-        "analysis_type": AnalysisType.FULL
-    }
-    defaults.update(overrides)
-    return AnalysisState(**defaults)
+_state = partial(_base_state, ticker="TSLA")
+_amd = partial(_base_state, ticker="AMD")
 
 
 def _nine_state(**overrides: Any) -> AnalysisState:
@@ -368,7 +350,7 @@ def _set_free_model(monkeypatch, model: str | None) -> list[str]:
         asked.append(str(tier))
         return model
 
-    monkeypatch.setattr(capacity_module, "free_chain_model", _free)
+    monkeypatch.setattr(router_module, "free_chain_model", _free)
     monkeypatch.setattr(nodes_module, "free_chain_model", _free)
     return asked
 
@@ -396,12 +378,12 @@ class TestRetryCapacityGate:
             nodes_module, "tier_model_chain",
             lambda tier: ["primary", "fallback"])
         monkeypatch.setattr(
-            capacity_module, "google_model_pool_exhausted", _exhausted)
-        monkeypatch.setattr(capacity_module, "google_pool_cooldown", _cooldown)
+            router_module, "google_model_pool_exhausted", _exhausted)
+        monkeypatch.setattr(router_module, "google_pool_cooldown", _cooldown)
         monkeypatch.setattr(
-            capacity_module, "google_server_error_wait", _server_wait)
+            router_module, "google_server_error_wait", _server_wait)
         monkeypatch.setattr(
-            capacity_module, "google_model_timeout_wait",
+            router_module, "google_model_timeout_wait",
             lambda model: _timeout_wait(state, model))
         monkeypatch.setattr(nodes_module.asyncio, "sleep", _sleep)
         return state
@@ -441,19 +423,19 @@ class TestRetryCapacityGate:
         assert "fallback sent no response within the request timeout" in (
             notes[0].text)
         monkeypatch.setattr(
-            capacity_module, "tier_model_chain",
+            router_module, "tier_model_chain",
             lambda tier: ["primary", "fallback"])
-        assert await capacity_module.free_chain_model(
+        assert await router_module.free_chain_model(
             LLMTier.HIGHEST_ACCURACY) is None
-        assert await capacity_module.capacity_aware_delay(
+        assert await router_module.capacity_aware_delay(
             LLMTier.HIGHEST_ACCURACY, 60.0) == (60.0, None)
         chain["timeouts"] = {"primary": 200.0}
-        assert await capacity_module.free_chain_model(
+        assert await router_module.free_chain_model(
             LLMTier.HIGHEST_ACCURACY) == "fallback"
-        assert await capacity_module.capacity_aware_delay(
+        assert await router_module.capacity_aware_delay(
             LLMTier.HIGHEST_ACCURACY, 60.0) == (0.0, "fallback")
         monkeypatch.setattr(config.settings, "LLM_DEFAULT_PROVIDER", "other")
-        assert await capacity_module.capacity_aware_delay(
+        assert await router_module.capacity_aware_delay(
             LLMTier.HIGHEST_ACCURACY, 60.0) == (60.0, None)
 
 
@@ -461,18 +443,14 @@ class TestSupervisorEnrichment:
 
     @pytest.mark.asyncio
     async def test_enrichment_failures_give_no_context(self, monkeypatch):
-        import ai.knowledge.fresh_filings as fresh_module
         import ai.knowledge.kg_context as kg_module
-        import ai.memory.procedural as procedural_module
         import clients.core_client as core_client
 
         async def _boom(*args, **kwargs):
             raise RuntimeError("down")
 
-        monkeypatch.setattr(
-            procedural_module, "retrieve_procedural_hints", _boom)
-        monkeypatch.setattr(
-            fresh_module, "check_for_fresh_filing_content", _boom)
+        monkeypatch.setattr(memory_module, "retrieve_procedural_hints", _boom)
+        monkeypatch.setattr(nodes_module, "ingest_new_filings", _boom)
         monkeypatch.setattr(kg_module, "get_kg_context_for_ticker", _boom)
         monkeypatch.setattr(core_client, "get_portfolio_holdings", _boom)
         state = _nine_state(portfolio_id="p1")
@@ -960,7 +938,7 @@ class TestEpisodicMemory:
             return [_hit("buy", 0.7, 3)]
 
         monkeypatch.setattr(
-            episodic_module, "retrieve_episodic_context", _fake)
+            memory_module, "retrieve_episodic_context", _fake)
         state = _amd(user_id=str(uuid4()))
         result = await episodic_memory_node(state)
         assert seen == {"ticker": "AMD", "user_id": state.user_id}
@@ -979,7 +957,7 @@ class TestEpisodicMemory:
                 raise error
 
             monkeypatch.setattr(
-                episodic_module, "retrieve_episodic_context", _raise)
+                memory_module, "retrieve_episodic_context", _raise)
             if limit is not None:
                 monkeypatch.setattr(
                     config.settings, "EPISODIC_CONTEXT_LIMIT", limit)
@@ -1046,7 +1024,7 @@ class TestEpisodicMemory:
         assert line.endswith("(confidence 0.40), call was correct")
         assert "summary" not in EpisodicMemoryHit.model_fields
         assert "reasoning" not in EpisodicMemoryHit.model_fields
-        f = episodic_module.stored_judge_verdict
+        f = memory_module.stored_judge_verdict
         assert f("buy", 0.7) == (RecommendationAction.BUY, 0.7)
         assert f("buy", None) == (None, None)
         assert f(None, 0.7) == (None, None)
@@ -1077,8 +1055,8 @@ class TestEpisodicMemory:
             user_id=None, analysis_id=without.id, ticker=ticker,
             recommendation="sell", confidence=0.5, summary="s")
         monkeypatch.setattr(
-            episodic_module, "SessionLocal", _fake_session_local(db_session))
-        hits = await episodic_module.retrieve_episodic_context(
+            memory_module, "SessionLocal", _fake_session_local(db_session))
+        hits = await memory_module.retrieve_episodic_context(
             ticker, user_id=None, limit=5)
         by_id = {h.analysis_id: h for h in hits}
         raw = by_id[str(with_raw.id)]
@@ -1094,7 +1072,7 @@ class TestEpisodicMemory:
             self,
             scratch: Any  # noqa: F811
     ) -> None:
-        schema, engine, _ = scratch
+        schema, engine = scratch
         judge_columns = {"judge_leaning", "judge_confidence"}
 
         async def _has_owner() -> bool:
@@ -1438,7 +1416,7 @@ class TestAnalysisWorkflow:
     async def test_learning_still_runs_when_publishing_fails(
             self, rows, workflow_env, monkeypatch):
         import shared.events as shared_events
-        from shared.events_registry import EventName
+        from shared.events import EventName
 
         wf, _events = workflow_env
         archived: list[Any] = []

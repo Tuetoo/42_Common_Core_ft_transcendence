@@ -392,7 +392,7 @@ user`), or `organization_id` in the user's organizations. An analysis
 without a user (a system analysis) sees system chunks only. The user's
 organizations come from auth-service (`resolve_visibility_scope` through
 `clients/auth_client.list_user_organization_ids`), cached in Redis by
-`shared/org_membership_cache.py` (60 s) and deleted by auth-service when a
+`shared/user_state.py` (60 s) and deleted by auth-service when a
 membership changes. There is no second cache inside the process: a
 membership change could not clear it. If auth-service fails, the scope falls back to system plus the user's
 own documents.
@@ -624,7 +624,7 @@ ticker and at least one English item.
 - The News tool (`ai/tools/news_tool.py::SearchNewsTool`) uses the
   classified items and caps consumer items per run. Without a ticker
   nothing is classified and every item is `unclassified`.
-- The daily news digest (`ai/ingestion/news_ingestion.py`) passes the
+- The daily news digest (`ai/ingestion/digests.py`) passes the
   classified items to `stored_evidence_articles`. It stores only items
   with a trusted company_business or stock_market verdict
   (`CONFIRMED_EVIDENCE_KINDS`).
@@ -648,7 +648,7 @@ words are split, because NewsAPI reads "-" as "exclude". The digest
 passes an empty query, so it searches the company alone. A bare ticker
 was not enough: "KO" returned boxing items.
 
-**The web-search classifier** (`ai/tools/search_relevance.py::classify_results`)
+**The web-search classifier** (`ai/tools/web_search_tool.py::classify_results`)
 judges each result against the caller's own query, because `web_search`
 is shared by agents with different subjects. One CHEAP call returns per
 result `relevant` (true or false) and a `kind` from the same definitions
@@ -786,7 +786,7 @@ holdings and watchlists, `clients/core_client.py::get_tracked_tickers`):
   (`forget_filing_caches`), so the XBRL line sees the new filing
   (chapter 18, sections 3.10-3.12). A filing that could not be stored
   makes the ticker count as failed, and its news step is skipped.
-- *News:* `ai/ingestion/news_ingestion.py::generate_news_digest` builds at
+- *News:* `ai/ingestion/digests.py::generate_news_digest` builds at
   most one digest per ticker per day (`{TICKER}_news_{date}.txt`). It
   fetches up to 8 NewsAPI articles of the last 28 days, newest first
   (`sort_by="publishedAt"`, so the digest does not repeat the same
@@ -805,7 +805,7 @@ document route (`create_system_document`), so it goes through the normal
 `document.uploaded` path and becomes a system document.
 
 **`run_macro_auto_ingestion_workflow`**: once per calendar month
-(`macro_auto_{YYYY-MM}.txt`), `ai/ingestion/macro_ingestion.py` fetches
+(`macro_auto_{YYYY-MM}.txt`), `ai/ingestion/digests.py::generate_macro_report` fetches
 five FRED indicators (fed funds rate, CPI, unemployment rate, GDP, 10-year
 Treasury yield) and has the Lite model write a short narrative from those
 values only. Every indicator is fetched with the macro tool's
@@ -820,7 +820,7 @@ observations is logged (`auto_ingestion.macro_indicator_empty`) and left
 out.
 
 The same filing check also runs during an analysis
-(`ai/knowledge/fresh_filings.py`, chapter 16): a brand-new filing is
+(`ai/graph/nodes.py::load_fresh_filing_context`, chapter 16): a brand-new filing is
 ingested and also handed directly to that analysis's agents.
 
 ### 3.14 Seed documents
@@ -866,15 +866,15 @@ are uploaded without a ticker.
 
 | Tool | Purpose |
 |---|---|
-| `ai/evaluation/golden_set.py` | sample indexed chunks, ask an LLM for one question whose answer is in that chunk; drop near-duplicate chunks and duplicate questions |
+| `ai/evaluation/rag_recall.py` (`generate_golden_set`) | sample indexed chunks, ask an LLM for one question whose answer is in that chunk; drop near-duplicate chunks and duplicate questions |
 | `scripts/generate_rag_golden_set.py` | runs the generator in the container (Lite model), writes the JSON |
 | `tests/fixtures/rag_golden_set.json` | the current golden set (909 questions: 706 earnings_call, 126 filing, 31 news, 25 analyst_report, 16 risk_analysis, 5 macro_research) |
-| `ai/evaluation/recall.py` | Recall@K, Recall@1/@3, MRR for BM25-only, vector-only and fused |
+| `ai/evaluation/rag_recall.py` (scoring) | Recall@K, Recall@1/@3, MRR for BM25-only, vector-only and fused |
 | `scripts/measure_rag_recall.py` | read-only measurement of the live index against a golden set; `--sweep` is the grid search for the weights in `category_weights.json` |
 | `tests/integration/test_rag_recall.py` | integration test gate on recall: Recall@5 floors for BM25, vector and fused (chapter 31, section 3.6); skipped when the golden set file is missing |
 | `tests/ai-service/test_rag.py` | checks the recall arithmetic (Recall@1/@3, MRR) against hand-computed values |
 
-How a question is scored (`ai/evaluation/recall.py`): each golden-set
+How a question is scored (`ai/evaluation/rag_recall.py`): each golden-set
 question runs through `BaseRetriever` three times, with `sources={"bm25"}`,
 `sources={"vector"}` and both (the fused RRF path), and counts a hit when
 the expected chunk id is in the top K. RAG recall is the first of the four
@@ -935,7 +935,7 @@ sets the embedding values explicitly.
 | code: `_ECHO_MIN_OVERLAP`, `_ECHO_WORDS` | 0.6, 6 | title echo check |
 | code: `_STALE_FILING_THRESHOLD_DAYS` | 450 | stale flag of `search_filings` |
 | code: `_STALE_THRESHOLD_DAYS` | see 3.9 | stale flags of the archive tools |
-| code: digest limits | 8 articles, 28 days, 80 words | `ai/ingestion/news_ingestion.py` |
+| code: digest limits | 8 articles, 28 days, 80 words | `ai/ingestion/digests.py` |
 | file: `ai/rag/category_weights.json` | see 3.9 | fusion weights per category |
 
 ---
@@ -1234,14 +1234,13 @@ bash scripts/psql.sh -c "SELECT count(*) AS chunk_rows, count(DISTINCT document_
 | `services/ai-service/ai/workflows/auto_ingestion_workflow.py` | daily filing/news and monthly macro ingestion |
 | `services/ai-service/ai/ingestion/` | SEC EDGAR, NewsAPI digest, FRED macro report |
 | `services/ai-service/ai/providers/news_relevance.py`, `news_filters.py` | news relevance classifier, `verify_with_cheap_tier`, `parsed_with_retry`, `clean_articles`, `stored_evidence_articles`; structural pre-checks and the NewsAPI query builder |
-| `services/ai-service/ai/tools/search_relevance.py` | web-search relevance classifier |
-| `services/ai-service/ai/tools/news_tool.py`, `web_search_tool.py` | result lines, kind tags, catalog field, result header |
+| `services/ai-service/ai/tools/news_tool.py`, `web_search_tool.py` | result lines, kind tags, catalog field, result header; the web-search relevance classifier (`classify_results`, in `web_search_tool.py`) |
 | `services/ai-service/ai/providers/newsapi.py` | NewsAPI client and source catalog |
 | `services/ai-service/ai/tools/filing_tool.py`, `research_archive_tool.py` | agent search tools |
 | `services/ai-service/event_listener.py` | `document.uploaded` / `document.deleted` handlers |
 | `services/ai-service/domains/rag/` | ask API, schema, QA flow, repositories, models |
 | `services/ai-service/qdrant.py` | Qdrant client and collection check |
-| `services/ai-service/ai/evaluation/` | golden set generation, recall |
+| `services/ai-service/ai/evaluation/rag_recall.py` | golden set generation, recall |
 | `services/ai-service/scripts/measure_rag_recall.py` and siblings | evaluation and maintenance scripts |
 | `services/core-service/domains/research/` | upload, duplicate check, delete, status persistence |
 

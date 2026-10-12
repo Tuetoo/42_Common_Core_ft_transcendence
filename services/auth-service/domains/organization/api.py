@@ -54,7 +54,7 @@ async def get_organization(
 @router.patch("/{org_id}", response_model=APIResponse[OrganizationRead])
 async def update_organization(
     org_id: UUID, data: OrganizationUpdate, background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[OrganizationRead]:
     service = OrganizationService(db)
@@ -66,7 +66,7 @@ async def update_organization(
 @router.delete("/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_organization(
     org_id: UUID, background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
     service = OrganizationService(db)
@@ -91,7 +91,7 @@ async def list_members(
     status_code=status.HTTP_204_NO_CONTENT)
 async def remove_member(
     org_id: UUID, user_id: UUID, background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
     service = OrganizationService(db)
@@ -120,7 +120,7 @@ async def leave_organization(
 async def update_member_role(
     org_id: UUID, user_id: UUID, data: MemberRoleUpdate,
     background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[OrganizationMemberRead]:
     service = OrganizationService(db)
@@ -171,7 +171,7 @@ async def list_invitations(
         "only; an admin invitation can be revoked by the owner only."))
 async def revoke_invitation(
     org_id: UUID, invitation_id: UUID,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
     await OrganizationService(db).revoke_invitation(
@@ -183,7 +183,7 @@ async def revoke_invitation(
     description=(
         "Accept an organization invitation. The body carries the token from "
         "the link in the invitation email (never put it in the URL path). "
-        "Guests may accept; owner invitations are rejected with 409."))
+        "Guests may accept."))
 async def accept_invitation(
     data: InvitationAccept, background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(get_current_user),

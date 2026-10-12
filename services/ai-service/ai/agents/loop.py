@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 import structlog
+from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMMessage,
                          LLMNonEnglishOutputError, LLMResponse, LLMTier)
@@ -16,7 +17,7 @@ from ai.llm.json_fence import parse_json_dict
 from ai.llm.router import LLMRouter
 from ai.tools.base import NON_EVIDENTIAL_TOOLS, Tool, is_evidence_record
 from config import settings
-from shared.enums import AgentRole
+from shared.enums import AgentRole, AgentStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -438,6 +439,23 @@ def derive_agent_quality(
         "agent_loop.quality_score_derived", role=result.role, score=score,
         is_retry=is_retry, thin_evidence=thin_evidence, **signals)
     return score, True
+
+
+def flag_unresolved_issue(
+        result: AgentLoopResult, summary: str, warnings: list[str], *,
+        event: str, ticker: str, consequence: str) -> str:
+    issue = result.unresolved_finish_validation_issue
+    if issue is None:
+        return summary
+    logger.warning(event, ticker=ticker, issue=issue)
+    reason = f"{issue}{consequence}"
+    warnings.append(reason)
+    return wrap_verification_warning(reason, summary)
+
+
+def combine_context(*parts: str | None) -> str | None:
+    non_empty = [p for p in parts if p]
+    return "\n\n".join(non_empty) if non_empty else None
 
 
 def is_thin_evidence(evidence_yield: int | None) -> bool:
@@ -1000,3 +1018,27 @@ class BaseAgent(ABC):
     @abstractmethod
     async def run(self, state: AnalysisState) -> AgentOutput:
         raise NotImplementedError
+
+    def completed_output(
+            self, result: AgentLoopResult, *, feedback: str | None,
+            summary: str, raw_output: dict[str, Any],
+            verification_warnings: list[str] | None = None,
+            no_evidence: bool = False, thin_evidence: bool = False,
+            recycled: bool = False) -> AgentOutput:
+        score, is_well_supported = derive_agent_quality(
+            result, is_retry=feedback is not None, no_evidence=no_evidence,
+            thin_evidence=thin_evidence,
+            verification_warnings=verification_warnings, recycled=recycled)
+        warnings_field = ({} if verification_warnings is None else {
+            "verification_warnings": verification_warnings
+        })
+        return AgentOutput(
+            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
+            score=score, is_well_supported=is_well_supported,
+            iterations_used=result.iterations_used,
+            hit_iteration_cap=result.hit_iteration_cap,
+            retry_of_feedback=feedback, raw_output={
+                "scratchpad": [vars(e) for e in result.scratchpad],
+                **warnings_field,
+                **raw_output, "finish_meta": result.finish_meta
+            })

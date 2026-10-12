@@ -58,7 +58,7 @@ async def _schema_ready():
     await admin_engine.dispose()
 
     import apikeys  # noqa: F401
-    import outbox_model  # noqa: F401
+    import outbox  # noqa: F401
     from database import engine as app_engine
     import domains.notification.model  # noqa: F401
     import domains.portfolio.model  # noqa: F401
@@ -198,3 +198,13 @@ def published_events(monkeypatch):
 
     monkeypatch.setattr(outbox, "publish_durable_event", _publish)
     return events
+
+
+@pytest.fixture
+def no_sentiment_analysis(monkeypatch):
+    import clients.ai_client as ai_client
+
+    async def _none(text, kind):
+        return None
+
+    monkeypatch.setattr(ai_client, "analyze_sentiment", _none)

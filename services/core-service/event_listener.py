@@ -4,16 +4,16 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 import structlog
-from api.yjs_websocket import recheck_user_sessions
+from api.websocket import recheck_user_sessions
 from config import settings
 from database import SessionLocal
 from sqlalchemy import select
 from websocket_manager import WebSocketEnvelope, manager
-from domains.notification import actions
+import domains.notification.service as notifications
 from domains.research.repository import DocumentRepository
 from shared.enums import NotificationType
-from shared.events import CrossServiceSubscriber, DurableEventSubscriber
-from shared.events_registry import EventName
+from shared.events import (CrossServiceSubscriber, DurableEventSubscriber,
+                           EventName)
 from shared.redis import get_events_client
 from shared.schemas import SYSTEM_DOCUMENT_OWNER_ID
 
@@ -38,38 +38,38 @@ async def _claim_event(event: str, payload: dict[str, Any]) -> bool:
     return bool(claimed)
 
 
-async def _handle_analysis_completed(payload: dict[str, Any]) -> None:
-    analysis_id = payload.get("analysis_id")
-    await _broadcast_analysis(EventName.ANALYSIS_COMPLETED, payload)
-
+async def _notify_payload_user(
+        event: str, payload: dict[str, Any], *, type: NotificationType,
+        title: str, content: str) -> None:
     user_id = payload.get("user_id")
     if not user_id:
         logger.warning(
-            "analysis_completed_missing_user_id", analysis_id=analysis_id)
+            "event_missing_user_id", event_name=str(event),
+            analysis_id=payload.get("analysis_id"))
         return
-    if not await _claim_event(EventName.ANALYSIS_COMPLETED, payload):
+    if not await _claim_event(event, payload):
         return
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.ANALYSIS_COMPLETED,
+    await notifications.notify_user(
+        user_id=user_id, type=type, title=title, content=content)
+
+
+async def _handle_analysis_completed(payload: dict[str, Any]) -> None:
+    await _broadcast_analysis(EventName.ANALYSIS_COMPLETED, payload)
+    await _notify_payload_user(
+        EventName.ANALYSIS_COMPLETED, payload,
+        type=NotificationType.ANALYSIS_COMPLETED,
         title="Your analysis is ready",
-        content=f"Analysis {analysis_id} has completed.")
+        content=f"Analysis {payload.get('analysis_id')} has completed.")
 
 
 async def _handle_recommendation_ready(payload: dict[str, Any]) -> None:
-    analysis_id = payload.get("analysis_id")
     await _broadcast_analysis(EventName.RECOMMENDATION_READY, payload)
-
-    user_id = payload.get("user_id")
-    if not user_id:
-        logger.warning(
-            "recommendation_ready_missing_user_id", analysis_id=analysis_id)
-        return
-    if not await _claim_event(EventName.RECOMMENDATION_READY, payload):
-        return
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.RECOMMENDATION_READY,
+    await _notify_payload_user(
+        EventName.RECOMMENDATION_READY, payload,
+        type=NotificationType.RECOMMENDATION_READY,
         title="A new recommendation is ready",
-        content=f"Analysis {analysis_id} produced a recommendation.")
+        content=f"Analysis {payload.get('analysis_id')} produced a "
+        "recommendation.")
 
 
 async def _persist_document_status(payload: dict[str, Any]) -> None:
@@ -108,13 +108,13 @@ async def _persist_document_status(payload: dict[str, Any]) -> None:
         return
     name = updated.title or updated.filename
     if updated.status == "ready":
-        await actions.notify_user(
+        await notifications.notify_user(
             user_id=updated.owner_id, type=NotificationType.DOCUMENT_READY,
             title="Document ready", content=(
                 f'Your document "{name}" has been processed and is searchable.'
             ))
     else:
-        await actions.notify_user(
+        await notifications.notify_user(
             user_id=updated.owner_id, type=NotificationType.DOCUMENT_FAILED,
             title="Document processing failed",
             content=f'Your document "{name}" could not be processed.')
@@ -146,17 +146,17 @@ async def _notify_organization(
         return
     affected = payload.get("user_id") or None
     if affected and user_title is not None:
-        await actions.notify_user(
+        await notifications.notify_user(
             user_id=affected, type=type, title=user_title, content=user_content
             or member_content)
         others = [m for m in _member_ids(payload) if str(m) != str(affected)]
     else:
         others = [*_member_ids(payload), *([affected] if affected else [])]
-    await actions.notify_users(
+    await notifications.notify_users(
         others, type=type, title=member_title, content=member_content)
 
 
-async def _recheck_yjs_sessions(
+async def _recheck_sessions(
         user_ids: list[Any], *, reason: str,
         deactivated: bool = False) -> None:
     for user_id in dict.fromkeys(str(u) for u in user_ids if u):
@@ -188,7 +188,7 @@ async def _handle_organization_updated(payload: dict[str, Any]) -> None:
 
 
 async def _handle_organization_deleted(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions(
+    await _recheck_sessions(
         _member_ids(payload), reason=EventName.ORGANIZATION_DELETED)
     org = _org_name(payload)
     await _notify_organization(
@@ -214,8 +214,8 @@ async def _handle_organization_member_joined(payload: dict[str, Any]) -> None:
 
 
 async def _handle_organization_member_left(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.ORGANIZATION_MEMBER_LEFT)
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.ORGANIZATION_MEMBER_LEFT)
     org = _org_name(payload)
     await _notify_organization(
         payload, EventName.ORGANIZATION_MEMBER_LEFT,
@@ -227,8 +227,8 @@ async def _handle_organization_member_left(payload: dict[str, Any]) -> None:
 
 
 async def _handle_organization_member_removed(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.ORGANIZATION_MEMBER_REMOVED)
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.ORGANIZATION_MEMBER_REMOVED)
     org = _org_name(payload)
     await _notify_organization(
         payload, EventName.ORGANIZATION_MEMBER_REMOVED,
@@ -240,8 +240,8 @@ async def _handle_organization_member_removed(payload: dict[str, Any]) -> None:
 
 
 async def _handle_organization_role_changed(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.ORGANIZATION_ROLE_CHANGED)
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.ORGANIZATION_ROLE_CHANGED)
     org = _org_name(payload)
     role = payload.get("role") or "a new role"
     await _notify_organization(
@@ -255,57 +255,40 @@ async def _handle_organization_role_changed(payload: dict[str, Any]) -> None:
 
 async def _handle_organization_invitation_created(
         payload: dict[str, Any]) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(
-            EventName.ORGANIZATION_INVITATION_CREATED, payload):
-        return
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.ORGANIZATION_INVITE,
+    await _notify_payload_user(
+        EventName.ORGANIZATION_INVITATION_CREATED, payload,
+        type=NotificationType.ORGANIZATION_INVITE,
         title="Organization invitation", content=(
             f"You were invited to join the organization {_org_name(payload)}."
         ))
 
 
-async def _handle_friend_event(
-        payload: dict[str, Any], event: str, *, type: NotificationType,
-        title: str, verb: str) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(event, payload):
-        return
-    actor = payload.get("actor_username") or "Someone"
-    await actions.notify_user(
-        user_id=user_id, type=type, title=title, content=f"{actor} {verb}.")
+def _actor(payload: dict[str, Any]) -> str:
+    return str(payload.get("actor_username") or "Someone")
 
 
 async def _handle_friend_requested(payload: dict[str, Any]) -> None:
-    await _handle_friend_event(
-        payload, EventName.FRIEND_REQUESTED,
-        type=NotificationType.FRIEND_REQUEST, title="New friend request",
-        verb="sent you a friend request")
+    await _notify_payload_user(
+        EventName.FRIEND_REQUESTED, payload,
+        type=NotificationType.FRIEND_REQUEST,
+        title="New friend request",
+        content=f"{_actor(payload)} sent you a friend request.")
 
 
 async def _handle_friend_accepted(payload: dict[str, Any]) -> None:
-    await _handle_friend_event(
-        payload, EventName.FRIEND_ACCEPTED,
-        type=NotificationType.FRIEND_ACCEPTED, title="Friend request accepted",
-        verb="accepted your friend request")
+    await _notify_payload_user(
+        EventName.FRIEND_ACCEPTED, payload,
+        type=NotificationType.FRIEND_ACCEPTED,
+        title="Friend request accepted",
+        content=f"{_actor(payload)} accepted your friend request.")
 
 
 async def _handle_friend_removed(payload: dict[str, Any]) -> None:
-    await _handle_friend_event(
-        payload, EventName.FRIEND_REMOVED,
-        type=NotificationType.FRIEND_REMOVED, title="Friend removed",
-        verb="removed you from their friends")
-
-
-async def _handle_user_event(
-        payload: dict[str, Any], event: str, *, type: NotificationType,
-        title: str, content: str) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(event, payload):
-        return
-    await actions.notify_user(
-        user_id=user_id, type=type, title=title, content=content)
+    await _notify_payload_user(
+        EventName.FRIEND_REMOVED, payload,
+        type=NotificationType.FRIEND_REMOVED,
+        title="Friend removed",
+        content=f"{_actor(payload)} removed you from their friends.")
 
 
 async def _handle_user_updated(payload: dict[str, Any]) -> None:
@@ -313,44 +296,44 @@ async def _handle_user_updated(payload: dict[str, Any]) -> None:
     fields = (
         ", ".join(str(f)
                   for f in changed) if isinstance(changed, list) else "")
-    await _handle_user_event(
-        payload, EventName.USER_UPDATED, type=NotificationType.ACCOUNT_UPDATED,
+    await _notify_payload_user(
+        EventName.USER_UPDATED, payload, type=NotificationType.ACCOUNT_UPDATED,
         title="Account updated", content=(
             f"Your account was updated ({fields})."
             if fields else "Your account was updated."))
 
 
 async def _handle_user_role_changed(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.USER_ROLE_CHANGED)
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.USER_ROLE_CHANGED)
     role = payload.get("role") or "a new role"
-    await _handle_user_event(
-        payload, EventName.USER_ROLE_CHANGED,
+    await _notify_payload_user(
+        EventName.USER_ROLE_CHANGED, payload,
         type=NotificationType.ACCOUNT_ROLE_CHANGED, title="Your role changed",
         content=f"Your account role is now {role}.")
 
 
 async def _handle_user_deactivated(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.USER_DEACTIVATED,
-                                deactivated=True)
-    await _handle_user_event(
-        payload, EventName.USER_DEACTIVATED,
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.USER_DEACTIVATED,
+                            deactivated=True)
+    await _notify_payload_user(
+        EventName.USER_DEACTIVATED, payload,
         type=NotificationType.ACCOUNT_UPDATED, title="Account deactivated",
         content="Your account was deactivated by an administrator.")
 
 
 async def _handle_user_reactivated(payload: dict[str, Any]) -> None:
-    await _handle_user_event(
-        payload, EventName.USER_REACTIVATED,
+    await _notify_payload_user(
+        EventName.USER_REACTIVATED, payload,
         type=NotificationType.ACCOUNT_UPDATED, title="Account reactivated",
         content="Your account was reactivated.")
 
 
 async def _handle_user_deleted(payload: dict[str, Any]) -> None:
-    await _recheck_yjs_sessions([payload.get("user_id")],
-                                reason=EventName.USER_DELETED,
-                                deactivated=True)
+    await _recheck_sessions([payload.get("user_id")],
+                            reason=EventName.USER_DELETED,
+                            deactivated=True)
     logger.info("user_deleted_received", user_id=payload.get("user_id"))
 
 
@@ -368,13 +351,10 @@ async def _broadcast_analysis(event: str, payload: dict[str, Any]) -> None:
 
 async def _handle_analysis_started(payload: dict[str, Any]) -> None:
     await _broadcast_analysis(EventName.ANALYSIS_STARTED, payload)
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(EventName.ANALYSIS_STARTED,
-                                             payload):
-        return
     ticker = payload.get("ticker") or "your ticker"
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.ANALYSIS_STARTED,
+    await _notify_payload_user(
+        EventName.ANALYSIS_STARTED, payload,
+        type=NotificationType.ANALYSIS_STARTED,
         title="Analysis started", content=(
             f"The analysis of {ticker} ({payload.get('analysis_id')}) started."
         ))
@@ -382,14 +362,11 @@ async def _handle_analysis_started(payload: dict[str, Any]) -> None:
 
 async def _handle_analysis_failed(payload: dict[str, Any]) -> None:
     await _broadcast_analysis(EventName.ANALYSIS_FAILED, payload)
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(EventName.ANALYSIS_FAILED,
-                                             payload):
-        return
     ticker = payload.get("ticker") or "your ticker"
     reason = payload.get("failure_reason")
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.ANALYSIS_FAILED,
+    await _notify_payload_user(
+        EventName.ANALYSIS_FAILED, payload,
+        type=NotificationType.ANALYSIS_FAILED,
         title="Analysis failed", content=(
             f"The analysis of {ticker} failed: {reason}."
             if reason else f"The analysis of {ticker} failed."))
@@ -397,23 +374,16 @@ async def _handle_analysis_failed(payload: dict[str, Any]) -> None:
 
 async def _handle_decision_recorded(payload: dict[str, Any]) -> None:
     await _broadcast_analysis(EventName.DECISION_RECORDED, payload)
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(EventName.DECISION_RECORDED,
-                                             payload):
-        return
     ticker = payload.get("ticker") or "the ticker"
     decision = payload.get("decision") or "recorded"
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.DECISION_RECORDED,
+    await _notify_payload_user(
+        EventName.DECISION_RECORDED, payload,
+        type=NotificationType.DECISION_RECORDED,
         title="Decision recorded",
         content=f"Your decision on {ticker} was recorded ({decision}).")
 
 
 async def _handle_decision_outcome_evaluated(payload: dict[str, Any]) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(
-            EventName.DECISION_OUTCOME_EVALUATED, payload):
-        return
     ticker = payload.get("ticker") or "the ticker"
     days = payload.get("evaluation_days")
     after = f" after {days} days" if days else ""
@@ -427,8 +397,9 @@ async def _handle_decision_outcome_evaluated(payload: dict[str, Any]) -> None:
             f"({alpha * 100:+.1f} percentage points)")
     else:
         result = " (no price data to compare with the benchmark)"
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.DECISION_EVALUATED,
+    await _notify_payload_user(
+        EventName.DECISION_OUTCOME_EVALUATED, payload,
+        type=NotificationType.DECISION_EVALUATED,
         title="Decision evaluated",
         content=f"Your decision on {ticker} was evaluated{after}{result}.")
 
@@ -463,7 +434,7 @@ async def _handle_tier_event(
             "tier_event_without_recipient", event_name=event,
             tier_id=payload.get("tier_id"))
         return
-    await actions.notify_user(
+    await notifications.notify_user(
         user_id=user_id, type=type, title=title, content=describe(payload))
 
 
@@ -511,26 +482,20 @@ async def _handle_tier_cancelled(payload: dict[str, Any]) -> None:
 
 
 async def _handle_backtest_completed(payload: dict[str, Any]) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(EventName.BACKTEST_COMPLETED,
-                                             payload):
-        return
     kind = payload.get("kind") or "backtest"
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.BACKTEST_COMPLETED,
+    await _notify_payload_user(
+        EventName.BACKTEST_COMPLETED, payload,
+        type=NotificationType.BACKTEST_COMPLETED,
         title="Backtest completed", content=(
             f"Your {kind} backtest ({payload.get('backtest_id')}) completed."))
 
 
 async def _handle_backtest_failed(payload: dict[str, Any]) -> None:
-    user_id = payload.get("user_id")
-    if not user_id or not await _claim_event(EventName.BACKTEST_FAILED,
-                                             payload):
-        return
     kind = payload.get("kind") or "backtest"
     error = payload.get("error")
-    await actions.notify_user(
-        user_id=user_id, type=NotificationType.BACKTEST_FAILED,
+    await _notify_payload_user(
+        EventName.BACKTEST_FAILED, payload,
+        type=NotificationType.BACKTEST_FAILED,
         title="Backtest failed", content=(
             f"Your {kind} backtest failed: {error}."
             if error else f"Your {kind} backtest failed."))

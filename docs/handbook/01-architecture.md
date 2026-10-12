@@ -131,7 +131,7 @@ are behind profiles). Source: `docker-compose.yaml` and
 | `grafana` | `grafana/grafana:13.1.1` | dashboards, served at `/grafana/` | 3000 | none (through the gateway) | prometheus | none | `grafana_data`, provisioning |
 | `scheduler` | built, `infra/scheduler/Dockerfile` (Alpine 3.20 + dcron) | cron jobs and nightly backup | - | none | postgres, qdrant, objectstore healthy | none | `./logs`, `./backups`, `avatar_data` (ro); objects are copied through the S3 API |
 | `vector` | `timberio/vector:0.46.1-alpine` | copies every compose container's output to `./logs/` | - | none | - | none | Docker socket (ro), `./logs` |
-| `restore` (profile `tools`) | same image as scheduler | one-off restore runner | - | none | postgres healthy, qdrant started | none | `./backups`, `avatar_data` **read-write**, `objectstore_data` read-write (only for older tarball backups); objects are restored through the S3 API |
+| `restore` (profile `tools`) | same image as scheduler | one-off restore runner | - | none | postgres healthy, qdrant started | none | `./backups`, `avatar_data` **read-write**; objects are restored through the S3 API |
 | `adminer` (profile `adminer`) | `adminer:4.8.1` | PostgreSQL web UI | 8080 | `127.0.0.1:8080` | postgres healthy | none | - |
 
 Every container uses the same log settings (`x-logging` anchor at the top
@@ -240,8 +240,8 @@ that the application must keep the links tidy itself, for example with
 the `portfolio.deleted` event (section 3.5).
 
 **Each service migrates its own schema.** At startup each service calls
-`db_bootstrap.ensure_schema`, which calls
-`shared/alembic_bootstrap.py::bootstrap_schema`. It creates the schema if
+`database.ensure_schema`, which calls
+`shared/database.py::bootstrap_schema`. It creates the schema if
 it is missing and runs `alembic upgrade head`. Each schema has its own
 `alembic_version` table, so the three services can start at the same
 time without stepping on each other. Chapter [20](20-postgresql.md)
@@ -304,7 +304,7 @@ The pieces:
 | Caller | Client module | Internal routes it calls |
 |---|---|---|
 | core-service | `clients/auth_client.py` | `/internal/users/{id}`, `/internal/connections/check`, `/internal/users/{id}/notification-settings`, `/internal/users/{id}/presence` |
-| core-service, ai-service | `clients/auth_client.py` -> `shared/org_membership_cache.py` | auth `/internal/users/{id}/organizations` (organization membership and role, cached 60 s in Redis) |
+| core-service, ai-service | `clients/auth_client.py` -> `shared/user_state.py` | auth `/internal/users/{id}/organizations` (organization membership and role, cached 60 s in Redis) |
 | all three services | `shared/user_state.py` | auth `/internal/users/{id}/state` (live role and active flag, only when the Redis key is missing) |
 | core-service | `clients/ai_client.py` | `/internal/recommendations/latest`, `/internal/analyses/{id}`, `/internal/market/instruments/{ticker}/prices`, `/internal/fx-rate`, `/internal/analyses` (create), `/internal/sentiment` |
 | ai-service | `clients/core_client.py` | `/internal/portfolios/{id}/holdings`, `/owner`, `/cash-balance`, `/snapshots`, `/cash-flows`, `POST /internal/portfolios/{id}/transactions` (tier execution), `/internal/tracked-tickers`, `/internal/documents/filenames`, `/internal/documents` |
@@ -324,7 +324,7 @@ Internal HTTP is for questions ("who owns this portfolio?"). Events are
 for announcements ("analysis X finished"). The publisher does not wait
 for, or even know, the listeners. Two transports exist
 (`shared/events.py`); every event name and its owner is listed in
-`shared/events_registry.py` (`EventName`, `EVENT_OWNERS`).
+`shared/events.py` (`EventName`, `EVENT_OWNERS`).
 
 | Transport | Function | Redis | Guarantee | Used for |
 |---|---|---|---|---|
@@ -432,7 +432,7 @@ All three services use the same building blocks from `shared/`, so a
 client sees the same shapes everywhere. A client (the frontend,
 a script) must be ready for every shape below.
 
-**Request id.** `shared/request_id.py::RequestIdMiddleware` runs in every
+**Request id.** `shared/logging.py::RequestIdMiddleware` runs in every
 service. It takes the caller's `X-Request-ID` header when it is a short
 safe token (regex `[A-Za-z0-9._-]{1,64}`), otherwise it makes a new
 `uuid4` hex. It stores the id in `request.state.request_id`, binds it to
@@ -454,7 +454,7 @@ lines of a failed request: `bash scripts/logs.sh <service> | grep <id>`.
 | plain JSON or `204` with no body | route-specific | some routes, and every `/internal/*` route |
 
 `request_id` inside `APIResponse` is filled automatically: its default is
-`shared/request_id.py::current_request_id()`, the id the middleware set for
+`shared/logging.py::current_request_id()`, the id the middleware set for
 this request. So it is the same id as the `X-Request-ID` header, the log
 lines and (for a failed request) the error body. No route sets it. The
 shapes without a `data` envelope (paginated lists, plain JSON, 204) carry
@@ -645,8 +645,6 @@ auth-service:
     - ./shared:/app/shared
     - ./services/auth-service:/app
     - avatar_data:/app/data/avatars
-  command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000",
-            "--proxy-headers", "--forwarded-allow-ips=*"]
 # core-service: same pattern; ai-service: same pattern plus LOG_LEVEL=DEBUG
 ```
 
@@ -673,8 +671,7 @@ What this means:
   analyses in ai-service, and every WebSocket and in-memory Yjs editing
   room in core-service (one file delivery restarted core-service four
   times in three seconds). The Dockerfiles' development `CMD` has no
-  `--reload` either; the override still sets `command` explicitly so an
-  image built from an older Dockerfile is also reload-free.
+  `--reload`, and the override does not set `command`.
 - **Forwarded headers are trusted.** `--proxy-headers
   --forwarded-allow-ips=*` makes the request's client address and scheme
   come from the gateway's `X-Forwarded-*` headers. Trusting every
@@ -719,9 +716,8 @@ What still needs an image **rebuild** (`up -d --build`, or
   with `TZ=America/New_York`. Its job scripts and crontab are **copied**
   into the image, not mounted. `jq` parses Qdrant's REST answers and
   writes the backup manifest; `rclone` copies the object storage's
-  objects through its S3 API. The folders `/backups`, `/avatar-data` and
-  (for `restore`) `/objectstore-data` are deliberately not created in the
-  image: they must
+  objects through its S3 API. The folders `/backups` and `/avatar-data`
+  are deliberately not created in the image: they must
   come from Compose mounts, and `backup.sh` refuses to run (or skips the
   avatars) when one is missing, instead of silently backing up an empty
   folder inside the container.
@@ -759,12 +755,12 @@ scripts.
 | PostgreSQL 16 | Transactions and constraints for financial data (ledger, tiers), JSONB for flexible fields, full-text search (`TSVECTOR`) for notes. |
 | Redis 7 | Already needed for caches and rate limits; its pub/sub and streams give events without running a separate message broker. |
 | Qdrant | A dedicated vector database for RAG similarity search, owned by ai-service so vector load stays off PostgreSQL. |
-| SeaweedFS (S3 API) + boto3 | S3-compatible storage in one container. MinIO's public images were withdrawn from Docker Hub and Quay, so a fresh install could not pull it; SeaweedFS is pullable and speaks the same protocol. The code speaks plain S3 through boto3, so AWS S3 or Cloudflare R2 work by changing `S3_ENDPOINT_URL` and the keys. |
+| SeaweedFS (S3 API) + boto3 | S3-compatible storage in one container that a fresh install can pull (it replaced MinIO; see [chapter 22](22-object-storage.md)). The code speaks plain S3 through boto3, so AWS S3 or Cloudflare R2 work by changing `S3_ENDPOINT_URL` and the keys. |
 | LangGraph + the vendor SDKs (`google-genai`, `mistralai`, `openai`, `anthropic`) | LangGraph gives the agent graph with parallel fan-out, joins and conditional loops (debate rounds, reflection retries). Each LLM provider is called through its own SDK behind one router (`ai/llm/`); no LangChain wrapper is used (`langgraph` itself pulls in `langchain-core`). Google Gemini is the configured default (`LLM_DEFAULT_PROVIDER=google`). |
 | bm25s | Keyword (BM25) search, fused with Qdrant's vector search for hybrid retrieval. |
 | y-py | Python bindings for Yrs, the Rust implementation of the Yjs CRDT, for collaborative note editing in core-service. |
 | nginx | Mature reverse proxy: TLS, WebSocket upgrade, path routing, rate limiting, static status page. |
-| Next.js 16 + React 19 (Node 24) | The frontend: server-rendered pages and Server Actions, so the tokens stay in httpOnly cookies on the frontend's server; `yjs` for the collaborative note editor. |
+| Next.js 16 + React 19 (Node 24) | The frontend: server-rendered pages and Server Actions, so the refresh token stays in an httpOnly cookie on the frontend's server (the short-lived access token is also given to the page for live connections); `yjs` for the collaborative note editor. |
 | Prometheus + Alertmanager + Grafana + exporters | Standard open-source metrics, alert rules with unit tests, email alerts, dashboards. |
 | vector | Copies every compose container's output to dated files on disk, independent of the application code, so logs survive container recreation. |
 | MailHog | Catches all email locally, so verification and reset emails can be read without a real mail provider. |
@@ -873,8 +869,7 @@ fresh install gets the same versions. Never pin an image to a version
 older than the one that already wrote a volume: Grafana and Qdrant cannot
 downgrade their stored data. Keep the application on a standard protocol
 (S3) and the network name stable (`minio` alias), so a server can be
-swapped without touching the services; this is how MinIO was replaced
-by SeaweedFS when its public images disappeared.
+swapped without touching the services.
 
 **Logs to files by a separate collector.** Docker's own logs vanish when
 a container is recreated, so a failed overnight batch could not be
@@ -995,23 +990,22 @@ Run from the repository root with the stack already up (see
 | File | What it holds |
 |---|---|
 | `docker-compose.yaml` | Every container, ports, volumes, health checks, dependencies, log limits, profiles. |
-| `docker-compose.override.yml` | Development stage, bind-mounted source, uvicorn command without `--reload` and with `--proxy-headers`, ai-service `LOG_LEVEL=DEBUG`. |
-| `shared/request_id.py`, `shared/exceptions.py`, `shared/schemas.py` | Request id middleware, error envelope and status map, response and pagination models (section 3.6b). |
+| `docker-compose.override.yml` | Development stage (its Dockerfile `CMD` runs uvicorn without `--reload` and with `--proxy-headers`), bind-mounted source, ai-service `LOG_LEVEL=DEBUG`. |
+| `shared/logging.py`, `shared/exceptions.py`, `shared/schemas.py` | Request id middleware, error envelope and status map, response and pagination models (section 3.6b). |
 | `.env.example` | Template and documentation of every environment setting. |
 | `services/<name>/Dockerfile` | `base`, `development`, `production` stages; uv install into `/opt/venv`; non-root user in production. |
 | `services/<name>/main.py` | FastAPI app, `lifespan` startup/shutdown steps, routers, `/health`, `/metrics`. |
-| `services/<name>/db_bootstrap.py` | Calls `shared/alembic_bootstrap.py::bootstrap_schema` for the service's schema. |
+| `services/<name>/database.py` | Engine and sessions; `ensure_schema` calls `shared/database.py::bootstrap_schema` for the service's schema. |
 | `services/<name>/api/internal.py` | The service's `/internal/*` routes, guarded by `require_internal_token`. |
 | `services/core-service/clients/`, `services/ai-service/clients/` | Typed clients for other services' internal routes. |
 | `services/<name>/event_listener.py` (core, ai) | Event subscriptions and handlers. |
 | `services/ai-service/domains/analysis/queue.py` | The serial in-process analysis queue. |
 | `shared/config.py` | `BaseServiceSettings`: shared settings, service URLs, Redis DB numbers, startup checks. |
-| `shared/database.py` | Engine with per-service `search_path`, `make_get_db`. |
+| `shared/database.py` | Engine with per-service `search_path`, `make_get_db`, startup schema bootstrap with Alembic (`bootstrap_schema`). |
 | `shared/redis.py` | Redis clients per logical database. |
 | `shared/http_client.py` | Pooled `httpx` clients that add the internal token. |
 | `shared/security.py` | JWT decoding, live user state check, `require_internal_token`. |
-| `shared/events.py`, `shared/events_registry.py` | Pub/sub and durable stream transports; event names and owners. |
-| `shared/alembic_bootstrap.py` | Startup schema bootstrap with Alembic. |
+| `shared/events.py` | Pub/sub and durable stream transports; event names and owners. |
 | `infra/gateway/nginx.conf` | Routing, TLS, headers, rate limit, resolver. |
 | `infra/postgres/init-schemas.sql` | Creates `pgcrypto` and the three schemas on first initialisation. |
 | `infra/scheduler/` | Scheduler image, crontab, job scripts, backup and restore. |

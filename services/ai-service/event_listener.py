@@ -2,8 +2,7 @@ from typing import Any
 from uuid import UUID
 import structlog
 from config import settings
-from shared.events import DurableEventSubscriber
-from shared.events_registry import EventName
+from shared.events import DurableEventSubscriber, EventName
 
 logger = structlog.get_logger(__name__)
 

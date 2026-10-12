@@ -59,9 +59,9 @@ async def _schema_ready():
             text(f"CREATE SCHEMA IF NOT EXISTS {settings.POSTGRES_SCHEMA}"))
     await admin_engine.dispose()
 
-    from database import register_all_models
+    from database import register_models
 
-    register_all_models()
+    register_models()
     from database import engine as app_engine
     from shared.database import Base
 
@@ -135,6 +135,20 @@ def _no_agent_prefetch(monkeypatch):
     from config import settings
 
     monkeypatch.setattr(settings, "AGENT_PREFETCH_ENABLED", False)
+
+
+@pytest.fixture
+def clean_pacer(monkeypatch):
+    from ai.llm.base import request_pacer
+    from config import settings
+
+    request_pacer.reset()
+    for name in ("LLM_GOOGLE_CHEAP_MIN_INTERVAL_SECONDS",
+                 "LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS",
+                 "LLM_GOOGLE_LITE_POOL_MIN_DISPATCH_INTERVAL_SECONDS"):
+        monkeypatch.setattr(settings, name, 0.0)
+    yield
+    request_pacer.reset()
 
 
 @pytest.fixture

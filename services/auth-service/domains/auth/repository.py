@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domains.auth.model import (OAuthAccount, SessionRevokeReason,
                                 TwoFactorSecret, User, UserProfile,
                                 UserSession, UserSettings)
+from shared.exceptions import NotFoundError
 
 _EXPIRED_SESSION_RETENTION = timedelta(days=7)
 
@@ -19,6 +20,13 @@ class UserRepository:
     async def get_by_id(self, user_id: UUID) -> User | None:
         result = await self._db.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
+
+    async def require(
+            self, user_id: UUID, message: str = "User not found.") -> User:
+        user = await self.get_by_id(user_id)
+        if user is None:
+            raise NotFoundError(message)
+        return user
 
     async def get_by_email(self, email: str) -> User | None:
         result = await self._db.execute(

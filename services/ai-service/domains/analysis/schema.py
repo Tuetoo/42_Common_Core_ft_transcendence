@@ -4,8 +4,7 @@ from typing import Any
 from uuid import UUID
 from pydantic import ConfigDict, Field, field_validator
 from shared.enums import AgentRole, AnalysisType
-from shared.schemas import BaseSchema, IDMixin
-from shared.tickers import Ticker
+from shared.schemas import BaseSchema, IDMixin, Ticker
 
 RESEARCH_ROLES = tuple(
     role for role in AgentRole

@@ -5,8 +5,9 @@ from typing import Any
 from uuid import UUID
 import structlog
 from config import settings
+from domains.backtest.schema import backtest_kind
 from shared import events as shared_events
-from shared.events_registry import EventName
+from shared.events import EventName
 
 logger = structlog.get_logger(__name__)
 
@@ -106,19 +107,6 @@ def decision_outcome_event_payload(
         "alpha": alpha,
         "outperformed": outperformed
     }
-
-
-RECOMMENDATION_REPLAY_STRATEGY = "ai_recommendation_replay"
-PORTFOLIO_SNAPSHOT_STRATEGY = "portfolio_snapshot_backtest"
-_BACKTEST_KIND_BY_STRATEGY = {
-    RECOMMENDATION_REPLAY_STRATEGY: "recommendation_replay",
-    PORTFOLIO_SNAPSHOT_STRATEGY: "portfolio"
-}
-RESERVED_STRATEGY_NAMES = frozenset(_BACKTEST_KIND_BY_STRATEGY)
-
-
-def backtest_kind(strategy_name: str | None) -> str:
-    return _BACKTEST_KIND_BY_STRATEGY.get(strategy_name or "", "ticker")
 
 
 def backtest_event_payload(

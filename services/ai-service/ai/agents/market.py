@@ -1,23 +1,17 @@
 import re
 from typing import Any
-import structlog
-from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check,
                                      reported_number_issue)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_successful_tool_entry,
-                            prefetch_tool_calls)
+                            combine_context, flag_unresolved_issue,
+                            is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.memory.procedural import combine_context
 from ai.tools.market_tool import (CLOSE_RE, GetCurrentPriceTool,
                                   GetRecentPriceHistoryTool)
 from ai.tools.market_tool import \
     latest_close_from_price_history as _latest_close_from_price_history
-from shared.enums import AgentStatus
-
-logger = structlog.get_logger(__name__)
 
 MAX_ITERATIONS = 5
 
@@ -170,34 +164,18 @@ class MarketAgent(BaseAgent):
         if reference_price is None:
             reference_price = price_history_close
 
-        summary = result.final_answer
         verification_warnings: list[str] = []
-        if result.unresolved_finish_validation_issue is not None:
-            logger.warning(
-                "market.unresolved_finish_issue_after_retries",
-                ticker=state.ticker,
-                issue=result.unresolved_finish_validation_issue)
-            reason = (
-                f"{result.unresolved_finish_validation_issue} -- this was not "
-                "corrected even after being flagged -- treat the price "
-                "figures below as unverified until manually re-checked "
-                "against this run's tool output.")
-            summary = wrap_verification_warning(reason, summary)
-            verification_warnings.append(reason)
-
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None,
-            verification_warnings=verification_warnings)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+        summary = flag_unresolved_issue(
+            result, result.final_answer, verification_warnings,
+            event="market.unresolved_finish_issue_after_retries",
+            ticker=state.ticker, consequence=(
+                " -- this was not corrected even after being flagged -- treat "
+                "the price figures below as unverified until manually "
+                "re-checked against this run's tool output."))
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=verification_warnings, raw_output={
                 "key_facts": ({
                     "reference_price": reference_price
-                } if reference_price is not None else {}),
-                "finish_meta": result.finish_meta
+                } if reference_price is not None else {})
             })

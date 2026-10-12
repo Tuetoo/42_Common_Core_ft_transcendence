@@ -24,7 +24,7 @@ import pytest_asyncio
 import qdrant as qdrant_module
 from ai.benchmark import metrics as production_metrics
 from ai.providers.base import PriceBar
-from ai.workflows.portfolio_backtest_workflow import _twr_daily_returns
+from ai.workflows.backtest_workflow import _twr_daily_returns
 from config import settings
 from database import SessionLocal
 from qdrant_client import AsyncQdrantClient
@@ -244,9 +244,9 @@ class TestSmokeChecks:
 
     async def test_offline_window_filing_golden_and_scoring_checks(
             self, monkeypatch) -> None:
-        import ai.evaluation.recall as recall_module
+        import ai.evaluation.rag_recall as recall_module
         import scripts.backfill_filing_records as backfill
-        from ai.evaluation.golden_set import GoldenQAPair
+        from ai.evaluation.rag_recall import GoldenQAPair
         from shared.enums import DocumentCategory
 
         now = datetime(2026, 9, 29, 20, 0, tzinfo=UTC)
@@ -1060,7 +1060,7 @@ class TestE2eTierCheck:
             self, monkeypatch, capsys):
         from scripts.e2e_tier_check import CheckFailed
         from scripts import e2e_tier_check as script
-        from shared import e2e_lock
+        import shared.redis as shared_redis
 
         checker = _tier_checker()
         checker.token = "t"
@@ -1121,7 +1121,7 @@ class TestE2eTierCheck:
         async def _no_lock(*args, **kwargs):
             raise AssertionError("the lock must not be taken")
 
-        monkeypatch.setattr(e2e_lock, "acquire", _no_lock)
+        monkeypatch.setattr(shared_redis, "acquire_e2e_lock", _no_lock)
         monkeypatch.setenv("E2E_ADMIN_TOKEN", "")
         out = io.StringIO()
         assert await script.main_async([], out) == 2

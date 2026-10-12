@@ -6,11 +6,11 @@ from typing import Any
 from uuid import UUID, uuid4
 import structlog
 import y_py as Y
-from api.ws_common import CLOSE_FORBIDDEN
 from config import settings
 from database import SessionLocal
 from fastapi import WebSocket
 from sqlalchemy import select, update
+from websocket_manager import CLOSE_FORBIDDEN
 from domains.research import yjs_guard
 from domains.research.sentiment import schedule_note_sentiment
 from shared.events import run_pubsub_listener
@@ -26,10 +26,6 @@ _REPLICA_ID = uuid4().hex
 _ACTIVE_KEY_PREFIX = "yjs:active:"
 _ACTIVE_TTL_SECONDS = 90
 ACTIVE_HEARTBEAT_SECONDS = 30.0
-
-
-def max_update_bytes() -> int:
-    return settings.YJS_MAX_UPDATE_BYTES
 
 
 class InvalidYjsUpdate(Exception):
@@ -111,7 +107,12 @@ class YjsRelay:
 
     async def connect(self, websocket: WebSocket, note_id: str) -> YjsRoom:
         await _mark_room_active(note_id)
-        room = await self.get_or_create_room(note_id)
+        try:
+            room = await self.get_or_create_room(note_id)
+        except BaseException:
+            if note_id not in self._rooms:
+                await _mark_room_inactive(note_id)
+            raise
         room.connections.add(websocket)
         try:
             await websocket.send_bytes(room.encode_state())
@@ -174,7 +175,7 @@ class YjsRelay:
 
     async def handle_local_update(
             self, room: YjsRoom, update: bytes, sender: WebSocket) -> None:
-        limit = max_update_bytes()
+        limit = settings.YJS_MAX_UPDATE_BYTES
         if len(update) > limit:
             raise InvalidYjsUpdate(
                 f"update of {len(update)} bytes exceeds {limit}")

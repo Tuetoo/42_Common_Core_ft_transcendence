@@ -1,4 +1,7 @@
+import asyncio
 import json
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -8,15 +11,18 @@ from uuid import UUID, uuid4
 import ai.llm.google_provider as google_module
 import ai.rag.embedding as embedding_module
 import config
+import pytest
 from ai.agents.filing import FilingRecordsCache
 from ai.agents.loop import ScratchpadEntry
 from ai.agents.risk import _CapturingRiskEventsValidator
 from ai.graph.state import (AgentOutput, AnalysisState, DebateArgument,
                             JudgeVerdict)
 from ai.knowledge import filing_records as frec
-from ai.llm.base import (LLMMessage, LLMProviderAdapter, LLMResponse,
-                         LLMServerOverloadedError, LLMUsage)
+from ai.llm.base import (LLMMessage, LLMProviderAdapter,
+                         LLMRequestTimeoutError, LLMResponse,
+                         LLMServerOverloadedError, LLMUsage, request_pacer)
 from ai.providers.base import PriceQuote, ProviderRequestError
+from google.genai import errors as genai_errors
 from domains.analysis.repository import (AnalysisPersistenceRepository,
                                          AnalysisRepository)
 from domains.decision.repository import (DecisionOutcomeRepository,
@@ -93,15 +99,15 @@ class _ScriptedAgentRouter:
             finish_reason="STOP")
 
 
-def _aapl_state(**overrides: Any) -> AnalysisState:
-    defaults: dict[str, Any] = {
+def _state(ticker: str = "AAPL", **overrides: Any) -> AnalysisState:
+    values: dict[str, Any] = {
         "analysis_id": "a1",
         "user_id": "u1",
-        "ticker": "AAPL",
+        "ticker": ticker,
         "analysis_type": AnalysisType.FULL
     }
-    defaults.update(overrides)
-    return AnalysisState(**defaults)
+    values.update(overrides)
+    return AnalysisState(**values)
 
 
 def _news_output(
@@ -213,17 +219,6 @@ _ALL_ROLES = [
 ]
 
 
-def _amd_state(**overrides: Any) -> AnalysisState:
-    defaults: dict[str, Any] = {
-        "analysis_id": "a1",
-        "user_id": "u1",
-        "ticker": "AMD",
-        "analysis_type": AnalysisType.FULL
-    }
-    defaults.update(overrides)
-    return AnalysisState(**defaults)
-
-
 def _tool_entry(
         observation: str, *, error: bool = False, tool: bool = True) -> dict:
     return {
@@ -301,6 +296,13 @@ class _PerModelAdapter(LLMProviderAdapter):
         outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
         if outcome == "503":
             raise LLMServerOverloadedError(f"{model} 503")
+        if outcome == "timeout":
+            cooldown = config.settings.LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS
+            if cooldown > 0:
+                await request_pacer.mark_unavailable_until(
+                    ("google", "timeout", model),
+                    time.monotonic() + cooldown)
+            raise LLMRequestTimeoutError(f"{model} timed out")
         return LLMResponse(
             content=f"answer from {model}", provider="google", model=model,
             usage=LLMUsage(prompt_tokens=1,
@@ -317,6 +319,19 @@ class _PerModelAdapter(LLMProviderAdapter):
 
 async def _no_sleep(seconds: float) -> None:
     return None
+
+
+async def _run_steps(
+        *steps: Callable[[pytest.MonkeyPatch], Awaitable[Any]],
+        setup: Callable[[pytest.MonkeyPatch], Any] | None = None,
+        reset: Callable[[], Any] | None = None) -> None:
+    for step in steps:
+        if reset is not None:
+            reset()
+        with pytest.MonkeyPatch.context() as mp:
+            if setup is not None:
+                setup(mp)
+            await step(mp)
 
 
 def _chain(monkeypatch, primary: str = "m1", fallback: str = "m2") -> None:
@@ -426,6 +441,7 @@ class _FakeGeminiResponse:
     class _Usage:
         prompt_token_count = 10
         candidates_token_count = 5
+        thoughts_token_count = None
 
     class _Candidate:
         finish_reason = "STOP"
@@ -457,6 +473,7 @@ class _FakeGooglePool:
 
     def __init__(self, clients: dict[str, _FakeGoogleClient]):
         self._clients = clients
+        self.used: list[str] = []
 
     def key_count(self) -> int:
         return len(self._clients)
@@ -465,7 +482,39 @@ class _FakeGooglePool:
         return [lbl for lbl in self._clients if lbl not in excluded]
 
     def client_for(self, label: str) -> _FakeGoogleClient:
+        self.used.append(label)
         return self._clients[label]
+
+
+def _single_client_pool(
+        generate: Any,
+        labels: Sequence[str] = ("primary", )) -> _FakeGooglePool:
+    client = _FakeGoogleClient(generate)
+    return _FakeGooglePool({label: client for label in labels})
+
+
+def _server_503() -> genai_errors.ServerError:
+    return genai_errors.ServerError(
+        503,
+        {"error": {
+            "code": 503,
+            "status": "UNAVAILABLE",
+            "message": "busy"
+        }})
+
+
+def _scripted_pool(labels: list[str], script: list[str]) -> _FakeGooglePool:
+    outcomes = list(script)
+
+    async def generate_content(*, model, contents, config):
+        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+        if outcome == "503":
+            raise _server_503()
+        if outcome == "hang":
+            await asyncio.sleep(3600)
+        return _FakeGeminiResponse()
+
+    return _single_client_pool(generate_content, labels)
 
 
 def _headers(user_id: UUID) -> dict[str, str]:

@@ -1,24 +1,22 @@
 import re
 from typing import Any
 import structlog
-from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.agents.filing import FilingRecordsCache, one_off_items_for
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check,
                                      reported_number_issue)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_successful_tool_entry,
-                            prefetch_tool_calls)
+                            combine_context, flag_unresolved_issue,
+                            is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.memory.procedural import combine_context
 from ai.rag.visibility import visibility_for_state
 from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.fundamentals_tool import GetFundamentalsTool
 from ai.tools.knowledge_graph_tool import QueryKnowledgeGraphTool
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
 from ai.tools.web_search_tool import WebSearchTool
-from shared.enums import AgentStatus, DocumentCategory
+from shared.enums import DocumentCategory
 
 logger = structlog.get_logger(__name__)
 
@@ -390,23 +388,14 @@ class FundamentalAgent(BaseAgent):
                 feedback, state.procedural_hints.get(self.role),
                 state.fresh_filing_context, kg_context),
             prefetched_evidence=prefetched)
-        summary = result.final_answer
         verification_warnings: list[str] = []
-        if result.unresolved_finish_validation_issue is not None:
-            logger.warning(
-                "fundamental.unresolved_finish_issue_after_retries",
-                ticker=state.ticker,
-                issue=result.unresolved_finish_validation_issue)
-            reason = (
-                f"{result.unresolved_finish_validation_issue} -- this was not "
-                "corrected even after being flagged -- treat the figures "
-                "below as unverified until manually re-checked against this "
-                "run's tool output.")
-            summary = wrap_verification_warning(reason, summary)
-            verification_warnings.append(reason)
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None,
-            verification_warnings=verification_warnings)
+        summary = flag_unresolved_issue(
+            result, result.final_answer, verification_warnings,
+            event="fundamental.unresolved_finish_issue_after_retries",
+            ticker=state.ticker, consequence=(
+                " -- this was not corrected even after being flagged -- treat "
+                "the figures below as unverified until manually re-checked "
+                "against this run's tool output."))
         data_caveats = _fundamentals_data_caveats(result.scratchpad)
         if data_caveats:
             summary = (
@@ -426,14 +415,9 @@ class FundamentalAgent(BaseAgent):
             for key, value in fresh_metrics.items() if key in (
                 "gross_margin_pct", "operating_margin_pct", "net_margin_pct")
         }
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=verification_warnings, raw_output={
                 "key_facts": margin_key_facts,
                 "data_caveats": data_caveats,
                 **({
@@ -442,6 +426,5 @@ class FundamentalAgent(BaseAgent):
                 one_off_items_for(state.ticker, records, role=self.role.value),
                 "final_answer": result.final_answer,
                 "injected_context": combine_context(
-                    state.fresh_filing_context, kg_context),
-                "finish_meta": result.finish_meta
+                    state.fresh_filing_context, kg_context)
             })

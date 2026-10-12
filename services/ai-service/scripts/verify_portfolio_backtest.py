@@ -250,11 +250,11 @@ async def closes_for(tickers: set[str], start: date,
 async def run_production(
         portfolio: str, start: date, end: date, benchmark: str, initial: float,
         keep: bool) -> dict[str, Any]:
-    import ai.workflows.portfolio_backtest_workflow as workflow
-    from ai_events import PORTFOLIO_SNAPSHOT_STRATEGY
+    import ai.workflows.backtest_workflow as workflow
     from database import SessionLocal
     from sqlalchemy import text
     from domains.backtest.repository import BacktestRepository
+    from domains.backtest.schema import PORTFOLIO_SNAPSHOT_STRATEGY
 
     async def _no_event(*_args: Any, **_kwargs: Any) -> None:
         return None

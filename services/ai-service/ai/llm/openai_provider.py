@@ -3,7 +3,7 @@ from typing import Any, cast
 from ai.llm.base import (LLMConfigError, LLMMessage, LLMProviderAdapter,
                          LLMRequestError, LLMResponse, LLMUsage)
 from config import settings
-from openai import AsyncOpenAI
+from openai import NOT_GIVEN, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.shared_params import ResponseFormatJSONObject
 
@@ -38,17 +38,19 @@ class OpenAIAdapter(LLMProviderAdapter):
             timeout_seconds: float | None = None,
             response_schema: dict[str, Any] | None = None) -> LLMResponse:
         client = _get_client()
+        timeout = NOT_GIVEN if timeout_seconds is None else timeout_seconds
         try:
             if response_format == "json_object":
                 resp = await client.chat.completions.create(
                     model=model, messages=_to_openai_messages(messages),
                     temperature=temperature, max_tokens=max_tokens,
                     response_format=ResponseFormatJSONObject(
-                        type="json_object"))
+                        type="json_object"), timeout=timeout)
             else:
                 resp = await client.chat.completions.create(
                     model=model, messages=_to_openai_messages(messages),
-                    temperature=temperature, max_tokens=max_tokens)
+                    temperature=temperature, max_tokens=max_tokens,
+                    timeout=timeout)
         except Exception as exc:
             raise LLMRequestError(
                 f"OpenAI completion failed for model {model!r}") from exc

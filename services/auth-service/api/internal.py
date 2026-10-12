@@ -16,7 +16,6 @@ from domains.auth.service import (AuthService, avatar_or_default,
 from domains.organization.repository import OrganizationRepository
 from domains.social.repository import ConnectionRepository
 from shared.enums import ConnectionStatus
-from shared.exceptions import NotFoundError
 from shared.scheduled_jobs import job_response
 from shared.schemas import OrganizationRef, UserRef
 from shared.security import require_internal_token
@@ -35,9 +34,7 @@ async def get_user_ref(
     user_id: UUID, db: AsyncSession = Depends(get_db, scope="function")
 ) -> UserRef:
     users = UserRepository(db)
-    user = await users.get_by_id(user_id)
-    if user is None:
-        raise NotFoundError(f"User {user_id} not found.")
+    user = await users.require(user_id, f"User {user_id} not found.")
 
     profile = await users.get_profile(user_id)
     return UserRef(
@@ -55,9 +52,8 @@ class UserStateRead(BaseModel):
 async def get_user_state(
     user_id: UUID, db: AsyncSession = Depends(get_db, scope="function")
 ) -> UserStateRead:
-    user = await UserRepository(db).get_by_id(user_id)
-    if user is None:
-        raise NotFoundError(f"User {user_id} not found.")
+    user = await UserRepository(db).require(
+        user_id, f"User {user_id} not found.")
     state = state_of(user)
     return UserStateRead(role=state.role, is_active=state.is_active)
 
@@ -104,9 +100,7 @@ async def get_notification_settings(
     user_id: UUID, db: AsyncSession = Depends(get_db, scope="function")
 ) -> dict[str, Any]:
     users = UserRepository(db)
-    user = await users.get_by_id(user_id)
-    if user is None:
-        raise NotFoundError(f"User {user_id} not found.")
+    user = await users.require(user_id, f"User {user_id} not found.")
     settings_row = await users.get_settings(user_id)
     deliverable = (
         user.deleted_at is None and user.is_active and user.is_verified)

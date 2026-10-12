@@ -1,7 +1,7 @@
 from uuid import UUID
 from config import settings
 from shared.http_client import get_http_client
-from shared.org_membership_cache import organization_roles
+from shared.user_state import organization_roles
 
 _TIMEOUT = 3.0
 

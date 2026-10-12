@@ -5,7 +5,7 @@ import Link from "next/link";
 // Shown inside the app layout when a page throws. In production the error
 // text is replaced by a digest, so the message stays generic (it also
 // covers rate limiting, which can't be told apart here). No stack traces.
-export default function ProtectedError({ reset }: { error: Error & { digest?: string }; reset: () => void }) {
+export default function ProtectedError({ retry }: { error: Error & { digest?: string }; retry: () => void }) {
   return (
     <div className="page">
       <div>
@@ -17,7 +17,7 @@ export default function ProtectedError({ reset }: { error: Error & { digest?: st
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-4">
-        <button type="button" className="btn btn-primary" onClick={() => reset()}>
+        <button type="button" className="btn btn-primary" onClick={() => retry()}>
           Try again
         </button>
         <Link href="/portfolios" className="link-btn">

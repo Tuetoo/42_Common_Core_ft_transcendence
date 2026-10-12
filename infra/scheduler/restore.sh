@@ -37,14 +37,6 @@
 #             core-service and ai-service first. Buckets that are not in
 #             the backup are left alone. Content-Type is set from each
 #             key's file extension (the services never read it back).
-#             Older backups hold a tarball of the SeaweedFS data
-#             directory (objectstore-data.tar.gz) instead: it is extracted
-#             into OBJECTSTORE_DATA_DIR (default /objectstore-data), which
-#             needs that volume mounted READ-WRITE (the `restore` compose
-#             service, profile "tools") and the objectstore service
-#             STOPPED. Backups from the MinIO era hold MinIO's files
-#             (minio-data.tar.gz), which SeaweedFS cannot read: this part
-#             is then skipped (refused with --only objectstore).
 #   avatars   empties auth-service's avatar_data volume (AVATAR_DATA_DIR,
 #             default /avatar-data, mounted read-write) and extracts
 #             avatars.tar.gz into it, when the backup has one. Stop
@@ -122,8 +114,6 @@ case "$TARGET" in
     *) SRC="$BACKUP_ROOT/$TARGET" ;;
 esac
 SRC="${SRC%/}"
-# SeaweedFS data directory (tarball backups only).
-OBJECTSTORE_DATA_DIR="${OBJECTSTORE_DATA_DIR:-/objectstore-data}"
 AVATAR_DATA_DIR="${AVATAR_DATA_DIR:-/avatar-data}"
 QDRANT_URL="${QDRANT_URL:-http://${QDRANT_HOST:-qdrant}:${QDRANT_PORT:-6333}}"
 QDRANT_URL="${QDRANT_URL%/}"
@@ -203,7 +193,7 @@ verify_backup() {
             fi
         done
     fi
-    if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
+    if wants objectstore; then
         for dir in $BUCKET_DIRS; do
             bucket="$(basename "$dir")"
             if s3 check "$dir" "objectstore:$bucket"; then
@@ -212,9 +202,6 @@ verify_backup() {
                 mismatch "objectstore: bucket '$bucket' differs from the backup (see the rclone lines above)"
             fi
         done
-    fi
-    if wants objectstore && [ "$OBJECTSTORE_KIND" = tar ]; then
-        log "objectstore: a tarball backup cannot be compared object by object, skipped"
     fi
     if wants avatars; then
         unpacked="$(mktemp -d /tmp/restore-avatars.XXXXXX)"
@@ -252,22 +239,8 @@ if wants postgres; then
     [ -f "$SRC/postgres.dump" ] || die "postgres.dump missing"
     pg_restore -l "$SRC/postgres.dump" > /dev/null || die "postgres.dump is not readable by pg_restore"
 fi
-# How the object storage was backed up: "s3" (objectstore/<bucket>/
-# folders), "tar" (a tarball of the SeaweedFS data directory) or, from
-# the MinIO era, MinIO's files, which must never be extracted into the
-# SeaweedFS volume.
-OBJECTSTORE_KIND=""
-if [ -d "$SRC/objectstore" ]; then
-    OBJECTSTORE_KIND=s3
-elif [ -f "$SRC/objectstore-data.tar.gz" ]; then
-    OBJECTSTORE_KIND=tar
-fi
-if wants objectstore && [ -z "$OBJECTSTORE_KIND" ]; then
-    if [ -f "$SRC/minio-data.tar.gz" ]; then
-        msg="this backup is from before the move to SeaweedFS: it has MinIO's minio-data.tar.gz, which SeaweedFS cannot read (its documents are in SeaweedFS and in newer backups)"
-    else
-        msg="this backup has no object storage part (objectstore/ or objectstore-data.tar.gz)"
-    fi
+if wants objectstore && [ ! -d "$SRC/objectstore" ]; then
+    msg="this backup has no object storage part (objectstore/)"
     [ "$EXPLICIT_ONLY" -eq 0 ] || die "$msg"
     log "WARNING: $msg -- the object storage part is skipped"
     ONLY="$(printf '%s' "$ONLY" | sed 's/ *objectstore//')"
@@ -284,7 +257,7 @@ fi
 
 # Bucket folders of an S3 backup, one per line.
 BUCKET_DIRS=""
-if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
+if wants objectstore; then
     BUCKET_DIRS="$(find "$SRC/objectstore" -mindepth 1 -maxdepth 1 -type d | sort)"
 fi
 
@@ -305,7 +278,7 @@ if [ "$CONFIRM" -ne 1 ]; then
             log "no Qdrant snapshots in this backup"
         fi
     fi
-    if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
+    if wants objectstore; then
         if [ -z "$BUCKET_DIRS" ]; then
             log "no buckets in this backup"
         fi
@@ -318,7 +291,6 @@ if [ "$CONFIRM" -ne 1 ]; then
             log "WARNING: object storage at $S3_ENDPOINT does not answer; start it before the real restore"
         fi
     fi
-    wants objectstore && [ "$OBJECTSTORE_KIND" = tar ] && log "would empty $OBJECTSTORE_DATA_DIR and extract $SRC/objectstore-data.tar.gz into it (objectstore must be stopped)"
     wants avatars && log "would empty $AVATAR_DATA_DIR and extract $SRC/avatars.tar.gz into it (auth-service must be stopped)"
     exit 0
 fi
@@ -327,14 +299,6 @@ fi
 # A part that cannot run must stop the restore here, not after Postgres or
 # Qdrant were already replaced (that would leave a mix of backup and live
 # data).
-writable_dir() {
-    [ -d "$2" ] || die "$2 does not exist (mount the $1 volume there); nothing was changed"
-    probe="$2/.restore-write-test.$$"
-    if ! ( : > "$probe" ) 2>/dev/null; then
-        die "$2 is read-only: run the $1 part through the 'restore' compose service (profile tools); nothing was changed"
-    fi
-    rm -f "$probe"
-}
 log "preflight: checking every part before anything is replaced"
 if wants postgres; then
     psql -X -At --no-password -c 'SELECT 1' > /dev/null 2>&1 \
@@ -344,15 +308,16 @@ if wants qdrant && [ -n "$SNAPSHOTS" ]; then
     qdrant "$QDRANT_URL/collections" > /dev/null \
         || die "qdrant at $QDRANT_URL does not answer; nothing was changed"
 fi
-if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
+if wants objectstore; then
     s3_reachable || die "object storage at $S3_ENDPOINT does not answer: start it (docker compose up -d --wait objectstore) and run again; nothing was changed"
 fi
-if wants objectstore && [ "$OBJECTSTORE_KIND" = tar ]; then
-    ! s3_reachable || die "object storage at $S3_ENDPOINT is running: stop it (docker compose stop objectstore) before its data directory is replaced; nothing was changed"
-    writable_dir objectstore "$OBJECTSTORE_DATA_DIR"
-fi
 if wants avatars; then
-    writable_dir avatars "$AVATAR_DATA_DIR"
+    [ -d "$AVATAR_DATA_DIR" ] || die "$AVATAR_DATA_DIR does not exist (mount the avatar_data volume there); nothing was changed"
+    probe="$AVATAR_DATA_DIR/.restore-write-test.$$"
+    if ! ( : > "$probe" ) 2>/dev/null; then
+        die "$AVATAR_DATA_DIR is read-only: run the avatars part through the 'restore' compose service (profile tools); nothing was changed"
+    fi
+    rm -f "$probe"
 fi
 log "preflight: OK"
 
@@ -396,15 +361,8 @@ if wants qdrant; then
     [ -z "$SNAPSHOTS" ] || log "qdrant: done"
 fi
 
-# --- (3) object storage / (4) avatars: replace a mounted volume's files ----
-# $1 label, $2 target directory, $3 archive
-restore_volume() {
-    log "$1: emptying $2 and extracting $(basename "$3")"
-    find "$2" -mindepth 1 -maxdepth 1 -exec rm -rf {} \; || die "could not empty $2"
-    tar -xzf "$3" -C "$2" || die "extracting $(basename "$3") failed"
-    log "$1: done"
-}
-if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
+# --- (3) object storage ------------------------------------------------------
+if wants objectstore; then
     for dir in $BUCKET_DIRS; do
         bucket="$(basename "$dir")"
         log "objectstore: restoring bucket '$bucket'"
@@ -414,12 +372,12 @@ if wants objectstore && [ "$OBJECTSTORE_KIND" = s3 ]; then
     done
     log "objectstore: done"
 fi
-if wants objectstore && [ "$OBJECTSTORE_KIND" = tar ]; then
-    restore_volume objectstore "$OBJECTSTORE_DATA_DIR" "$SRC/objectstore-data.tar.gz"
-    log "objectstore: start the objectstore service again"
-fi
+# --- (4) avatars --------------------------------------------------------------
 if wants avatars; then
-    restore_volume avatars "$AVATAR_DATA_DIR" "$SRC/avatars.tar.gz"
+    log "avatars: emptying $AVATAR_DATA_DIR and extracting avatars.tar.gz"
+    find "$AVATAR_DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} \; || die "could not empty $AVATAR_DATA_DIR"
+    tar -xzf "$SRC/avatars.tar.gz" -C "$AVATAR_DATA_DIR" || die "extracting avatars.tar.gz failed"
+    log "avatars: done"
 fi
 
 log "restore of $SRC complete: $ONLY"

@@ -307,8 +307,8 @@ files_json="$(
     done < SHA256SUMS | jq -s -c '.'
 )" || die "could not build the file list"
 
-# Manifest format 3: objects copied through the S3 API (format 2 had a
-# tarball of the SeaweedFS data directory, format 1 a MinIO tarball).
+# Manifest format 3: objects copied through the S3 API. restore.sh reads
+# only this format.
 jq -n \
     --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg stamp "$STAMP" \

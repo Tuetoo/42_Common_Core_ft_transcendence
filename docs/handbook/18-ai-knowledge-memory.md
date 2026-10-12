@@ -154,7 +154,7 @@ days old and not yet scored
   `outcome_return` = the ticker's return.
 
 **Reading.** `ai/graph/nodes.py::episodic_memory_node` runs first in every
-analysis and calls `ai/memory/episodic.py::retrieve_episodic_context`,
+analysis and calls `ai/memory/agent_memory.py::retrieve_episodic_context`,
 which uses `EpisodicMemoryRepository.list_recent_for_ticker`:
 
 - newest first, at most `EPISODIC_CONTEXT_LIMIT` (3) rows;
@@ -181,7 +181,7 @@ A database error gives an empty list (log
 
 ### 3.4 L4 procedural memory
 
-**Writing** (`ai/memory/procedural.py::maybe_remember_trajectory`), called
+**Writing** (`ai/memory/agent_memory.py::maybe_remember_trajectory`), called
 for every agent after the analysis is `completed`. An output becomes an
 example only if `procedural_memory_skip_reason` returns nothing:
 
@@ -251,7 +251,7 @@ then reappears in a later run. So the final answer is never injected,
 only the tool steps, and every gate above applies.
 
 The hints and any Reflection retry feedback are merged into one
-`extra_context` string for the agent (`combine_context`).
+`extra_context` string for the agent (`ai/agents/loop.py::combine_context`).
 
 ### 3.5 L3: archiving agent reports
 
@@ -404,7 +404,7 @@ After the report is stored, `_extract_and_store_kg` runs (its own
 try/except; a failure logs `archival.kg_extraction_failed` and leaves the
 note in place):
 
-1. `resolve_ticker_name` (`ai/knowledge/ticker_names.py`) gives the
+1. `resolve_ticker_name` (`ai/knowledge/kg_context.py`) gives the
    official company name, cached in `ai.ticker_names` and fetched once
    from SEC's `company_tickers.json` (needs `SEC_EDGAR_USER_AGENT`;
    falls back to the bare ticker). The cache row is written and committed
@@ -683,7 +683,7 @@ listed in `failed_filenames`; the other filings continue. The raw filing
 text is never indexed (owner decision: retrieval depth is what the
 summary keeps).
 
-**Fresh-filing check.** `ai/knowledge/fresh_filings.py::check_for_fresh_filing_content`
+**Fresh-filing check.** `ai/graph/nodes.py::load_fresh_filing_context`
 runs this same ingestion inside `supervisor_node` when Filing, Fundamental
 or Risk is selected (chapter 16), so an analysis waits for the summary and
 records calls of any new filing. Only the newest new filing's summary is
@@ -1211,7 +1211,7 @@ not ok.
 | `FILING_RECORDS_MAX_FILINGS` | 5 | same | newest filings whose records agents load and `search_filings` shows |
 | `FILING_RECORDS_BACKFILL_LLM_TIER` | `cheap` | same | default tier of the backfill's records-only call (`--tier` overrides; ingestion always uses HIGHEST) |
 | `PRIOR_NOTE_MAX_SIMILARITY` | 0.9 | same | `prior_note_similarity` at which a Risk or News answer counts as a copy of a prior note (archive skip, chapter 15) |
-| code: `_MIN_SCORE_TO_REMEMBER` | 0.7 | `ai/memory/procedural.py` | procedural memory bar |
+| code: `_MIN_SCORE_TO_REMEMBER` | 0.7 | `ai/memory/agent_memory.py` | procedural memory bar |
 | code: `_DEFAULT_LIMIT` | 2 | same | hints per role |
 | code: `_MAX_STEPS_PER_TRAJECTORY` | 4 | same | steps kept per example |
 | code: `prune_beyond_retention(keep=3)` | 3 | `domains/memory/repository.py` | rows kept per role and ticker |
@@ -1225,7 +1225,7 @@ not ok.
 | code: `_TRUNCATION_STAIRCASE` | 1.2M: 100%, 1.6M: 80%, 1.8M: 70%, 2.1M: 60%, 2.5M: 50%, above: skip | `ai/knowledge/filing_summary.py` | summary-call input cut |
 | code: `RECORDS_MAX_CHARS` | 900,000 | same | records-call input cut |
 | code: `_SUMMARY_MAX_TOKENS` / `_RECORDS_MAX_TOKENS` / `_RETRY_MAX_TOKENS` | 12,288 / 10,240 / 16,384 | same | output limits; one retry after a length stop |
-| code: `_FILING_SUMMARY_TIMEOUT_SECONDS` | 300 | same | request timeout of both filing calls |
+| code: `_FILING_SUMMARY_TIMEOUT_SECONDS` | 300 | same | request timeout of both filing calls (at most 2 attempts each) |
 | code: `QUOTE_MIN_CHARS` / `_QUOTE_PART_MIN_CHARS` | 25 / 12 | `ai/knowledge/filing_records.py` | quote check (letters and digits) |
 | code: `_UNIT_REQUIRED_MIN` | 10 | same | currency amount that needs a scale word |
 | code: `_PERIOD_END_TOLERANCE_DAYS` | 7 | same | own-period tolerance of records |
@@ -1458,15 +1458,13 @@ All queries below are read-only.
 
 | File | What it holds |
 |---|---|
-| `services/ai-service/ai/memory/episodic.py` | L2 read path |
-| `services/ai-service/ai/memory/procedural.py` | L4 gates, write, read, `combine_context` |
+| `services/ai-service/ai/memory/agent_memory.py` | L2 read path; L4 gates, write, read (`combine_context` is in `ai/agents/loop.py`) |
 | `services/ai-service/domains/memory/model.py` | `EpisodicMemory`, `AgentMemory` |
 | `services/ai-service/domains/memory/repository.py` | scoped queries, retention pruning |
 | `services/ai-service/ai/knowledge/archival.py` | archival gates, visibility, near-duplicate supersede, KG extraction call |
 | `services/ai-service/ai/knowledge/recycled_content.py` | recycled share, amounts found only in prior agent notes (chapter 15) |
 | `services/ai-service/ai/knowledge/extraction.py` | triple extraction prompt and validation |
-| `services/ai-service/ai/knowledge/kg_context.py` | fetch, format, tag, inject KG facts |
-| `services/ai-service/ai/knowledge/ticker_names.py` | official names, core-name matching |
+| `services/ai-service/ai/knowledge/kg_context.py` | fetch, format, tag, inject KG facts; official names, core-name matching |
 | `services/ai-service/ai/ingestion/sec_edgar_filings.py` | listing new filings, raw archive, `ingest_new_filings` |
 | `services/ai-service/ai/knowledge/filing_summary.py` | summary call (staircase, retry, fallback) and the records-only call |
 | `services/ai-service/ai/knowledge/filing_records.py` | records schema and prompt, checks, amount parser, rendering, `record_by_id`, storage |
@@ -1474,7 +1472,7 @@ All queries below are read-only.
 | `services/ai-service/domains/filings/` | `filing_records` model and repository |
 | `services/ai-service/scripts/backfill_filing_records.py` | records extraction for stored filings |
 | `services/ai-service/scripts/regenerate_filing_summaries.py` | regenerate chosen stored filing summaries (two steps) |
-| `services/ai-service/ai/knowledge/fresh_filings.py` | new-filing check during an analysis |
+| `services/ai-service/ai/graph/nodes.py` (`load_fresh_filing_context`) | new-filing check during an analysis |
 | `services/ai-service/domains/knowledge/model.py` | `AgentReport`, `KgEntity`, `KgRelation`, `TickerName` |
 | `services/ai-service/domains/knowledge/repository.py` | report and KG queries, aggregation, viewer filter |
 | `services/ai-service/ai/tools/knowledge_graph_tool.py` | `query_knowledge_graph` tool |

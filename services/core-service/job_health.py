@@ -4,7 +4,7 @@ import redis.asyncio as redis
 import structlog
 from config import settings
 from prometheus_client import Gauge
-from shared.metrics import get_or_create
+from shared.logging import get_or_create
 from shared.redis import get_cache_client
 
 logger = structlog.get_logger(__name__)

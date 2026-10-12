@@ -1,25 +1,26 @@
 import asyncio
-from typing import Any, Literal
+from typing import Any
 import structlog
 from ai.agents.debate_common import (_FIGURE_RE, CODE_BUILT_LINES_ARE_EVIDENCE,
                                      FREE_CASH_FLOW_RULE, OVERLAP_RULE,
                                      _quote_is_grounded,
                                      find_ungrounded_figures, format_evidence,
                                      format_grounding_reference)
-from ai.graph.state import (FAILURE_KIND_TEXT, ISSUE_AGENT_FAILED,
+from ai.graph.state import (AVAILABILITY_FAILURE_KINDS, FAILURE_KIND_TEXT,
+                            ISSUE_AGENT_FAILED,
                             ISSUE_DEBATE_SIDE_NOT_REGENERATED,
                             ISSUE_ITERATION_CAP, ISSUE_KINDS, ISSUE_LLM_REVIEW,
                             ISSUE_NO_EVIDENCE_NOT_RETRIED, ISSUE_NOT_RETRIED,
                             ISSUE_NOT_WELL_SUPPORTED, ISSUE_ZERO_EVIDENCE,
-                            AgentOutput, AnalysisState, FailureKind, IssueKind,
-                            ReflectionIssue, ReflectionVerdict,
-                            is_usable_evidence, lacks_successful_tool_evidence)
+                            AgentOutput, AnalysisState, DebateSide,
+                            FailureKind, IssueKind, ReflectionIssue,
+                            ReflectionVerdict, is_usable_evidence,
+                            lacks_successful_tool_evidence)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
                          LLMRateLimitError, LLMRequestTimeoutError,
                          LLMServerOverloadedError, LLMTier)
-from ai.llm.capacity import capacity_aware_delay
 from ai.llm.json_fence import parse_json_dict
-from ai.llm.router import LLMRouter
+from ai.llm.router import LLMRouter, capacity_aware_delay
 from config import settings
 from shared.enums import AgentRole, AgentStatus
 
@@ -143,12 +144,10 @@ _SYSTEM_PROMPT = (
 
 _REVIEW_MAX_TOKENS = 2048
 
-_DEBATE_SIDE_ROLES: tuple[tuple[AgentRole, Literal["bull", "bear"]],
-                          ...] = ((AgentRole.BULL, "bull"),
-                                  (AgentRole.BEAR, "bear"))
+_DEBATE_SIDE_ROLES: tuple[tuple[AgentRole, DebateSide], ...] = (
+    (AgentRole.BULL, "bull"), (AgentRole.BEAR, "bear"))
 
-_NOT_RETRIABLE_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"rate_limit", "server_overload", "non_english"})
+_NOT_RETRIABLE_FAILURE_KINDS = AVAILABILITY_FAILURE_KINDS | {"non_english"}
 
 
 def _not_retriable_failure_kind(out: AgentOutput) -> FailureKind | None:
@@ -307,8 +306,7 @@ class ReflectionAgent:
         for role, side in _DEBATE_SIDE_ROLES:
             latest = state.debate.latest_argument(side)
             if (latest is not None and not latest.available
-                    and latest.unavailable_kind
-                    in ("rate_limit", "server_overload")):
+                    and latest.unavailable_kind in AVAILABILITY_FAILURE_KINDS):
                 kind = latest.unavailable_kind
                 side_issues.append(
                     ReflectionIssue(

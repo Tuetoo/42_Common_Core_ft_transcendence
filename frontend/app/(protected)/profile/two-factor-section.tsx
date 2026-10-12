@@ -10,6 +10,7 @@ import {
   type VerifyTwoFactorState,
   type DisableTwoFactorState,
 } from "@/app/lib/actions/twofa";
+import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "@/app/(public)/field-rules";
 
 const setupInitial: SetupTwoFactorState = {};
 const verifyInitial: VerifyTwoFactorState = {};
@@ -49,7 +50,7 @@ export function TwoFactorSection() {
             <form action={verifyAction} className="form">
               <div className="field">
                 <label htmlFor="verify-code">Authentication code</label>
-                <input id="verify-code" name="code" type="text" inputMode="numeric" maxLength={6} required />
+                <input id="verify-code" name="code" type="text" inputMode="numeric" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required />
               </div>
               {verifyState.error && !verifyState.needsRelogin && (
                 <p aria-live="polite" className="form-message error">
@@ -103,7 +104,7 @@ export function TwoFactorSection() {
             <form action={disableAction} className="form">
               <div className="field">
                 <label htmlFor="disable-code">Authentication code</label>
-                <input id="disable-code" name="code" type="text" inputMode="numeric" maxLength={6} required />
+                <input id="disable-code" name="code" type="text" inputMode="numeric" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required />
               </div>
               {disableState.error && (
                 <p aria-live="polite" className="form-message error">

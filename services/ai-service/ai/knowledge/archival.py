@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 import structlog
 from ai.agents.evidence_grounding import non_english_reason
 from ai.knowledge.extraction import extract_entities_relations
-from ai.knowledge.ticker_names import core_company_name, resolve_ticker_name
+from ai.knowledge.kg_context import core_company_name, resolve_ticker_name
 from ai.llm.base import LLMTier
 from ai.rag.chunking import Chunk, chunk_document
 from ai.rag.embedding import (cosine_similarity, embed_texts,

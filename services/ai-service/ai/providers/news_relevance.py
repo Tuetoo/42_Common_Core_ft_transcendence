@@ -45,6 +45,11 @@ async def lookup_company_name(ticker: str) -> str | None:
     return name
 
 
+async def lookup_search_name(ticker: str) -> str | None:
+    legal_name = await lookup_company_name(ticker)
+    return company_search_name(legal_name) if legal_name else None
+
+
 THIS_COMPANY = "this_company"
 PARTY = "party"
 SUBJECTS = ("this_company", PARTY, "other_company", "none")

@@ -276,7 +276,7 @@ and returns `{"recommendations_scored", "recommendations_attempted",
 
 **1. AI accuracy** (`review_ai_accuracy`), for *every* recommendation at
 least `AI_ACCURACY_EVALUATION_DAYS` (30) days old without a metric (up to
-200 per run), whether or not anybody acted on it:
+200 per run, oldest first), whether or not anybody acted on it:
 
 - return of the ticker from the analysis date to 30 days later
   (`_realized_return`: first to last daily close in the window);
@@ -291,7 +291,8 @@ followed ones would hide exactly the calls nobody trusted.
 
 **2. Decision outcomes** (`review_decision_outcomes`), for every
 `InvestmentDecision` at each window of 7, 30 and 90 days
-(`_DECISION_EVALUATION_WINDOWS`) that has no outcome for that window yet:
+(`_DECISION_EVALUATION_WINDOWS`) that has no outcome for that window yet
+(up to 200 per window and run, oldest first):
 
 - `strategy_return` = the ticker's return over the window, negated for a
   SELL recommendation (`_directional_return`). The direction is the
@@ -469,12 +470,12 @@ optional `portfolio_id`.
   adjusted).
 
 **B. Recommendation replay** -- `POST /api/v1/backtests/recommendation-replay`,
-`ai/workflows/recommendation_replay_workflow.py`. Body: `benchmark_symbol`
+`ai/workflows/backtest_workflow.py::run_recommendation_replay_workflow`. Body: `benchmark_symbol`
 (default `SPY`), `initial_capital` (default 100000). It replays *all*
 triggered tiers of the caller's own analyses, across tickers, in time
 order, from the first trigger to today (`strategy_name =
 ai_recommendation_replay`). The route stores that window on the backtest
-row; the workflow (`_load_trade_events`) then passes `start_date` and
+row; the workflow (`_load_replay_trade_events`) then passes `start_date` and
 `end_date` to `RecommendationTierRepository.list_triggered_tiers`, so the
 replay counts only fills whose `triggered_at` is inside the window (UTC
 days, both ends inclusive). A fill that lands after the
@@ -486,12 +487,18 @@ gives no win-rate observation. Without any triggered tier of the caller:
 422.
 
 **C. Portfolio backtest** -- `POST /api/v1/backtests/portfolio`,
-`ai/workflows/portfolio_backtest_workflow.py`. Body: `portfolio_id`,
+`ai/workflows/backtest_workflow.py::run_portfolio_backtest_workflow`. Body: `portfolio_id`,
 `benchmark_symbol` (default `SPY`), optional `start_date`/`end_date`.
 It reads the portfolio's real daily values from `core.portfolio_snapshots`
-(written by the 17:30 market-close job) and needs at least 2 snapshots in
-the window (422 otherwise). `initial_capital` is the first snapshot's
-total value (`strategy_name = portfolio_snapshot_backtest`).
+(written by the 17:30 market-close job). Leading snapshots with a total
+value of 0 or less (a portfolio created before it was funded) are
+skipped: it needs at least 2 snapshots in the window, counted from the
+first one with a positive value (422 otherwise). Without `start_date` the
+backtest starts on that first funded day, and `initial_capital` is that
+day's total value (`strategy_name = portfolio_snapshot_backtest`). The
+workflow also drops leading aligned days with a value of 0 or less before
+the TWR (log `portfolio_backtest.skipped_unfunded_leading_days`) and fails
+with a clear error if fewer than 2 days remain.
 
 - Snapshot days are aligned with benchmark days by date; a day without a
   usable benchmark close is dropped from both (and named in the error if
@@ -612,7 +619,7 @@ backtest's metrics come from `GET /api/v1/backtests/{id}`; RAG recall
 comes from `scripts/measure_rag_recall.py` (chapter 17, section 3.15).
 The script and the integration-test floor
 (`tests/integration/test_rag_recall.py`) share one scoring module,
-`ai/evaluation/recall.py`: `rank_of`, `Score` (Recall@K and MRR) and
+`ai/evaluation/rag_recall.py`: `rank_of`, `Score` (Recall@K and MRR) and
 `embed_golden_questions`, which embeds the golden questions with the
 `query` purpose, exactly as production searches embed a question.
 
@@ -889,9 +896,7 @@ real accepted tiers into the portfolio.
 | `services/ai-service/ai/workflows/tier_monitoring_workflow.py` | daily trigger/expiry check and execution |
 | `services/ai-service/ai/workflows/review_workflow.py` | accuracy, decision outcomes, agent metrics |
 | `services/ai-service/ai/workflows/auto_ingestion_workflow.py` | nightly ingestion (chapter 17) |
-| `services/ai-service/ai/workflows/backtest_workflow.py` | single-ticker replay; shared helpers |
-| `services/ai-service/ai/workflows/recommendation_replay_workflow.py` | replay of all the user's fills |
-| `services/ai-service/ai/workflows/portfolio_backtest_workflow.py` | snapshot-based TWR backtest |
+| `services/ai-service/ai/workflows/backtest_workflow.py` | all three backtests: single-ticker replay and replay of all the user's fills (one runner, `_replay_backtest`), the snapshot-based TWR backtest; shared helpers |
 | `services/ai-service/ai/benchmark/metrics.py` | return, drawdown, Sharpe, Sortino, alpha/beta, IR, TE, win rate |
 | `services/ai-service/api/internal.py` | scheduler routes, `/internal/sentiment` |
 | `services/ai-service/domains/backtest/` | backtest API, schemas, repository, models |

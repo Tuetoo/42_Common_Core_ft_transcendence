@@ -9,15 +9,13 @@ from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_successful_tool_entry,
+                            combine_context, is_successful_tool_entry,
                             is_thin_evidence, prefetch_tool_call,
                             prefetch_tool_calls, tool_reported_error)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.knowledge.recycled_content import (prior_note_only_claims_in_run,
                                            prior_note_similarity)
-from ai.memory.procedural import combine_context
-from ai.providers.news_filters import company_search_name
-from ai.providers.news_relevance import lookup_company_name
+from ai.providers.news_relevance import lookup_search_name
 from ai.rag.visibility import visibility_for_state
 from ai.tools.base import Tool
 from ai.tools.news_tool import (SearchNewsTool, live_search_yield,
@@ -25,7 +23,7 @@ from ai.tools.news_tool import (SearchNewsTool, live_search_yield,
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
 from ai.tools.web_search_tool import WebSearchTool
 from config import settings
-from shared.enums import AgentStatus, DocumentCategory
+from shared.enums import DocumentCategory
 
 logger = structlog.get_logger(__name__)
 
@@ -382,10 +380,9 @@ class NewsAgent(BaseAgent):
         if any(e.action == "search_news"
                and tool_reported_error(str(e.observation or ""))
                for e in prefetched):
-            legal_name = await lookup_company_name(state.ticker)
             prefetched += await prefetch_web_fallback(
-                prefetched, state.ticker, fallback_web_tool, company_name=(
-                    company_search_name(legal_name) if legal_name else None))
+                prefetched, state.ticker, fallback_web_tool,
+                company_name=await lookup_search_name(state.ticker))
         loop = ReActAgentLoop(
             role=self.role, tools=[prior_notes_tool, news_tool, web_tool],
             system_prompt=_SYSTEM_PROMPT, max_iterations=MAX_ITERATIONS,
@@ -451,22 +448,14 @@ class NewsAgent(BaseAgent):
                     "written": m.written,
                     "actual_weekday": m.actual_weekday
                 } for m in mismatches])
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None, no_evidence=no_evidence,
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=verification_warnings,
+            no_evidence=no_evidence,
             thin_evidence=is_thin_evidence(evidence_yield)
-            or unverified_fallback,
-            verification_warnings=verification_warnings, recycled=recycled)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+            or unverified_fallback, recycled=recycled, raw_output={
                 "no_evidence": no_evidence,
                 "evidence_yield": evidence_yield,
                 "fallback_sources_unverified": unverified_fallback,
-                "reused_prior_note": recycled,
-                "finish_meta": result.finish_meta
+                "reused_prior_note": recycled
             })

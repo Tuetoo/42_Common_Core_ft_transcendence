@@ -14,9 +14,7 @@ migrations:
 | ai | `f1160a000001` (baseline) -> `f1170a000001` (drops four unused tables) -> `f1210a000001` (drops four write-only tables) -> `f1220a000001` (`filing_records`) -> `f1230a000001` (`kg_relations.kind`, `as_of`) -> `f1240a000001` (`recommendations.judge_leaning`, `judge_confidence`) -> `f1250a000001` (`agent_memories.user_id`) |
 
 The files are under `services/<service>/migrations/versions/`; details in
-`handbook/20-postgresql.md` section 3.5. `migrations/archive/` holds an
-older chain that is used only to convert a database restored from an old
-backup (`DISASTER_RECOVERY.md` section 8).
+`handbook/20-postgresql.md` section 3.5.
 
 ## 1. Cross-Service Reference Rule
 
@@ -306,7 +304,7 @@ an analysis without an owner), `memory_type` (default `"trajectory"`),
 queried by its internal fields), `created_at`. Written for a clean agent run
 scoring ≥ 0.7 that made at least one tool call of its own; read back per
 role and owner only (same ticker first, then the same owner's other
-tickers — see `ai/memory/procedural.py`) before that role's next run.
+tickers — see `ai/memory/agent_memory.py`) before that role's next run.
 
 ### Knowledge (agent reports and knowledge graph)
 

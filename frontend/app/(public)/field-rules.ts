@@ -21,3 +21,19 @@ export function checkPasswordBytes(input: HTMLInputElement): void {
   const tooLong = new TextEncoder().encode(input.value).length > PASSWORD_MAX_BYTES;
   input.setCustomValidity(tooLong ? `Password must be at most ${PASSWORD_MAX_BYTES} bytes.` : "");
 }
+
+// Authenticator codes are 6 digits (security.py match_totp_step).
+export const TOTP_CODE_PATTERN = "[0-9]{6}";
+export const TOTP_CODE_TITLE = "The 6-digit code from your authenticator app.";
+
+// Avatar rules (config.py AVATAR_MAX_SIZE_MB, AVATAR_ALLOWED_CONTENT_TYPES).
+// The browser check also keeps files away from Next's 6MB Server Action
+// body limit, which would otherwise fail the whole request.
+export const AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+export const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
+
+export function avatarFileError(file: { size: number; type: string }): string | null {
+  if (!AVATAR_TYPES.includes(file.type)) return "Use a PNG, JPEG, WebP or GIF image.";
+  if (file.size > AVATAR_MAX_BYTES) return "The image must be 5MB or smaller.";
+  return null;
+}

@@ -9,8 +9,7 @@ RUN apk add --no-cache dcron curl tzdata jq postgresql16-client rclone
 
 ENV TZ=America/New_York
 
-# /backups and /avatar-data (and, for the `restore` service,
-# /objectstore-data) are NOT created here on purpose -- they must come
+# /backups and /avatar-data are NOT created here on purpose -- they must come
 # from compose mounts, and backup.sh refuses to run (or skips avatars)
 # when they are missing, instead of silently backing up an empty
 # directory inside the container.

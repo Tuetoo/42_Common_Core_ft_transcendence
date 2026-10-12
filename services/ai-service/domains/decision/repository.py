@@ -70,8 +70,8 @@ class InvestmentDecisionRepository:
         stmt = (
             select(InvestmentDecision).where(
                 InvestmentDecision.created_at <= cutoff_dt).where(
-                    InvestmentDecision.id.not_in(already_evaluated)).limit(
-                        limit))
+                    InvestmentDecision.id.not_in(already_evaluated)).order_by(
+                        InvestmentDecision.created_at).limit(limit))
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 

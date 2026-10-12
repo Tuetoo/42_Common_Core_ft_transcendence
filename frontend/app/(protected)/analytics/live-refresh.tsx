@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { useRouter } from "next/navigation";
 import { wsUrl } from "@/app/lib/ws-url";
-import { closeSocket } from "../close-socket";
+import { CLOSE_UNAUTHORIZED, closeSocket } from "../close-socket";
 
 type ConnectionStatus = "connecting" | "live" | "reconnecting";
 
@@ -16,8 +16,6 @@ const RELEVANT_TYPES = new Set([
   "analysis_completed",
   "analysis_failed",
   "recommendation_ready",
-  
-  
 ]);
 
 // At most one re-render per MIN_REFRESH_GAP_MS, however many events arrive.
@@ -79,17 +77,20 @@ export function LiveRefresh({
           // Not JSON: nothing this page understands.
         }
       };
-      // The server closes the socket when the access token expires, so a
-      // retry first re-renders the page (which brings a fresh token; the
-      // effect then reconnects with it). Waits grow 2s, 4s, 8s ... 60s.
-      socket.onclose = () => {
+      // The server closes the socket with 4401 when the access token
+      // expires, so that retry first re-renders the page (which brings a
+      // fresh token; the effect then reconnects with it). Other drops only
+      // reconnect; the poll below catches up. Waits grow 2s, 4s, 8s ... 60s.
+      socket.onclose = (event) => {
         setStatus("reconnecting");
         const delay = Math.min(2000 * 2 ** attempts, 60_000);
         attempts += 1;
         retryTimer = setTimeout(() => {
           retryTimer = null;
-          lastRefresh = Date.now();
-          router.refresh();
+          if (event.code === CLOSE_UNAUTHORIZED) {
+            lastRefresh = Date.now();
+            router.refresh();
+          }
           connect();
         }, delay);
       };

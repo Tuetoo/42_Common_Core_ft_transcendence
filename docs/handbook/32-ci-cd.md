@@ -7,7 +7,8 @@
 > once more on a fresh GitHub machine; only if that succeeds does a
 > second workflow log in to the cloud host over SSH and run
 > `scripts/deploy.sh`, which updates the code, rebuilds the images and
-> waits until every service is healthy again (continuous deployment).
+> waits until every service is healthy again (continuous deployment; a
+> stopped scheduler stays stopped).
 > The host is one AWS virtual machine running the same
 > `docker-compose.yaml` as a laptop. Nothing in the application code
 > knows whether it runs locally or in the cloud: the differences live in
@@ -47,7 +48,8 @@
                                                                                         scripts/deploy.sh
                                                                                           git merge --ff-only origin/main
                                                                                           docker compose up -d --build --wait
-                                                                                          (17 containers)
+                                                                                          (17 containers; a stopped
+                                                                                           scheduler stays stopped)
                                                                                               |
  browser  <------------------ https://alphamind-research.duckdns.org:8443 -------------------- gateway
 ```
@@ -75,7 +77,7 @@ Three ideas explain almost everything:
 
 | Term | Meaning | In AlphaMind |
 |---|---|---|
-| **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The five `*-ci.yml` workflows on pull requests. |
+| **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The five `*-ci.yml` workflows on pull requests and pushes to `main`. |
 | **Continuous delivery** | Every change that passed CI is ready to be released by one action. | `main` is always deployable; the deploy can also be started by hand. |
 | **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`. |
 | **Pipeline** | The ordered chain of automated steps from a change to a running release. | Section 1. |
@@ -168,7 +170,7 @@ A change goes through these steps:
 Before running anything locally, always know which branch you are on:
 `git branch --show-current`.
 
-### 3.2 Continuous integration on pull requests
+### 3.2 Continuous integration on pull requests and pushes to `main`
 
 Each service has its own workflow, so a change to core-service does not
 wait for the ai-service suite. The `paths:` list of each workflow is
@@ -176,13 +178,13 @@ wait for the ai-service suite. The `paths:` list of each workflow is
 shared test helpers, the Makefile, the dependency files, the workflow
 itself, and any repository file a test inspects.
 
-| Workflow | Runs when a PR touches | Steps |
+| Workflow | Runs when a PR or a push to `main` touches | Steps |
 |---|---|---|
 | `auth-service-ci.yml` | `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, `tests/alembic_contract.py`, `tests/auth_tokens.py`, `Makefile`, `pyproject.toml`, `uv.lock`, the workflow | checkout; install uv 0.8.17; `uv sync --frozen`; flake8 of the service, `shared/` and its tests; `make mypy-shared mypy-auth`; `make test-auth`; `docker build ... --target production` |
-| `core-service-ci.yml` | the same for core, plus `infra/scheduler/**` and `infra/gateway/nginx.conf` (its tests read them) | the same with `mypy-core`, `test-core` |
-| `ai-service-ci.yml` | the same for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example`, `.gitignore` | the same with `mypy-ai`, `test-ai` |
+| `core-service-ci.yml` | the same for core, plus `infra/scheduler/**`, `infra/gateway/nginx.conf` and `infra/prometheus/alert_rules.yml` (its tests read them) | the same with `mypy-core`, `test-core` |
+| `ai-service-ci.yml` | the same for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example`, `.gitignore`, `.dockerignore` and the auth and core Dockerfiles | the same with `mypy-ai`, `test-ai` |
 | `frontend-ci.yml` ("frontend CI") | `frontend/**`, the workflow (and pushes to `main` that touch them) | in `frontend/` with Node 24: `npm ci`; `npm run lint`; `npx next typegen && npx tsc --noEmit` (route types, then the type check); `npm run build` |
-| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | `infra/**`, `scripts/**`, both compose files, `frontend/Dockerfile`, `Makefile`, `.env.example`, the workflow (and every push to `main`) | flake8 of `infra/`; the status page's CSP hashes (`csp_hashes.py --check`); `docker compose config -q` for the stack and the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` (alert rules and their unit tests) |
+| `integration-ci.yml` ("stack smoke CI"), job `config-checks` | `infra/**`, `scripts/**`, both compose files, `.dockerignore`, `frontend/Dockerfile`, `Makefile`, `.env.example`, the workflow (and every push to `main`) | flake8 of `infra/`; the status page's CSP hashes (`csp_hashes.py --check`); `docker compose config -q` for the stack and the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` (alert rules and their unit tests) |
 
 What each step protects against:
 
@@ -299,7 +301,10 @@ It runs on the host, from the deploy workflow or by hand
 | `git fetch --quiet origin main` | Download the latest `main` from GitHub with the read-only deploy key. |
 | `git merge --ff-only --quiet origin/main` | Move the checkout forward. `--ff-only` refuses if the host has local commits or edited tracked files, so a hand-made change on the host is never silently merged or overwritten (section 6). |
 | `echo "deploying ..."` | Put the commit hash and title in the log. |
-| `docker compose --env-file .env.docker up -d --build --remove-orphans --wait --wait-timeout 300` | Rebuild images whose inputs changed, recreate only containers whose image or configuration changed, remove containers of services deleted from the compose file, then wait up to 5 minutes until every container is running and healthy. Any failure makes the script, and so the workflow, fail. |
+| `ps -q --status running scheduler` | Remember whether the scheduler runs before the deploy. The host may keep it stopped on purpose (its cron jobs spend the shared API quotas), and a deploy must not change that. |
+| `docker compose --env-file .env.docker up -d --build --remove-orphans --wait --wait-timeout 300` | Rebuild images whose inputs changed, recreate only containers whose image or configuration changed, remove containers of services deleted from the compose file, then wait up to 5 minutes until every container is running and healthy. Any failure makes the script, and so the workflow, fail. When the scheduler was running, this runs for every service. |
+| `build scheduler`, then the same `up` with the service list from `config --services` without `scheduler` | When the scheduler was not running: its image is still rebuilt (a later `up -d scheduler` runs the new code), but only the other services are started, so no cron job can fire during the `--wait` window. |
+| `stop scheduler` and the message "scheduler was not running before the deploy: kept stopped" | A guard in case a future dependency starts it anyway; the message says how to start it. |
 | `docker image prune -f` | Delete image layers no container uses, so repeated builds do not fill the 40 GiB disk. |
 | `docker compose ... ps` | Show the final state in the log. |
 

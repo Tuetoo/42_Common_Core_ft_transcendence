@@ -3,7 +3,7 @@ from typing import Any
 import structlog
 from ai.agents.finish_checks import InternalTokenValidator
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_thin_evidence)
+                            is_thin_evidence)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.llm.base import AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier
 from ai.llm.json_fence import parse_json_dict
@@ -258,19 +258,9 @@ class SentimentAgent(BaseAgent):
                 logger.warning(
                     "sentiment.label_extraction_failed_after_fallback",
                     final_answer_excerpt=result.final_answer[:200])
-        raw_output: dict[str, Any] = {
-            "scratchpad": [vars(e) for e in result.scratchpad],
-            "sentiment_label": sentiment_label
-        }
         summary = result.final_answer
         if no_evidence:
             logger.warning("sentiment.no_evidence", ticker=state.ticker)
-        raw_output["verification_warnings"] = []
-        raw_output["no_evidence"] = no_evidence
-        raw_output["evidence_yield"] = (
-            news_yield if news_yielded else own_yield)
-        raw_output["finish_meta"] = result.finish_meta
-        if no_evidence:
             written = _extract_sentiment_label(result.final_answer)
             if written is not None:
                 logger.warning(
@@ -280,14 +270,15 @@ class SentimentAgent(BaseAgent):
                 "[NO EVIDENCE: neither the News Agent's live search nor this "
                 "agent's own search returned any relevant article this run; "
                 "no sentiment reading is possible.]\n\n" + summary)
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None, no_evidence=no_evidence,
+        evidence_yield = news_yield if news_yielded else own_yield
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=[], no_evidence=no_evidence,
             thin_evidence=(
-                is_thin_evidence(news_yield if news_yielded else own_yield)
-                or (news_yielded and _news_fallback_unverified(news_output))))
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output=raw_output)
+                is_thin_evidence(evidence_yield)
+                or (news_yielded and _news_fallback_unverified(news_output))),
+            raw_output={
+                "sentiment_label": sentiment_label,
+                "no_evidence": no_evidence,
+                "evidence_yield": evidence_yield
+            })

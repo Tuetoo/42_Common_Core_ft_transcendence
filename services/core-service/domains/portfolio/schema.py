@@ -5,9 +5,8 @@ from uuid import UUID
 from pydantic import (AfterValidator, BaseModel, ConfigDict, Field,
                       model_validator)
 from shared.enums import Currency, TransactionType
-from shared.schemas import (BaseSchema, IDMixin, RecommendationRef,
+from shared.schemas import (BaseSchema, IDMixin, RecommendationRef, Ticker,
                             TimestampMixin, UserRef)
-from shared.tickers import Ticker
 
 PortfolioVisibility = Literal["private", "organization"]
 

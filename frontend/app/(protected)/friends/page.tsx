@@ -1,5 +1,5 @@
-import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, requireOk } from "@/app/lib/backend";
+import { can, getMe } from "@/app/lib/me";
 import { Avatar } from "../avatar";
 import { AddFriendForm, AutoRefresh, ConnectionButton } from "./friend-forms";
 
@@ -34,15 +34,12 @@ function PersonRow({ connection, children }: { connection: Connection; children?
 }
 
 export default async function FriendsPage() {
-  const accessToken = await getAccessToken();
-  const [meRes, connectionsRes] = await Promise.all([
-    backendFetch("/auth/me", accessToken!, { cache: "no-store" }),
-    backendFetch("/connections", accessToken!, { cache: "no-store" }),
-  ]);
-  requireOk(meRes, "Failed to load current user");
+  const { me, accessToken } = await getMe();
+  const connectionsRes = await backendFetch("/connections", accessToken, { cache: "no-store" });
   requireOk(connectionsRes, "Failed to load friends");
+  // A guest may remove, decline, cancel and block, but not send or accept.
+  const canWrite = can(me, "connection:write");
 
-  const { data: me }: { data: { id: string } } = await meRes.json();
   const { data: connections }: { data: Connection[] } = await connectionsRes.json();
 
   // Online friends first, then alphabetical.
@@ -65,10 +62,12 @@ export default async function FriendsPage() {
         <h1 className="page-title">Friends</h1>
       </div>
 
-      <div className="section">
-        <h2 className="section-title">Add a friend</h2>
-        <AddFriendForm />
-      </div>
+      {canWrite && (
+        <div className="section">
+          <h2 className="section-title">Add a friend</h2>
+          <AddFriendForm />
+        </div>
+      )}
 
       {incoming.length > 0 && (
         <div className="section">
@@ -76,7 +75,7 @@ export default async function FriendsPage() {
           <div className="row-list">
             {incoming.map((c) => (
               <PersonRow key={c.id} connection={c}>
-                <ConnectionButton connectionId={c.id} kind="accept" label="Accept" primary />
+                {canWrite && <ConnectionButton connectionId={c.id} kind="accept" label="Accept" primary />}
                 <ConnectionButton connectionId={c.id} kind="remove" label="Decline" />
                 <ConnectionButton connectionId={c.id} kind="block" label="Block" />
               </PersonRow>
@@ -93,7 +92,7 @@ export default async function FriendsPage() {
           </span>
         </h2>
         {friends.length === 0 ? (
-          <p className="empty-state">No friends yet. Send a request by username above.</p>
+          <p className="empty-state">No friends yet.{canWrite && " Send a request by username above."}</p>
         ) : (
           <div className="row-list">
             {friends.map((c) => (

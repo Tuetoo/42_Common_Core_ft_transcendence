@@ -17,7 +17,7 @@ restore drill.
 |------|----------------|---------------------|--------------------|
 | PostgreSQL: all three schemas (`auth`, `core`, `ai`) -- users, organizations, portfolios, transactions, research notes, analyses, recommendations, agent memory, ... | `postgres_data` volume | `pg_dump -Fc` of the whole database (consistent snapshot, the database stays online) | `postgres.dump` |
 | Qdrant: every collection (RAG vectors, e.g. `research_documents_gemini`) | `qdrant_data` volume | Qdrant REST API: create a snapshot per collection, download it, delete it from Qdrant | `qdrant/<collection>.snapshot` |
-| Object storage (SeaweedFS, service `objectstore`): every bucket, in practice `research-documents` (uploaded research files and archived raw SEC filings) | `objectstore_data` volume | every object copied through the S3 API with `rclone copy`, with the services' own endpoint and keys (`S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`); rclone checks each object's MD5 | `objectstore/<bucket>/<key>`: one plain file per object, an empty folder for an empty bucket (older backups: `objectstore-data.tar.gz`, or `minio-data.tar.gz` from the MinIO era, see sections 4.3 and 9) |
+| Object storage (SeaweedFS, service `objectstore`): every bucket, in practice `research-documents` (uploaded research files and archived raw SEC filings) | `objectstore_data` volume | every object copied through the S3 API with `rclone copy`, with the services' own endpoint and keys (`S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`); rclone checks each object's MD5 | `objectstore/<bucket>/<key>`: one plain file per object, an empty folder for an empty bucket |
 | auth-service avatars (uploaded profile pictures) | `avatar_data` volume | `tar -czf` of the volume, mounted read-only | `avatars.tar.gz` |
 | Checksums | -- | `sha256sum` of every file above | `SHA256SUMS` |
 | Manifest | -- | time, sizes and checksums of the top-level and Qdrant files, Qdrant collections with their exact point counts, object count and bytes per bucket, and the **Alembic revision of each schema** | `manifest.json` |
@@ -34,10 +34,10 @@ bucket was listed is in the next night's backup. The backup keeps keys and
 contents, not S3 metadata: on restore each object's `Content-Type` is set
 from its key's file extension (the services never read it back).
 
-`manifest.json` has `"format": 3`. Backups written before this method have
-`"format": 2` and `objectstore-data.tar.gz` (a tarball of the SeaweedFS data
-directory); MinIO-era backups have `"format": 1` and `minio-data.tar.gz`.
-`restore.sh` recognises all three (section 4.3).
+`manifest.json` has `"format": 3`. The older formats (a tarball of the
+object storage's data directory, before 2026-10-05) are no longer
+restored: they aged out of the 7-day retention, and their object storage
+part cannot be put back.
 
 The layout of one backup:
 
@@ -121,10 +121,8 @@ part.
 
 Before it changes anything, a real restore runs a **preflight** of every
 chosen part: PostgreSQL and Qdrant answer; for an `objectstore/` backup
-the object storage's S3 API answers (objectstore running); for an older
-tarball backup the S3 API does NOT answer (objectstore stopped) and the
-data directory is mounted writable; the avatars directory is mounted
-writable. If one check fails, the restore stops with "nothing was
+the object storage's S3 API answers (objectstore running); the avatars
+directory is mounted writable. If one check fails, the restore stops with "nothing was
 changed", so a restore never stops half-way with the database from the
 backup and the object storage from now.
 
@@ -136,7 +134,7 @@ any difference:
 |------|------------------------|
 | postgres | each schema's Alembic revision equals the manifest's; each schema has as many tables as the dump holds table data for; prints the row counts of `auth.users`, `core.portfolios` and `ai.analyses` |
 | qdrant | every collection of the manifest exists, with exactly the point count the manifest recorded (the backup records it only when the count was the same before and after the snapshot) |
-| objectstore | `rclone check` of every bucket against its `objectstore/<bucket>/` folder: the same keys, sizes and MD5 in both directions (not possible for a tarball backup: skipped) |
+| objectstore | `rclone check` of every bucket against its `objectstore/<bucket>/` folder: the same keys, sizes and MD5 in both directions |
 | avatars | the volume's files equal the files in `avatars.tar.gz` |
 
 Run it before the services start again (they migrate the schemas
@@ -186,7 +184,7 @@ backup -- exactly the "after a bad migration" case -- could not be
 restored. On their next start the services run `alembic upgrade head`
 (see section 8), so a backup from an older code version is migrated
 forward automatically -- except a backup from before the current
-baselines, which needs the one-time conversion described in section 8.
+baselines (before round 116), which cannot be restored (section 8).
 
 ### 4.2 Only Qdrant
 
@@ -224,19 +222,6 @@ and objects that are not in the backup (uploaded after it) are deleted.
 Buckets that are not in the backup are left alone. A document whose
 object is restored but whose database row is not (or the reverse) is a
 mismatch between parts: restore PostgreSQL from the same backup.
-
-An older backup with `objectstore-data.tar.gz` holds SeaweedFS's data
-directory instead. It is extracted into the `objectstore_data` volume,
-which the `restore` service mounts read-write, so `objectstore` must be
-**stopped** for it (`restore.sh` refuses while the S3 API answers):
-`docker compose --env-file .env.docker stop objectstore core-service
-ai-service scheduler`, then the same `restore.sh --yes --only objectstore`
-command, then `up -d`. `make restore` stops or starts `objectstore`
-according to the backup's format. Restore such a backup with the
-SeaweedFS image tag that wrote it (`docker-compose.yaml`). A backup from
-the time the stack used MinIO has `minio-data.tar.gz`, which SeaweedFS
-cannot read: `restore.sh` skips that part in a full restore and refuses
-`--only objectstore`; see section 9.
 
 For avatars use `--only avatars` and stop `auth-service` instead. The
 `restore` service mounts `avatar_data` read-write; the scheduler mounts it
@@ -277,9 +262,7 @@ Needed: a copy of `./backups/<stamp>/` and your saved `.env.docker`.
        /scripts/restore.sh --verify /backups/<stamp>
    ```
    (`make restore BACKUP=<stamp> CONFIRM=yes` does the last two steps and
-   starts the stack. For an older backup with `objectstore-data.tar.gz`,
-   stop `objectstore` before the `--yes` step and start it again after
-   it, see section 4.3.)
+   starts the stack.)
 7. Start the whole stack: `make up` (or
    `docker compose --env-file .env.docker up -d`).
 8. Check: `https://localhost:8443/status` shows every service and
@@ -355,36 +338,22 @@ an analysis on restored data, do a full rebuild on a spare machine
 
 ## 8. How the database schema is brought up to date
 
-Each service runs `db_bootstrap.ensure_schema` at startup, in every
+Each service runs `database.ensure_schema` at startup, in every
 environment. Alembic alone manages the schema:
 
 - an empty schema: `alembic upgrade head` -- the baseline migration
   (`f1160b000001` auth, `f1160c000001` core, `f1160a000001` ai) creates
   every table;
 - a schema at a known revision: `alembic upgrade head`;
-- a schema still on the archived migration chain (`migrations/archive/`;
-  its heads are auth `f1130b000001`, core `f1130c000002`, ai `f1120a000002`):
-  the service refuses to start and names the one-time conversion:
-
-  ```sh
-  docker compose --env-file .env.docker exec -T auth-service python -m scripts.alembic_convert
-  docker compose --env-file .env.docker exec -T auth-service python -m scripts.alembic_convert --apply
-  ```
-
-  (same for `core-service` and `ai-service`; the first command is a
-  preview and changes nothing). The container must be running for
-  `exec`; if it keeps restarting because of the refusal, use
-  `docker compose --env-file .env.docker run --rm auth-service python -m
-  scripts.alembic_convert` instead;
+- a schema at a revision Alembic does not know (for example from a backup
+  taken before round 116, when an older migration chain was used): Alembic
+  stops with "Can't locate revision" and the service does not start. Such
+  backups cannot be restored with this version;
 - a schema with tables but no Alembic revision: refused (its state is
   unknown).
 
 So a backup whose schemas carry a revision of the current chains is
-migrated forward on the next start. A backup at an archived head needs the
-conversion above for each service after the restore. A backup at an
-older archived revision is refused: it must first be started once with a
-version of the code whose live chain is the archived one, which upgrades
-it to the archived heads. The three services
+migrated forward on the next start. The three services
 keep separate version tables (`auth.alembic_version`,
 `core.alembic_version`, `ai.alembic_version`) and can start at the same
 time.
@@ -398,12 +367,6 @@ deployment cannot pull it. The application only speaks S3 through boto3,
 and the service has the network alias `minio`, so `S3_ENDPOINT_URL=
 http://minio:9000` and the keys in `.env.docker` work unchanged. The stack
 has no MinIO service, volume or copy tooling.
-
-A backup from the time the stack used MinIO has `minio-data.tar.gz`
-instead of an object storage part SeaweedFS can use: its PostgreSQL and
-Qdrant parts restore as usual, its object storage part cannot be restored
-(it is skipped, and refused with `--only objectstore`). Such backups age
-out after `BACKUP_RETENTION_DAYS` days.
 
 ### 9.1 SeaweedFS notes
 
@@ -421,8 +384,7 @@ out after `BACKUP_RETENTION_DAYS` days.
   S3 ListBuckets request with those keys.
 - The backup and restore scripts reach SeaweedFS only through its S3
   API, so a backup can be restored into any SeaweedFS version (or any
-  other S3 server). Only an older tarball backup of `objectstore_data`
-  needs the image tag that wrote it. Never switch the same volume between
+  other S3 server). Never switch the same volume between
   the normal and the `_large_disk` image variants (different on-disk
   format).
 

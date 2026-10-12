@@ -21,7 +21,7 @@ const STATUS_COLOR: Record<ConnectionStatus, string> = {
   ended: "var(--down)",
 };
 
-// Close codes from services/core-service/api/ws_common.py.
+// Close codes from services/core-service/websocket_manager.py.
 const CLOSE_UNAUTHORIZED = 4401; // token expired or invalid: get a new one
 const CLOSE_FORBIDDEN = 4403; // no access (or the note was deleted)
 const FATAL_CLOSE_CODES = new Set([1003, 1008, 4400, CLOSE_FORBIDDEN]);

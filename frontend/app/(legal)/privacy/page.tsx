@@ -44,8 +44,9 @@ export default function PrivacyPolicyPage() {
       </ul>
       <h3>Signing in with Google or GitHub</h3>
       <p>
-        If you sign in with Google or GitHub, we receive your email address, your name and your account ID on that
-        service, and use them to create your AlphaMind account or link it to an existing one.
+        If you sign in with Google or GitHub, that service sends us your basic account details. We only use and keep
+        your email address and your account ID on that service, to create your AlphaMind account or link it to an
+        existing one. Your name on that service is not stored.
       </p>
       <h3>Two-factor authentication</h3>
       <p>If you turn on two-factor authentication, its secret key (TOTP) is stored encrypted.</p>
@@ -58,7 +59,7 @@ export default function PrivacyPolicyPage() {
       <h3>Organizations and friends</h3>
       <p>
         Your organization memberships and invitations, your friend connections, and whether you are currently online
-        (shown to your friends).
+        (shown to your friends and to administrators).
       </p>
       <h3>Technical data</h3>
       <ul>
@@ -68,7 +69,8 @@ export default function PrivacyPolicyPage() {
         </li>
         <li>
           The gateway&apos;s access logs record your IP address, browser information, the page or API path and the
-          response status. They do not record the query string of a URL, so sign-in tokens never appear in the logs.
+          response status. They do not record the query string of a URL, so sign-in tokens are not written to the
+          access logs.
         </li>
       </ul>
 
@@ -91,7 +93,11 @@ export default function PrivacyPolicyPage() {
           </ul>
         </li>
         <li>For security: rate limiting, detecting abuse and recording errors.</li>
-        <li>To send email: verifying your email address, resetting your password and organization invitations.</li>
+        <li>
+          To send email: verifying your email address, resetting your password and organization invitations. If you
+          turn on email notifications in your account settings (they are off by default), your notifications are
+          also sent to your email address.
+        </li>
       </ul>
       <p>There is no advertising, and your information is not sold.</p>
 
@@ -104,7 +110,8 @@ export default function PrivacyPolicyPage() {
           <strong>GitHub</strong>: GitHub sign-in.
         </li>
         <li>
-          <strong>Mistral AI</strong>: a backup AI model, when it is configured.
+          <strong>Mistral AI</strong>: a backup AI model, when it is configured. The system can also be configured to
+          use other AI providers, such as OpenAI or Anthropic; they are off unless an operator adds their keys.
         </li>
         <li>
           <strong>Market data and news</strong>: Yahoo Finance, SEC EDGAR, FRED (Federal Reserve economic data),
@@ -126,9 +133,11 @@ export default function PrivacyPolicyPage() {
       <h2>5. Cookies and browser storage</h2>
       <ul>
         <li>
-          <code>access_token</code> and <code>refresh_token</code> keep you signed in. They cannot be read by
-          JavaScript on the page (httpOnly), are only sent over HTTPS in production, use SameSite=Lax, and are
-          session cookies that your browser clears when it closes.
+          <code>access_token</code> and <code>refresh_token</code> keep you signed in. These cookies cannot be read
+          by JavaScript on the page (httpOnly), are only sent over HTTPS in production, use SameSite=Lax, and are
+          session cookies that your browser clears when it closes. The refresh token is never readable by page
+          scripts. A short-lived access token (valid for 15 minutes) is given to the page so it can open live
+          connections, such as notifications and the shared note editor.
         </li>
         <li>
           <code>alphamind_oauth_nonce</code> exists only for the few minutes of a Google or GitHub sign-in, to check
@@ -147,8 +156,15 @@ export default function PrivacyPolicyPage() {
           linked Google or GitHub account are deleted automatically.
         </li>
         <li>Read notifications are deleted after 90 days. Unread ones are kept.</li>
-        <li>Server logs are kept for 14 days.</li>
-        <li>Backups are kept for 7 days.</li>
+        <li>
+          Sign-in session records (IP address and browser information) are removed when you next sign in, once the
+          session has been expired for more than 7 days. Records of an account that does not sign in again are kept.
+        </li>
+        <li>
+          Server log files are kept for about 14 days. Each container&apos;s own Docker log is limited by size (up to
+          100 MB), not by age.
+        </li>
+        <li>Backups are kept for about 7 days. The newest 3 backups are always kept, even if they are older.</li>
       </ul>
       <h3>Deleting your account</h3>
       <p>

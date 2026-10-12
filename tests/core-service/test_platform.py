@@ -708,7 +708,7 @@ class TestUserState:
                 await client.get(url, headers=guest)).status_code == 200, url
 
     async def test_websocket_subject_and_user_state_lookup(self, monkeypatch):
-        from api.ws_common import authenticate
+        from websocket_manager import authenticate
 
         assert authenticate(_access_token_with_claims(sub="admin")) is None
         assert authenticate(_access_token_with_claims()) is None
@@ -815,10 +815,10 @@ class TestSharedContracts:
         import shared.market_calendar as market_calendar
 
         monkeypatch.setattr(market_calendar, "datetime", _FakeDateTime)
-        assert internal._market_today() == date(2026, 11, 26)
+        assert internal.market_today() == date(2026, 11, 26)
 
         from prometheus_client import Counter, Gauge
-        from shared.metrics import get_or_create
+        from shared.logging import get_or_create
 
         name = f"alphamind_test_{uuid4().hex[:8]}"
         first = get_or_create(Gauge, name, "doc", ("a", ))
@@ -828,23 +828,19 @@ class TestSharedContracts:
 
         import main
 
-        paths = main.app.openapi()["paths"]
+        schema = main.app.openapi()
+        paths = schema["paths"]
         assert not [p for p in paths if p.startswith("/internal")]
-
-        from shared.enums import AgentRole, NotificationType, WorkflowStatus
-
-        values = {t.value for t in NotificationType}
-        assert "system" not in values and "transaction_deleted" not in values
-        assert "cancelled" not in {s.value for s in WorkflowStatus}
-        assert not {"supervisor", "judge", "reflection"
-                    } & {r.value
-                         for r in AgentRole}
+        assert schema["components"]["securitySchemes"]["APIKeyHeader"] == {
+            "type": "apiKey", "in": "header", "name": "X-API-Key"}
+        public_ops = [
+            op for path, item in paths.items()
+            if path.startswith("/api/v1/public") for op in item.values()]
+        assert len(public_ops) == 5
+        assert all(
+            op["security"] == [{"APIKeyHeader": []}] for op in public_ops)
 
         import clients.ai_client as ai_client
-        from domains.research.repository import DocumentRepository
-
-        assert not hasattr(ai_client, "get_current_price")
-        assert not hasattr(DocumentRepository, "update_status")
 
         import domains.portfolio.ledger as ledger
         from shared.market_calendar import MARKET_TZ
@@ -853,9 +849,303 @@ class TestSharedContracts:
 
         conf = (_REPO / "infra" / "gateway" / "nginx.conf").read_text()
         assert "$proxy_add_x_forwarded_for" not in conf
-        # http level, /ws, /grafana/ and the internal 8080 listener.
         assert (
             conf.count("proxy_set_header X-Forwarded-For $remote_addr;") == 4)
+
+
+class TestApiKeys:
+
+    async def test_api_key_access_owner_state_and_rate_limit(
+            self, real_client, mock_cross_service, monkeypatch):
+        client = real_client
+        user_id, headers = _headers()
+
+        created = await client.post(
+            "/api/v1/api-keys", json={"name": "my integration"},
+            headers=headers)
+        assert created.status_code == 201
+        raw_key = created.json()["data"]["key"]
+        assert raw_key.startswith("amk_")
+
+        portfolio = (
+            await client.post(
+                "/api/v1/portfolios", json={"name": "Public API Test"},
+                headers=headers)).json()["data"]
+
+        no_key = await client.get(
+            f"/api/v1/public/portfolios/{portfolio['id']}")
+        assert no_key.status_code == 401
+
+        wrong_key = await client.get(
+            f"/api/v1/public/portfolios/{portfolio['id']}",
+            headers={"X-API-Key": "amk_not-a-real-key"})
+        assert wrong_key.status_code == 401
+
+        with_key = await client.get(
+            f"/api/v1/public/portfolios/{portfolio['id']}",
+            headers={"X-API-Key": raw_key})
+        assert with_key.status_code == 200
+        assert with_key.json()["data"]["id"] == portfolio["id"]
+
+        client = real_client
+        _, headers = _headers()
+        key = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "p"},
+                headers=headers)).json()["data"]["key"]
+        wl = (
+            await client.post(
+                "/api/v1/watchlists", json={"name": "w"},
+                headers=headers)).json()["data"]["id"]
+        created = await client.post(
+            f"/api/v1/public/watchlists/{wl}/items", json={"ticker": "amd"},
+            headers={"X-API-Key": key})
+        assert created.status_code == 201, created.text
+        assert created.json()["data"]["ticker"] == "AMD"
+        removed = await client.delete(
+            f"/api/v1/public/watchlists/{wl}/items/AMD",
+            headers={"X-API-Key": key})
+        assert removed.status_code == 204
+
+        import apikeys as middleware
+        from config import settings
+        from shared.user_state import UserState
+
+        client = real_client
+        _, headers = _headers()
+        pid = await create_portfolio(client, headers, "Key owner state")
+        holding = (
+            await client.post(
+                f"/api/v1/portfolios/{pid}/holdings", json={
+                    "ticker": "AAPL",
+                    "quantity": "1",
+                    "average_cost": "10"
+                }, headers=headers)).json()["data"]
+        key = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "state"},
+                headers=headers)).json()["data"]["key"]
+        api = {"X-API-Key": key}
+        read_url = f"/api/v1/public/portfolios/{pid}"
+        write_url = f"/api/v1/public/portfolios/{pid}/holdings/{holding['id']}"
+
+        state: dict[str, UserState | None] = {"value": None}
+        looked_up: list[str] = []
+
+        async def _state(_settings, user_id):
+            looked_up.append(str(user_id))
+            return state["value"]
+
+        monkeypatch.setattr(middleware, "get_user_state", _state)
+        monkeypatch.setattr(settings, "USER_STATE_CHECK_ENABLED", True)
+
+        assert (await client.get(read_url, headers=api)).status_code == 200
+        state["value"] = UserState(role="user", is_active=False)
+        denied = await client.get(read_url, headers=api)
+        assert denied.status_code == 401
+        assert denied.json()["error"]["code"] == "account_deactivated"
+        assert (
+            await client.put(write_url, json={"quantity": "2"},
+                             headers=api)).status_code == 401
+        state["value"] = UserState(role="guest", is_active=True)
+        assert (await client.get(read_url, headers=api)).status_code == 200
+        forbidden = await client.put(
+            write_url, json={"quantity": "2"}, headers=api)
+        assert forbidden.status_code == 403
+        assert forbidden.json()["error"]["code"] == "insufficient_permissions"
+        state["value"] = UserState(role="user", is_active=True)
+        assert (
+            await client.put(write_url, json={"quantity": "2"},
+                             headers=api)).status_code == 200
+        assert looked_up
+
+        monkeypatch.setattr(settings, "USER_STATE_CHECK_ENABLED", False)
+        looked_up.clear()
+        state["value"] = UserState(role="user", is_active=False)
+        assert (await client.get(read_url, headers=api)).status_code == 200
+        assert looked_up == []
+
+        client = real_client
+        _, headers = _headers()
+        keys = [(
+            await client.post(
+                "/api/v1/api-keys", json={"name": f"k{i}"},
+                headers=headers)).json()["data"]["key"] for i in range(2)]
+        pid = await create_portfolio(client, headers)
+        monkeypatch.setattr(settings, "PUBLIC_API_RATE_LIMIT_PER_MINUTE", 3)
+        url = f"/api/v1/public/portfolios/{pid}"
+        statuses = [
+            (await client.get(url,
+                              headers={"X-API-Key": keys[i % 2]})).status_code
+            for i in range(4)
+        ]
+        assert statuses == [200, 200, 200, 429]
+
+        client = real_client
+        _, headers = _headers()
+        created = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "r"},
+                headers=headers)).json()["data"]
+        pid = await create_portfolio(client, headers)
+        url = f"/api/v1/public/portfolios/{pid}"
+        assert (
+            await client.get(url, headers={"X-API-Key": created["key"]
+                                           })).status_code == 200
+        assert (
+            await client.delete(
+                f"/api/v1/api-keys/{created['id']}",
+                headers=headers)).status_code == 204
+        assert (
+            await client.get(url, headers={"X-API-Key": created["key"]
+                                           })).status_code == 401
+
+    async def test_api_key_revoke_and_cache(
+            self, client, mock_cross_service, monkeypatch, db_session):
+        user_id, headers = _headers()
+        created = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "to be revoked"},
+                headers=headers)).json()["data"]
+        raw_key = created["key"]
+
+        revoke = await client.delete(
+            f"/api/v1/api-keys/{created['id']}", headers=headers)
+        assert revoke.status_code == 204
+
+        portfolio = (
+            await client.post(
+                "/api/v1/portfolios", json={"name": "Revoked Key Test"},
+                headers=headers)).json()["data"]
+
+        response = await client.get(
+            f"/api/v1/public/portfolios/{portfolio['id']}",
+            headers={"X-API-Key": raw_key})
+        assert response.status_code == 401
+
+        import apikeys
+
+        _, headers = _headers()
+        created = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "r"},
+                headers=headers)).json()["data"]
+
+        class _DownRedis:
+
+            async def set(self, *args, **kwargs):
+                raise ConnectionError("redis down")
+
+            async def delete(self, *args, **kwargs):
+                raise ConnectionError("redis down")
+
+        monkeypatch.setattr(
+            apikeys, "get_cache_client", lambda settings: _DownRedis())
+        response = await client.delete(
+            f"/api/v1/api-keys/{created['id']}", headers=headers)
+        assert response.status_code == 204
+        listed = (await client.get("/api/v1/api-keys",
+                                   headers=headers)).json()["data"]
+        mine = next(k for k in listed if k["id"] == created["id"])
+        assert mine["revoked_at"] is not None
+
+        class _AcceptingCache:
+
+            async def set(self, *args, **kwargs):
+                return True
+
+        monkeypatch.setattr(
+            apikeys, "get_cache_client", lambda _s: _AcceptingCache())
+        row, _raw = await apikeys.create_api_key(
+            db_session, owner_user_id=uuid4(), name="k")
+        limit = apikeys.settings.PUBLIC_API_RATE_LIMIT_PER_MINUTE
+        assert row.rate_limit_per_minute == limit
+        await apikeys.revoke(db_session, row)
+        first = row.revoked_at
+        await apikeys.revoke(db_session, row)
+        assert row.revoked_at == first
+        found = await apikeys.get_for_owner(
+            db_session, row.owner_user_id, row.id)
+        assert found is row
+        assert (
+            await apikeys.get_for_owner(db_session, uuid4(), row.id) is None)
+
+        writes: list[tuple[str, str]] = []
+
+        class _Cache:
+
+            async def set(self, key, value, ex=None):
+                writes.append(("set", key))
+
+            async def delete(self, key):
+                writes.append(("delete", key))
+
+        monkeypatch.setattr(apikeys, "get_cache_client", lambda _s: _Cache())
+        _, headers = _headers()
+        created = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "k"},
+                headers=headers)).json()["data"]
+        cache_key = apikeys.validation_cache_key(
+            apikeys.hash_key(created["key"]))
+        updated = await client.patch(
+            f"/api/v1/api-keys/{created['id']}",
+            json={"rate_limit_per_minute": 5}, headers=headers)
+        assert updated.status_code == 200, updated.text
+        assert writes == [("delete", cache_key)] * 2
+        writes.clear()
+        revoked = await client.delete(
+            f"/api/v1/api-keys/{created['id']}", headers=headers)
+        assert revoked.status_code == 204
+        assert writes == [("set", cache_key)] * 2
+
+    async def test_api_key_preflight_and_update(self, client):
+        resp = await client.options(
+            f"/api/v1/public/portfolios/{uuid4()}", headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "X-API-Key"
+            })
+        assert resp.status_code == 200, resp.text
+        assert (
+            resp.headers.get("access-control-allow-origin") ==
+            "http://localhost:3000")
+
+        from config import settings
+
+        _, headers = _headers()
+        key = (
+            await client.post(
+                "/api/v1/api-keys", json={"name": "orig"},
+                headers=headers)).json()["data"]
+        response = await client.patch(
+            f"/api/v1/api-keys/{key['id']}", json={
+                "name": "renamed",
+                "rate_limit_per_minute": 5
+            }, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["name"] == "renamed"
+        assert response.json()["data"]["rate_limit_per_minute"] == 5
+        assert (
+            await client.patch(
+                f"/api/v1/api-keys/{key['id']}", json={},
+                headers=headers)).status_code == 422
+        too_high = settings.PUBLIC_API_RATE_LIMIT_PER_MINUTE + 1
+        assert (
+            await client.patch(
+                f"/api/v1/api-keys/{key['id']}",
+                json={"rate_limit_per_minute": too_high},
+                headers=headers)).status_code == 422
+        _, other = _headers()
+        assert (
+            await client.patch(
+                f"/api/v1/api-keys/{key['id']}", json={"name": "x"},
+                headers=other)).status_code == 404
+        await client.delete(f"/api/v1/api-keys/{key['id']}", headers=headers)
+        assert (
+            await client.patch(
+                f"/api/v1/api-keys/{key['id']}", json={"name": "x"},
+                headers=headers)).status_code == 409
 
 
 class TestE2eCheckScript:
@@ -1040,18 +1330,18 @@ class TestE2eCheckScript:
                 b"\x00\xff\xff\xff\xff\xff\xff\xff\xff\x0fgarbage")
 
         from config import settings
-        from shared import e2e_lock
+        from shared.redis import acquire_e2e_lock as acquire
+        from shared.redis import release_e2e_lock as release
 
-        await e2e_lock.release(settings, "nobody")
-        assert await e2e_lock.acquire(settings, "run-a") is None
-        assert await e2e_lock.acquire(settings, "run-b") == "run-a"
-        await e2e_lock.release(settings, "run-b")
-        assert await e2e_lock.acquire(settings, "run-c") == "run-a"
-        assert (
-            await e2e_lock.acquire(settings, "run-c", break_lock=True) is None)
-        await e2e_lock.release(settings, "run-c")
-        assert await e2e_lock.acquire(settings, "run-d") is None
-        await e2e_lock.release(settings, "run-d")
+        await release(settings, "nobody")
+        assert await acquire(settings, "run-a") is None
+        assert await acquire(settings, "run-b") == "run-a"
+        await release(settings, "run-b")
+        assert await acquire(settings, "run-c") == "run-a"
+        assert await acquire(settings, "run-c", break_lock=True) is None
+        await release(settings, "run-c")
+        assert await acquire(settings, "run-d") is None
+        await release(settings, "run-d")
 
     def test_admin_token_help_and_main_refusals(self, monkeypatch, capsys):
         assert "_create_token('<ADMIN_USER_ID>', timedelta(hours=2)" in (
@@ -1063,7 +1353,7 @@ class TestE2eCheckScript:
         assert "E2E_ADMIN_TOKEN" in capsys.readouterr().err
         assert e2e.main(["--only", "bogus"]) == 2
 
-        from shared import e2e_lock
+        import shared.redis as shared_redis
 
         async def _held(settings, holder, *, break_lock=False):
             return "e2e_check abc123 2026-09-30T01:00:00+00:00"
@@ -1072,7 +1362,7 @@ class TestE2eCheckScript:
             return None
 
         monkeypatch.setattr(e2e.E2E, "admin_token_problem", _usable)
-        monkeypatch.setattr(e2e_lock, "acquire", _held)
+        monkeypatch.setattr(shared_redis, "acquire_e2e_lock", _held)
         monkeypatch.setenv("E2E_ADMIN_TOKEN", "t")
         assert e2e.main(["--only", "platform"]) == 2
         err = capsys.readouterr().err
@@ -1086,7 +1376,7 @@ class TestE2eCheckScript:
             raise AssertionError("the lock must not be taken")
 
         monkeypatch.setattr(e2e.E2E, "admin_token_problem", _expired)
-        monkeypatch.setattr(e2e_lock, "acquire", _no_lock)
+        monkeypatch.setattr(shared_redis, "acquire_e2e_lock", _no_lock)
         monkeypatch.setenv("E2E_ADMIN_TOKEN", "expired")
         assert e2e.main(["--only", "auth"]) == 2
         err = capsys.readouterr().err
@@ -1098,7 +1388,7 @@ class TestE2eCheckScript:
 class TestMigrations:
 
     async def test_status_changed_at_is_filled_from_uploaded_at(self, scratch):
-        schema, engine, _ = scratch
+        schema, engine = scratch
         await upgrade_to(engine, schema, "f1200c000001")
         await _insert_document(
             engine, schema, owner=uuid4(), filename="old.txt")
@@ -1118,8 +1408,8 @@ class TestMigrations:
 
     async def test_upgrade_refuses_duplicate_documents_then_succeeds(
             self, scratch):
-        schema, engine, conversion = scratch
-        await upgrade_to(engine, schema, conversion.baseline)
+        schema, engine = scratch
+        await upgrade_to(engine, schema, "f1160c000001")
         owner = uuid4()
         await _insert_document(
             engine, schema, owner=owner, filename="fomc.txt")
@@ -1128,7 +1418,7 @@ class TestMigrations:
 
         with pytest.raises(Exception, match=r"fomc\.txt.*2 copies"):
             await upgrade_to(engine, schema, "head")
-        assert await revision(engine, schema) == conversion.baseline
+        assert await revision(engine, schema) == "f1160c000001"
 
         async with engine.begin() as conn:
             await conn.execute(

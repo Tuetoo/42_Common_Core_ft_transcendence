@@ -10,10 +10,10 @@ import ai.agents.news as news_module
 import ai.agents.reflection as reflection_module
 import ai.agents.sentiment as sentiment_module
 import ai.graph.nodes as nodes_module
-import ai.ingestion.macro_ingestion as macro_ingestion
-import ai.ingestion.news_ingestion as news_ingestion
-import ai.llm.capacity as capacity_module
+import ai.ingestion.digests as macro_ingestion
+import ai.ingestion.digests as news_ingestion
 import ai.llm.google_provider as google_provider
+import ai.llm.router as router_module
 import ai.providers.news_filters as filters_module
 import ai.providers.news_relevance as relevance_module
 import ai.providers.newsapi as newsapi_module
@@ -21,11 +21,10 @@ import ai.rag.indexing as indexing_module
 import ai.recommendation.position_sizing as sizing_module
 import ai.tools.news_tool as news_tool_module
 import ai.tools.portfolio_tool as portfolio_tool_module
-import ai.tools.search_relevance as search_relevance_module
 import ai.tools.web_search_tool as web_tool_module
 import httpx
 import pytest
-from ai.agents import debate_side
+from ai.agents import debate_common as dc
 from ai.agents import macro as macro_module
 from ai.agents.finish_checks import INTERNAL_TOKEN_MESSAGE
 from ai.agents.loop import ScratchpadEntry
@@ -63,7 +62,7 @@ from ai.tools.research_archive_tool import (AGENT_NOTE_GUIDANCE,
 from ai.tools.web_search_tool import WebSearchTool
 from ai.workflows.analysis_workflow import _archival_recycled_share
 from config import settings
-from helpers import _finish, _ScriptedReviewRouter
+from helpers import _finish, _run_steps, _ScriptedReviewRouter
 from qdrant_client.http.exceptions import ResponseHandlingException
 from structlog.testing import capture_logs
 from shared.enums import (AgentRole, AnalysisType, DocumentCategory,
@@ -232,14 +231,6 @@ def _patch_catalog(
     monkeypatch.setattr(web_tool_module, "source_catalog", _catalog)
 
 
-async def _run_steps(*steps: Any, setup: Any = None) -> None:
-    for step in steps:
-        with pytest.MonkeyPatch.context() as mp:
-            if setup is not None:
-                setup(mp)
-            await step(mp)
-
-
 @pytest.fixture
 def known_companies(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return _install_known_companies(monkeypatch)
@@ -251,8 +242,7 @@ def _install_known_companies(
     async def _lookup(ticker: str) -> str:
         return _LEGAL[ticker]
 
-    for module in (relevance_module, news_tool_module, search_relevance_module,
-                   news_module, news_ingestion):
+    for module in (relevance_module, news_ingestion):
         monkeypatch.setattr(module, "lookup_company_name", _lookup)
     _patch_catalog(monkeypatch)
     return monkeypatch
@@ -267,7 +257,7 @@ def _company_news_env(monkeypatch, name: str) -> None:
     async def _name(ticker):
         return name
 
-    monkeypatch.setattr(news_tool_module, "lookup_company_name", _name)
+    monkeypatch.setattr(relevance_module, "lookup_company_name", _name)
     monkeypatch.setattr(
         relevance_module, "classify_articles", _keep_all_unclassified)
 
@@ -1381,13 +1371,13 @@ class TestWebSearch:
                     "kind": verdicts[t][1]
                 }))
         known_companies.setattr(
-            search_relevance_module, "LLMRouter", lambda: router)
+            web_tool_module, "LLMRouter", lambda: router)
         results = [
             _web_result(t, f"https://site{i}.example/p")
             for i, t in enumerate(verdicts)
         ]
         with capture_logs() as logs:
-            kept = await search_relevance_module.classify_results(
+            kept = await web_tool_module.classify_results(
                 "fed decision", results)
         assert [(c.result.title, c.kind) for c in kept] == [
             ("Short-Term Energy Outlook: forecast tables", "company_business"),
@@ -1407,15 +1397,15 @@ class TestWebSearch:
                     "kind": "company_business"
                 }))
         known_companies.setattr(
-            search_relevance_module, "LLMRouter", lambda: router)
-        await search_relevance_module.classify_results(
+            web_tool_module, "LLMRouter", lambda: router)
+        await web_tool_module.classify_results(
             "Coca Cola company news", [_web_result("Coca-Cola news story")],
             ticker="KO")
         assert "research on Coca Cola (ticker KO)" in router.prompts[0]
 
     async def _web_answers_budget_and_unverified_items(self, monkeypatch):
         router = _ScriptedRouter([_fed_answer(broken=None)])
-        kept = await search_relevance_module.classify_results(
+        kept = await web_tool_module.classify_results(
             "fed decision", _fed_results(),
             llm_router=router)  # type: ignore[arg-type]
         assert router.max_tokens == [4096]
@@ -1424,7 +1414,7 @@ class TestWebSearch:
 
         router = _ScriptedRouter([_fed_answer(), _fed_answer()])
         monkeypatch.setattr(
-            search_relevance_module, "LLMRouter", lambda: router)
+            web_tool_module, "LLMRouter", lambda: router)
 
         async def _no_catalog() -> None:
             return None
@@ -1463,7 +1453,7 @@ class TestWebSearch:
         router = _TitleRouter(
             _aligned(lambda t: ("this_company", "price_page")))
         known_companies.setattr(
-            search_relevance_module, "LLMRouter", lambda: router)
+            web_tool_module, "LLMRouter", lambda: router)
         provider = _RecordingTavily([
             _web_result(
                 "NVIDIA Stock Forecast 2026", "https://midforex.example/nvda",
@@ -1557,7 +1547,7 @@ class TestNewsAgent:
         monkeypatch.setattr(
             web_tool_module, "get_web_search_provider", lambda: provider)
         monkeypatch.setattr(
-            search_relevance_module, "LLMRouter",
+            web_tool_module, "LLMRouter",
             lambda: _TitleRouter(_aligned(_business)))
         finish = _finish(
             "Nvidia ships new chips to data centers this week, per an "
@@ -1665,10 +1655,10 @@ def test_prompt_wording():
         "macro-agent-prompt-names-no-outlet": (
             macro_module._SYSTEM_PROMPT.lower(), (), ("reuters", )),
         "bull-prompt": (
-            debate_side._BULL_SYSTEM_PROMPT,
+            dc._BULL_SYSTEM_PROMPT,
             ("do not present net income as evidence of", ), ()),
         "bear-prompt": (
-            debate_side._BEAR_SYSTEM_PROMPT,
+            dc._BEAR_SYSTEM_PROMPT,
             ("do not present net income as evidence of", ), ()),
         "internal-label-message-has-no-outlet-list": (
             INTERNAL_TOKEN_MESSAGE, ("{tokens}", ), ()),
@@ -1843,7 +1833,7 @@ class TestNewsDigest:
         monkeypatch.setattr(news_ingestion, "NewsApiProvider", _Provider)
         monkeypatch.setattr(relevance_module, "classify_articles", passthrough)
         monkeypatch.setattr(news_ingestion, "lookup_company_name", _amd_name)
-        monkeypatch.setattr(news_ingestion, "_MIN_WORD_COUNT", 1)
+        monkeypatch.setattr(news_ingestion, "_NEWS_MIN_WORD_COUNT", 1)
         digest = await news_ingestion.generate_news_digest(
             "AMD", already_ingested_filenames=set())
         assert digest is not None and digest.article_count == 8
@@ -1854,7 +1844,7 @@ class TestNewsDigest:
             self, monkeypatch):
         monkeypatch.setattr(relevance_module, "lookup_company_name", _amd_name)
         monkeypatch.setattr(news_ingestion, "lookup_company_name", _amd_name)
-        monkeypatch.setattr(news_ingestion, "_MIN_WORD_COUNT", 1)
+        monkeypatch.setattr(news_ingestion, "_NEWS_MIN_WORD_COUNT", 1)
         monkeypatch.setattr(settings, "NEWS_RELEVANCE_BATCH_SIZE", 10)
         provider = _AmdStoriesProvider()
         monkeypatch.setattr(
@@ -2157,7 +2147,7 @@ def _review_sleeps(monkeypatch):
         return None
 
     monkeypatch.setattr(reflection_module.asyncio, "sleep", _sleep)
-    monkeypatch.setattr(capacity_module, "free_chain_model", _no_free_model)
+    monkeypatch.setattr(router_module, "free_chain_model", _no_free_model)
     monkeypatch.setattr(
         reflection_module.settings, "REFLECTION_REVIEW_DELAYED_RETRY_SECONDS",
         60.0)
@@ -2254,7 +2244,7 @@ class TestAnalysisPlumbing:
         async def _free(tier):
             return "gemini-3.6-flash"
 
-        monkeypatch.setattr(capacity_module, "free_chain_model", _free)
+        monkeypatch.setattr(router_module, "free_chain_model", _free)
         router = _FailingReviewRouter([LLMServerOverloadedError("503")])
         monkeypatch.setattr(reflection_module, "LLMRouter", lambda: router)
         with capture_logs() as logs:
@@ -2338,7 +2328,7 @@ _REMOVED = [(settings, "NEWS_BLOCKED_DOMAINS"),
             (relevance_module, "_reasoning_contradicts_relevant"),
             (relevance_module, "_reasoning_affirms_company"),
             (relevance_module, "_keyword_prefilter"),
-            (search_relevance_module, "_BLOCKED_DOMAINS"),
+            (web_tool_module, "_BLOCKED_DOMAINS"),
             (news_tool_module, "_REPUTABLE_DOMAINS"),
             (news_tool_module, "DOWNWEIGHTED_HEADER")]
 

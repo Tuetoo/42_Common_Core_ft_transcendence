@@ -34,9 +34,9 @@ ENV NODE_ENV=production \
 RUN addgroup -S nextjs && adduser -S nextjs -G nextjs
 
 # The standalone server does not include static files; they go next to it.
+# (There is no public/ folder: the app serves no files from it.)
 COPY --from=build --chown=nextjs:nextjs /app/.next/standalone ./
 COPY --from=build --chown=nextjs:nextjs /app/.next/static ./.next/static
-COPY --from=build --chown=nextjs:nextjs /app/public ./public
 
 USER nextjs
 EXPOSE 3000

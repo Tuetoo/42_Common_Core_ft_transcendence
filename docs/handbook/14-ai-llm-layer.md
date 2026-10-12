@@ -117,10 +117,10 @@ Who uses which tier (from the call sites):
 - `CHEAP` (Lite): every data agent's ReAct loop (`ai/agents/loop.py`),
   Sentiment's label classifier, the news relevance classifier
   (`ai/providers/news_relevance.py`), the web-search relevance classifier
-  (`ai/tools/search_relevance.py`), query expansion, knowledge-graph
+  (`ai/tools/web_search_tool.py`), query expansion, knowledge-graph
   extraction, the RAG assistant (`RAG_ASK_LLM_TIER`), user-content
   sentiment, decision reviews, the monthly macro note
-  (`ai/ingestion/macro_ingestion.py`), position sizing's second try, and
+  (`ai/ingestion/digests.py`), position sizing's second try, and
   the filing-records backfill (`scripts/backfill_filing_records.py`,
   tier `FILING_RECORDS_BACKFILL_LLM_TIER`, `cheap` by default, overridable
   with `--tier`).
@@ -385,7 +385,7 @@ always wins):
 | Lite models | 60 s | `google_provider.REQUEST_TIMEOUT_SECONDS` |
 | Flash primary model | 30 s | `LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS` |
 | Flash fallback model (`fallback=True`, set by the router) | 60 s | `LLM_GOOGLE_HIGHEST_FALLBACK_REQUEST_TIMEOUT_SECONDS` |
-| Filing summary and records-only calls | 300 s (caller-supplied) | `ai/knowledge/filing_summary.py::_FILING_SUMMARY_TIMEOUT_SECONDS` |
+| Filing summary and records-only calls | 300 s (caller-supplied; at most 2 attempts) | `ai/knowledge/filing_summary.py::_FILING_SUMMARY_TIMEOUT_SECONDS` |
 
 The measurements behind these numbers (batches of 2026-10-09 and
 2026-10-10):
@@ -419,7 +419,7 @@ retry, but every agent and debate call passes
 |---|---|
 | `LLMInvalidRequestError` (400/404) | 0 |
 | Google Lite `LLMRateLimitError` (a 429, or a 503 give-up, because `LLMServerOverloadedError` is a subclass of it) | 0 (the fallback model and the cooldown retry take over) |
-| Google Lite `LLMProviderTimeoutError` | at most 1 (`_GOOGLE_LITE_TIMEOUT_RETRIES`) |
+| Google `LLMProviderTimeoutError` (Lite, or a caller-supplied timeout on Flash) | at most 1 (`_GOOGLE_TIMEOUT_RETRIES`) |
 | Everything else | the caller's `retries` |
 
 The wait before a retry is `rate_limit_backoff_seconds(attempt)` for
@@ -430,7 +430,9 @@ rate-limit errors: the schedule `[1, 2, 4, 8, 60]` seconds
 For Google with a fallback model, a rate-limit failure **breaks out of the
 retries early** (`llm_router.primary_unavailable_skipping_remaining_attempts`)
 when the adapter sent nothing, the pool is exhausted, or (Flash) the
-model has a 503 marker or a timeout marker. A Flash 503 or timeout always
+model has a 503 marker or a timeout marker, or the error is a request
+timeout (`LLMRequestTimeoutError`, also when the timeout cooldown is 0).
+A Flash 503 or timeout always
 sets one of these markers, so in practice it moves to the fallback model
 at once. An immediate new try of `gemini-3.8-flash` after its own 503
 succeeded only 2 of 18 times in the batches of 2026-10-09 and 2026-10-10.
@@ -443,7 +445,7 @@ after a Lite 503 only 1 succeeded.
 Each tier has at most one fallback model (section 3.2).
 `tier_model_chain(tier)` returns the primary model followed by its
 fallback, for the default provider. The router, the capacity checks in
-`ai/llm/capacity.py` and Reflection's retry gate (chapter 16, section
+`ai/llm/router.py` and Reflection's retry gate (chapter 16, section
 3.10) use this same chain, so the gate never drops a retry that the
 router could still serve with the fallback model.
 
@@ -471,7 +473,8 @@ If the fallback also fails, the router makes the Lite cooldown retry
 (CHEAP only, section 3.7) or raises the fallback's error, chained to the
 primary's error. An error outside the rate-limit family (for example a
 400, or a timeout on a caller-supplied limit) never goes to the fallback
-model; it is raised after the same-model retries.
+model; it is raised after the same-model retries (for a timeout, at most 1
+same-model retry).
 
 Above the router, the graph has its own slower retries for whole steps
 (a failed debate side is re-run after `DEBATE_SIDE_REPAIR_DELAY_SECONDS =
@@ -479,7 +482,7 @@ Above the router, the graph has its own slower retries for whole steps
 = 60.0`, and the Judge retries within a budget of
 `JUDGE_RETRY_BUDGET_SECONDS = 240.0` and `JUDGE_RETRY_MAX_ATTEMPTS = 4`).
 The side repair and the review retry first ask
-`ai/llm/capacity.py::capacity_aware_delay`: when a model of the step's
+`ai/llm/router.py::capacity_aware_delay`: when a model of the step's
 chain is free now, the wait is skipped and the step retries at once;
 otherwise the full wait runs. The Judge asks
 `chain_capacity` instead (the same test, which the Reflection retry gate
@@ -793,7 +796,7 @@ Constants in code (not settings):
 | `RATE_LIMIT_BACKOFF_SCHEDULE` | `[1.0, 2.0, 4.0, 8.0, 60.0]`, +/-20% jitter | `ai/llm/base.py` |
 | `AGENT_LLM_CALL_RETRIES` | 4 | `ai/llm/base.py` |
 | `_RETRY_BACKOFF_SECONDS` | 0.5 | `ai/llm/router.py` |
-| `_GOOGLE_LITE_TIMEOUT_RETRIES` | 1 | `router.py` |
+| `_GOOGLE_TIMEOUT_RETRIES` | 1 | `router.py` |
 | `GOOGLE_LITE_COOLDOWN_DEFAULT_WAIT_SECONDS` | 60.0 | `google_provider.py` (Lite cooldown retry wait when no cooldown is recorded) |
 | `_RUNAWAY_THINKING_SHARE` | 0.5 | `google_provider.py` |
 | `_REACT_LOOP_MAX_TOKENS` | 4096 | `ai/agents/loop.py` |
@@ -1046,12 +1049,11 @@ real requests and spends daily quota.
 | File | What it holds |
 |---|---|
 | `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. |
-| `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets). |
+| `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets); the capacity checks `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
 | `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config (and the caller's `thinking_budget` on Lite models), timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`); the `fallback` flag (60 s timeout, 3 keys on a 503). |
 | `services/ai-service/ai/llm/mistral_provider.py` | `MistralAdapter` and its key pool. |
 | `services/ai-service/ai/llm/openai_provider.py`, `anthropic_provider.py` | Dormant adapters. |
 | `services/ai-service/ai/llm/json_fence.py` | `strip_json_code_fence`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
-| `services/ai-service/ai/llm/capacity.py` | `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
 | `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
 | `services/ai-service/ai/providers/news_relevance.py` | `verify_with_cheap_tier` (the relevance classifiers' CHEAP call, fail-open and echo check) and `parsed_with_retry` (their JSON retry at 8192 tokens). |
 | `services/ai-service/ai/rag/embedding.py` | Gemini and Mistral embeddings, batching, key rotation. |

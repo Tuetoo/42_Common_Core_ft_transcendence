@@ -8,6 +8,7 @@ import {
   completeOAuthTwoFactor,
   type OAuthTwoFactorState,
 } from "@/app/lib/actions/oauth";
+import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../../field-rules";
 
 type Outcome =
   | { kind: "login"; accessToken: string; refreshToken: string }
@@ -96,7 +97,7 @@ function TwoFactorStep({ challengeToken }: { challengeToken: string }) {
       <form action={formAction} className="form">
         <div className="field">
           <label htmlFor="code">Authentication code</label>
-          <input id="code" name="code" type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={6} required autoFocus />
+          <input id="code" name="code" type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required autoFocus />
         </div>
         {/* Always mounted so screen readers announce the error when it appears. */}
         <p aria-live="polite" className="form-message error">

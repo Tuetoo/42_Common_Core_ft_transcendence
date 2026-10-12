@@ -317,7 +317,7 @@ organization members could match it.
 Where the organizations come from at read time
 (`resolve_visibility_scope`): auth-service's
 `/internal/users/{id}/organizations` through
-`shared/org_membership_cache.py` (one Redis key per user in DB 0, 60 s
+`shared/user_state.py` (one Redis key per user in DB 0, 60 s
 TTL, deleted by auth-service whenever a membership changes, so a removed
 member loses access at once; see [23-redis.md](23-redis.md)). There is
 no in-process cache, because a membership change could not clear it. If

@@ -17,6 +17,7 @@ on:
       - "scripts/**"
       - "docker-compose.yaml"
       - "docker-compose.override.yml"
+      - ".dockerignore"
       - "frontend/Dockerfile"
       - "Makefile"
       - ".env.example"

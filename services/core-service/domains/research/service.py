@@ -28,14 +28,14 @@ from domains.research.schema import (DocumentRead, ResearchCommentCreate,
                                      SentimentDay, SentimentSummary)
 from shared.concurrency import gather_bounded
 from shared.enums import DocumentCategory
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
 from shared.permissions import Permission, has_permission
-from shared.schemas import SYSTEM_DOCUMENT_OWNER_ID, PaginationParams, UserRef
+from shared.schemas import (PaginationParams, SYSTEM_DOCUMENT_OWNER_ID,
+                            UserRef, normalize_ticker)
 from shared.security import CurrentUser
 from shared.storage import delete_object, download_bytes, upload_bytes
-from shared.tickers import normalize_ticker
 
 logger = structlog.get_logger(__name__)
 

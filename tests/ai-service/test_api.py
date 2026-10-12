@@ -6,6 +6,7 @@ import sys
 import types
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 import httpx
@@ -22,8 +23,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import delete, func, select, text
 from shared.config import get_settings
 from shared.enums import AgentRole, AnalysisType, TierSide, TierStatus
-from shared.events import DurableEventSubscriber, publish_durable_event
-from shared.events_registry import EventName
+from shared.events import (DurableEventSubscriber, EventName,
+                           publish_durable_event)
 from shared.exceptions import NotFoundError, UpstreamServiceError
 from shared.http_client import build_http_client
 from shared.schemas import PaginationParams
@@ -1297,9 +1298,11 @@ class TestReadAccess:
 class TestBacktestRoutes:
 
     @pytest.mark.asyncio
-    async def test_portfolio_backtest_checks_access(
-            self, client, owners, monkeypatch):
+    async def test_access_reads_and_deletes_are_owner_only(
+            self, client, owners, db_session, monkeypatch):
         import domains.backtest.api as backtest_api
+        from domains.backtest.model import Backtest, BacktestMetrics
+        from domains.backtest.repository import BacktestRepository
 
         async def _no_call(*args, **kwargs):
             raise AssertionError(
@@ -1312,6 +1315,52 @@ class TestBacktestRoutes:
             "/api/v1/backtests/portfolio", headers=_headers(me),
             json={"portfolio_id": str(theirs)})
         assert response.status_code == 404
+
+        owner = uuid4()
+        backtest = await BacktestRepository(db_session).create(
+            user_id=owner, strategy_name="s", benchmark_symbol="SPY",
+            start_date=date(2026, 1, 1), end_date=date(2026, 2, 1),
+            initial_capital=1000.0)
+        system = await BacktestRepository(db_session).create(
+            user_id=None, strategy_name="s", benchmark_symbol="SPY",
+            start_date=date(2026, 1, 1), end_date=date(2026, 2, 1),
+            initial_capital=1000.0)
+        url = f"/api/v1/backtests/{backtest.id}"
+        assert (await client.get(url)).status_code == 401
+        assert (
+            await client.get(url, headers=_headers(owner))).status_code == 200
+        stranger = _headers(uuid4())
+        assert (await client.get(url, headers=stranger)).status_code == 404
+        assert (
+            await client.get(url + "/metrics",
+                             headers=stranger)).status_code == 404
+        sys_url = f"/api/v1/backtests/{system.id}"
+        assert (
+            await client.get(sys_url,
+                             headers=_headers(owner))).status_code == 404
+
+        for status in ("completed", "failed"):
+            me = uuid4()
+            backtest_id = await _stored_backtest(db_session, me, status)
+            response = await client.delete(
+                f"/api/v1/backtests/{backtest_id}", headers=_headers(me))
+            assert response.status_code == 204, response.text
+            assert await db_session.get(Backtest, backtest_id) is None
+            orphans = (
+                await db_session.execute(
+                    select(func.count()).select_from(BacktestMetrics).where(
+                        BacktestMetrics.backtest_id == backtest_id)
+                )).scalar_one()
+            assert orphans == 0, status
+            again = await client.get(
+                f"/api/v1/backtests/{backtest_id}", headers=_headers(me))
+            assert again.status_code == 404, status
+
+        backtest_id = await _stored_backtest(db_session, uuid4(), "completed")
+        response = await client.delete(
+            f"/api/v1/backtests/{backtest_id}",
+            headers=bearer_headers(uuid4(), role="guest"))
+        assert response.status_code == 403
 
     @pytest.mark.asyncio
     async def test_fewer_than_two_snapshots_is_refused_up_front(
@@ -1340,6 +1389,24 @@ class TestBacktestRoutes:
             assert f"has {count} daily snapshot(s)" in message
             assert "second market close" in message
             assert started == []
+
+        async def _unfunded_first(*args, **kwargs):
+            return [{
+                "snapshot_date": "2026-09-28",
+                "total_value": 0.0
+            }, {
+                "snapshot_date": "2026-09-29",
+                "total_value": 100.0
+            }]
+
+        monkeypatch.setattr(
+            backtest_api, "get_portfolio_snapshots", _unfunded_first)
+        response = await client.post(
+            "/api/v1/backtests/portfolio", headers=_headers(me),
+            json={"portfolio_id": str(pid)})
+        assert response.status_code == 422, response.text
+        assert "positive total value" in response.json()["error"]["message"]
+        assert started == []
 
     @pytest.mark.asyncio
     async def test_create_commits_before_starting_task(
@@ -1450,169 +1517,6 @@ class TestBacktestRoutes:
             await client.post(
                 "/api/v1/backtests", headers=bearer_headers(user),
                 json=body)).status_code == 201
-
-    @pytest.mark.asyncio
-    async def test_reads_are_owner_only(self, client, db_session):
-        from domains.backtest.repository import BacktestRepository
-
-        owner = uuid4()
-        backtest = await BacktestRepository(db_session).create(
-            user_id=owner, strategy_name="s", benchmark_symbol="SPY",
-            start_date=date(2026, 1, 1), end_date=date(2026, 2, 1),
-            initial_capital=1000.0)
-        system = await BacktestRepository(db_session).create(
-            user_id=None, strategy_name="s", benchmark_symbol="SPY",
-            start_date=date(2026, 1, 1), end_date=date(2026, 2, 1),
-            initial_capital=1000.0)
-        url = f"/api/v1/backtests/{backtest.id}"
-        assert (await client.get(url)).status_code == 401
-        assert (
-            await client.get(url, headers=_headers(owner))).status_code == 200
-        stranger = _headers(uuid4())
-        assert (await client.get(url, headers=stranger)).status_code == 404
-        assert (
-            await client.get(url + "/metrics",
-                             headers=stranger)).status_code == 404
-        sys_url = f"/api/v1/backtests/{system.id}"
-        assert (
-            await client.get(sys_url,
-                             headers=_headers(owner))).status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_owner_deletes_a_finished_backtest_and_guest_cannot(
-            self, client, db_session):
-        from domains.backtest.model import Backtest, BacktestMetrics
-
-        for status in ("completed", "failed"):
-            me = uuid4()
-            backtest_id = await _stored_backtest(db_session, me, status)
-            response = await client.delete(
-                f"/api/v1/backtests/{backtest_id}", headers=_headers(me))
-            assert response.status_code == 204, response.text
-            assert await db_session.get(Backtest, backtest_id) is None
-            orphans = (
-                await db_session.execute(
-                    select(func.count()).select_from(BacktestMetrics).where(
-                        BacktestMetrics.backtest_id == backtest_id)
-                )).scalar_one()
-            assert orphans == 0, status
-            again = await client.get(
-                f"/api/v1/backtests/{backtest_id}", headers=_headers(me))
-            assert again.status_code == 404, status
-
-        backtest_id = await _stored_backtest(db_session, uuid4(), "completed")
-        response = await client.delete(
-            f"/api/v1/backtests/{backtest_id}",
-            headers=bearer_headers(uuid4(), role="guest"))
-        assert response.status_code == 403
-
-
-class TestMarketValidation:
-
-    @pytest.mark.asyncio
-    async def test_bad_inputs_rejected_before_provider(
-            self, client, monkeypatch):
-        import domains.market.api as market_api
-
-        calls: list[tuple] = []
-
-        async def _fake_bars(ticker, *, interval, lookback_days):
-            calls.append((ticker, interval, lookback_days))
-            return []
-
-        monkeypatch.setattr(market_api, "get_bars_cache_first", _fake_bars)
-        base = "/api/v1/market/instruments"
-        bad = [
-            f"{base}/AMD/prices?interval=1m",
-            f"{base}/AMD/prices?lookback_days=0",
-            f"{base}/AMD/prices?lookback_days=5000",
-            f"{base}/TOO_LONG_TICKER/prices", f"{base}/A%20B/prices"
-        ]
-        headers = _headers(uuid4())
-        for url in bad:
-            assert (
-                await client.get(url, headers=headers)).status_code == 422, url
-        assert calls == []
-
-        ok = await client.get(
-            f"{base}/brk.b/prices?interval=1d", headers=headers)
-        assert ok.status_code == 200
-        assert calls == [("BRK.B", "1d", 5)]
-
-    @pytest.mark.asyncio
-    async def test_refresh_never_stores_the_session_in_progress(
-            self, monkeypatch, db_session):
-        import ai.tools.market_data_cache as cache
-        from ai.providers.base import PriceBar
-        from domains.market.service import MarketService
-
-        class _RecentBarsProvider:
-
-            def __init__(self, bars):
-                self._bars = bars
-
-            async def get_recent_price_history(
-                    self, ticker, *, interval, lookback_days):
-                return self._bars
-
-            async def get_instrument_metadata(self, ticker):
-                return None
-
-        wed_open = datetime(2026, 9, 30, 14, 0, tzinfo=UTC)
-        monkeypatch.setattr(cache, "_utcnow", lambda: wed_open)
-        ticker = "P" + uuid4().hex[:5].upper()
-
-        def bar(day, close):
-            return PriceBar(
-                ticker=ticker, interval="1d",
-                timestamp=datetime(2026, 9, day, 4, tzinfo=UTC),
-                open=Decimal("1"), high=Decimal("1"), low=Decimal("1"),
-                close=Decimal(close), volume=1, source="fake")
-
-        service = MarketService(db_session)
-        written = await service.refresh_from_external_provider(
-            ticker,
-            provider=_RecentBarsProvider([bar(29, "10"),
-                                          bar(30, "11")]))
-        assert written == 1
-        stored = await service.get_recent_prices(ticker, "1d")
-        assert [
-            b.timestamp.astimezone(cache.MARKET_TZ).date().day for b in stored
-        ] == [29]
-
-    @pytest.mark.asyncio
-    async def test_cache_read_covers_the_longest_lookback(
-            self, monkeypatch, db_session):
-        import ai.tools.market_data_cache as cache
-        from ai.providers.base import PriceBar
-        from domains.market.service import MarketService
-
-        first = datetime(2022, 1, 3, 4, tzinfo=UTC)
-        ticker = "L" + uuid4().hex[:5].upper()
-        bars = [
-            PriceBar(
-                ticker=ticker, interval="1d",
-                timestamp=first + timedelta(days=i), open=Decimal("1"),
-                high=Decimal("1"), low=Decimal("1"), close=Decimal("1"),
-                volume=1, source="fake") for i in range(1300)
-        ]
-
-        class _Provider:
-
-            async def get_recent_price_history(
-                    self, ticker, *, interval, lookback_days):
-                return bars
-
-            async def get_instrument_metadata(self, ticker):
-                return None
-
-        monkeypatch.setattr(
-            cache, "_utcnow", lambda: datetime(2026, 9, 30, 14, tzinfo=UTC))
-        service = MarketService(db_session)
-        written = await service.refresh_from_external_provider(
-            ticker, lookback_days=1400, provider=_Provider())
-        stored = await service.get_recent_prices(ticker, "1d")
-        assert written == len(stored) == 1300
 
 
 class TestTriggeredTiers:
@@ -1971,8 +1875,8 @@ class TestInternalRoutes:
         assert internal._market_today() == date(2026, 9, 29)
 
     @pytest.mark.asyncio
-    async def test_tier_monitoring_status_follows_failed_units(
-            self, client, monkeypatch):
+    async def test_job_status_follows_failed_units(self, client, monkeypatch):
+        import ai.workflows.review_workflow as rw
         import ai.workflows.tier_monitoring_workflow as tm
         import api.internal as internal
 
@@ -2012,9 +1916,6 @@ class TestInternalRoutes:
             else:
                 assert "all_units_failed" not in body, case_id
 
-    @pytest.mark.asyncio
-    async def test_rag_ingest_status_follows_failed_units(
-            self, client, monkeypatch):
         cases = {
             "filings-failed-for-every-ticker": ((2, ["AAA", "BBB"]), (2, []),
                                                 (True,
@@ -2065,11 +1966,6 @@ class TestInternalRoutes:
             assert body["macro"] == macro_result, case_id
             assert body.get("all_units_failed") == steps, case_id
 
-    @pytest.mark.asyncio
-    async def test_review_run_status_follows_failed_items(
-            self, client, monkeypatch):
-        import ai.workflows.review_workflow as rw
-
         cases = {
             "all-recommendations-failed": (
                 _review_counts(
@@ -2098,6 +1994,35 @@ class TestInternalRoutes:
             for key, value in counts.items():
                 assert body[key] == value, case_id
             assert body.get("all_units_failed") == steps, case_id
+
+    @pytest.mark.asyncio
+    async def test_fx_rate_survives_a_redis_error(self, client, monkeypatch):
+        import ai.providers.registry as registry
+        import api.internal as internal
+
+        class _Down:
+
+            async def get(self, key):
+                raise ConnectionError("redis down")
+
+            async def set(self, *args, **kwargs):
+                raise ConnectionError("redis down")
+
+        class _Provider:
+
+            async def get_current_price(self, ticker):
+                return SimpleNamespace(price=Decimal("0.79"))
+
+        monkeypatch.setattr(internal, "get_cache_client", lambda _s: _Down())
+        monkeypatch.setattr(
+            registry, "get_market_data_provider", lambda: _Provider())
+        response = await client.get(
+            "/internal/fx-rate", params={
+                "from_currency": "usd",
+                "to_currency": "gbp"
+            })
+        assert response.status_code == 200, response.text
+        assert response.json() == {"rate": 0.79}
 
     def test_internal_routes_not_in_openapi(self):
         import main

@@ -246,7 +246,7 @@ slot, show a finished run folder and start a new analysis only as a live
 | Access / refresh token | Short-lived JWT for requests; long-lived token to get a new access token. | [11](11-auth-service.md) |
 | Heartbeat | A scheduled job's "I succeeded" report, exported as a Prometheus metric. | [26](26-scheduler-jobs.md) |
 | Busy window | A time range when the scheduler's daily jobs run and restarts are refused. | [26](26-scheduler-jobs.md) |
-| Development override | `docker-compose.override.yml`: development image stage, the service's source and `shared/` bind-mounted, uvicorn without `--reload` (a code change needs `docker compose restart <service>`), client address and scheme taken from the gateway's `X-Forwarded-*` headers, and ai-service at `LOG_LEVEL=DEBUG`. | [01](01-architecture.md) |
+| Development override | `docker-compose.override.yml`: development image stage (its Dockerfile `CMD` runs uvicorn without `--reload`, so a code change needs `docker compose restart <service>`), the service's source and `shared/` bind-mounted, client address and scheme taken from the gateway's `X-Forwarded-*` headers, and ai-service at `LOG_LEVEL=DEBUG`. | [01](01-architecture.md) |
 
 ## 7. Conventions this handbook follows
 
@@ -270,7 +270,7 @@ not finished; the chapters give the details.
 
 | Item | State | Chapter |
 |---|---|---|
-| Frontend | Built: the Next.js app in `frontend/`, served by the gateway at `/`; its server side calls the API on the gateway's internal listener (port 8080). The Privacy Policy and Terms of Service pages are not written yet (the Frontend Lead's part; the footer links to `/privacy` and `/terms` exist). Every route can also be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) section 3.11, [10](10-gateway.md) section 3.3 |
+| Frontend | Built: the Next.js app in `frontend/`, served by the gateway at `/`; its server side calls the API on the gateway's internal listener (port 8080). The Privacy Policy and Terms of Service pages are written (`frontend/app/(legal)/privacy`, `terms`; linked from the footer). Every route can also be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) section 3.11, [10](10-gateway.md) section 3.3 |
 | Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main`. The first deployment waits for the new `infra/` to reach `main`. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 | Top-level README | None. The only READMEs are `tests/README.md`, `infra/gateway/certs/README.md` and `frontend/README.md` (the default text of `create-next-app`). | - |
 | Calibration of the confidence rules | The penalties and caps in `ai/recommendation/engine.py`, the HOLD flat band of the accuracy score (`review_workflow.py::_HOLD_FLAT_BAND`) and the procedural-memory score bar (`_MIN_SCORE_TO_REMEMBER`) are fixed constants. Nothing derives them from scored outcomes yet; that needs enough rows in `ai.recommendation_metrics`. | [16](16-ai-analysis-pipeline.md) section 3.12, [19](19-ai-workflows-backtest.md) section 3.11 |

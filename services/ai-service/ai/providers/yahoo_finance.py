@@ -7,8 +7,8 @@ import structlog
 import yfinance as yf  # type: ignore[import-untyped]
 from ai.providers.base import (FundamentalDataProvider, FundamentalsSnapshot,
                                InstrumentMetadata, MarketDataProvider,
-                               PriceBar, PriceQuote, ProviderRequestError)
-from ai.providers.retry import call_with_retry, retry_everything
+                               PriceBar, PriceQuote, ProviderRequestError,
+                               call_with_retry, retry_everything)
 
 logger = structlog.get_logger(__name__)
 

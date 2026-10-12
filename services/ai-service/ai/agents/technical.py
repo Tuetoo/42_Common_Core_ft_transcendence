@@ -1,23 +1,20 @@
 import re
 from typing import Any
 import structlog
-from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check,
                                      reported_number_issue)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_successful_tool_entry,
-                            prefetch_tool_calls)
+                            combine_context, flag_unresolved_issue,
+                            is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.memory.procedural import combine_context
 from ai.tools.indicators import (PRICE_VS_LEVEL_BAND_PCT,
                                  price_position_vs_level, rsi_band)
 from ai.tools.market_tool import GetRecentPriceHistoryTool
 from ai.tools.market_tool import \
     latest_close_from_price_history as _latest_close_from_price_history
 from ai.tools.technical_tool import GetTechnicalIndicatorsTool
-from shared.enums import AgentStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -309,35 +306,20 @@ class TechnicalAgent(BaseAgent):
             "distinct indicators.", extra_context=combine_context(
                 feedback, state.procedural_hints.get(self.role)),
             prefetched_evidence=prefetched)
-        summary = result.final_answer
         verification_warnings: list[str] = []
-        if result.unresolved_finish_validation_issue is not None:
-            logger.warning(
-                "technical.unresolved_indicator_mismatch_after_retries",
-                ticker=state.ticker,
-                issue=result.unresolved_finish_validation_issue)
-            reason = (
-                f"{result.unresolved_finish_validation_issue}, and this was "
-                "not corrected even after being flagged for recomputation "
-                "-- treat any indicator value or trend characterization "
-                "below as unverified until manually re-checked.")
-            summary = wrap_verification_warning(reason, summary)
-            verification_warnings.append(reason)
-
+        summary = flag_unresolved_issue(
+            result, result.final_answer, verification_warnings,
+            event="technical.unresolved_indicator_mismatch_after_retries",
+            ticker=state.ticker, consequence=(
+                ", and this was not corrected even after being flagged for "
+                "recomputation -- treat any indicator value or trend "
+                "characterization below as unverified until manually "
+                "re-checked."))
         latest_close = _indicator_latest_close(result.scratchpad)
-
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=verification_warnings, raw_output={
                 "key_facts": ({
                     "reference_price": latest_close
-                } if latest_close is not None else {}),
-                "finish_meta": result.finish_meta
+                } if latest_close is not None else {})
             })

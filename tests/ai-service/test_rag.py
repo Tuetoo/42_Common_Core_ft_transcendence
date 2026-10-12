@@ -5,7 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
-import ai.evaluation.recall as recall_module
+import ai.evaluation.rag_recall as recall_module
 import ai.ingestion.sec_edgar_filings as sec_edgar_filings
 import ai.rag.embedding as embedding_module
 import ai.rag.indexing as indexing_module
@@ -14,12 +14,10 @@ import ai.workflows.auto_ingestion_workflow as auto_workflow
 import ai.workflows.rag_ingestion_workflow as ingestion_module
 import numpy as np
 import pytest
-from ai.evaluation.golden_set import (GoldenQAPair,
+from ai.evaluation.rag_recall import (GoldenQAPair,
                                       _drop_near_duplicate_chunks,
-                                      _fact_signature)
-from ai.evaluation.recall import compute_recall_at_k
-from ai.ingestion.macro_ingestion import MacroReport
-from ai.ingestion.news_ingestion import NewsDigest
+                                      _fact_signature, compute_recall_at_k)
+from ai.ingestion.digests import MacroReport, NewsDigest
 from ai.llm.base import (LLMMessage, LLMNonEnglishOutputError,
                          LLMProviderTimeoutError, LLMRateLimitError,
                          LLMRequestError, LLMResponse, LLMTier, LLMUsage)

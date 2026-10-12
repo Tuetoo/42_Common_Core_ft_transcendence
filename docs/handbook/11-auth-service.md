@@ -29,7 +29,7 @@
   |  domains/social        connections (friends), block              |
   |  domains/admin         user administration, site statistics      |
   |  api/internal.py       /internal/* for core-service, ai-service  |
-  |  rate_limit.py         Redis fixed-window limits, 2FA lockout    |
+  |  security.py           tokens, TOTP, rate limits, 2FA lockout    |
   |  events_out.py         events published after the commit         |
   |  user_state_sync.py    live role/active mirror in Redis          |
   +------------------------------------------------------------------+
@@ -90,7 +90,7 @@ service. Access tokens are self-contained, and the role check reads Redis.
 `services/auth-service/main.py`, function `lifespan`, runs once at start:
 
 1. `configure_logging(settings)` (structured JSON logs).
-2. `ensure_schema(engine)` (`db_bootstrap.py`): brings the `auth` schema to
+2. `ensure_schema(engine)` (`database.py`): brings the `auth` schema to
    the newest Alembic revision (section 3.16).
 3. `mirror_all_users_safely(SessionLocal)` (`user_state_sync.py`): writes
    every user's live role and active flag to Redis (section 3.10). A
@@ -103,7 +103,7 @@ Then the app is built:
   `openapi_url="/api/openapi-auth.json"` (the gateway exposes them at
   `/docs/auth/` and `/api/openapi-auth.json`).
 - CORS from `BACKEND_CORS_ORIGINS`.
-- `RequestIdMiddleware` (`shared/request_id.py`): one request id per HTTP
+- `RequestIdMiddleware` (`shared/logging.py`): one request id per HTTP
   request, on every log line, in the error body, in every
   `{"data": ..., "request_id"}` success body and in the `X-Request-ID`
   response header.
@@ -125,7 +125,7 @@ Then the app is built:
   OAuth callback route does not use these statuses: it catches every
   `AppError` itself and redirects to the frontend with the error in the
   URL fragment (section 3.9).
-  `RateLimitedError` (in `rate_limit.py`, code `rate_limited`) has its
+  `RateLimitedError` (in `security.py`, code `rate_limited`) has its
   own handler that adds `Retry-After`; it is more specific than the
   `AppError` handler (FastAPI picks the handler of the nearest class), so
   it wins. Two answers do **not** use this envelope: FastAPI's
@@ -253,7 +253,7 @@ shorter than 32 characters. In development it only logs a warning.
    |                                     |  email lowercased,           |          |            |
    |                                     |  username ^[A-Za-z0-9_.-]{3,32}$          |            |
    |                                     |  password >= 10 chars, <= 72 bytes        |            |
-   |                                     | rate_limit.hit("register:ip",|          |            |
+   |                                     | security.hit("register:ip",  |          |            |
    |                                     |   client ip, 10 per 3600 s) ------------>|            |
    |                                     | email/username taken? -> 409 |          |            |
    |                                     | bcrypt hash, INSERT user,    |          |            |
@@ -510,7 +510,7 @@ Code: `AuthService.setup_two_factor`, `verify_two_factor`,
 - **No replay:** the accepted step is stored in `last_used_step`, and the
   update only succeeds when the new step is larger. The same code (or an
   older one) cannot be used twice.
-- **Lockout:** each failure calls `rate_limit.two_factor_failed`. After
+- **Lockout:** each failure calls `security.two_factor_failed`. After
   `RATE_LIMIT_2FA_FAILURES` = 5 failures within
   `RATE_LIMIT_2FA_WINDOW_SECONDS` = 300 s, the user's 2FA is locked for
   `RATE_LIMIT_2FA_LOCK_SECONDS` = 900 s; every check during the lock gets
@@ -718,7 +718,7 @@ unconfigured provider.
 
 | Permission | guest | user | moderator | admin |
 |---|---|---|---|---|
-| `portfolio:write`, `analysis:create`, `document:upload`, `note:write`, `comment:write`, `organization:create`, `api_key:manage`, `rag:ask` | - | yes | yes | yes |
+| `portfolio:write`, `analysis:create`, `document:upload`, `note:write`, `comment:write`, `organization:create`, `connection:write`, `api_key:manage`, `rag:ask` | - | yes | yes | yes |
 | `content:moderate`, `user:deactivate` | - | - | yes | yes |
 | `user:manage`, `site:stats` | - | - | - | yes |
 
@@ -775,7 +775,7 @@ deactivated user would keep their power until the token expires.
   deliberate choice: an auth outage must not lock everybody out of core
   and ai.
 - core-service applies the same rule to API keys (the key owner's live
-  state) and to WebSockets (`api/ws_common.py`, `resolve_live_identity`).
+  state) and to WebSockets (`websocket_manager.py`, `resolve_live_identity`).
 
 ### 3.11 Password reset
 
@@ -866,18 +866,18 @@ Routes in `domains/organization/api.py` (prefix `/api/v1/organizations`):
 
 | Method and path | Who may | Event |
 |---|---|---|
-| `POST ""` | permission `organization:create` (not guests) | `organization.created` |
+| `POST ""` | permission `organization:create` (not guests); the name is stripped and must not be blank (422) | `organization.created` |
 | `GET ""` | any user (own memberships) | |
 | `GET /{org_id}` | members | |
-| `PATCH /{org_id}` | owner or admin | `organization.updated` |
-| `DELETE /{org_id}` | owner only (404 for non-members, 403 for other members) | `organization.deleted` |
+| `PATCH /{org_id}` | `organization:create` and owner or admin; the name is stripped and must not be blank (422) | `organization.updated` |
+| `DELETE /{org_id}` | `organization:create` and owner only (404 for non-members, 403 for other members) | `organization.deleted` |
 | `GET /{org_id}/members` | members | |
-| `POST /{org_id}/members/{user_id}/remove` | owner or admin; only the owner removes an admin; the owner cannot be removed | `organization.member.removed` |
-| `POST /{org_id}/leave` | any member except the owner | `organization.member.left` |
-| `PATCH /{org_id}/members/{user_id}/role` | owner or admin; only the owner changes admin roles or makes admins; never `owner` (422) | `organization.role.changed` |
+| `POST /{org_id}/members/{user_id}/remove` | `organization:create` and owner or admin; only the owner removes an admin; the owner cannot be removed | `organization.member.removed` |
+| `POST /{org_id}/leave` | any member except the owner (guests too) | `organization.member.left` |
+| `PATCH /{org_id}/members/{user_id}/role` | `organization:create` and owner or admin; only the owner changes admin roles or makes admins; never `owner` (422) | `organization.role.changed` |
 | `POST /{org_id}/invitations` | `organization:create` and owner/admin; only the owner invites admins | `organization.invitation.created` |
 | `GET /{org_id}/invitations` | owner or admin: the open invitations (not accepted, not expired), newest expiry first | |
-| `DELETE /{org_id}/invitations/{invitation_id}` | owner or admin; only the owner revokes an admin invitation; 404 for an unknown, accepted or foreign invitation | |
+| `DELETE /{org_id}/invitations/{invitation_id}` | `organization:create` and owner or admin; only the owner revokes an admin invitation; 404 for an unknown, accepted or foreign invitation | |
 | `POST /invitations/accept` `{token}` | the invited email's account (guests too) | `organization.member.joined` |
 
 Every route that needs membership answers 404 "Organization not found."
@@ -910,8 +910,7 @@ Invitation flow:
    |                    |   (user_id = invitee if they have an account)          |
    |                                                                              |
    |                    | POST /invitations/accept {token}  (invitee logged in) <--|
-   |                    | decode; invitation exists, not accepted, not an owner  |
-   |                    |   invitation, not expired                               |
+   |                    | decode; invitation exists, not accepted, not expired   |
    |                    | logged-in email == invitation email (case-insensitive)? |
    |                    |   else 403                                              |
    |                    | INSERT member (savepoint; double submit -> 409),       |
@@ -919,8 +918,7 @@ Invitation flow:
 ```
 
 The token's subject is the invitation row id, because the invitee may not
-have an account yet. Invitations that grant `owner` (possible in old data)
-are refused with 409.
+have an account yet. No invitation can grant `owner` (422 when sent).
 
 - **The token travels in the body.** The accept route takes `{token}` in
   the JSON body, never in the URL path, so the invitation JWT does not
@@ -946,7 +944,7 @@ are refused with 409.
 
 **Membership cache invalidation.** core-service and ai-service cache "which
 organizations is this user in, with which role" in Redis
-(`shared/org_membership_cache.py`): one key per user in DB 0 with a 60 s
+(`shared/user_state.py`): one key per user in DB 0 with a 60 s
 TTL (`MEMBERSHIP_CACHE_TTL_SECONDS`). If the delete below fails because
 Redis is down, the TTL bounds how long a removed member keeps access (at
 most 60 s). For every membership-changing event
@@ -959,7 +957,9 @@ dropped.
 
 ### 3.14 Connections (friends)
 
-`domains/social/` (prefix `/api/v1/connections`):
+`domains/social/` (prefix `/api/v1/connections`). Sending and accepting
+need the permission `connection:write` (a guest gets 403); blocking and
+`DELETE` stay open to guests, so a guest can still protect itself:
 
 - `POST ""` `{addressee_username}`: a pending request (not to yourself; 409
   if any connection already exists; a blocked pair gets a neutral 409).
@@ -1020,13 +1020,13 @@ route (`login`, `refresh`, `logout`, `oauth_callback`, the OAuth 2FA step,
 never announces a change. A presence publish failure is logged by
 `events_out.publish_events` and never fails a login or refresh.
 
-### 3.16 Rate limits (`rate_limit.py`)
+### 3.16 Rate limits (`security.py`)
 
 All counters live in the rate-limit Redis database (db 1) under keys
 `auth:rl:<scope>:<sha256 of the identity, 32 hex chars>`. The identity
 (email or IP) is hashed so raw addresses never sit in Redis keys. The
 counter itself is shared with core-service's public API
-(`shared/rate_limit.py`, `fixed_window_hits`): one Redis transaction does
+(`shared/redis.py`, `fixed_window_hits`): one Redis transaction does
 `SET key 0 EX window NX`, `INCR key`, `TTL key`, so the window starts at
 the first hit and a key can never be left without an expiry. A Redis
 error **fails open** (logged as `rate_limit_unavailable`).
@@ -1183,24 +1183,19 @@ and writes nothing. Exit code 0 on success or no change, 1 when refused.
   a table of custom roles would be read by nothing. The table is dropped
   with its rows; the downgrade recreates it empty, as the baseline
   created it. Head: `f1210b000001`.
-- `migrations/archive/`: an older migration chain, kept only so
-  `python -m scripts.alembic_convert` can convert a database that still
-  carries one of its revisions (preview by default, `--apply` to convert
-  in one transaction; take a backup first). Both go once no backup from
-  before the baseline is kept.
 - `migrations/env.py` uses the synchronous URL (`postgresql+psycopg`) and
   keeps the `alembic_version` table inside the `auth` schema
   (`version_table_schema`), so the three services' migrations never
   touch each other. It skips the `alembic_version` table during
-  comparison with `shared.alembic_bootstrap.exclude_alembic_version`, the
+  comparison with `shared.database.exclude_alembic_version`, the
   same predicate the startup drift check uses. The details of `env.py` (search path, type and
   default comparison, the explicit commit) are the same in all three
   services and are explained in [chapter 20](20-postgresql.md).
 
-On every start `db_bootstrap.ensure_schema` calls
-`shared/alembic_bootstrap.py`, `bootstrap_schema`: create the schema if
-missing; an empty schema or a known revision -> `alembic upgrade head`; a
-revision from the archived chain -> refuse with the convert command;
+On every start `database.ensure_schema` calls
+`shared/database.py`, `bootstrap_schema`: create the schema if
+missing; an empty schema or a known revision -> `alembic upgrade head`;
+an unknown revision -> Alembic fails ("Can't locate revision");
 tables but no `alembic_version` -> refuse (nothing can tell which state
 they are in). There is no `create_all` path.
 
@@ -1354,7 +1349,7 @@ a body is not.
 | OAuth message "This sign-in was not started in this browser. Start the sign-in again." (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
 | OAuth `oauth_callback_failed` code `oauth_link_refused` | a local account with that email exists but one side is unverified | log in with the password first |
 | OAuth `oauth_callback_failed` code `oauth_provider_error` | provider unreachable or odd answer | log events `oauth_provider_http_error`, `oauth_github_emails_unavailable` |
-| auth-service does not start, log says the schema was refused | old migration chain or tables without `alembic_version` | follow the command in the log (`python -m scripts.alembic_convert`) after a backup |
+| auth-service does not start, log says the schema was refused | tables without `alembic_version`, or a revision Alembic does not know (a backup from before round 116) | restore a backup made by the current code |
 | auth-service refuses to start: "JWT_SECRET must be set..." | weak secret with `APP_ENV` not development/test | set a random secret of 32+ characters |
 | 2FA login answers 409 "Your 2FA settings cannot be read..." | the stored secret cannot be decrypted with `TOTP_ENCRYPTION_KEY` or the `JWT_SECRET`-derived key (both changed, or a damaged row); log `totp_secret_unreadable` with `user_id` | an admin resets the user's 2FA: `DELETE /api/v1/admin/users/{id}/2fa`; the user then sets it up again |
 | auth-service refuses to start: "TOTP_ENCRYPTION_KEY must be set..." or "...is not a valid Fernet key" | key missing with `APP_ENV` not development/test, or malformed | generate one: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
@@ -1611,12 +1606,11 @@ in the database and in Redis.)
 |---|---|
 | `services/auth-service/main.py` | app, lifespan (schema, user-state sync, avatar dir), routers, `/health`, avatar static mount |
 | `services/auth-service/config.py` | all auth settings (token lifetimes, OAuth, avatars, presence, rate limits) |
-| `services/auth-service/security.py` | bcrypt, JWT creation and decoding, token types, TOTP helpers, encrypt/decrypt stored TOTP secrets (Fernet), refresh-token hashing |
-| `services/auth-service/rate_limit.py` | `hit`, 2FA lockout, `client_ip`, 429 handler |
+| `services/auth-service/security.py` | bcrypt, JWT creation and decoding, token types, TOTP helpers, encrypt/decrypt stored TOTP secrets (Fernet), refresh-token hashing; rate limits (`hit`), 2FA lockout, `client_ip`, 429 handler |
 | `services/auth-service/events_out.py` | after-commit event publishing, payload builders, membership cache invalidation |
 | `services/auth-service/user_state_sync.py` | writes the live role/active mirror (`commit_with_state`, startup sync) |
 | `services/auth-service/deps.py` | `get_current_user`, `require_recent_login` (2FA setup/verify) and permission-checked dependencies |
-| `services/auth-service/database.py`, `db_bootstrap.py` | engine, sessions, Alembic bootstrap |
+| `services/auth-service/database.py` | engine, sessions, Alembic bootstrap |
 | `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai, and the scheduler's `purge-unverified` |
 | `services/auth-service/domains/auth/model.py` | users, profiles, settings, sessions (`SessionRevokeReason`), OAuth accounts, 2FA secrets |
 | `services/auth-service/domains/auth/schema.py` | request/response models, password and username rules |
@@ -1627,12 +1621,11 @@ in the database and in Redis.)
 | `services/auth-service/domains/social/*` | connections (friends), block |
 | `services/auth-service/domains/admin/*` | user administration, site statistics |
 | `services/auth-service/scripts/set_system_role.py` | set a user's system role (first admin) |
-| `services/auth-service/scripts/alembic_convert.py` | one-time conversion from the archived migration chain |
-| `services/auth-service/migrations/` | Alembic `env.py`, `versions/` (`f1160b000001` baseline -> `f1190b000001` `user_sessions.revoked_reason` -> `f1210b000001` drops `organization_roles`; head `f1210b000001`), `archive/` (until the conversion tooling is deleted) |
+| `services/auth-service/migrations/` | Alembic `env.py`, `versions/` (`f1160b000001` baseline -> `f1190b000001` `user_sessions.revoked_reason` -> `f1210b000001` drops `organization_roles`; head `f1210b000001`) |
 | `shared/security.py` | access-token check and live state on every service, permission dependencies, internal-token guard |
 | `shared/user_state.py` | the Redis mirror key format and reader |
 | `shared/permissions.py`, `shared/enums.py` | roles and permissions |
-| `shared/rate_limit.py` | the shared fixed-window counter |
+| `shared/redis.py` | the shared fixed-window counter |
 | `shared/email.py` | email templates and SMTP sender |
 | `scripts/token.sh`, `scripts/lib.sh` | operator access tokens |
 

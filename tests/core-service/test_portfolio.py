@@ -16,7 +16,7 @@ FUNDING_TIME = datetime(2026, 9, 28, 15, tzinfo=UTC)
 
 @pytest.fixture
 def silent_notifications(monkeypatch):
-    import domains.notification.actions as actions
+    import domains.notification.service as actions
 
     async def _noop(*args, **kwargs):
         return None
@@ -26,7 +26,7 @@ def silent_notifications(monkeypatch):
 
 @pytest.fixture
 def notified_users(monkeypatch):
-    import domains.notification.actions as actions
+    import domains.notification.service as actions
 
     calls: list[dict] = []
 
@@ -869,7 +869,7 @@ class TestSnapshots:
             return None
 
         monkeypatch.setattr(ai_client, "get_daily_closes", _no_closes)
-        monkeypatch.setattr(internal, "_market_today", lambda: SESSION)
+        monkeypatch.setattr(internal, "market_today", lambda: SESSION)
         _only_portfolios(monkeypatch, pid)
         body = (await client.post("/internal/scheduler/market-close")).json()
         assert body["skipped"] is False
@@ -1028,7 +1028,7 @@ class TestScheduledJobs:
             monkeypatch.setattr(PortfolioService, method, _run)
 
             monkeypatch.setattr(
-                internal, "_market_today", lambda: date(2026, 11, 26))
+                internal, "market_today", lambda: date(2026, 11, 26))
             response = await client.post(path)
             assert response.status_code == 200, case_id
             assert response.json() == {
@@ -1038,13 +1038,13 @@ class TestScheduledJobs:
                 count_key: 0
             }, case_id
             monkeypatch.setattr(
-                internal, "_market_today", lambda: date(2026, 11, 28))
+                internal, "market_today", lambda: date(2026, 11, 28))
             reason = (await client.post(path)).json()["reason"]
             assert reason == "weekend", case_id
             assert runs == [], case_id
 
             monkeypatch.setattr(
-                internal, "_market_today", lambda: date(2026, 11, 25))
+                internal, "market_today", lambda: date(2026, 11, 25))
             response = await client.post(path)
             assert response.status_code == 200, case_id
             expected = {"skipped": False, "date": "2026-11-25", count_key: 3}
@@ -1065,7 +1065,7 @@ class TestScheduledJobs:
 
             monkeypatch.setattr(PortfolioService, "run_market_open_job", _run)
             monkeypatch.setattr(
-                internal, "_market_today", lambda: date(2026, 11, 25))
+                internal, "market_today", lambda: date(2026, 11, 25))
             response = await client.post("/internal/scheduler/market-open")
             assert response.status_code == status, case_id
             body = response.json()
@@ -1313,20 +1313,16 @@ class TestExports:
 
 class TestWriteSideEffects:
 
-    async def test_failed_delete_publishes_nothing(
+    async def test_notifications_for_every_write(
             self, client, notified_users, published_events):
-        _, owner = _make_token()
+        user_id, headers = _make_token()
         _, stranger = _make_token()
-        pid = await create_portfolio(client, owner)
+        pid = await create_portfolio(client, headers, "Notify")
         response = await client.delete(
             f"/api/v1/portfolios/{pid}", headers=stranger)
         assert response.status_code == 404
         assert published_events == []
         assert [n["type"] for n in notified_users] == ["portfolio_created"]
-
-    async def test_notifications_for_every_write(self, client, notified_users):
-        user_id, headers = _make_token()
-        pid = await create_portfolio(client, headers, "Notify")
         await client.patch(
             f"/api/v1/portfolios/{pid}", json={"name": "Notify 2"},
             headers=headers)

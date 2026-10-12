@@ -17,7 +17,7 @@ from ai.rag.visibility import VisibilityScope
 from config import settings
 from domains.rag.schema import RagAnswer, RagAskRequest, RagCitation
 from shared.enums import DocumentCategory
-from shared.rate_limit import fixed_window_hits
+from shared.redis import fixed_window_hits
 
 logger = structlog.get_logger(__name__)
 

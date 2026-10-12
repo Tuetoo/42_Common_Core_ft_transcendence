@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import PurePosixPath
 from uuid import UUID
+import httpx
 import structlog
 from ai.llm.base import LLMProviderTimeoutError, LLMRateLimitError
 from ai.rag.chunking import chunk_document, parse_document
@@ -14,8 +15,8 @@ from database import SessionLocal
 from domains.rag.repository import (DocumentChunkRepository,
                                     EmbeddingJobRepository)
 from shared.enums import DocumentCategory, DocumentStatus
-from shared.events import publish_cross_service, publish_durable_event
-from shared.events_registry import EventName
+from shared.events import (EventName, publish_cross_service,
+                           publish_durable_event)
 from shared.storage import download_bytes
 
 logger = structlog.get_logger(__name__)
@@ -39,10 +40,6 @@ def is_transient_ingestion_error(exc: BaseException) -> bool:
         status = code if isinstance(code, int) else None
     if status in _TRANSIENT_STATUS_CODES:
         return True
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover
-        return False
     return isinstance(exc, httpx.TransportError)
 
 

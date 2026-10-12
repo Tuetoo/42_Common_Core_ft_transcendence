@@ -1,7 +1,7 @@
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from shared.enums import DocumentCategory
-from shared.tickers import OptionalTicker
+from shared.schemas import OptionalTicker
 
 MAX_QUESTION_CHARS = 2000
 MAX_TOP_K = 10

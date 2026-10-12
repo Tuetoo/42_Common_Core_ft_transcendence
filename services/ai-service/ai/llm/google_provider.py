@@ -336,17 +336,23 @@ async def _wait_for_reserved_key(
 _DAY_SCALE_WAIT_THRESHOLD_SECONDS = _MINUTE_COOLDOWN_SECONDS + 120.0
 
 
-async def _pool_wait_and_interval(model: str) -> tuple[float, float]:
+def _pool_candidates(
+        model: str) -> tuple[list[tuple[str, str, str]], float] | None:
     try:
         labels = _pool.available_labels_excluding(set())
     except LLMConfigError:
-        return 0.0, 0.0
-    if not labels:
-        return 0.0, 0.0
+        return None
     min_interval = _min_interval_seconds_for(model)
-    if min_interval <= 0:
+    if not labels or min_interval <= 0:
+        return None
+    return [("google", model, lbl) for lbl in labels], min_interval
+
+
+async def _pool_wait_and_interval(model: str) -> tuple[float, float]:
+    pool = _pool_candidates(model)
+    if pool is None:
         return 0.0, 0.0
-    candidates = [("google", model, lbl) for lbl in labels]
+    candidates, min_interval = pool
     earliest = await request_pacer.peek_earliest_next_allowed_at(candidates)
     wait = max(0.0, earliest - time.monotonic())
     return wait, min_interval
@@ -356,18 +362,11 @@ _POOL_EXHAUSTION_FRACTION_THRESHOLD = 0.7
 
 
 async def _pool_exhausted_fraction(model: str) -> float:
-    try:
-        labels = _pool.available_labels_excluding(set())
-    except LLMConfigError:
+    pool = _pool_candidates(model)
+    if pool is None:
         return 0.0
-    if not labels:
-        return 0.0
-    min_interval = _min_interval_seconds_for(model)
-    if min_interval <= 0:
-        return 0.0
-    candidates = [("google", model, lbl) for lbl in labels]
     return await request_pacer.peek_exhausted_fraction(
-        candidates, _DAY_SCALE_WAIT_THRESHOLD_SECONDS)
+        pool[0], _DAY_SCALE_WAIT_THRESHOLD_SECONDS)
 
 
 async def google_pool_cooldown(model: str) -> tuple[float, str]:

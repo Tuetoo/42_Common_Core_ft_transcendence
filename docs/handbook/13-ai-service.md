@@ -99,26 +99,26 @@ All paths are relative to `services/ai-service/`.
 | `api/internal.py` | The `/internal/*` routes (unversioned, not proxied by the gateway). |
 | `domains/` | Classic web layers per domain: `api.py` (routes), `schema.py` (Pydantic request/response models), `model.py` (SQLAlchemy tables), `repository.py` (queries), `service.py` (business logic). Domains: `analysis`, `analytics`, `backtest`, `decision`, `filings` (filing records table), `knowledge`, `market`, `memory`, `rag`. |
 | `domains/analysis/queue.py` | The serial analysis queue and the admission check. |
-| `ai/agents/` | The nine data agents, Bull, Bear, Judge, Reflection, the Supervisor, the ReAct loop and the evidence checks (chapter 15). |
-| `ai/graph/` | The LangGraph graph: `builder.py` (wiring), `nodes.py` (node functions), `edges.py` (routing decisions and node names per role), `state.py` (the shared `AnalysisState`). Chapter 16. |
+| `ai/agents/` | The nine data agents, Bull, Bear, Judge, Reflection, the ReAct loop and the evidence checks (chapter 15). |
+| `ai/graph/` | The LangGraph graph: `builder.py` (wiring and routing decisions), `nodes.py` (node functions, the agent registry and the Supervisor's agent selection), `state.py` (the shared `AnalysisState`, node names per role, the debate and reflection caps). Chapter 16. |
 | `ai/llm/` | LLM adapters (Google, Mistral, OpenAI, Anthropic), the router with tiers and one fallback model per tier, request pacing, JSON fence helper. Chapter 14. |
 | `ai/providers/` | Clients for external data: Yahoo Finance, FRED, NewsAPI (with its source catalog), SEC EDGAR (fundamentals, filing periods, the XBRL latest-quarter line), Tavily; a small retry helper; `news_filters.py` (query building, structural pre-drops, consent-link relinking) and `news_relevance.py` (the LLM relevance classifier with its subject/kind enums). |
 | `ai/tools/` | Agent tools that wrap providers, the RAG retriever, core-service and the knowledge graph; the cache-first price store (`market_data_cache.py`); indicator math. |
 | `ai/rag/` | Chunking, embeddings, Qdrant + BM25 indexing, hybrid retrieval with Reciprocal Rank Fusion, visibility rules. Chapter 17. |
-| `ai/knowledge/` | Archival of agent reports into RAG, knowledge-graph extraction and KG context, filing summaries and structured filing records (`filing_records.py`, table `ai.filing_records`), fresh-filing lookup, recycled-content and prior-note-claim detection, ticker names. Chapter 18. |
+| `ai/knowledge/` | Archival of agent reports into RAG, knowledge-graph extraction and KG context, filing summaries and structured filing records (`filing_records.py`, table `ai.filing_records`), recycled-content and prior-note-claim detection, ticker names. Chapter 18. |
 | `ai/memory/` | Episodic memory (track record per ticker) and procedural memory (good tool-call patterns per agent role). Chapter 18. |
 | `ai/recommendation/` | The final recommendation and the single-position limit (`engine.py`), position sizing into tiers (`position_sizing.py`). Chapter 16. |
 | `ai/ingestion/` | Daily ingestion helpers: SEC filings (via `edgartools`; summary and records calls), a news digest, a monthly macro note. |
 | `ai/workflows/` | Long-running jobs with their own DB session: the analysis workflow, RAG ingestion, auto-ingestion, review, tier monitoring, three backtest workflows. Chapter 19. |
 | `ai/benchmark/metrics.py` | Pure financial metrics (returns, drawdown, Sharpe, ...) shared by the backtests. |
-| `ai/evaluation/` | The RAG golden set model and loader (`golden_set.py`) and the one Recall@K / MRR scoring module (`recall.py`: `rank_of`, `Score`, `embed_golden_questions` with the `query` embedding purpose) shared by `scripts/measure_rag_recall.py` and the integration-test floor. |
+| `ai/evaluation/` | One module, `rag_recall.py`: the RAG golden set model and loader, and the one Recall@K / MRR scoring code (`rank_of`, `Score`, `embed_golden_questions` with the `query` embedding purpose) shared by `scripts/measure_rag_recall.py` and the integration-test floor. |
 | `ai/user_sentiment.py` | Sentiment of a user's research note or comment, for core-service. |
 | `clients/` | HTTP clients for core-service (`core_client.py`: holdings, cash, snapshots, documents, transactions) and auth-service (`auth_client.py`: organization membership). |
 | `deps.py` | Access checks: `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
 | `event_listener.py` | Handlers for the durable Redis events. |
 | `ai_events.py` | Payload builders and a best-effort publisher for ai-service events. |
 | `observability.py` | ai-service Prometheus metrics. |
-| `qdrant.py`, `database.py`, `db_bootstrap.py` | Qdrant client and collection check, SQLAlchemy engine/session, Alembic upgrade at startup. |
+| `qdrant.py`, `database.py` | Qdrant client and collection check, SQLAlchemy engine/session, Alembic upgrade at startup. |
 | `migrations/` | Alembic revisions for the `ai` schema (chapter 20). |
 | `scripts/` | Operator and maintenance scripts, run inside the container (section 3.7). |
 
@@ -160,7 +160,7 @@ The create route (`create_analysis` in `domains/analysis/api.py`):
    check, insert the row, commit, enqueue the job (section 3.4).
 
 The request body is `AnalysisCreate` (`domains/analysis/schema.py`):
-`ticker` (1-10 characters, normalised by `shared/tickers.py`),
+`ticker` (1-10 characters, normalised by `shared/schemas.py`),
 `portfolio_id` (optional), `analysis_type` (default `full`) and
 `requested_agents` (optional list; when given it must name at least one
 research agent, `RESEARCH_ROLES` = every role except `portfolio`, `bull`
@@ -292,7 +292,7 @@ The failure reasons a row can carry are listed in
 1. `configure_logging(settings)`: structured JSON logs to stdout
    (`shared/logging.py`, `LOG_JSON` default true). Logs
    `service_startup`.
-2. `ensure_schema(engine)` (`db_bootstrap.py`): brings the `ai` schema to
+2. `ensure_schema(engine)` (`database.py`): brings the `ai` schema to
    the Alembic head on every start (chapter 20).
 3. `check_embedding_configuration()` (`ai/rag/embedding.py`): fails
    startup if the embedding provider and the vector size do not match.
@@ -333,9 +333,9 @@ failure_reason}`, `alphamind_analysis_queue_pending`,
 kind}`. The HTTP latency histogram has extra buckets (beyond the library's
 0.1/0.5/1 s) so the p95 panel and the `HighLatencyP95` alert (2 s) can see
 slow requests. ai-service builds its collectors in `observability.py`
-with `shared/metrics.py::get_or_create`, like core-service.
+with `shared/logging.py::get_or_create`, like core-service.
 Every response and error envelope carries the request id
-(`shared/request_id.py`). Swagger UI is at `/api/docs` with the schema at
+(`shared/logging.py`). Swagger UI is at `/api/docs` with the schema at
 `/api/openapi-ai.json` (behind the gateway: `/docs/ai/`). The schema path
 is unique per service because Swagger UI fetches it as an absolute URL
 from the gateway's root, and the gateway must know which backend to route
@@ -375,7 +375,7 @@ failed" still sees a `ProviderRequestError`, while the nightly ingestion
 can treat it as a deferral instead of an outage (chapter 26, section
 3.5). Tools catch all of them and return a readable failure text to the
 agent instead of crashing it.
-`ai/providers/retry.py::call_with_retry` retries Yahoo, SEC EDGAR and
+`ai/providers/base.py::call_with_retry` retries Yahoo, SEC EDGAR and
 FRED calls. It makes at most 3 attempts in total
 (`DEFAULT_MAX_ATTEMPTS = 3`). The waits are about 1 s and then 2 s, each
 with up to 30 % random jitter. For SEC EDGAR and FRED it retries only
@@ -435,7 +435,6 @@ folder call some of them for you.
 | `backfill_filing_records.py` | Extracts (or with `--redo` re-extracts) `ai.filing_records` for filing documents already stored, oldest first, one records-only call each. Flags `--ticker` (repeatable; default every ticker with FILING documents), `--latest N`, `--filename NAME` (repeatable; tickers taken from the names when no `--ticker`), `--tier` (default `FILING_RECORDS_BACKFILL_LLM_TIER`), `--apply` (default dry run: no LLM, SEC or database writes). Waits 65 s before a filing above 500,000 characters; a failed filing stores nothing and the exit code is 1. Chapter 18, 3.13. | Yes with `--apply` |
 | `regenerate_filing_summaries.py` | Two steps for a stored summary that is bad (for example cut off): `--filename F` (repeatable) makes one HIGHEST summary call from the archived raw text and saves it to `/app/_regenerated/` (no database writes; prints the current core document id); after the owner deletes the old document with core-service `scripts.delete_documents`, `--filename F --apply` stores the new document (normal RAG ingestion). Summary only; records are redone with the backfill. Chapter 18, 3.13. | Yes with `--apply` |
 | `upload_seed_documents.py` | Uploads the RAG seed corpus from the repo-root `rag_seed_documents/` folder. | Writes documents |
-| `alembic_convert.py` | One-time conversion of an old schema to the Alembic baseline; preview by default, `--apply` converts. | Yes with `--apply` |
 | `verify_portfolio_backtest.py` | Recomputes a portfolio backtest independently and compares. | No |
 
 ## 4. Configuration
@@ -696,11 +695,11 @@ then `... analysis_cli status <id>` and `... analysis_cli get <id>`.
 | `services/ai-service/ai/workflows/analysis_workflow.py` | `run_analysis_workflow`, persistence, `mark_analysis_failed`. |
 | `services/ai-service/event_listener.py` | Durable event handlers. |
 | `services/ai-service/qdrant.py` | Qdrant client and `ensure_collection`. |
-| `services/ai-service/db_bootstrap.py` | `ensure_schema` (Alembic at startup). |
+| `services/ai-service/database.py` | `ensure_schema` (Alembic at startup). |
 | `services/ai-service/observability.py` | Prometheus metrics. |
 | `services/ai-service/ai/providers/registry.py` | Provider singletons. |
 | `services/ai-service/ai/providers/yahoo_finance.py`, `fred.py`, `newsapi.py`, `sec_edgar.py`, `tavily.py` | The five data providers. |
-| `services/ai-service/ai/providers/retry.py` | `call_with_retry` for market data. |
+| `services/ai-service/ai/providers/base.py` | Provider error rule; `call_with_retry` for market data. |
 | `services/ai-service/ai/ingestion/sec_edgar_filings.py` | Filing download through `edgartools`, summary and records calls, `ingest_new_filings`. |
 | `shared/scheduled_jobs.py` | `job_response`: 200, or 500 when every attempted item of a step failed. |
 | `services/ai-service/scripts/backfill_filing_records.py`, `regenerate_filing_summaries.py` | Filing maintenance (chapter 18). |

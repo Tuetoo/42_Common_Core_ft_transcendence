@@ -186,7 +186,7 @@ The graph is invoked with `recursion_limit` 100
 ### 3.2 episodic_memory_node: the track record
 
 `ai/graph/nodes.py::episodic_memory_node` runs first. It calls
-`ai/memory/episodic.py::retrieve_episodic_context(ticker, user_id=...)`,
+`ai/memory/agent_memory.py::retrieve_episodic_context(ticker, user_id=...)`,
 which returns the newest `EPISODIC_CONTEXT_LIMIT` (default 3) earlier
 completed calls on this ticker: the user's own plus system ones (a system
 analysis sees system calls only). Each hit carries date, action,
@@ -197,7 +197,7 @@ gives an empty list, never a failure. Setting `EPISODIC_CONTEXT_LIMIT` to
 
 ### 3.3 supervisor_node: agent selection and shared context
 
-`supervisor_node` calls `ai/agents/supervisor.py::select_agents`,
+`supervisor_node` calls `ai/graph/nodes.py::select_agents`,
 which has no LLM at all:
 
 - `requested_agents`, when given, replaces the default set.
@@ -212,18 +212,18 @@ which has no LLM at all:
 The Supervisor node also computes context once and shares it, so agents
 stay pure functions of the state. Every item below is an optional
 enrichment: a failure is logged (`supervisor_node.procedural_hints_failed`,
-`supervisor_node.fresh_filing_check_failed`,
+`fresh_filing_check.sec_check_failed`,
 `supervisor_node.kg_context_failed`,
 `supervisor_node.portfolio_kg_context_failed`) and gives "no context" for
 that item, never a failed analysis.
 
 - **L4 procedural hints** for each selected role
-  (`ai/memory/procedural.py::retrieve_procedural_hints`). A hint lists only
+  (`ai/memory/agent_memory.py::retrieve_procedural_hints`). A hint lists only
   tool calls the model chose itself in an earlier high-scoring run; the
   calls code makes before the first turn (prefetched calls) are never
   stored, and a role with no such stored calls gets no hint. Only rows
   written by analyses of the same owner are read (chapter 18).
-- **Fresh filing context** (`ai/knowledge/fresh_filings.py::check_for_fresh_filing_content`)
+- **Fresh filing context** (`ai/graph/nodes.py::load_fresh_filing_context`)
   when Filing, Fundamental or Risk is selected: checks SEC EDGAR for
   10-K/10-Q filings that are not yet stored and ingests them
   (`ingest_new_filings`, chapter 18, 3.10). This runs inside
@@ -245,7 +245,7 @@ that item, never a failed analysis.
 
 ### 3.4 The data agents and the join
 
-`fan_out_to_selected_agents` (`ai/graph/edges.py`) sends the state to each
+`fan_out_to_selected_agents` (`ai/graph/builder.py`) sends the state to each
 selected agent node. One exception: when both News and Sentiment are
 selected, Sentiment is held back. News's node has a conditional edge,
 `route_after_news`, that dispatches Sentiment every time News finishes, so
@@ -307,7 +307,7 @@ has 9 of 9 usable agents (measured over three 15-ticker batches).
 
 `bull_node` and `bear_node` run in parallel every round. Bear sleeps
 `_DEBATE_SIDE_STAGGER_SECONDS` (0.5 s) first. Both call
-`DebateSideAgent(side).make_argument` (`ai/agents/debate_side.py`, one
+`DebateSideAgent(side).make_argument` (`ai/agents/debate_common.py`, one
 class; the sides differ only in their prompt), built on
 `ai/agents/debate_common.py::generate_debate_argument`.
 
@@ -331,7 +331,7 @@ What a side receives:
   and code, with a hard rule not to repeat them, and `not_engaged` issues
   listed separately as points to answer.
 
-The prompt (`debate_side.py`, one per side) asks for 3-6 sentences (the
+The prompt (`debate_common.py`, one per side) asks for 3-6 sentences (the
 statements the rules require count towards them), an inline source tag
 after each claim, like `[fundamental]`, and the shared rules on periods,
 unusual items, overlapping items, free cash flow, legal amounts and source
@@ -346,7 +346,8 @@ warning, so a fabricated number from a flagged agent cannot "ground" Bull's
 repetition of it. With ungrounded figures the side writes once more with
 the list of figures (`DEBATE_MAX_REGENERATIONS` = 1); a regenerated draft
 that is still flagged is accepted and logged
-(`<side>.final_draft_still_flagged`). Reflection's strong-model review
+(`<side>.final_draft_still_flagged`). If the regeneration call fails, the
+first draft is kept (`<side>.regeneration_failed_kept_draft`). Reflection's strong-model review
 still runs afterwards.
 
 Why there is no LLM self-check: a Lite self-check of every draft (about
@@ -368,7 +369,7 @@ checks whether a side's argument is unavailable *for availability*
 `debate_join_node.side_repair_retry`, waits
 `DEBATE_SIDE_REPAIR_DELAY_SECONDS` (60 s) and re-runs that side. The wait
 is skipped when a model of the strong chain is free now
-(`ai/llm/capacity.py::capacity_aware_delay`, chapter 14, 3.10; the log
+(`ai/llm/router.py::capacity_aware_delay`, chapter 14, 3.10; the log
 line then has `delay_seconds=0` and the `free_model`), for example when
 the other side has just been answered by a fallback model. If both sides
 failed, both are re-run in parallel (Bear 0.5 s later). The repaired
@@ -526,7 +527,7 @@ the Judge to leave debate-process text out.
 (`LLMRateLimitError`, which includes 429s, 503s and strong-model
 timeouts), `judge_node` asks `_judge_retry_wait` how long to wait. It
 reads the cooldowns of the strong chain
-(`ai/llm/capacity.py::chain_capacity` over
+(`ai/llm/router.py::chain_capacity` over
 `tier_model_chain(HIGHEST_ACCURACY)`, chapter 14, 3.10):
 
 - a model has no 429, 503 or timeout cooldown: wait 0 s;
@@ -670,7 +671,7 @@ usable_agents=N/M` (`ReflectionVerdict.review_meta_line`).
      retry is dropped (`reflection_node.rate_limit_skip`), with the note
      "retry skipped this round (provider capacity)".
    - Otherwise every usable chain model is near its per-minute limit or
-     has a 503 or request-timeout marker (`ai/llm/capacity.py`); the node
+     has a 503 or request-timeout marker (`ai/llm/router.py`); the node
      waits for the shortest of those waits,
      at most 20 s (`_RATE_LIMIT_RETRY_BACKOFF_SECONDS`,
      `reflection_node.rate_limit_backoff`), and adds the note "retry
@@ -1002,8 +1003,8 @@ All settings are in `services/ai-service/config.py` (class
 | `TIER_MIN_NOTIONAL_USD` | 100.0 | smallest BUY tier in USD |
 | `TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION` | 0.01 | smallest BUY tier as a share of net value |
 | `TIER_WINDOW_DAYS_MAX` | 30 | longest tier validity window; a larger `window_days` answer is capped |
-| code: `MAX_DEBATE_ROUNDS` (`ai/graph/edges.py`) | 3 | mutual debate rounds |
-| code: `MAX_REFLECTION_RETRIES` (`ai/graph/edges.py`) | 2 | Reflection retry rounds |
+| code: `MAX_DEBATE_ROUNDS` (`ai/graph/state.py`) | 3 | mutual debate rounds |
+| code: `MAX_REFLECTION_RETRIES` (`ai/graph/state.py`) | 2 | Reflection retry rounds |
 | code: `DEBATE_MAX_REGENERATIONS` (`debate_common.py`) | 1 | rewrites of one argument (only for ungrounded figures) |
 | code: `_JUDGE_MAX_TOKENS` (`judge.py`) | 3072 | Judge output budget |
 | code: `CONFIDENCE_CHANGE_TO_EXPLAIN` (`judge.py`) | 0.05 | confidence move against the Judge's own earlier verdict that needs a stated change |
@@ -1266,13 +1267,10 @@ tier can only become a trade after the owner accepts it."
 
 | File | What it holds |
 |---|---|
-| `services/ai-service/ai/graph/builder.py` | `build_analysis_graph`: nodes and edges |
-| `services/ai-service/ai/graph/nodes.py` | every node; `_run_agent_safely`, the Supervisor's guarded enrichments, side repair, Judge retry (`_judge_retry_wait`, using `ai/llm/capacity.py::chain_capacity`) and late side repair (`_late_side_repair`), Reflection retry gating (`_rate_limit_gate_for_retry`, using `ai/llm/capacity.py::chain_capacity`) |
-| `services/ai-service/ai/graph/edges.py` | routing functions, `node_name` (node names per role), `MAX_DEBATE_ROUNDS`, `MAX_REFLECTION_RETRIES` |
-| `services/ai-service/ai/graph/state.py` | `AnalysisState`, reducers, `DebateState`, `JudgeVerdict`, `ReflectionVerdict`, `confidence_adjustment_note` |
-| `services/ai-service/ai/agents/supervisor.py` | `AGENT_REGISTRY`, agent selection table |
-| `services/ai-service/ai/agents/debate_common.py` | Bull/Bear shared generation, evidence formatting and code-built lines, figure check, shared prompt rules |
-| `services/ai-service/ai/agents/debate_side.py` | `DebateSideAgent` and both side prompts |
+| `services/ai-service/ai/graph/builder.py` | `build_analysis_graph`: nodes and edges; routing functions |
+| `services/ai-service/ai/graph/nodes.py` | every node; `_run_agent_safely`, the Supervisor's guarded enrichments, side repair, Judge retry (`_judge_retry_wait`, using `ai/llm/router.py::chain_capacity`) and late side repair (`_late_side_repair`), Reflection retry gating (`_rate_limit_gate_for_retry`, using `ai/llm/router.py::chain_capacity`); `AGENT_REGISTRY`, the agent selection table, `make_agent_node`, `load_fresh_filing_context` |
+| `services/ai-service/ai/graph/state.py` | `AnalysisState`, reducers, `DebateState`, `JudgeVerdict`, `ReflectionVerdict`, `confidence_adjustment_note`, `node_name` (node names per role), `MAX_DEBATE_ROUNDS`, `MAX_REFLECTION_RETRIES` |
+| `services/ai-service/ai/agents/debate_common.py` | Bull/Bear shared generation, evidence formatting and code-built lines, figure check, shared prompt rules, `DebateSideAgent` and both side prompts |
 | `services/ai-service/ai/agents/judge.py` | Judge prompt, context lines, earlier-verdict rules, figure check and rewrite, parsing, audit logs |
 | `services/ai-service/ai/agents/reflection.py` | mechanical checks, citation review |
 | `services/ai-service/ai/recommendation/engine.py` | single-position limit helpers, `no_verdict_reason`, `build_final_recommendation` |

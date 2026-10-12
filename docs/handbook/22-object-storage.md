@@ -237,7 +237,7 @@ system documents), in `ResearchService.upload`:
 1. Validate: extension, size up to `MAX_UPLOAD_SIZE_BYTES` (20 MB),
    category in `ALLOWED_DOCUMENT_CATEGORIES`, and content (a PDF must
    start with `%PDF-`; text must be UTF-8 without NUL bytes). An optional
-   `ticker` must pass `shared/tickers.normalize_ticker` (stripped,
+   `ticker` must pass `shared/schemas.normalize_ticker` (stripped,
    uppercased, 1 to 10 characters of `A-Z`, `0-9`, `.`, `-`), else 422.
    For an organization upload, the user must be allowed to write in that
    organization. Nothing is stored before all of this passes.
@@ -297,7 +297,7 @@ authenticated endpoints.
 **Files outside the bucket.** `scripts/regenerate_filing_summaries.py`
 keeps its drafts on local disk (`/app/_regenerated/<file>.summary.txt`
 in the ai-service container; with the development bind mount that is
-`services/ai-service/_regenerated/` on the host), not in the bucket. Only
+`services/ai-service/_regenerated/` on the host, git-ignored), not in the bucket. Only
 its `--apply` step creates the new filing document, under the normal
 system-owner key. Delete the old document first with
 `scripts.delete_documents --confirm`; a filing whose old document still
@@ -381,13 +381,11 @@ empty volumes and no published ports, runs `restore.sh --yes` and then
 the project with its volumes, also when a step failed. It never touches
 the live stack.
 
-Older backups hold `objectstore-data.tar.gz` (format 2, a tarball of the
-SeaweedFS data directory). `restore.sh` still extracts it into the
-`objectstore_data` volume, which needs `objectstore` **stopped**
-(`restore.sh` refuses while the S3 API answers; `make restore` stops or
-starts `objectstore` according to the backup's format). A backup with
-`minio-data.tar.gz` (MinIO era) cannot be read by SeaweedFS: a full
-restore skips that part and `--only objectstore` refuses it. See
+`restore.sh` reads only the current backup format 3 (`objectstore/<bucket>/`
+folders through the S3 API); `make restore` always starts `objectstore`
+first. Older formats (a tarball of the SeaweedFS data directory, or a MinIO
+tarball) are no longer read: a backup without `objectstore/` skips that
+part, and `--only objectstore` refuses it. See
 `../DISASTER_RECOVERY.md` sections 1, 4.3, 6 and 9.
 
 ### 3.8 Operator tools
@@ -429,7 +427,6 @@ restore skips that part and `--only objectstore` refuses it. See
 | `OBJECTSTORE_S3_CONFIG` | `/etc/seaweedfs/s3.json` | where the identity file is written | `infra/objectstore/entrypoint.sh` |
 | `SEAWEEDFS_ENTRYPOINT` | `/entrypoint.sh` | the image entrypoint the script hands over to | `infra/objectstore/entrypoint.sh` |
 | `OBJECTSTORE_S3_PORT` | `9000` | port the healthcheck calls | `infra/objectstore/healthcheck.sh` |
-| `OBJECTSTORE_DATA_DIR` | `/objectstore-data` | where `restore.sh` sees the volume (only for an old tarball backup; the `restore` service mounts it) | `infra/scheduler/restore.sh` |
 | image | `chrislusf/seaweedfs:4.47` | pinned SeaweedFS release | `docker-compose.yaml` |
 
 ---

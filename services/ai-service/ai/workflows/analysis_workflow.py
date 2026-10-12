@@ -7,8 +7,8 @@ from ai.graph.state import (AgentOutput, AnalysisState, PriorRecommendation,
                             ReflectionVerdict, is_usable_evidence)
 from ai.knowledge.archival import archive_agent_report, is_archivable_role
 from ai.knowledge.recycled_content import recycled_share
-from ai.memory.episodic import stored_judge_verdict
-from ai.memory.procedural import maybe_remember_trajectory, owner_uuid
+from ai.memory.agent_memory import (maybe_remember_trajectory, owner_uuid,
+                                    stored_judge_verdict)
 from ai.recommendation.position_sizing import (KeepEarlierTiersNote,
                                                current_position_weight_pct,
                                                generate_position_sizing,
@@ -29,7 +29,7 @@ from domains.analysis.repository import (AgentCatalogRepository,
 from domains.memory.repository import EpisodicMemoryRepository
 from shared.enums import (AgentRole, AgentStatus, AnalysisFailureReason,
                           AnalysisType, RecommendationAction, WorkflowStatus)
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import UpstreamServiceError
 
 logger = structlog.get_logger(__name__)

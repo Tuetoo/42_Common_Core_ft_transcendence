@@ -5,7 +5,6 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
-import ai.agents.debate_side as debate_side_module
 import ai.agents.loop as loop_module
 import ai.knowledge.extraction as extraction_module
 import ai.knowledge.kg_context as kg_context_module
@@ -24,8 +23,8 @@ import pytest
 from ai.agents import debate_common as dc
 from ai.agents import (filing, fundamental, judge, macro, market, news,
                        portfolio, reflection, risk, sentiment, technical)
-from ai.agents.debate_side import (_BEAR_SYSTEM_PROMPT, _BULL_SYSTEM_PROMPT,
-                                   DebateSideAgent)
+from ai.agents.debate_common import (_BEAR_SYSTEM_PROMPT, _BULL_SYSTEM_PROMPT,
+                                     DebateSideAgent)
 from ai.agents.filing import (FilingRecordsCache, key_records_for,
                               one_off_item_lines)
 from ai.agents.fundamental import (fundamental_answer_issue,
@@ -55,7 +54,7 @@ from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.news_tool import counts_as_live_search
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
 from helpers import (_TSLA_ROWS, _events, _news_output, _NoCallRouter, _pad,
-                     _Row, _ScriptedAgentRouter, _validator)
+                     _Row, _ScriptedAgentRouter, _state, _validator)
 from structlog.testing import capture_logs
 from shared.enums import (AgentRole, AgentStatus, AnalysisType,
                           DocumentCategory, RecommendationAction)
@@ -141,12 +140,6 @@ class _Stop(Exception):
     pass
 
 
-def _state(ticker: str = "AAPL", **overrides: Any) -> AnalysisState:
-    return AnalysisState(
-        analysis_id="a1", user_id="u1", ticker=ticker,
-        analysis_type=AnalysisType.FULL, **overrides)
-
-
 def _entry(
         action: str, observation: str,
         action_input: dict[str, Any] | None = None, *,
@@ -176,7 +169,7 @@ def _classified(fn):
 
 
 def _web_classified(fn):
-    from ai.tools.search_relevance import ClassifiedResult
+    from ai.tools.web_search_tool import ClassifiedResult
 
     async def wrapper(query, results, **kwargs):
         kept = await fn(query, results)
@@ -1539,13 +1532,13 @@ class TestSentimentAgent:
     async def test_unverified_fallback_news_is_thin_evidence(
             self, monkeypatch):
         captured: dict[str, Any] = {}
-        real = sentiment.derive_agent_quality
+        real = loop_module.derive_agent_quality
 
         def _spy(result: Any, **kwargs: Any) -> Any:
             captured.update(kwargs)
             return real(result, **kwargs)
 
-        monkeypatch.setattr(sentiment, "derive_agent_quality", _spy)
+        monkeypatch.setattr(loop_module, "derive_agent_quality", _spy)
         monkeypatch.setattr(sentiment, "_news_live_yield", lambda out: 5)
         router = _ScriptedAgentRouter([
             _finish(
@@ -2693,7 +2686,7 @@ class TestDebateSides:
     @pytest.mark.asyncio
     async def test_bull_cites_agent_evidence_in_prompt(self, monkeypatch):
         router = _Router(["Strong buy case."])
-        monkeypatch.setattr(debate_side_module, "LLMRouter", lambda: router)
+        monkeypatch.setattr(dc, "LLMRouter", lambda: router)
 
         state = _state(
             agent_outputs={

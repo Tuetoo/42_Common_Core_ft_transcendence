@@ -9,7 +9,12 @@ type ConnectionStatus = "connecting" | "live" | "polling";
 
 // Events on the analysis:<id> channel that mean "the analysis page has new
 // data". The socket only signals; the server page re-fetches the real data.
-const REFRESH_EVENTS = new Set(["analysis.completed", "analysis.failed", "recommendation.ready"]);
+const REFRESH_EVENTS = new Set([
+  "analysis.started",
+  "analysis.completed",
+  "analysis.failed",
+  "recommendation.ready",
+]);
 
 const POLL_INTERVAL_MS = 15_000;
 

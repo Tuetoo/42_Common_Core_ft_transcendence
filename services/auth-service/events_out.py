@@ -4,9 +4,8 @@ from uuid import UUID
 import structlog
 from config import settings
 from fastapi import BackgroundTasks
-from shared.events import publish_cross_service
-from shared.events_registry import EventName
-from shared.org_membership_cache import invalidate_membership_cache
+from shared.events import EventName, publish_cross_service
+from shared.user_state import invalidate_membership_cache
 
 logger = structlog.get_logger(__name__)
 

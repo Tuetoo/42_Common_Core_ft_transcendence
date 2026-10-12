@@ -44,7 +44,8 @@ type Invitation = {
 // - admin: edit details, invite, change roles of members/viewers, remove
 //   members/viewers, list and revoke non-admin invitations;
 // - member / viewer: read, and leave. The owner cannot leave.
-// Inviting also needs the system permission organization:create.
+// Every change (edit, delete, invite, roles, removal, revoke) also needs the
+// system permission organization:create, so a guest only reads and leaves.
 export default async function OrganizationDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const { me, accessToken } = await getMe();
@@ -62,7 +63,8 @@ export default async function OrganizationDetailPage({ params }: { params: Promi
 
   const myRole = members.find((m) => m.user_id === me.id)?.role ?? "viewer";
   const isOwner = org.owner_id === me.id;
-  const isManager = isOwner || myRole === "admin";
+  const canWrite = can(me, "organization:create");
+  const isManager = canWrite && (isOwner || myRole === "admin");
   const grantable = isOwner ? (["admin", "member", "viewer"] as const) : (["member", "viewer"] as const);
 
   let invitations: Invitation[] = [];
@@ -90,7 +92,7 @@ export default async function OrganizationDetailPage({ params }: { params: Promi
         </div>
         <div className="flex flex-wrap gap-2">
           {isOwner ? (
-            <ActionButton
+            canWrite && <ActionButton
               action={deleteOrganization.bind(null, org.id)}
               label="Delete organization"
               confirmLabel="Confirm delete"
@@ -216,11 +218,7 @@ export default async function OrganizationDetailPage({ params }: { params: Promi
 
           <div className="section">
             <h2 className="section-title">Invite a member</h2>
-            {can(me, "organization:create") ? (
-              <InviteMemberForm orgId={org.id} roles={grantable} />
-            ) : (
-              <p className="empty-state">Your account role ({me.system_role}) cannot send invitations.</p>
-            )}
+            <InviteMemberForm orgId={org.id} roles={grantable} />
           </div>
 
           <div className="section">

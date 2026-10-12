@@ -1,7 +1,8 @@
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
-from pydantic import (BaseModel, ConfigDict, Field, field_validator,
-                      model_validator)
+from pydantic import (BaseModel, ConfigDict, Field, StringConstraints,
+                      field_validator, model_validator)
 from domains.auth.schema import Email
 from shared.enums import OrganizationRole
 from shared.schemas import BaseSchema, IDMixin, TimestampMixin
@@ -13,8 +14,13 @@ def _reject_owner(role: OrganizationRole) -> OrganizationRole:
     return role
 
 
+OrganizationName = Annotated[str,
+                             StringConstraints(strip_whitespace=True,
+                                               min_length=1, max_length=128)]
+
+
 class OrganizationCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=128)
+    name: OrganizationName
     description: str | None = Field(default=None, max_length=1000)
 
 
@@ -27,7 +33,7 @@ class OrganizationUpdate(BaseModel):
                 "with null; `name` cannot be null.")
         })
 
-    name: str | None = Field(default=None, min_length=1, max_length=128)
+    name: OrganizationName | None = None
     description: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")

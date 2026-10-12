@@ -16,9 +16,8 @@ from domains.analytics.schema import (AgentPerformanceRead,
 from shared.enums import RecommendationAction, WorkflowStatus
 from shared.exceptions import ValidationAppError
 from shared.permissions import Permission
-from shared.schemas import APIResponse
+from shared.schemas import APIResponse, normalize_ticker
 from shared.security import CurrentUser, ensure_permission
-from shared.tickers import normalize_ticker
 
 router = APIRouter(tags=["analytics"])
 

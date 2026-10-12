@@ -4,7 +4,7 @@ import Link from "next/link";
 
 // Shown inside the public layout's panel when a page throws. Generic on
 // purpose: production hides the real error, and no stack trace is shown.
-export default function PublicError({ reset }: { error: Error & { digest?: string }; reset: () => void }) {
+export default function PublicError({ retry }: { error: Error & { digest?: string }; retry: () => void }) {
   return (
     <div className="flex flex-col gap-6">
       <div>
@@ -16,7 +16,7 @@ export default function PublicError({ reset }: { error: Error & { digest?: strin
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-4">
-        <button type="button" className="btn btn-primary" onClick={() => reset()}>
+        <button type="button" className="btn btn-primary" onClick={() => retry()}>
           Try again
         </button>
         <Link href="/login" className="link-btn">

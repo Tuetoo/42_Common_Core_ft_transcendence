@@ -68,6 +68,7 @@ class AnalyticsRepository:
         stmt = (
             select(Recommendation).where(
                 Recommendation.created_at <= cutoff_dt).where(
-                    Recommendation.id.not_in(already_scored)).limit(limit))
+                    Recommendation.id.not_in(already_scored)).order_by(
+                        Recommendation.created_at).limit(limit))
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

@@ -21,15 +21,16 @@ tests/
   auth_tokens.py        access_token(), auth_headers(), bearer_headers()
 ```
 
-The unit suites hold 44 (auth), 87 (core) and 488 (ai) collected tests
-from 602 test functions in 21 files: 3 (auth), 4 (core) and 14 (ai)
+The unit suites hold 41 (auth), 84 (core) and 483 (ai) collected tests
+from 596 test functions in 21 files: 3 (auth), 4 (core) and 14 (ai)
 (parametrized tests expand into several cases). Coverage of the service
 code is about 74% (auth), 66% (core) and 90% (ai). Tests are grouped by topic into `Test*` classes. Each
 test file passes on its own, and so does each service's whole suite.
 
 `alembic_contract.py` holds the checks that a schema built by the real
-Alembic migrations equals the models, that downgrade and upgrade work, and
-that the one-time conversion of old databases behaves. It is star-imported
+Alembic migrations equals the models, that downgrade and upgrade work, that
+no model default is a quoted function call, and that a schema with tables
+but no Alembic revision is refused. It is star-imported
 by `auth-service/test_platform.py`, `core-service/test_platform.py` and
 `ai-service/test_api.py`, so each suite runs it against its own schema.
 
@@ -189,7 +190,7 @@ hour. The pure helpers are unit-tested in
 `tests/core-service/test_platform.py` (`TestE2eCheckScript`).
 
 Only one end-to-end run at a time. `e2e_check` and
-`e2e_tier_check` (below) share a Redis lock (`shared/e2e_lock.py`); a
+`e2e_tier_check` (below) share a Redis lock (`shared/redis.py`, `acquire_e2e_lock`); a
 second run started meanwhile exits with code 2 and names the run holding
 the lock. A killed run's lock expires after 45 minutes, or pass
 `--break-lock`. Both scripts check the admin token first and exit with

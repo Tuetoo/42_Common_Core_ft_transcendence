@@ -10,7 +10,7 @@ from fastapi import (APIRouter, BackgroundTasks, Depends, Query, Response,
                      status)
 from outbox import enqueue, publish_now
 from sqlalchemy.ext.asyncio import AsyncSession
-from domains.notification.actions import notify_after_commit
+from domains.notification.service import notify_after_commit
 from domains.portfolio.schema import (HoldingAdjustmentRead, HoldingCreate,
                                       HoldingRead, HoldingUpdate,
                                       PortfolioCreate, PortfolioRead,
@@ -21,7 +21,7 @@ from domains.portfolio.schema import (HoldingAdjustmentRead, HoldingCreate,
                                       WatchlistUpdate)
 from domains.portfolio.service import PortfolioService
 from shared.enums import NotificationType, TransactionType
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.permissions import Permission
 from shared.schemas import (MAX_PAGE, APIResponse, PaginatedResponse,
                             PaginationParams)

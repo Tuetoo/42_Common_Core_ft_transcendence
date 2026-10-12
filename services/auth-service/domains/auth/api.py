@@ -1,7 +1,7 @@
 from pathlib import Path
 from urllib.parse import urlencode
 from uuid import uuid4
-import rate_limit
+import security
 import structlog
 from config import settings
 from database import get_db
@@ -38,7 +38,7 @@ router = APIRouter(tags=["auth"])
 
 def _client_context(request: Request) -> dict[str, str | None]:
     return {
-        "ip_address": rate_limit.client_ip(request),
+        "ip_address": security.client_ip(request),
         "device_info": request.headers.get("user-agent")
     }
 
@@ -50,8 +50,8 @@ async def register(
     data: UserRegister, request: Request, background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
-    await rate_limit.hit(
-        "register:ip", rate_limit.client_ip(request),
+    await security.hit(
+        "register:ip", security.client_ip(request),
         limit=settings.RATE_LIMIT_REGISTER_PER_IP,
         window=settings.RATE_LIMIT_REGISTER_WINDOW_SECONDS)
     dispatch = await AuthService(db).register(data)
@@ -81,7 +81,7 @@ async def resend_verification_email(
     data: ResendVerificationRequest, background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
-    await rate_limit.hit(
+    await security.hit(
         "resend:email", data.email,
         limit=settings.RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL,
         window=settings.RATE_LIMIT_RESEND_VERIFICATION_WINDOW_SECONDS)
@@ -102,11 +102,11 @@ async def request_password_reset(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[dict[str, str]]:
-    await rate_limit.hit(
-        "reset:ip", rate_limit.client_ip(request),
+    await security.hit(
+        "reset:ip", security.client_ip(request),
         limit=settings.RATE_LIMIT_PASSWORD_RESET_PER_IP,
         window=settings.RATE_LIMIT_PASSWORD_RESET_WINDOW_SECONDS)
-    await rate_limit.hit(
+    await security.hit(
         "reset:email", data.email,
         limit=settings.RATE_LIMIT_PASSWORD_RESET_PER_EMAIL,
         window=settings.RATE_LIMIT_PASSWORD_RESET_WINDOW_SECONDS)
@@ -137,11 +137,11 @@ async def login(
     data: UserLogin, request: Request, background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[TokenPair]:
-    await rate_limit.hit(
-        "login:ip", rate_limit.client_ip(request),
+    await security.hit(
+        "login:ip", security.client_ip(request),
         limit=settings.RATE_LIMIT_LOGIN_PER_IP,
         window=settings.RATE_LIMIT_LOGIN_WINDOW_SECONDS)
-    await rate_limit.hit(
+    await security.hit(
         "login:email", data.email, limit=settings.RATE_LIMIT_LOGIN_PER_EMAIL,
         window=settings.RATE_LIMIT_LOGIN_WINDOW_SECONDS)
     service = AuthService(db)
@@ -332,7 +332,6 @@ async def upload_avatar(
             "The file content is not a valid image of the declared type.")
 
     storage_dir = Path(settings.AVATAR_STORAGE_DIR)
-    storage_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{current_user.user_id}-{uuid4().hex}{extension_for(detected)}"
     (storage_dir / filename).write_bytes(contents)
 

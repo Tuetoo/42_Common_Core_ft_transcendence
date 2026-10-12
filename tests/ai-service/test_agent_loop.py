@@ -8,7 +8,7 @@ from uuid import uuid4
 import ai.agents.finish_checks as finish_checks_module
 import ai.agents.loop as loop_module
 import ai.agents.news as news_module
-import ai.memory.procedural as procedural_module
+import ai.memory.agent_memory as memory_module
 import pytest
 from ai.agents import (filing, fundamental, macro, market, portfolio, risk,
                        sentiment, technical)
@@ -30,11 +30,11 @@ from ai.graph.state import AgentOutput
 from ai.knowledge.recycled_content import prior_note_only_claims
 from ai.llm.base import (LLMNonEnglishOutputError, LLMRateLimitError,
                          LLMResponse, LLMServerOverloadedError, LLMUsage)
-from ai.memory.procedural import procedural_memory_skip_reason
+from ai.memory.agent_memory import procedural_memory_skip_reason
 from ai.tools.base import Tool
 from config import settings
 from helpers import _TSLA_FILINGS, _TSLA_ROWS
-from helpers import _aapl_state as _state
+from helpers import _state
 from helpers import _events, _pad, _ScriptedAgentRouter, _validator
 from structlog.testing import capture_logs
 from shared.enums import AgentRole, AgentStatus
@@ -933,8 +933,8 @@ class TestProceduralMemoryGate:
         def _no_session():
             raise AssertionError("must not write")
 
-        monkeypatch.setattr(procedural_module, "SessionLocal", _no_session)
-        written = await procedural_module.maybe_remember_trajectory(
+        monkeypatch.setattr(memory_module, "SessionLocal", _no_session)
+        written = await memory_module.maybe_remember_trajectory(
             agent_id=None, user_id=None, ticker="AAPL", scratchpad=[], **{
                 **self._OK, "no_evidence": True
             })
@@ -954,18 +954,18 @@ class TestProceduralMemoryGate:
                     thought="done", action=None, action_input=None,
                     observation=None, is_tool_result=False))
         ]
-        content = procedural_module.build_trajectory_content(
+        content = memory_module.build_trajectory_content(
             final_answer="a", scratchpad=pad)
         assert [s["action"] for s in content["steps"]] == ["get_current_price"]
-        assert procedural_module.usable_hint_steps(content) == (
+        assert memory_module.usable_hint_steps(content) == (
             content["steps"])
-        assert procedural_module.usable_hint_steps({"steps": content["steps"]
-                                                    }) == []
+        assert memory_module.usable_hint_steps({"steps": content["steps"]
+                                                }) == []
         owner = uuid4()
-        assert procedural_module.owner_uuid(str(owner)) == owner
-        assert procedural_module.owner_uuid("") is None
-        assert procedural_module.owner_uuid(None) is None
-        assert procedural_module.owner_uuid("not-a-uuid") is None
+        assert memory_module.owner_uuid(str(owner)) == owner
+        assert memory_module.owner_uuid("") is None
+        assert memory_module.owner_uuid(None) is None
+        assert memory_module.owner_uuid("not-a-uuid") is None
 
     @pytest.mark.asyncio
     async def test_prefetch_only_trajectory_is_not_stored(self, monkeypatch):
@@ -973,13 +973,13 @@ class TestProceduralMemoryGate:
         def _no_session():
             raise AssertionError("must not write")
 
-        monkeypatch.setattr(procedural_module, "SessionLocal", _no_session)
+        monkeypatch.setattr(memory_module, "SessionLocal", _no_session)
         prefetched = ScratchpadEntry(
             thought="(fetched in code before the first turn)",
             action="get_technical_indicators", action_input={"ticker": "AAPL"},
             observation="RSI(14): 50", prefetched=True)
         with capture_logs() as logs:
-            written = await procedural_module.maybe_remember_trajectory(
+            written = await memory_module.maybe_remember_trajectory(
                 agent_id=None, user_id=None, ticker="AAPL",
                 scratchpad=[vars(prefetched)], **self._OK)
         assert written is False
@@ -1003,7 +1003,7 @@ class TestProceduralMemoryGate:
                         "ticker": "AAPL"
                     }
                 }],
-                procedural_module.MODEL_STEPS_ONLY_KEY: True
+                memory_module.MODEL_STEPS_ONLY_KEY: True
             }
 
         class _OldRow:
@@ -1051,12 +1051,12 @@ class TestProceduralMemoryGate:
                 seen_limits.append(limit)
                 return list(rows)
 
-        monkeypatch.setattr(procedural_module, "SessionLocal", _Session)
+        monkeypatch.setattr(memory_module, "SessionLocal", _Session)
         monkeypatch.setattr(
-            procedural_module, "AgentCatalogRepository", _Catalog)
+            memory_module, "AgentCatalogRepository", _Catalog)
         monkeypatch.setattr(
-            procedural_module, "AgentMemoryRepository", _Memory)
-        hints = await procedural_module.retrieve_procedural_hints(
+            memory_module, "AgentMemoryRepository", _Memory)
+        hints = await memory_module.retrieve_procedural_hints(
             AgentRole.MARKET, "AAPL", user_id=None)
         assert hints is not None
         assert "get_current_price" in hints
@@ -1067,7 +1067,7 @@ class TestProceduralMemoryGate:
 
         rows[:] = [_OldRow()]
         assert (
-            await procedural_module.retrieve_procedural_hints(
+            await memory_module.retrieve_procedural_hints(
                 AgentRole.MARKET, "AAPL", user_id=None) is None)
 
 
