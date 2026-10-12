@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { CONTACT_URL, LAST_UPDATED } from "../legal";
+import { LAST_UPDATED } from "../legal";
 
 export const metadata: Metadata = {
   title: "Privacy Policy · AlphaMind",
@@ -107,20 +107,19 @@ export default function PrivacyPolicyPage() {
           <strong>Mistral AI</strong>: a backup AI model, when it is configured.
         </li>
         <li>
-          <strong>DiceBear</strong>: if you have not uploaded a profile picture, your browser loads a generated
-          default picture from DiceBear, and your username is part of that request.
-        </li>
-        <li>
           <strong>Market data and news</strong>: Yahoo Finance, SEC EDGAR, FRED (Federal Reserve economic data),
           NewsAPI and Tavily (web search). Only ticker symbols and search terms are sent to them, never your personal
           information.
         </li>
         <li>
-          <strong>Email</strong>: messages are sent through an SMTP server.
+          <strong>Email</strong>: messages are sent through an SMTP server. In a local copy, email is caught by a
+          local test mail server (MailHog) and is never delivered.
         </li>
         <li>
           <strong>Hosting</strong>: the online version runs on a virtual machine at Amazon Web Services (AWS), at
-          alphamind-research.duckdns.org; the domain name is provided by DuckDNS.
+          alphamind-research.duckdns.org; the domain name is provided by DuckDNS. A local copy started with Docker
+          (https://localhost:8443) keeps all of its data on the computer that runs it; the AI, market-data and
+          sign-in services above are still used.
         </li>
       </ul>
 
@@ -153,11 +152,8 @@ export default function PrivacyPolicyPage() {
       </ul>
       <h3>Deleting your account</h3>
       <p>
-        You cannot delete your account yourself at the moment; an administrator does it. To ask for it,{" "}
-        <a href={CONTACT_URL} target="_blank" rel="noopener noreferrer">
-          contact the team
-        </a>
-        . When an account is deleted:
+        You cannot delete your account yourself at the moment; an administrator does it. To ask for it, contact the
+        AlphaMind team. When an account is deleted:
       </p>
       <ul>
         <li>its email address and username are replaced with anonymous values;</li>
@@ -193,11 +189,8 @@ export default function PrivacyPolicyPage() {
       </ul>
       <h3>Anything else</h3>
       <p>
-        For other requests, such as deleting your account or asking what information is stored about you,{" "}
-        <a href={CONTACT_URL} target="_blank" rel="noopener noreferrer">
-          contact the team through the project&apos;s GitHub Issues page
-        </a>
-        .
+        For other requests, such as deleting your account or asking what information is stored about you, contact
+        the AlphaMind team.
       </p>
 
       <h2>9. Changes to this policy</h2>
@@ -208,11 +201,7 @@ export default function PrivacyPolicyPage() {
 
       <h2>10. Contact</h2>
       <p>
-        Questions about this policy go to the team through the{" "}
-        <a href={CONTACT_URL} target="_blank" rel="noopener noreferrer">
-          project&apos;s GitHub Issues page
-        </a>
-        .
+        Questions about this policy go to the AlphaMind team, the students who build and run the project.
       </p>
     </article>
   );
