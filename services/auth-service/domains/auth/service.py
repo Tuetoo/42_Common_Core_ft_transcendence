@@ -11,7 +11,6 @@ from typing import Any
 from urllib.parse import quote
 from uuid import UUID
 import httpx
-import rate_limit
 import security
 import structlog
 from config import settings
@@ -30,7 +29,7 @@ from domains.auth.schema import (PROFILE_FIELDS, MeRead, MeUpdate,
 from shared.email import (send_password_reset_email, send_quietly,
                           send_verification_email)
 from shared.enums import OAuthProvider
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import (AppError, ConflictError,
                                InvalidCredentialsError, NotFoundError,
                                PermissionDeniedError, UpstreamServiceError,
@@ -346,15 +345,11 @@ class AuthService:
         return EmailDispatch(to=email, link=link)
 
     async def verify_email(self, token: str) -> None:
-        try:
-            payload = security.decode_special_token(
-                token, security.EMAIL_VERIFICATION_TOKEN_TYPE)
-        except security.SpecialTokenError as exc:
-            raise ValidationAppError(str(exc)) from exc
+        payload = security.decode_or_invalid(
+            token, security.EMAIL_VERIFICATION_TOKEN_TYPE)
 
-        user = await self.users.get_by_id(UUID(payload["sub"]))
-        if user is None:
-            raise NotFoundError("Account no longer exists.")
+        user = await self.users.require(
+            UUID(payload["sub"]), "Account no longer exists.")
         if user.email.lower() != str(payload.get("email", "")).lower():
             raise ValidationAppError(
                 "This verification link is no longer valid.")
@@ -383,15 +378,11 @@ class AuthService:
 
     async def confirm_password_reset(
             self, token: str, new_password: str) -> None:
-        try:
-            payload = security.decode_special_token(
-                token, security.PASSWORD_RESET_TOKEN_TYPE)
-        except security.SpecialTokenError as exc:
-            raise ValidationAppError(str(exc)) from exc
+        payload = security.decode_or_invalid(
+            token, security.PASSWORD_RESET_TOKEN_TYPE)
 
-        user = await self.users.get_by_id(UUID(payload["sub"]))
-        if user is None:
-            raise NotFoundError("Account no longer exists.")
+        user = await self.users.require(
+            UUID(payload["sub"]), "Account no longer exists.")
         if user.deleted_at is not None:
             raise ValidationAppError("This reset link is no longer valid.")
         if payload.get("pwd") != security.password_fingerprint(
@@ -477,9 +468,7 @@ class AuthService:
                 await self._mark_offline(user)
 
     async def set_presence(self, user_id: UUID, online: bool) -> None:
-        user = await self.users.get_by_id(user_id)
-        if user is None:
-            raise NotFoundError(f"User {user_id} not found.")
+        user = await self.users.require(user_id, f"User {user_id} not found.")
         if online:
             await self._mark_online(user)
         else:
@@ -520,7 +509,7 @@ class AuthService:
     async def _check_totp(
             self, user_id: UUID, row: TwoFactorSecret, code: str,
             error: AppError) -> None:
-        await rate_limit.two_factor_guard(str(user_id))
+        await security.two_factor_guard(str(user_id))
         try:
             secret = security.decrypt_secret(row.secret)
         except security.UnreadableTotpSecretError:
@@ -529,7 +518,7 @@ class AuthService:
         step = security.match_totp_step(secret, code)
         if step is None or not await self.users.consume_totp_step(row.id,
                                                                   step):
-            await rate_limit.two_factor_failed(str(user_id))
+            await security.two_factor_failed(str(user_id))
             raise error
         if not security.is_encrypted(row.secret):
             row.secret = security.encrypt_secret(secret)
@@ -541,9 +530,7 @@ class AuthService:
             raise ConflictError(
                 "2FA is already enabled. Disable it with a valid code "
                 "before setting it up again.")
-        user = await self.users.get_by_id(user_id)
-        if user is None:
-            raise NotFoundError("User not found.")
+        user = await self.users.require(user_id)
         secret = security.generate_totp_secret()
         row = await self.users.upsert_two_factor_secret(user_id, secret)
         if row.enabled:
@@ -722,10 +709,8 @@ class AuthService:
         existing_link = await self.users.get_oauth_account(
             provider, identity.provider_user_id)
         if existing_link is not None:
-            user = await self.users.get_by_id(existing_link.user_id)
-            if user is None:
-                raise NotFoundError("Linked account no longer exists.")
-            return user
+            return await self.users.require(
+                existing_link.user_id, "Linked account no longer exists.")
 
         email = normalize_email(identity.email) if identity.email else None
         local = await self.users.get_by_email(email) if email else None
@@ -780,9 +765,7 @@ class AuthService:
         return candidate
 
     async def get_me(self, user_id: UUID) -> MeRead:
-        user = await self.users.get_by_id(user_id)
-        if user is None:
-            raise NotFoundError("User not found.")
+        user = await self.users.require(user_id)
         profile = await self.users.get_profile(user_id)
         settings_row = await self.users.get_settings(user_id)
         return MeRead(
@@ -797,9 +780,7 @@ class AuthService:
                 if settings_row else None))
 
     async def update_me(self, user_id: UUID, data: MeUpdate) -> MeRead:
-        user = await self.users.get_by_id(user_id)
-        if user is None:
-            raise NotFoundError("User not found.")
+        user = await self.users.require(user_id)
 
         changes = data.model_dump(exclude_unset=True)
         changed: list[str] = []

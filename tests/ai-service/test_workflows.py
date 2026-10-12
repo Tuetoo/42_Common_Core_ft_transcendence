@@ -7,7 +7,6 @@ from uuid import UUID, uuid4
 import ai.ingestion.sec_edgar_filings as sec_filings_module
 import ai.workflows.auto_ingestion_workflow as auto_ingestion_workflow
 import ai.workflows.backtest_workflow as backtest_workflow
-import ai.workflows.portfolio_backtest_workflow as portfolio_backtest_workflow
 import ai.workflows.review_workflow as review_workflow
 import ai.workflows.tier_monitoring_workflow as tier_workflow
 import pytest
@@ -443,7 +442,7 @@ class TestAutoIngestionWorkflow:
     @pytest.mark.asyncio
     async def test_outages_fail_the_ticker_but_missing_filings_do_not(
             self, monkeypatch):
-        import ai.ingestion.news_ingestion as news_ingestion
+        import ai.ingestion.digests as digests
         import config
         from edgar import CompanyNotFoundError
 
@@ -472,8 +471,8 @@ class TestAutoIngestionWorkflow:
             sec_filings_module, "_fetch_real_filings_sync", _not_found)
         monkeypatch.setattr(
             auto_ingestion_workflow, "get_tracked_tickers", _spy)
-        monkeypatch.setattr(news_ingestion, "lookup_company_name", _no_name)
-        monkeypatch.setattr(news_ingestion, "load_ticker_to_title", _empty_map)
+        monkeypatch.setattr(digests, "lookup_company_name", _no_name)
+        monkeypatch.setattr(digests, "load_ticker_to_title", _empty_map)
 
         result = await auto_ingestion_workflow.run_auto_ingestion_workflow()
 
@@ -523,10 +522,10 @@ class TestAutoIngestionWorkflow:
 
             monkeypatch.setattr(
                 sec_filings_module, "_fetch_real_filings_sync", _fetch)
-            monkeypatch.setattr(news_ingestion, "lookup_company_name", _name)
+            monkeypatch.setattr(digests, "lookup_company_name", _name)
             monkeypatch.setattr(
-                news_ingestion, "load_ticker_to_title", _ticker_map)
-            monkeypatch.setattr(news_ingestion, "NewsApiProvider", _News)
+                digests, "load_ticker_to_title", _ticker_map)
+            monkeypatch.setattr(digests, "NewsApiProvider", _News)
 
             result = (
                 await auto_ingestion_workflow.run_auto_ingestion_workflow())
@@ -576,8 +575,8 @@ class TestAutoIngestionWorkflow:
 
     @pytest.mark.asyncio
     async def test_macro_step_outcomes_and_report_facts(self, monkeypatch):
-        import ai.ingestion.macro_ingestion as macro_ingestion
-        from ai.ingestion.macro_ingestion import MacroReport
+        import ai.ingestion.digests as digests
+        from ai.ingestion.digests import MacroReport
 
         async def _existing(ticker, category):
             return []
@@ -612,9 +611,9 @@ class TestAutoIngestionWorkflow:
                 stored.append(kwargs["content"])
                 return "doc-id"
 
-            monkeypatch.setattr(macro_ingestion, "FredProvider", _Fred)
+            monkeypatch.setattr(digests, "FredProvider", _Fred)
             monkeypatch.setattr(
-                macro_ingestion, "LLMRouter", lambda r=router: r)
+                digests, "LLMRouter", lambda r=router: r)
             monkeypatch.setattr(
                 auto_ingestion_workflow, "create_system_document", _create)
 
@@ -634,10 +633,10 @@ class TestAutoIngestionWorkflow:
                 return _macro_series(series, lookback_days)
 
         router = _CapturingRouter()
-        monkeypatch.setattr(macro_ingestion, "FredProvider", _FullFred)
-        monkeypatch.setattr(macro_ingestion, "LLMRouter", lambda: router)
+        monkeypatch.setattr(digests, "FredProvider", _FullFred)
+        monkeypatch.setattr(digests, "LLMRouter", lambda: router)
 
-        report = await macro_ingestion.generate_macro_report(
+        report = await digests.generate_macro_report(
             already_ingested_filenames=set())
 
         assert report is not None
@@ -729,8 +728,6 @@ class TestBacktestWorkflow:
     @pytest.mark.asyncio
     async def test_no_tiers_fails_scoping_and_unloadable_backtest(
             self, monkeypatch, _schema_ready):
-        import ai.workflows.recommendation_replay_workflow as rwf
-
         ticker = f"ZZZ{uuid4().hex[:6].upper()}"
         start = date(2026, 2, 1)
         end = date(2026, 2, 5)
@@ -799,16 +796,16 @@ class TestBacktestWorkflow:
         async def _mark(backtest_uuid, error=None):
             failed.append(backtest_uuid)
 
-        for module in (backtest_workflow, portfolio_backtest_workflow, rwf):
-            monkeypatch.setattr(
-                module, "load_backtest_and_mark_running", _boom)
-            monkeypatch.setattr(module, "mark_backtest_failed", _mark)
+        monkeypatch.setattr(
+            backtest_workflow, "load_backtest_and_mark_running", _boom)
+        monkeypatch.setattr(backtest_workflow, "mark_backtest_failed", _mark)
         ids = [uuid4() for _ in range(3)]
         await backtest_workflow.run_backtest_workflow(
             str(ids[0]), ticker="AMD")
-        await portfolio_backtest_workflow.run_portfolio_backtest_workflow(
+        await backtest_workflow.run_portfolio_backtest_workflow(
             str(ids[1]), portfolio_id=str(ids[1]))
-        await rwf.run_recommendation_replay_workflow(str(ids[2]))
+        await backtest_workflow.run_recommendation_replay_workflow(
+            str(ids[2]))
         assert failed == ids
 
     def test_replay_positions_capital_limit_and_paired_returns(self):
@@ -879,10 +876,10 @@ class TestPortfolioBacktestWorkflow:
             return _snapshot_rows([100.0], start=start)
 
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_portfolio_snapshots",
+            backtest_workflow, "get_portfolio_snapshots",
             _one_snapshot)
 
-        await portfolio_backtest_workflow.run_portfolio_backtest_workflow(
+        await backtest_workflow.run_portfolio_backtest_workflow(
             str(backtest_id), portfolio_id=str(uuid4()))
 
         async with SessionLocal() as session:
@@ -905,7 +902,7 @@ class TestPortfolioBacktestWorkflow:
             errors.append(error)
 
         provider = _FakeBenchmarkProvider([765.61, float("nan")], start=start)
-        workflow = portfolio_backtest_workflow
+        workflow = backtest_workflow
         monkeypatch.setattr(workflow, "get_portfolio_snapshots", _snap)
         monkeypatch.setattr(
             workflow, "get_market_data_provider", lambda: provider)
@@ -943,14 +940,14 @@ class TestPortfolioBacktestWorkflow:
 
         provider = _FakeBenchmarkProvider(spy_closes, start=start)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_portfolio_snapshots", _snap)
+            backtest_workflow, "get_portfolio_snapshots", _snap)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_market_data_provider",
+            backtest_workflow, "get_market_data_provider",
             lambda: provider)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_portfolio_cash_flows", _flows)
+            backtest_workflow, "get_portfolio_cash_flows", _flows)
 
-        await portfolio_backtest_workflow.run_portfolio_backtest_workflow(
+        await backtest_workflow.run_portfolio_backtest_workflow(
             str(backtest_id), portfolio_id=str(uuid4()))
 
         raw_total_return = metrics_module.total_return(total_values)
@@ -980,7 +977,7 @@ class TestPortfolioBacktestWorkflow:
             "price": 7.5
         }]
         closes = {"AMD": {date(2026, 1, 9): 101.0}}
-        assert portfolio_backtest_workflow._net_flow_by_date(
+        assert backtest_workflow._net_flow_by_date(
             flows, closes) == {
                 date(2026, 1, 10): 116.0
             }
@@ -1019,16 +1016,16 @@ class TestPortfolioBacktestWorkflow:
             published.append(args)
 
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_portfolio_snapshots", _snapshots)
+            backtest_workflow, "get_portfolio_snapshots", _snapshots)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_portfolio_cash_flows", _flows)
+            backtest_workflow, "get_portfolio_cash_flows", _flows)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "get_market_data_provider",
+            backtest_workflow, "get_market_data_provider",
             lambda: provider)
         monkeypatch.setattr(
-            portfolio_backtest_workflow, "publish_backtest_finished", _publish)
+            backtest_workflow, "publish_backtest_finished", _publish)
         try:
-            await portfolio_backtest_workflow.run_portfolio_backtest_workflow(
+            await backtest_workflow.run_portfolio_backtest_workflow(
                 str(backtest_id), portfolio_id=str(uuid4()))
             async with SessionLocal() as session:
                 row = await BacktestRepository(session).get_by_id(backtest_id)
@@ -1041,6 +1038,46 @@ class TestPortfolioBacktestWorkflow:
             assert published
         finally:
             await _delete_backtest(backtest_id)
+
+    @pytest.mark.asyncio
+    async def test_leading_zero_value_snapshot_days_are_skipped(
+            self, monkeypatch, _schema_ready):
+        start = date(2026, 3, 2)
+        values = [0.0, 100_000.0, 101_000.0]
+        provider = _FakeBenchmarkProvider([400.0, 402.0, 404.0], start=start)
+
+        async def _flows(portfolio_id, *, start_date, end_date):
+            return _cash_flows({1: 100_000.0}, start=start)
+
+        monkeypatch.setattr(
+            backtest_workflow, "get_market_data_provider", lambda: provider)
+        monkeypatch.setattr(
+            backtest_workflow, "get_portfolio_cash_flows", _flows)
+        for rows, status in ((values, "completed"), (values[:2], "failed")):
+
+            async def _snap(portfolio_id, *, start_date=None, end_date=None,
+                            rows=rows):
+                return _snapshot_rows(rows, start=start)
+
+            monkeypatch.setattr(
+                backtest_workflow, "get_portfolio_snapshots", _snap)
+            backtest_id = await _create_portfolio_backtest(
+                start_date=start, end_date=start + timedelta(days=2),
+                initial_capital=100_000.0)
+            try:
+                await backtest_workflow.run_portfolio_backtest_workflow(
+                    str(backtest_id), portfolio_id=str(uuid4()))
+                async with SessionLocal() as session:
+                    row = await BacktestRepository(session).get_by_id(
+                        backtest_id)
+                    assert row.status == status
+                    if status == "completed":
+                        assert float(row.ending_capital) == pytest.approx(
+                            101_000.0)
+                        assert float(row.strategy_return) == pytest.approx(
+                            0.01)
+            finally:
+                await _delete_backtest(backtest_id)
 
 
 class TestReviewAiAccuracy:
@@ -1742,13 +1779,8 @@ class TestDecisionUpdates:
 
 class TestMarketCalendar:
 
-    def test_market_today_and_shared_constants_are_defined_once(self):
-        import ai.agents.debate_common as debate_common
-        import ai.agents.loop as loop
-        import ai.agents.market as market
-        import ai.tools.market_data_cache as cache
-        import ai.tools.market_tool as market_tool
-        from shared.market_calendar import MARKET_TZ, market_today
+    def test_market_today_uses_the_new_york_midnight(self):
+        from shared.market_calendar import market_today
 
         cases = {
             "before-the-new-york-midnight": (
@@ -1760,16 +1792,6 @@ class TestMarketCalendar:
         }
         for case_id, (moment, expected) in cases.items():
             assert market_today(moment) == expected, case_id
-
-        assert cache.MARKET_TZ is MARKET_TZ is tier_workflow.MARKET_TZ
-
-        assert market.CLOSE_RE is market_tool.CLOSE_RE
-        assert not hasattr(market, "_CLOSE_RE")
-
-        assert (
-            debate_common.NUMBER_MATCH_REL_TOLERANCE
-            is loop.NUMBER_MATCH_REL_TOLERANCE)
-        assert not hasattr(debate_common, "_PLAIN_DOLLAR_REL_TOLERANCE")
 
 
 class TestKnowledgeGraphGuards:

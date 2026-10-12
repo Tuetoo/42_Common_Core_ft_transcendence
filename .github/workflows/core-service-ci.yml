@@ -8,6 +8,21 @@ name: core-service CI
 # the shared test helpers, the Makefile targets the steps call, and the
 # repository files the tests check.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "services/core-service/**"
+      - "shared/**"
+      - "tests/core-service/**"
+      - "tests/alembic_contract.py"
+      - "tests/auth_tokens.py"
+      - "Makefile"
+      - "infra/scheduler/**"
+      - "infra/gateway/nginx.conf"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "infra/prometheus/alert_rules.yml"
+      - ".github/workflows/core-service-ci.yml"
   pull_request:
     paths:
       - "services/core-service/**"
@@ -20,6 +35,7 @@ on:
       - "infra/gateway/nginx.conf"
       - "pyproject.toml"
       - "uv.lock"
+      - "infra/prometheus/alert_rules.yml"
       - ".github/workflows/core-service-ci.yml"
 
 jobs:

@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch } from "@/app/lib/backend";
 import { extractErrorMessage } from "@/app/lib/api-error";
+import { avatarFileError } from "@/app/(public)/field-rules";
 
 export type ProfileValues = {
   username: string;
@@ -103,11 +104,6 @@ export type UploadAvatarState = {
   success?: boolean;
 };
 
-// Same rules as the backend, checked here first for a quick, clear message.
-// The backend still verifies the bytes really are that kind of image.
-const AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
-
 export async function uploadAvatar(
   _prevState: UploadAvatarState,
   formData: FormData
@@ -116,11 +112,11 @@ export async function uploadAvatar(
   if (!(file instanceof File) || file.size === 0) {
     return { error: "Please choose an image" };
   }
-  if (!AVATAR_TYPES.includes(file.type)) {
-    return { error: "Use a PNG, JPEG, WebP or GIF image" };
-  }
-  if (file.size > AVATAR_MAX_BYTES) {
-    return { error: "The image must be 5MB or smaller" };
+  // Same rules as the backend, checked here first for a quick, clear
+  // message. The backend still verifies the bytes really are that image type.
+  const fileError = avatarFileError(file);
+  if (fileError) {
+    return { error: fileError };
   }
 
   const accessToken = await getAccessToken();

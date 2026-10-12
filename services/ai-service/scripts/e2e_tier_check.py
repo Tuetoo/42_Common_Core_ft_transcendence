@@ -610,7 +610,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 async def main_async(argv: Sequence[str], out: TextIO = sys.stdout) -> int:
     from config import settings
-    from shared import e2e_lock
+    import shared.redis as shared_redis
 
     args = parse_args(argv)
     checker = TierCheck(args, out)
@@ -626,7 +626,7 @@ async def main_async(argv: Sequence[str], out: TextIO = sys.stdout) -> int:
         f"e2e_tier_check {checker.run_id} "
         f"{datetime.now(UTC).isoformat(timespec='seconds')}")
     try:
-        other = await e2e_lock.acquire(
+        other = await shared_redis.acquire_e2e_lock(
             settings, holder, break_lock=args.break_lock)
     except Exception as exc:
         other = None
@@ -644,7 +644,7 @@ async def main_async(argv: Sequence[str], out: TextIO = sys.stdout) -> int:
         await checker.run()
     finally:
         with contextlib.suppress(Exception):
-            await e2e_lock.release(settings, holder)
+            await shared_redis.release_e2e_lock(settings, holder)
         await checker.api.aclose()
         with contextlib.suppress(Exception):
             from database import engine

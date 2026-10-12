@@ -7,16 +7,15 @@ from api.apikeys_api import router as apikeys_router
 from api.internal import router as internal_router
 from api.public import router as public_router
 from api.websocket import router as websocket_router
-from api.yjs_websocket import router as yjs_websocket_router
+from api.websocket import yjs_router as yjs_websocket_router
 from config import settings
-from database import engine
-from db_bootstrap import ensure_schema
+from database import engine, ensure_schema
 from event_listener import build_durable_subscriber, build_subscriber
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from job_health import load_job_health
-from middleware import register_middleware
+from apikeys import register_middleware
 from outbox import run_outbox_dispatcher
 from prometheus_fastapi_instrumentator import Instrumentator
 from websocket_manager import \
@@ -27,15 +26,14 @@ from domains.notification.api import router as notification_router
 from domains.portfolio.api import router as portfolio_router
 from domains.portfolio.api import watchlist_router
 from domains.research.api import router as research_router
-from domains.research.moderation_api import router as moderation_router
+from domains.research.api import moderation_router
 from domains.research.yjs_guard import validator as yjs_update_validator
 from shared.database import check_database_connection
 from shared.events import start_background_task
 from shared.exceptions import register_exception_handlers
 from shared.http_client import close_http_clients
-from shared.logging import configure_logging
+from shared.logging import RequestIdMiddleware, configure_logging
 from shared.redis import check_redis_connection, close_redis_connections
-from shared.request_id import RequestIdMiddleware
 from shared.storage import (check_storage_connection, close_storage_clients,
                             ensure_bucket)
 

@@ -2954,7 +2954,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 async def _amain(
         args: argparse.Namespace, sections: Sequence[str], out: TextIO) -> int:
     from config import settings
-    from shared import e2e_lock
+    import shared.redis as shared_redis
 
     runner = E2E(args, out)
     if runner.admin_token:
@@ -2968,7 +2968,7 @@ async def _amain(
     now = datetime.now(UTC).isoformat(timespec="seconds")
     holder = f"e2e_check {runner.run_id} {now}"
     try:
-        other = await e2e_lock.acquire(
+        other = await shared_redis.acquire_e2e_lock(
             settings, holder, break_lock=args.break_lock)
     except Exception as exc:
         other = None
@@ -2989,7 +2989,7 @@ async def _amain(
         await runner.run(sections)
     finally:
         with contextlib.suppress(Exception):
-            await e2e_lock.release(settings, holder)
+            await shared_redis.release_e2e_lock(settings, holder)
         await runner.close()
     print(runner.summary(time.monotonic() - started), file=out, flush=True)
     return 1 if any(r.status == FAIL for r in runner.results.values()) else 0

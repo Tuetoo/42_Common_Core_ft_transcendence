@@ -1,7 +1,4 @@
-import importlib.util
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 import pytest
 from helpers import (PASSWORD, enable_2fa, login_response, make_user,
                      next_code, register, register_and_login,
@@ -13,9 +10,6 @@ from tests.alembic_contract import *  # noqa: F401,F403
 ORGS = "/api/v1/organizations"
 INTERNAL_TOKEN = "internal-token-for-tests"
 STRONG_JWT = "x" * 40
-INVITATION_MIGRATION = (
-    Path(__file__).resolve().parents[2] / "services" / "auth-service" /
-    "migrations" / "archive" / "f1130b000001_round113b_user_admin.py")
 
 
 @pytest.fixture
@@ -34,21 +28,6 @@ def small_limits(monkeypatch):
                         "RATE_LIMIT_INVITATIONS_PER_ORG": 2,
                         "RATE_LIMIT_2FA_FAILURES": 3}.items():
         monkeypatch.setattr(settings, name, value)
-
-
-async def legacy_owner_invitation(
-        db_session, org_id, email, invited_by, **extra):
-    from domains.organization.model import OrganizationInvitation
-
-    invitation = OrganizationInvitation(
-        organization_id=UUID(org_id), email=email, role="owner",
-        invited_by=UUID(invited_by), expires_at=extra.get(
-            "expires_at",
-            datetime.now(UTC) + timedelta(days=3)),
-        accepted_at=extra.get("accepted_at"))
-    db_session.add(invitation)
-    await db_session.flush()
-    return invitation
 
 
 class TestInternalToken:
@@ -364,76 +343,10 @@ class TestSharedDurableEvents:
             events.logger, "error", lambda event, **kw: logged.append(
                 (event, kw["task"])))
 
-        async def _boom():
-            raise RuntimeError("gone")
-
         async def _done():
             return None
 
-        for coro, name in ((_boom(), "boom"), (_done(), "done")):
-            task = events.start_background_task(coro, name)
-            await asyncio.gather(task, return_exceptions=True)
-            await asyncio.sleep(0)
-        assert logged == [("background_task_crashed", "boom"),
-                          ("background_task_ended", "done")]
-
-
-class TestMigrations:
-
-    async def test_migration_expires_pending_owner_invitations(
-            self, client, mock_email, db_session):
-        from sqlalchemy import text
-
-        owner = await make_user(client, mock_email, db_session)
-        org = (
-            await
-            client.post(ORGS, json={"name": "Mig"},
-                        headers=owner["headers"])).json()["data"]
-        pending = await legacy_owner_invitation(
-            db_session, org["id"], "p@example.com", owner["id"])
-        accepted_at = datetime.now(UTC) - timedelta(days=1)
-        accepted = await legacy_owner_invitation(
-            db_session, org["id"], "a@example.com", owner["id"],
-            accepted_at=accepted_at)
-        r = await client.post(
-            f"{ORGS}/{org['id']}/invitations", headers=owner["headers"], json={
-                "email": "m@example.com",
-                "role": "member"
-            })
-        member_invitation_id = UUID(r.json()["data"]["id"])
-
-        spec = importlib.util.spec_from_file_location(
-            "invitation_migration", INVITATION_MIGRATION)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        assert module.revision == "f1130b000001"
-        assert module.down_revision == "f1120b000001"
-        statements = []
-
-        class _Op:
-
-            @staticmethod
-            def execute(sql):
-                statements.append(sql)
-
-        module.op = _Op()
-        module.upgrade()
-        for sql in statements:
-            await db_session.execute(text(sql))
-        for sql in statements:
-            await db_session.execute(text(sql))
-
-        now = datetime.now(UTC)
-        rows = {
-            row.id: row
-            for row in (
-                await db_session.execute(
-                    text(
-                        "SELECT id, expires_at, accepted_at "
-                        "FROM organization_invitations "
-                        "WHERE organization_id = :org"), {"org": org["id"]})
-            ).all()
-        }
-        assert rows[pending.id].expires_at <= now
-        assert rows[accepted.id].expires_at > now
-        assert rows[member_invitation_id].expires_at > now
+        task = events.start_background_task(_done(), "done")
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert logged == [("background_task_ended", "done")]

@@ -550,9 +550,8 @@ async def check_backtest_metrics(ctx: SmokeContext) -> str:
 
 
 async def check_backtest_replay(ctx: SmokeContext) -> str:
-    from ai.workflows.backtest_workflow import run_backtest_workflow
-    from ai.workflows.recommendation_replay_workflow import \
-        run_recommendation_replay_workflow
+    from ai.workflows.backtest_workflow import (
+        run_backtest_workflow, run_recommendation_replay_workflow)
     from database import SessionLocal
     from sqlalchemy import select
     from domains.analysis.model import (Analysis, Recommendation,

@@ -143,12 +143,12 @@ logged; the answer is still returned.
 
 | Key | TTL | Holds | Written / read by | File |
 |---|---|---|---|---|
-| `auth_client:org_roles:<user_id>` | 60 s (`MEMBERSHIP_CACHE_TTL_SECONDS`) | JSON `{org_id: role}` from auth-service `/internal/users/{id}/organizations` | core-service and ai-service (via `organization_roles`); **deleted by auth-service** when a membership changes | `shared/org_membership_cache.py` |
+| `auth_client:org_roles:<user_id>` | 60 s (`MEMBERSHIP_CACHE_TTL_SECONDS`) | JSON `{org_id: role}` from auth-service `/internal/users/{id}/organizations` | core-service and ai-service (via `organization_roles`); **deleted by auth-service** when a membership changes | `shared/user_state.py` |
 | `ai:core_client:holdings:<portfolio_id>` | 30 s | a portfolio's holdings from core-service | ai-service agents | `services/ai-service/clients/core_client.py` |
 | `ai:internal:fx_rate:<from>:<to>` | 3600 s | an exchange rate | ai-service internal route | `services/ai-service/api/internal.py` |
 | `core:auth_client:user:<user_id>` | 60 s | a user reference from auth-service | core-service | `services/core-service/clients/auth_client.py` |
 | `core:ai_client:latest_recommendation:<portfolio_id>:<ticker>` | 10 s | latest recommendation reference | core-service | `services/core-service/clients/ai_client.py` |
-| `apikey:valid:<key hash>` | 30 s (`KEY_CACHE_TTL_SECONDS`) | result of validating a public API key | core-service middleware; deleted when a key is renamed or its limit changes; overwritten with a "revoked" marker when the key is revoked (so a racing request cannot re-cache it as valid); a failed write is logged (`api_key_cache_write_failed`) and does not fail the revoke | `services/core-service/apikeys.py`, `middleware.py` |
+| `apikey:valid:<key hash>` | 30 s (`KEY_CACHE_TTL_SECONDS`) | result of validating a public API key | core-service middleware; deleted when a key is renamed or its limit changes; overwritten with a "revoked" marker when the key is revoked (so a racing request cannot re-cache it as valid); a failed write is logged (`api_key_cache_write_failed`) and does not fail the revoke | `services/core-service/apikeys.py` |
 | `ai:newsapi:requests` | 25 h (members older than 24 h are removed on every write) | sorted set: one member per request NewsAPI counts against the key (score = unix time). Answers NewsAPI served from its own cache (`X-Cached-Result: true`) and rejected requests are not counted. Not a cache: a usage log. A failed write only logs `newsapi.usage_count_failed` | ai-service NewsAPI provider writes; `scripts/health.sh` reads it (100 per 24 h; a 15-ticker batch needs about 35) | `services/ai-service/ai/providers/newsapi.py` |
 | `ai:newsapi:source_catalog` | 7 days; refreshed when older than 24 h (its stored `fetched_at`); each process also keeps a copy for 1 h; after a failed load the next try waits 15 min | NewsAPI's own source catalog (`GET /v2/top-headlines/sources`), used to tell a known outlet from an unknown site in news and web results. A stale copy is served while a refetch is impossible (log `newsapi.source_catalog_stale_served`), because the web fallback runs exactly when NewsAPI is rate-limited. Every failure is open: no catalog means "unknown", never "not in catalog" | ai-service news and web tools | same file |
 
@@ -193,7 +193,7 @@ authenticated request (`USER_STATE_CHECK_ENABLED`, default true).
 
 ### 3.5 Rate limits (DB 1)
 
-**The shared fixed-window counter** (`shared/rate_limit.py::fixed_window_hits`):
+**The shared fixed-window counter** (`shared/redis.py::fixed_window_hits`):
 for each key, in one `MULTI` transaction:
 
 ```
@@ -208,7 +208,7 @@ an expiry. A Redis error returns `None` and the request is **allowed**
 store must not lock users out. `rate_limited_response` returns 429 in the
 project's error envelope with `Retry-After`.
 
-**auth-service** (`services/auth-service/rate_limit.py`): keys
+**auth-service** (`services/auth-service/security.py`): keys
 `auth:rl:<scope>:<sha256 of the identity, 32 hex>`. E-mails and IPs are
 hashed so raw addresses never sit in Redis. Scopes and limits
 (`services/auth-service/config.py`):
@@ -228,7 +228,7 @@ The 2FA lock uses its own keys: failures count in
 with a 15-minute TTL, and every attempt first checks that TTL.
 `RATE_LIMIT_ENABLED` turns all of it off (tests).
 
-**core-service public API** (`services/core-service/middleware.py`):
+**core-service public API** (`services/core-service/apikeys.py`):
 for requests with `X-API-Key` under `/api/v1/public`, two counters with a
 60-second window: `ratelimit:<api key id>` (limit = the key's
 `rate_limit_per_minute`, capped by `PUBLIC_API_RATE_LIMIT_PER_MINUTE`,
@@ -258,7 +258,7 @@ midnight. Fails open too: a Redis error logs
 | `oauth:state:<state>` | 0 | `SET` (JSON: provider, nonce hash, PKCE verifier) then `GETDEL` | 300 s | the OAuth `state` value can be used once and only by the browser holding the matching nonce cookie | `services/auth-service/domains/auth/service.py` |
 | `oauth:2fa:used:<jti>` | 0 | `SET NX EX` | until the challenge token expires | an OAuth 2FA challenge can be used once | same |
 | `core:event_claim:<event>:<event_id>` | 2 | `SET NX EX` | 300 s | each core replica receives every pub/sub event; only the first creates the notification row (fails open: a duplicate is better than a lost notification) | `services/core-service/event_listener.py::_claim_event` |
-| `e2e:run_lock` | 0 | `SET NX EX`; release with a Lua script that deletes only if the value is still ours | 45 min | only one end-to-end check run at a time | `shared/e2e_lock.py` |
+| `e2e:run_lock` | 0 | `SET NX EX`; release with a Lua script that deletes only if the value is still ours | 45 min | only one end-to-end check run at a time | `shared/redis.py` (`acquire_e2e_lock`) |
 | `yjs:active:<note_id>` | 2 | sorted set: member = replica id, score = expiry time | 90 s, refreshed | "is any replica editing this note right now?" | `services/core-service/yjs_relay.py` |
 
 **Why the end-to-end lock exists.** The end-to-end checks compare
@@ -400,7 +400,7 @@ on port 9121.
 | `RATE_LIMIT_ENABLED` and `RATE_LIMIT_*` | see section 3.5 | auth-service rate limits | `services/auth-service/config.py` |
 | `PUBLIC_API_RATE_LIMIT_PER_MINUTE` | `60` | public API cap per key and per owner | `services/core-service/config.py` |
 | `RAG_ASK_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `10` / `200` | research assistant limits | `services/ai-service/config.py` |
-| `MEMBERSHIP_CACHE_TTL_SECONDS` | `60` (constant) | org-role cache lifetime | `shared/org_membership_cache.py` |
+| `MEMBERSHIP_CACHE_TTL_SECONDS` | `60` (constant) | org-role cache lifetime | `shared/user_state.py` |
 | pool | `max_connections=20`, `socket_timeout=15` | per (URL, DB) pool | `shared/redis.py` |
 | stream cap | `MAXLEN ~ 10000` (constant) | approximate length limit per stream | `shared/events.py` |
 | server | `redis:7-alpine`, `--appendonly yes --appendfsync everysec` | version and persistence | `docker-compose.yaml` |
@@ -628,17 +628,14 @@ counted from `ai.analyses` in PostgreSQL.
 |---|---|
 | `docker-compose.yaml` (`redis`, `redis-exporter`) | server command (AOF), volume, healthcheck, exporter |
 | `shared/config.py` | `REDIS_*`, `USER_STATE_*` settings |
-| `shared/redis.py` | pools per database, URL fix, timeouts, health check |
-| `shared/org_membership_cache.py` | org-role cache and its invalidation |
-| `shared/user_state.py` | live role/active state readers and writer |
+| `shared/redis.py` | pools per database, URL fix, timeouts, health check; fixed-window counter, 429 response; end-to-end run lock |
+| `shared/user_state.py` | live role/active state readers and writer; org-role cache and its invalidation |
 | `services/auth-service/user_state_sync.py` | auth-service side of the mirror |
-| `shared/rate_limit.py` | fixed-window counter, 429 response |
 | `services/ai-service/ai/providers/newsapi.py` | NewsAPI usage log and source catalog keys |
-| `services/auth-service/rate_limit.py` | auth scopes, 2FA lock |
-| `services/core-service/middleware.py`, `apikeys.py` | public API counters, key validation cache |
+| `services/auth-service/security.py` | auth scopes, 2FA lock |
+| `services/core-service/apikeys.py` | public API counters, key validation cache |
 | `services/ai-service/domains/rag/qa.py` | research assistant counters |
 | `shared/events.py` | pub/sub publish/subscribe, streams, consumer group |
-| `shared/e2e_lock.py` | end-to-end run lock |
 | `shared/concurrency.py` | `gather_bounded` (in-process semaphore, not Redis) |
 | `services/core-service/event_listener.py` | event claims |
 | `services/core-service/yjs_relay.py`, `websocket_manager.py` | Yjs and WebSocket channels, active-room markers |

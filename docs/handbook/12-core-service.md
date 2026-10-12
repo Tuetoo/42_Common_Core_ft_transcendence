@@ -23,14 +23,14 @@
  +-----------------------------------------------------------------------+
  | core-service (FastAPI, uvicorn, port 8000)                            |
  |                                                                       |
- |  middleware.py       X-API-Key check + rate limit for /api/v1/public  |
+ |  apikeys.py          X-API-Key check + rate limit for /api/v1/public  |
  |  domains/portfolio   portfolios, ledger (ledger.py), holdings, cash,  |
  |                      snapshots, watchlists, market-open/close jobs    |
  |  domains/research    notes, comments, documents, moderation, Yjs guard|
  |  domains/notification  notification rows + delivery                   |
  |  apikeys.py + api/apikeys_api.py + api/public.py   public API         |
  |  api/websocket.py + websocket_manager.py   JSON WebSocket channels    |
- |  api/yjs_websocket.py + yjs_relay.py       collaborative notes        |
+ |  api/websocket.py + yjs_relay.py           collaborative notes        |
  |  api/internal.py     /internal/* (scheduler, ai-service, system docs) |
  |  event_listener.py   events from auth and ai -> notifications, pushes |
  |  job_health.py       last-success gauges of the scheduled jobs        |
@@ -87,7 +87,7 @@ Who calls core-service:
 `services/core-service/main.py`, `lifespan`:
 
 1. `configure_logging(settings)`.
-2. `ensure_schema(engine)` (`db_bootstrap.py`): Alembic upgrade of schema
+2. `ensure_schema(engine)` (`database.py`): Alembic upgrade of schema
    `core` (same mechanism as auth-service, chapter 11 section 3.20).
 3. `ensure_bucket(settings, settings.S3_BUCKET_DOCUMENTS)`: creates the
    documents bucket if missing.
@@ -123,7 +123,7 @@ closed.
 
 The app: `docs_url="/api/docs"`, `openapi_url="/api/openapi-core.json"`;
 `register_middleware(app)` (the public-API middleware),
-`RequestIdMiddleware` (`shared/request_id.py`: a request id on every log
+`RequestIdMiddleware` (`shared/logging.py`: a request id on every log
 line, in the error body, in every `{"data": ..., "request_id"}` success
 body and in the `X-Request-ID` header), CORS, shared
 error handlers, Prometheus `/metrics`, routers. The public-API middleware
@@ -144,10 +144,10 @@ Routers:
 | Router | Mounted at |
 |---|---|
 | `api_router` (built in `main.py`): public API, api-keys, portfolios, watchlists, research, notifications | `/api/v1` |
-| `domains/research/moderation_api.py` | `/api/v1/moderation` |
+| `domains/research/api.py` (`moderation_router`) | `/api/v1/moderation` |
 | `api/internal.py` | `/internal` |
-| `api/websocket.py` | `/ws/{channel}` |
-| `api/yjs_websocket.py` | `/ws/yjs/{note_id}` |
+| `api/websocket.py` (`router`) | `/ws/{channel}` |
+| `api/websocket.py` (`yjs_router`) | `/ws/yjs/{note_id}` |
 
 The two WebSocket routers are mounted directly on the app, not inside
 `api_router`: the gateway proxies `/ws` to the unversioned path, so a
@@ -237,7 +237,7 @@ What each type needs (`TransactionCreate` in `schema.py` plus
 | `adjustment` | non-zero signed `quantity`; `price` >= 0 for shares in | none | shares in (positive) at `price` as cost basis, or out (negative) |
 
 Other validation: `CASH` is reserved for deposits and withdrawals; tickers
-are normalized (`shared/tickers.py`); decimals are bounded to at most 30
+are normalized (`shared/schemas.py`); decimals are bounded to at most 30
 digits, 18 of them after the decimal point (so an absurd value is a 422,
 not a database overflow);
 `transaction_date` may be at most one day in the future; there are no fee
@@ -562,7 +562,7 @@ tickers is what ai-service's nightly ingestion keeps fresh
   or an organization writer. A comment's author edits it; the comment's or
   the note's author deletes it. The note author is notified of new
   comments.
-- **Moderation** (`moderation_api.py`, permission `content:moderate`):
+- **Moderation** (`moderation_router` in `domains/research/api.py`, permission `content:moderate`):
   `POST /api/v1/moderation/notes/{id}/hide|unhide`,
   `DELETE /api/v1/moderation/notes/{id}`, the same for comments. Hidden
   rows disappear for everyone except their author and moderators. Hiding
@@ -606,12 +606,13 @@ tickers is what ai-service's nightly ingestion keeps fresh
   `.member.left`, `.role.changed`, `organization.deleted`,
   `user.role.changed`, `user.deactivated`, `user.deleted`), every replica
   re-checks its local Yjs sockets of the affected users
-  (`api/yjs_websocket.py::recheck_user_sessions`) with the same access
+  (`api/websocket.py::recheck_user_sessions`) with the same access
   rule as the connect path: a note no longer readable is closed with 4403
   (4401 for a deactivated or deleted account), a reader who may no longer
   write is downgraded to read-only (updates dropped, socket stays open).
   If the new rights cannot be determined (auth-service down), the socket
-  keeps its rights and `yjs_session_recheck_failed` is logged.
+  keeps its rights and `yjs_session_recheck_failed` is logged. The same
+  re-check also covers the user's `/ws/{channel}` sockets (section 3.16).
 
 ### 3.10 Research documents and the lifecycle with ai-service
 
@@ -629,7 +630,7 @@ chunking (a PDF 10-K and a PDF analyst report need different chunking),
 is chosen by the uploader, and is stored as plain text (not a PostgreSQL
 enum) so a new `DocumentCategory` member needs no core migration.
 `ticker` feeds the ticker filter of RAG retrieval. On every upload path
-it goes through `shared/tickers.normalize_ticker` (spaces around it
+it goes through `shared/schemas.normalize_ticker` (spaces around it
 removed, uppercased, then 1 to 10 characters of `A-Z`, `0-9`, `.` or
 `-`); anything else is a 422 `validation_error` before any byte is
 stored, and an empty value means "no ticker". Without this check a value
@@ -742,7 +743,7 @@ and the duplicate path above republishes their event. A document that is
 as present, so a document that is still being processed is never
 fetched and ingested a second time.
 
-**The outbox (`outbox.py`, `outbox_model.py`).** The three durable events
+**The outbox (`outbox.py`).** The three durable events
 core-service sends (`document.uploaded`, `document.deleted`,
 `portfolio.deleted`) are not published directly. The route writes the
 event as a row of `core.event_outbox` in the same transaction as the
@@ -841,7 +842,7 @@ own unread rows, silently skips ids that do not exist or belong to
 someone else, and answers only the count. Lists are ordered with the id
 as tie-breaker, so pages never repeat or skip.
 
-How a notification is made (`actions.py`):
+How a notification is made (`domains/notification/service.py`):
 
 ```
  route: notify_after_commit(background_tasks, [actor, other affected users], type, title, content)
@@ -994,7 +995,12 @@ acting for a request it already authorized.
 | `GET /internal/tracked-tickers` | ai-service ingestion | every held and watched ticker of owners whose account is active (one live-state lookup per owner; a deactivated or deleted owner's tickers are left out, logged `tracked_tickers_inactive_owners_skipped`; an unknown state is kept) |
 | `GET /internal/documents/filenames`, `POST /internal/documents`, `POST /internal/documents/system` | ai-service | system documents (3.10) |
 
-### 3.14 API keys and the public API (`apikeys.py`, `middleware.py`)
+### 3.14 API keys and the public API (`apikeys.py`)
+
+Swagger (`/docs/core/`) declares the `X-API-Key` header as a security
+scheme of the five `/api/v1/public/*` routes, so its "Authorize" button
+sends the key with "Try it out". The middleware in `apikeys.py` is still
+the only place that checks the key.
 
 Keys: `amk_` + 32 random bytes (URL-safe base64). The prefix lets a leaked
 key be recognized in logs. Only `sha256(key)` is stored
@@ -1032,7 +1038,7 @@ The public API (`api/public.py`, prefix `/api/v1/public`):
  owner live state (shared/user_state.py):
    deactivated/deleted -> 401 account_deactivated
    non-GET/HEAD and the owner's role lacks portfolio:write (guest) -> 403
- two fixed one-minute counters in Redis db1 (shared/rate_limit.py):
+ two fixed one-minute counters in Redis db1 (shared/redis.py):
    ratelimit:<key id>          limit = min(key's rate_limit_per_minute, 60)
    ratelimit:owner:<owner id>  limit = 60 (shared by ALL of the owner's keys)
    over -> 429 rate_limit_exceeded + Retry-After (Redis down -> allowed, logged)
@@ -1133,7 +1139,7 @@ without `event_id` falls back to a hash of its content. If Redis is
 down the claim fails open: a duplicate notification is better than a lost
 one.
 
-### 3.16 WebSockets (`api/websocket.py`, `api/ws_common.py`, `websocket_manager.py`)
+### 3.16 WebSockets (`api/websocket.py`, `websocket_manager.py`)
 
 URL: `wss://localhost:8443/ws/<channel>?token=<access token>`. The token
 goes in the query string because browsers cannot set an `Authorization`
@@ -1176,10 +1182,18 @@ check means deny.
 
 Close codes: 1003 unsupported data, 1008 policy violation (Yjs), 1011
 internal error, 4400 bad channel, 4401 unauthorized or token expired,
-4403 forbidden, 4429 too many connections (`api/ws_common.py`). The
+4403 forbidden, 4429 too many connections (`websocket_manager.py`). The
 `analysis.status` first message exists because ai-service usually
 publishes `analysis.started` before the client has subscribed; the
 snapshot makes sure the client is not left without a state.
+
+Open channel sockets follow access changes too: on the same events as
+the Yjs re-check (section 3.9), `recheck_user_sessions` runs the channel
+check again for every `/ws/{channel}` socket of the user. A deactivated or
+deleted account gets 4401 "account deactivated", a channel the user can
+no longer read gets 4403 "access to this channel was revoked" (log
+`websocket_session_closed_on_access_change`). If the check itself fails,
+the socket stays open (log `websocket_session_recheck_failed`).
 
 **Fan-out rules** (`websocket_manager.py`):
 
@@ -1204,7 +1218,7 @@ snapshot makes sure the client is not left without a state.
 | Client | Calls | Behaviour on failure |
 |---|---|---|
 | `auth_client.get_user_ref` | auth `/internal/users/{id}` | cached 60 s in Redis db 0 (a Redis error is a cache miss, because every portfolio, note and comment read builds one); error -> 502 |
-| `auth_client.list_user_organization_roles` / `_ids` | auth `/internal/users/{id}/organizations` (via `shared/org_membership_cache.py`) | cached 60 s, invalidated by auth on membership changes; a missing role counts as `viewer` |
+| `auth_client.list_user_organization_roles` / `_ids` | auth `/internal/users/{id}/organizations` (via `shared/user_state.py`) | cached 60 s, invalidated by auth on membership changes; a missing role counts as `viewer` |
 | `auth_client.ensure_organization_writer` | (uses the roles above) | 403 for non-members and viewers |
 | `auth_client.are_users_connected` | auth `/internal/connections/check` | False (fail closed) |
 | `auth_client.get_notification_settings` | auth `/internal/users/{id}/notification-settings` | not cached; error -> caller uses defaults |
@@ -1245,8 +1259,7 @@ Four revisions in `migrations/versions/`:
   default `now()`, filled from `uploaded_at` for existing rows; the stuck
   rule measures from it).
 
-Head: `f1250c000001`. `migrations/archive/` keeps the old chain for the
-one-time `python -m scripts.alembic_convert`. Bootstrap runs at start
+Head: `f1250c000001`. Bootstrap runs at start
 ([chapter 20](20-postgresql.md) describes the shared mechanism).
 
 ---
@@ -1269,7 +1282,7 @@ one-time `python -m scripts.alembic_convert`. Bootstrap runs at start
 | `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | `http://minio:9000`, ... (`shared/config.py`) | object storage (alias `minio` points at SeaweedFS) |
 | `USER_STATE_CHECK_ENABLED` | `true` (`shared/config.py`) | live owner check for tokens, API keys, WebSockets, internal trades |
 | `KEY_CACHE_TTL_SECONDS` | `30` (`apikeys.py`) | API key validation cache |
-| `_LAST_USED_UPDATE_INTERVAL_SECONDS` | `60` (`middleware.py`) | `last_used_at` write throttle |
+| `_LAST_USED_UPDATE_INTERVAL_SECONDS` | `60` (`apikeys.py`) | `last_used_at` write throttle |
 | `STUCK_DOCUMENT_AFTER` | 10 minutes (`domains/research/repository.py`) | a document still `uploaded` this long after its last status change is republished on re-upload and left out of the auto-ingestion dedup list |
 | `STUCK_PROCESSING_AFTER` | 60 minutes (same file) | the same for `parsing`, `chunking` and `embedding` |
 | `SNAPSHOT_TIME_ET` | 17:30 (`domains/portfolio/ledger.py`) | snapshot cutoff |
@@ -1684,18 +1697,16 @@ portfolio delete cascades to its transactions and holdings and publishes
 |---|---|
 | `services/core-service/main.py` | app, lifespan (schema, bucket, job health, background listeners, outbox dispatcher, Yjs save at shutdown), routers, `/health` |
 | `services/core-service/config.py` | core settings (API keys, uploads, Yjs) |
-| `services/core-service/middleware.py` | public-API key check, owner state, rate limits, `last_used_at` throttle |
-| `services/core-service/apikeys.py` | `ApiKey` model, hashing, create, revoke, cache key, the cache writes `mark_revoked_in_cache` and `forget_cached_key` |
+| `services/core-service/apikeys.py` | `ApiKey` model, hashing, create, revoke, cache key, the cache writes `mark_revoked_in_cache` and `forget_cached_key`; the public-API middleware: key check, owner state, rate limits, `last_used_at` throttle |
 | `services/core-service/api/apikeys_api.py` | `/api/v1/api-keys` routes |
 | `services/core-service/api/public.py` | `/api/v1/public` routes |
 | `services/core-service/api/internal.py` | scheduler, portfolio, stats, tracked-tickers and system document internal routes |
-| `services/core-service/api/websocket.py` | JSON WebSocket endpoint and channel authorization |
-| `services/core-service/api/ws_common.py` | token check, close codes, accept-then-close, expiry timer |
-| `services/core-service/api/yjs_websocket.py`, `yjs_relay.py` | collaborative note editing (chapter 25) |
-| `services/core-service/websocket_manager.py` | channel registry, fan-out, per-user cap, presence task, `ws:fanout` |
+| `services/core-service/api/websocket.py` | JSON WebSocket endpoint and channel authorization, the Yjs endpoint, `recheck_user_sessions` |
+| `services/core-service/yjs_relay.py` | collaborative note editing (chapter 25) |
+| `services/core-service/websocket_manager.py` | channel registry, fan-out, per-user cap, presence task, `ws:fanout`; token check, close codes, accept-then-close, expiry timer |
 | `services/core-service/event_listener.py` | pub/sub and durable handlers, replica claims |
 | `services/core-service/job_health.py` | job success gauges, the "tracked since" start value for jobs without a success, market-close skip count, and their Redis persistence |
-| `services/core-service/outbox.py`, `outbox_model.py` | transactional outbox: `enqueue`, `publish_now`, `run_outbox_dispatcher`, table `core.event_outbox` |
+| `services/core-service/outbox.py` | transactional outbox: `enqueue`, `publish_now`, `run_outbox_dispatcher`, table `core.event_outbox` |
 | `services/core-service/domains/portfolio/ledger.py` | replay, phases, cash rules, adjustment planning, snapshot day |
 | `services/core-service/domains/portfolio/service.py` | portfolios, transactions, holdings, cash, snapshots, jobs, CSV exports |
 | `services/core-service/domains/portfolio/model.py`, `schema.py`, `repository.py`, `api.py` | tables, validation, data access, routes and their notification texts |
@@ -1709,8 +1720,8 @@ portfolio delete cascades to its transactions and holdings and publishes
 | `services/core-service/migrations/` | Alembic `env.py`, `versions/` (`f1160c000001` -> `f1170c000001` -> `f1200c000001` -> `f1250c000001`, head), `archive/` |
 | `services/core-service/deps.py` | `get_current_user`, the one `from <= to` check (422) for date-range query parameters (`check_date_range`), `day_start` |
 | `shared/market_calendar.py` | NYSE calendar, New York date |
-| `shared/events.py`, `shared/events_registry.py` | pub/sub and durable events, event names |
-| `shared/rate_limit.py`, `shared/user_state.py`, `shared/org_membership_cache.py` | shared counters, live state, membership cache |
+| `shared/events.py` | pub/sub and durable events, event names |
+| `shared/redis.py`, `shared/user_state.py` | shared counters, live state, membership cache |
 | `infra/scheduler/crontab`, `call-job.sh`, `heartbeat.sh` | the callers of the scheduler endpoints |
 | `infra/prometheus/alert_rules.yml` (groups `scheduled_jobs`, `durable_events`) | stale-job, skipped-portfolio and outbox-backlog alerts |
 | `scripts/snapshots.sh`, `scripts/health.sh`, `scripts/objectstore.sh` | operator wrappers |

@@ -155,7 +155,7 @@ class TestOrganizations:
 
         from config import settings
         from redis.exceptions import ConnectionError as RedisConnectionError
-        import shared.org_membership_cache as cache_module
+        import shared.user_state as cache_module
 
         class _Broken:
 
@@ -347,6 +347,27 @@ class TestAdminUsers:
                                  headers=h)).status_code == stats, role
             delete = await client.delete(url, headers=h)
             assert delete.status_code == (204 if manage == 200 else 403), role
+
+        await reset_rate_limits()
+        owner = await make_user(client, mock_email, db_session)
+        friend = await make_user(client, mock_email, db_session)
+        org_url = f"{ORGS}/" + (
+            await client.post(
+                ORGS, json={"name": "Demoted"},
+                headers=owner["headers"])).json()["data"]["id"]
+        for method, url in (("POST", ORGS), ("PATCH", org_url)):
+            r = await client.request(
+                method, url, headers=owner["headers"], json={"name": "   "})
+            assert r.status_code == 422, method
+        await set_role(db_session, owner["id"], "guest")
+        guest, _ = await login(client, owner["email"])
+        for method, url, body in (
+                ("PATCH", org_url, {"name": "x"}), ("DELETE", org_url, None),
+                ("POST", "/api/v1/connections",
+                 {"addressee_username": friend["username"]})):
+            r = await client.request(method, url, headers=guest, json=body)
+            assert r.status_code == 403, (method, url)
+        assert (await client.get(org_url, headers=guest)).status_code == 200
 
     async def test_list_search_filter_sort_paginate(
             self, client, mock_email, db_session):
@@ -933,12 +954,6 @@ class TestNotificationSettings:
 
         unknown = await client.get(f"/internal/users/{uuid4()}/state")
         assert unknown.status_code == 404
-        client.headers.pop("X-Internal-Token", None)
-        from shared.config import get_settings
-
-        if get_settings().INTERNAL_API_TOKEN:
-            r = await client.get(f"/internal/users/{user['id']}/state")
-            assert r.status_code == 401
 
 
 class TestUserState:

@@ -18,6 +18,8 @@ async def require_recent_login(
 
 require_organization_create = require_permission(
     Permission.ORGANIZATION_CREATE)(get_current_user)
+require_connection_write = require_permission(
+    Permission.CONNECTION_WRITE)(get_current_user)
 require_user_manage = require_permission(
     Permission.USER_MANAGE)(get_current_user)
 require_user_deactivate = require_permission(

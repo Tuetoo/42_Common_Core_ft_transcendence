@@ -53,6 +53,16 @@ def merge_debate_state(
 
 
 FailureKind = Literal["rate_limit", "server_overload", "non_english", "other"]
+AVAILABILITY_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"rate_limit", "server_overload"})
+DebateSide = Literal["bull", "bear"]
+
+MAX_DEBATE_ROUNDS = 3
+MAX_REFLECTION_RETRIES = 2
+
+
+def node_name(role: AgentRole) -> str:
+    return f"{role.value}_node"
 
 
 class AgentOutput(BaseModel):
@@ -109,7 +119,7 @@ class AgentSkip(BaseModel):
 
 class DebateArgument(BaseModel):
     round_number: int
-    side: Literal["bull", "bear"]
+    side: DebateSide
     argument: str
     citations: list[str] = Field(default_factory=list)
     available: bool = True
@@ -270,14 +280,13 @@ class DebateState(BaseModel):
     def latest_verdict(self) -> JudgeVerdict | None:
         return self.verdicts[-1] if self.verdicts else None
 
-    def latest_argument(
-            self, side: Literal["bull", "bear"]) -> DebateArgument | None:
+    def latest_argument(self, side: DebateSide) -> DebateArgument | None:
         return next((a for a in reversed(self.arguments) if a.side == side),
                     None)
 
-    def unavailable_latest_sides(self) -> list[Literal["bull", "bear"]]:
-        missing: list[Literal["bull", "bear"]] = []
-        sides: tuple[Literal["bull", "bear"], ...] = ("bull", "bear")
+    def unavailable_latest_sides(self) -> list[DebateSide]:
+        missing: list[DebateSide] = []
+        sides: tuple[DebateSide, ...] = ("bull", "bear")
         for side in sides:
             latest = self.latest_argument(side)
             if latest is not None and not latest.available:
@@ -304,7 +313,7 @@ class DebateState(BaseModel):
         ]
 
     def previous_round_argument(
-            self, side: Literal["bull", "bear"]) -> DebateArgument | None:
+            self, side: DebateSide) -> DebateArgument | None:
         return next((
             a for a in reversed(self.current_arguments())
             if a.side == side and a.round_number <= self.round_number), None)

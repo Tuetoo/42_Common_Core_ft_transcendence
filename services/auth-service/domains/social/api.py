@@ -1,6 +1,6 @@
 from uuid import UUID
 from database import get_db
-from deps import get_current_user
+from deps import get_current_user, require_connection_write
 from events_out import schedule_events
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +18,7 @@ router = APIRouter(tags=["connections"])
     response_model=APIResponse[ConnectionRead])
 async def send_connection_request(
     data: ConnectionRequestCreate, background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_connection_write),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[ConnectionRead]:
     service = SocialService(db)
@@ -44,7 +44,7 @@ async def list_connections(
     "/{connection_id}/accept", response_model=APIResponse[ConnectionRead])
 async def accept_connection(
     connection_id: UUID, background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_connection_write),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[ConnectionRead]:
     service = SocialService(db)

@@ -25,24 +25,15 @@ backup:
 # make restore BACKUP=<YYYY-MM-DD_HHMM> CONFIRM=yes -> real restore, then
 #                                                    restore.sh --verify
 # The real restore stops the app services and the scheduler. Objects go
-# back through the S3 API, so objectstore (SeaweedFS) is kept running;
-# only an older backup holding a tarball of its data directory
-# (objectstore-data.tar.gz) needs it stopped.
+# back through the S3 API, so objectstore (SeaweedFS) is kept running.
 restore:
 ifndef BACKUP
 	$(error usage: make restore BACKUP=<YYYY-MM-DD_HHMM> [CONFIRM=yes])
 endif
 ifeq ($(CONFIRM),yes)
 	docker compose --env-file .env.docker stop auth-service core-service ai-service scheduler
-	if [ -f backups/$(BACKUP)/objectstore-data.tar.gz ]; then \
-	    docker compose --env-file .env.docker stop objectstore; \
-	else \
-	    docker compose --env-file .env.docker up -d --wait objectstore; \
-	fi
+	docker compose --env-file .env.docker up -d --wait objectstore
 	docker compose --env-file .env.docker --profile tools run --rm --build restore /scripts/restore.sh --yes /backups/$(BACKUP)
-	if [ -f backups/$(BACKUP)/objectstore-data.tar.gz ]; then \
-	    docker compose --env-file .env.docker up -d --wait objectstore; \
-	fi
 	docker compose --env-file .env.docker --profile tools run --rm restore /scripts/restore.sh --verify /backups/$(BACKUP)
 	docker compose --env-file .env.docker up -d
 else

@@ -15,6 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domains.notification.service import NotificationService
 from domains.portfolio.ledger import cash_delta, snapshot_day
 from domains.portfolio.model import Portfolio, Transaction, Watchlist
+from domains.portfolio.repository import (HoldingRepository,
+                                          PortfolioSnapshotRepository,
+                                          TransactionRepository,
+                                          WatchlistRepository)
 from domains.portfolio.schema import InternalTransactionCreate
 from domains.portfolio.service import PortfolioService
 from domains.research.model import Document, ResearchComment, ResearchNote
@@ -31,10 +35,6 @@ from shared.security import require_internal_token
 from shared.user_state import get_user_state
 
 logger = structlog.get_logger(__name__)
-
-
-def _market_today() -> date:
-    return market_today()
 
 
 def _non_trading_reason(day: date) -> str | None:
@@ -63,7 +63,7 @@ router = APIRouter(
 @router.post("/scheduler/market-close")
 async def market_close(db: AsyncSession = Depends(
         get_db, scope="function")) -> dict[str, Any]:
-    today = _market_today()
+    today = market_today()
     reason = _non_trading_reason(today)
     if reason is not None:
         return _skipped("market_close", today, reason, portfolios_processed=0)
@@ -81,8 +81,6 @@ async def market_close(db: AsyncSession = Depends(
 async def get_portfolio_holdings_internal(
     portfolio_id: UUID, db: AsyncSession = Depends(get_db, scope="function")
 ) -> list[dict[str, Any]]:
-    from domains.portfolio.repository import HoldingRepository
-
     holdings = await HoldingRepository(db).list_for_portfolio(portfolio_id)
     return [{
         "ticker": h.ticker,
@@ -126,8 +124,6 @@ async def get_portfolio_snapshots_internal(
     end_date: date | None = Query(default=None),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> list[dict[str, Any]]:
-    from domains.portfolio.repository import PortfolioSnapshotRepository
-
     snapshots = await PortfolioSnapshotRepository(db).list_for_portfolio(
         portfolio_id, start_date=start_date, end_date=end_date)
     return [{
@@ -143,8 +139,6 @@ async def get_portfolio_cash_flows_internal(
     end_date: date = Query(...),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> list[dict[str, Any]]:
-    from domains.portfolio.repository import TransactionRepository
-
     flows = await TransactionRepository(db).list_cash_flows_for_portfolio(
         portfolio_id, start_date=start_date, end_date=end_date)
     return [_cash_flow_row(f) for f in flows]
@@ -214,7 +208,7 @@ async def scheduler_heartbeat(job: str) -> dict[str, Any]:
 @router.post("/scheduler/market-open", response_model=None)
 async def market_open(db: AsyncSession = Depends(
         get_db, scope="function")) -> dict[str, Any] | JSONResponse:
-    today = _market_today()
+    today = market_today()
     reason = _non_trading_reason(today)
     if reason is not None:
         return _skipped("market_open", today, reason, analyses_requested=0)
@@ -262,9 +256,6 @@ async def get_stats(db: AsyncSession = Depends(
 @router.get("/tracked-tickers")
 async def get_tracked_tickers(
         db: AsyncSession = Depends(get_db, scope="function")) -> list[str]:
-    from domains.portfolio.repository import (HoldingRepository,
-                                              WatchlistRepository)
-
     pairs = (
         await HoldingRepository(db).list_all_owner_tickers() +
         await WatchlistRepository(db).list_all_owner_tickers())

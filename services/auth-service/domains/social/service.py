@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from uuid import UUID
-import rate_limit
+import security
 from config import settings
 from events_out import PendingEvent, friend_event_payload
 from sqlalchemy.exc import IntegrityError
@@ -12,7 +12,7 @@ from domains.social.model import Connection
 from domains.social.repository import ConnectionRepository
 from domains.social.schema import ConnectionRead
 from shared.enums import ConnectionStatus
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
 from shared.schemas import UserRef
@@ -38,7 +38,7 @@ class SocialService:
     async def send_request(
             self, requester_id: UUID,
             addressee_username: str) -> ConnectionRead:
-        await rate_limit.hit(
+        await security.hit(
             "friend:user", str(requester_id),
             limit=settings.RATE_LIMIT_FRIEND_REQUESTS_PER_USER,
             window=settings.RATE_LIMIT_FRIEND_REQUESTS_WINDOW_SECONDS)

@@ -9,6 +9,7 @@ class Permission(StrEnum):
     NOTE_WRITE = "note:write"
     COMMENT_WRITE = "comment:write"
     ORGANIZATION_CREATE = "organization:create"
+    CONNECTION_WRITE = "connection:write"
     API_KEY_MANAGE = "api_key:manage"
     RAG_ASK = "rag:ask"
     CONTENT_MODERATE = "content:moderate"
@@ -21,7 +22,7 @@ _WRITE: frozenset[Permission] = frozenset({
     Permission.PORTFOLIO_WRITE, Permission.ANALYSIS_CREATE,
     Permission.DOCUMENT_UPLOAD, Permission.NOTE_WRITE,
     Permission.COMMENT_WRITE, Permission.ORGANIZATION_CREATE,
-    Permission.API_KEY_MANAGE, Permission.RAG_ASK
+    Permission.CONNECTION_WRITE, Permission.API_KEY_MANAGE, Permission.RAG_ASK
 })
 
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {

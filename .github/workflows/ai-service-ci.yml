@@ -8,6 +8,26 @@ name: ai-service CI
 # the shared test helpers, the Makefile targets the steps call, and the
 # repository files the tests check.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "services/ai-service/**"
+      - "shared/**"
+      - "tests/ai-service/**"
+      - "tests/alembic_contract.py"
+      - "tests/auth_tokens.py"
+      - "Makefile"
+      - "infra/scheduler/**"
+      - "infra/vector/**"
+      - "scripts/**"
+      - ".env.example"
+      - ".gitignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".dockerignore"
+      - "services/auth-service/Dockerfile"
+      - "services/core-service/Dockerfile"
+      - ".github/workflows/ai-service-ci.yml"
   pull_request:
     paths:
       - "services/ai-service/**"
@@ -23,6 +43,9 @@ on:
       - ".gitignore"
       - "pyproject.toml"
       - "uv.lock"
+      - ".dockerignore"
+      - "services/auth-service/Dockerfile"
+      - "services/core-service/Dockerfile"
       - ".github/workflows/ai-service-ci.yml"
 
 jobs:

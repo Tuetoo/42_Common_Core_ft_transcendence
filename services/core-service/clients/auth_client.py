@@ -5,7 +5,7 @@ import structlog
 from config import settings
 from shared.exceptions import PermissionDeniedError, UpstreamServiceError
 from shared.http_client import get_http_client
-from shared.org_membership_cache import organization_roles
+from shared.user_state import organization_roles
 from shared.redis import get_cache_client
 from shared.schemas import UserRef
 

@@ -394,7 +394,7 @@ Grafana and the Swagger locations are on the HTTPS server only.
 
 | Location | Behaviour |
 |---|---|
-| `location /` | `proxy_buffering off; proxy_pass http://$frontend_service;` The catch-all: every path not matched above is a frontend page (including `/healthz`). Unknown pages get the frontend's 404 page. `proxy_buffering off` lets streamed pages reach the browser chunk by chunk. |
+| `location /` | `proxy_buffering off; proxy_read_timeout 180s; proxy_pass http://$frontend_service;` The catch-all: every path not matched above is a frontend page (including `/healthz`). Unknown pages get the frontend's 404 page. `proxy_buffering off` lets streamed pages reach the browser chunk by chunk; the 180 s read timeout lets the streamed document answer (frontend route `/research/ask/stream`, up to 120 s in the backend) finish. |
 
 **Static:**
 
@@ -626,8 +626,8 @@ Every service starts uvicorn with:
 uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*
 ```
 
-(the `CMD` of both stages in `services/*/Dockerfile`, and the `command` in
-`docker-compose.override.yml`).
+(the `CMD` of both stages in `services/*/Dockerfile`; the development
+override does not set `command`).
 
 - `--proxy-headers` tells uvicorn to read `X-Forwarded-For` and
   `X-Forwarded-Proto` and to set `request.client.host` and
@@ -689,6 +689,7 @@ accepted for this deployment.
 | `worker_processes` / `worker_connections` | `auto` / `1024` | one worker per CPU; connections per worker (client and upstream sides) | `nginx.conf` (top level) |
 | `proxy_read_timeout` `/ws` | `3600s` | an idle WebSocket closes after one hour without traffic | `nginx.conf` |
 | `proxy_read_timeout` `/api/v1/rag` | `180s` | long streamed answers | `nginx.conf` |
+| `proxy_read_timeout` `/` (frontend) | `180s` | the streamed document answers through the frontend route | `nginx.conf` |
 | other proxied paths | nginx default (60 s read timeout) | | |
 | `ssl_protocols` | `TLSv1.2 TLSv1.3` | | `nginx.conf` |
 | HSTS | `max-age=31536000` | one year | `nginx.conf` |
@@ -700,7 +701,7 @@ accepted for this deployment.
 | `GF_SERVER_SERVE_FROM_SUB_PATH` | `"true"` | Grafana serves under `/grafana/` | `docker-compose.yaml` |
 | `INTERNAL_API_TOKEN` | empty (must be set outside development/test) | `X-Internal-Token` secret for `/internal/*` | `.env.example`, `shared/config.py` |
 | `OAUTH_REDIRECT_BASE_URL` | `https://localhost:8443` | public base URL used in OAuth redirect URIs (must match the gateway) | `services/auth-service/config.py`, `.env.example` |
-| uvicorn flags | `--proxy-headers --forwarded-allow-ips=*` | trust `X-Forwarded-*` | `services/*/Dockerfile`, `docker-compose.override.yml` |
+| uvicorn flags | `--proxy-headers --forwarded-allow-ips=*` | trust `X-Forwarded-*` | `services/*/Dockerfile` |
 
 ---
 
@@ -1078,7 +1079,7 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 | `infra/gateway/status.html` | the public status page (one inline script, one inline style) |
 | `infra/gateway/csp_hashes.py` | computes, checks and writes the CSP hashes of the status page |
 | `docker-compose.yaml` (service `gateway`, `grafana`) | image, mounts, ports, `depends_on`, Grafana sub-path settings |
-| `docker-compose.override.yml` | development `command` for the services, with the uvicorn proxy flags |
+| `docker-compose.override.yml` | development target, bind mounts and `LOG_LEVEL` for the services (the uvicorn flags are in the Dockerfile development `CMD`) |
 | `services/*/Dockerfile` | production and development `CMD` with `--proxy-headers --forwarded-allow-ips=*` |
 | `services/*/main.py` | each service's `/health` and unique `openapi_url` |
 | `shared/security.py` | `require_internal_token` (the `/internal/*` guard) |

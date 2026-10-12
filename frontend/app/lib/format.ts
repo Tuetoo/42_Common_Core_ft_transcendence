@@ -14,7 +14,7 @@ export function formatNumber(value: string | number | null | undefined, maxDecim
 // can stop bad input early; the server actions check them again, because a
 // request can always skip the browser.
 
-// shared/tickers.py: 1-10 characters of A-Z, 0-9, "." or "-". The inputs
+// shared/schemas.py: 1-10 characters of A-Z, 0-9, "." or "-". The inputs
 // accept lower case too; the actions upper-case the value before sending.
 export const TICKER_PATTERN = "[A-Za-z0-9.\\-]{1,10}";
 export const TICKER_TITLE = "1-10 characters: letters, digits, '.' or '-' (for example BRK.B)";

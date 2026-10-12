@@ -8,7 +8,7 @@ from deps import get_current_user
 from fastapi import APIRouter, BackgroundTasks, Depends, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from domains.notification.actions import notify_after_commit
+from domains.notification.service import notify_after_commit
 from shared.enums import NotificationType
 from shared.exceptions import ConflictError, NotFoundError
 from shared.permissions import Permission

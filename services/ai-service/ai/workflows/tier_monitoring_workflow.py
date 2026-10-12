@@ -11,7 +11,7 @@ from database import SessionLocal
 from domains.analysis.model import RecommendationTier
 from domains.analysis.repository import RecommendationTierRepository
 from shared.enums import TierSide, TierStatus
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.market_calendar import MARKET_TZ, market_today
 
 logger = structlog.get_logger(__name__)
@@ -19,8 +19,6 @@ logger = structlog.get_logger(__name__)
 _OPEN_TIER_STATUSES = (
     TierStatus.PENDING_ACCEPTANCE.value,
     TierStatus.ACCEPTED_AWAITING_TRIGGER.value)
-
-TIER_STATUS_EXECUTION_FAILED = TierStatus.EXECUTION_FAILED.value
 
 
 def _session_open_utc(day: date) -> datetime:
@@ -101,7 +99,7 @@ async def _execute_and_mark_triggered(
             record_transaction, tier, portfolio_id=str(portfolio_id),
             ticker=ticker, price=price, transaction_type=transaction_type)
     except TransactionRejectedError as exc:
-        tier.status = TIER_STATUS_EXECUTION_FAILED
+        tier.status = TierStatus.EXECUTION_FAILED.value
         line = (
             f"Tier {tier.id} ({tier.side} "
             f"{plain_decimal(Decimal(tier.quantity))} @ "

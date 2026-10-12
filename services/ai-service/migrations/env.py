@@ -12,12 +12,11 @@ sys.path.insert(
 
 from alembic import context  # noqa: E402
 from config import settings  # noqa: E402
-from database import register_all_models  # noqa: E402
+from database import register_models  # noqa: E402
 from sqlalchemy import Connection, engine_from_config, pool, text  # noqa: E402
-from shared.alembic_bootstrap import exclude_alembic_version  # noqa: E402
-from shared.database import Base  # noqa: E402
+from shared.database import Base, exclude_alembic_version  # noqa: E402
 
-register_all_models()
+register_models()
 
 config = context.config
 if config.config_file_name is not None:
@@ -48,10 +47,6 @@ def _run_on(connection: Connection) -> None:
 
 
 def run_migrations_online() -> None:
-    external = config.attributes.get("connection")
-    if external is not None:
-        _run_on(external)
-        return
     configuration = config.get_section(config.config_ini_section) or {}
     configuration["sqlalchemy.url"] = settings.assemble_sync_database_url()
     connectable = engine_from_config(

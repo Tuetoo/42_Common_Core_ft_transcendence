@@ -25,9 +25,8 @@ from domains.auth.service import (EmailDispatch, avatar_or_default,
                                   verification_link)
 from domains.organization.repository import OrganizationRepository
 from shared.enums import OrganizationRole, SystemRole
-from shared.events_registry import EventName
-from shared.exceptions import (ConflictError, NotFoundError,
-                               PermissionDeniedError)
+from shared.events import EventName
+from shared.exceptions import ConflictError, PermissionDeniedError
 from shared.http_client import get_http_client
 from shared.permissions import Permission, has_permission, sorted_permissions
 from shared.schemas import PaginatedResponse, PaginationParams
@@ -98,7 +97,7 @@ class AdminService:
             total=total, page=pagination.page, page_size=pagination.page_size)
 
     async def get_user(self, user_id: UUID) -> AdminUserDetail:
-        user = await self._require_user(user_id)
+        user = await self.users.require(user_id)
         await self._db.flush()
         await self._db.refresh(user)
         profile = await self.users.get_profile(user_id)
@@ -206,6 +205,7 @@ class AdminService:
         result = UnverifiedPurgeResult(candidates=len(candidates))
         for user_id in candidates:
             events_before = len(self.pending_events)
+            self.removed_avatar_url = None
             try:
                 user = await self.admin.lock_unverified_account(
                     user_id, cutoff)
@@ -231,7 +231,6 @@ class AdminService:
                 continue
             if self.removed_avatar_url:
                 result.removed_avatar_urls.append(self.removed_avatar_url)
-                self.removed_avatar_url = None
             result.deleted += 1
         logger.info(
             "unverified_accounts_purged", candidates=result.candidates,
@@ -334,14 +333,8 @@ class AdminService:
             EventName.USER_DEACTIVATED), user, actor.user_id, ["is_active"])
         return await self.get_user(user.id)
 
-    async def _require_user(self, user_id: UUID) -> User:
-        user = await self.users.get_by_id(user_id)
-        if user is None:
-            raise NotFoundError("User not found.")
-        return user
-
     async def _require_live_user(self, user_id: UUID) -> User:
-        user = await self._require_user(user_id)
+        user = await self.users.require(user_id)
         if user.deleted_at is not None:
             raise ConflictError("This user has been deleted.")
         return user

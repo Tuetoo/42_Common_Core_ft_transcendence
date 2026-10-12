@@ -2,8 +2,8 @@ from datetime import date, timedelta
 import httpx
 import structlog
 from ai.providers.base import (MacroDataPoint, MacroDataProvider,
-                               ProviderRequestError, ProviderUnavailableError)
-from ai.providers.retry import call_with_retry, is_retryable_http_error
+                               ProviderRequestError, ProviderUnavailableError,
+                               call_with_retry, is_retryable_http_error)
 from config import settings
 from shared.http_client import get_http_client
 

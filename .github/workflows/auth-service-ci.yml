@@ -8,6 +8,18 @@ name: auth-service CI
 # the shared test helpers, the Makefile targets the steps call, and the
 # repository files the tests check.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "services/auth-service/**"
+      - "shared/**"
+      - "tests/auth-service/**"
+      - "tests/alembic_contract.py"
+      - "tests/auth_tokens.py"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/auth-service-ci.yml"
   pull_request:
     paths:
       - "services/auth-service/**"

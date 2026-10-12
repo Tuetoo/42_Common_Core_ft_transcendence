@@ -11,8 +11,8 @@ _AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
 if str(_AI_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(_AI_SERVICE_DIR))
 
-from ai.evaluation.recall import (Score, embed_golden_questions,  # noqa: E402
-                                  rank_of)
+from ai.evaluation.rag_recall import (Score,  # noqa: E402
+                                      embed_golden_questions, rank_of)
 
 BASELINE_2026_08_27 = (
     "2026-08-27 baseline (mistral-embed, older corpus): BM25 R@5 ~91-94%, "
@@ -196,7 +196,7 @@ async def main() -> None:
     if args.apply and not args.sweep:
         parser.error("--apply only works with --sweep")
 
-    from ai.evaluation.golden_set import GoldenQAPair
+    from ai.evaluation.rag_recall import GoldenQAPair
     from ai.rag.embedding import embedding_model_name
     from ai.rag.indexing import rebuild_bm25_from_qdrant
     from ai.rag.retriever import BaseRetriever

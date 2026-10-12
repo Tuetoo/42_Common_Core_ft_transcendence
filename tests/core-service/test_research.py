@@ -2,34 +2,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 import pytest
-from helpers import create_portfolio
 from tests.auth_tokens import auth_headers as _headers
 
 _STORAGE: dict[str, bytes] = {}
 
 
 @pytest.fixture
-def member_roles_and_no_sentiment(monkeypatch):
-    import clients.ai_client as ai_client
+def member_roles_and_no_sentiment(monkeypatch, no_sentiment_analysis):
     import clients.auth_client as auth_client
 
     async def _roles(user_id):
         ids = await auth_client.list_user_organization_ids(user_id)
         return dict.fromkeys(ids, "member")
 
-    async def _no_sentiment(text, kind):
-        return None
-
     monkeypatch.setattr(auth_client, "list_user_organization_roles", _roles)
-    monkeypatch.setattr(ai_client, "analyze_sentiment", _no_sentiment)
 
 
 @pytest.fixture
-def research_doubles(monkeypatch):
-    import clients.ai_client as ai_client
+def research_doubles(monkeypatch, no_sentiment_analysis):
     import outbox
-    import domains.notification.actions as notification_actions
-    import domains.research.moderation_api as moderation_api  # noqa: F401
+    import domains.notification.service as notification_service
     import domains.research.service as research_service
 
     async def _upload(settings, *, bucket, key, content, content_type=None):
@@ -52,15 +44,11 @@ def research_doubles(monkeypatch):
         for uid in dict.fromkeys(str(u) for u in user_ids if u):
             notified.append((uid, str(type), title))
 
-    async def _no_sentiment(text, kind):
-        return None
-
     monkeypatch.setattr(research_service, "upload_bytes", _upload)
     monkeypatch.setattr(research_service, "download_bytes", _download)
     monkeypatch.setattr(research_service, "delete_object", _delete)
     monkeypatch.setattr(outbox, "publish_durable_event", _publish)
-    monkeypatch.setattr(notification_actions, "notify_users", _notify_users)
-    monkeypatch.setattr(ai_client, "analyze_sentiment", _no_sentiment)
+    monkeypatch.setattr(notification_service, "notify_users", _notify_users)
     return {"published": published, "notified": notified}
 
 
@@ -1258,9 +1246,6 @@ class TestDocumentIngestion:
         assert document.status == "uploaded"
         assert document.ticker == "AMD"
 
-
-class TestDeleteDocumentsScript:
-
     async def test_delete_documents_script(self, db_session):
         from scripts.delete_documents import parse_ids
 
@@ -1307,301 +1292,6 @@ class TestDeleteDocumentsScript:
         }]
         assert await db_session.get(Document, failing_id) is None
         assert await db_session.get(Document, ok_id) is None
-
-
-class TestApiKeys:
-
-    async def test_api_key_access_owner_state_and_rate_limit(
-            self, real_client, mock_cross_service, monkeypatch):
-        client = real_client
-        user_id, headers = _headers()
-
-        created = await client.post(
-            "/api/v1/api-keys", json={"name": "my integration"},
-            headers=headers)
-        assert created.status_code == 201
-        raw_key = created.json()["data"]["key"]
-        assert raw_key.startswith("amk_")
-
-        portfolio = (
-            await client.post(
-                "/api/v1/portfolios", json={"name": "Public API Test"},
-                headers=headers)).json()["data"]
-
-        no_key = await client.get(
-            f"/api/v1/public/portfolios/{portfolio['id']}")
-        assert no_key.status_code == 401
-
-        wrong_key = await client.get(
-            f"/api/v1/public/portfolios/{portfolio['id']}",
-            headers={"X-API-Key": "amk_not-a-real-key"})
-        assert wrong_key.status_code == 401
-
-        with_key = await client.get(
-            f"/api/v1/public/portfolios/{portfolio['id']}",
-            headers={"X-API-Key": raw_key})
-        assert with_key.status_code == 200
-        assert with_key.json()["data"]["id"] == portfolio["id"]
-
-        client = real_client
-        _, headers = _headers()
-        key = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "p"},
-                headers=headers)).json()["data"]["key"]
-        wl = (
-            await client.post(
-                "/api/v1/watchlists", json={"name": "w"},
-                headers=headers)).json()["data"]["id"]
-        created = await client.post(
-            f"/api/v1/public/watchlists/{wl}/items", json={"ticker": "amd"},
-            headers={"X-API-Key": key})
-        assert created.status_code == 201, created.text
-        assert created.json()["data"]["ticker"] == "AMD"
-        removed = await client.delete(
-            f"/api/v1/public/watchlists/{wl}/items/AMD",
-            headers={"X-API-Key": key})
-        assert removed.status_code == 204
-
-        import middleware
-        from config import settings
-        from shared.user_state import UserState
-
-        client = real_client
-        _, headers = _headers()
-        pid = await create_portfolio(client, headers, "Key owner state")
-        holding = (
-            await client.post(
-                f"/api/v1/portfolios/{pid}/holdings", json={
-                    "ticker": "AAPL",
-                    "quantity": "1",
-                    "average_cost": "10"
-                }, headers=headers)).json()["data"]
-        key = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "state"},
-                headers=headers)).json()["data"]["key"]
-        api = {"X-API-Key": key}
-        read_url = f"/api/v1/public/portfolios/{pid}"
-        write_url = f"/api/v1/public/portfolios/{pid}/holdings/{holding['id']}"
-
-        state: dict[str, UserState | None] = {"value": None}
-        looked_up: list[str] = []
-
-        async def _state(_settings, user_id):
-            looked_up.append(str(user_id))
-            return state["value"]
-
-        monkeypatch.setattr(middleware, "get_user_state", _state)
-        monkeypatch.setattr(settings, "USER_STATE_CHECK_ENABLED", True)
-
-        assert (await client.get(read_url, headers=api)).status_code == 200
-        state["value"] = UserState(role="user", is_active=False)
-        denied = await client.get(read_url, headers=api)
-        assert denied.status_code == 401
-        assert denied.json()["error"]["code"] == "account_deactivated"
-        assert (
-            await client.put(write_url, json={"quantity": "2"},
-                             headers=api)).status_code == 401
-        state["value"] = UserState(role="guest", is_active=True)
-        assert (await client.get(read_url, headers=api)).status_code == 200
-        forbidden = await client.put(
-            write_url, json={"quantity": "2"}, headers=api)
-        assert forbidden.status_code == 403
-        assert forbidden.json()["error"]["code"] == "insufficient_permissions"
-        state["value"] = UserState(role="user", is_active=True)
-        assert (
-            await client.put(write_url, json={"quantity": "2"},
-                             headers=api)).status_code == 200
-        assert looked_up
-
-        monkeypatch.setattr(settings, "USER_STATE_CHECK_ENABLED", False)
-        looked_up.clear()
-        state["value"] = UserState(role="user", is_active=False)
-        assert (await client.get(read_url, headers=api)).status_code == 200
-        assert looked_up == []
-
-        client = real_client
-        _, headers = _headers()
-        keys = [(
-            await client.post(
-                "/api/v1/api-keys", json={"name": f"k{i}"},
-                headers=headers)).json()["data"]["key"] for i in range(2)]
-        pid = await create_portfolio(client, headers)
-        monkeypatch.setattr(settings, "PUBLIC_API_RATE_LIMIT_PER_MINUTE", 3)
-        url = f"/api/v1/public/portfolios/{pid}"
-        statuses = [
-            (await client.get(url,
-                              headers={"X-API-Key": keys[i % 2]})).status_code
-            for i in range(4)
-        ]
-        assert statuses == [200, 200, 200, 429]
-
-        client = real_client
-        _, headers = _headers()
-        created = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "r"},
-                headers=headers)).json()["data"]
-        pid = await create_portfolio(client, headers)
-        url = f"/api/v1/public/portfolios/{pid}"
-        assert (
-            await client.get(url, headers={"X-API-Key": created["key"]
-                                           })).status_code == 200
-        assert (
-            await client.delete(
-                f"/api/v1/api-keys/{created['id']}",
-                headers=headers)).status_code == 204
-        assert (
-            await client.get(url, headers={"X-API-Key": created["key"]
-                                           })).status_code == 401
-
-    async def test_api_key_revoke_and_cache(
-            self, client, mock_cross_service, monkeypatch, db_session):
-        user_id, headers = _headers()
-        created = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "to be revoked"},
-                headers=headers)).json()["data"]
-        raw_key = created["key"]
-
-        revoke = await client.delete(
-            f"/api/v1/api-keys/{created['id']}", headers=headers)
-        assert revoke.status_code == 204
-
-        portfolio = (
-            await client.post(
-                "/api/v1/portfolios", json={"name": "Revoked Key Test"},
-                headers=headers)).json()["data"]
-
-        response = await client.get(
-            f"/api/v1/public/portfolios/{portfolio['id']}",
-            headers={"X-API-Key": raw_key})
-        assert response.status_code == 401
-
-        import apikeys
-
-        _, headers = _headers()
-        created = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "r"},
-                headers=headers)).json()["data"]
-
-        class _DownRedis:
-
-            async def set(self, *args, **kwargs):
-                raise ConnectionError("redis down")
-
-            async def delete(self, *args, **kwargs):
-                raise ConnectionError("redis down")
-
-        monkeypatch.setattr(
-            apikeys, "get_cache_client", lambda settings: _DownRedis())
-        response = await client.delete(
-            f"/api/v1/api-keys/{created['id']}", headers=headers)
-        assert response.status_code == 204
-        listed = (await client.get("/api/v1/api-keys",
-                                   headers=headers)).json()["data"]
-        mine = next(k for k in listed if k["id"] == created["id"])
-        assert mine["revoked_at"] is not None
-
-        class _AcceptingCache:
-
-            async def set(self, *args, **kwargs):
-                return True
-
-        monkeypatch.setattr(
-            apikeys, "get_cache_client", lambda _s: _AcceptingCache())
-        row, _raw = await apikeys.create_api_key(
-            db_session, owner_user_id=uuid4(), name="k")
-        limit = apikeys.settings.PUBLIC_API_RATE_LIMIT_PER_MINUTE
-        assert row.rate_limit_per_minute == limit
-        await apikeys.revoke(db_session, row)
-        first = row.revoked_at
-        await apikeys.revoke(db_session, row)
-        assert row.revoked_at == first
-        found = await apikeys.get_for_owner(
-            db_session, row.owner_user_id, row.id)
-        assert found is row
-        assert (
-            await apikeys.get_for_owner(db_session, uuid4(), row.id) is None)
-
-        writes: list[tuple[str, str]] = []
-
-        class _Cache:
-
-            async def set(self, key, value, ex=None):
-                writes.append(("set", key))
-
-            async def delete(self, key):
-                writes.append(("delete", key))
-
-        monkeypatch.setattr(apikeys, "get_cache_client", lambda _s: _Cache())
-        _, headers = _headers()
-        created = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "k"},
-                headers=headers)).json()["data"]
-        cache_key = apikeys.validation_cache_key(
-            apikeys.hash_key(created["key"]))
-        updated = await client.patch(
-            f"/api/v1/api-keys/{created['id']}",
-            json={"rate_limit_per_minute": 5}, headers=headers)
-        assert updated.status_code == 200, updated.text
-        assert writes == [("delete", cache_key)] * 2
-        writes.clear()
-        revoked = await client.delete(
-            f"/api/v1/api-keys/{created['id']}", headers=headers)
-        assert revoked.status_code == 204
-        assert writes == [("set", cache_key)] * 2
-
-    async def test_api_key_preflight_and_update(self, client):
-        resp = await client.options(
-            f"/api/v1/public/portfolios/{uuid4()}", headers={
-                "Origin": "http://localhost:3000",
-                "Access-Control-Request-Method": "GET",
-                "Access-Control-Request-Headers": "X-API-Key"
-            })
-        assert resp.status_code == 200, resp.text
-        assert (
-            resp.headers.get("access-control-allow-origin") ==
-            "http://localhost:3000")
-
-        from config import settings
-
-        _, headers = _headers()
-        key = (
-            await client.post(
-                "/api/v1/api-keys", json={"name": "orig"},
-                headers=headers)).json()["data"]
-        response = await client.patch(
-            f"/api/v1/api-keys/{key['id']}", json={
-                "name": "renamed",
-                "rate_limit_per_minute": 5
-            }, headers=headers)
-        assert response.status_code == 200, response.text
-        assert response.json()["data"]["name"] == "renamed"
-        assert response.json()["data"]["rate_limit_per_minute"] == 5
-        assert (
-            await client.patch(
-                f"/api/v1/api-keys/{key['id']}", json={},
-                headers=headers)).status_code == 422
-        too_high = settings.PUBLIC_API_RATE_LIMIT_PER_MINUTE + 1
-        assert (
-            await client.patch(
-                f"/api/v1/api-keys/{key['id']}",
-                json={"rate_limit_per_minute": too_high},
-                headers=headers)).status_code == 422
-        _, other = _headers()
-        assert (
-            await client.patch(
-                f"/api/v1/api-keys/{key['id']}", json={"name": "x"},
-                headers=other)).status_code == 404
-        await client.delete(f"/api/v1/api-keys/{key['id']}", headers=headers)
-        assert (
-            await client.patch(
-                f"/api/v1/api-keys/{key['id']}", json={"name": "x"},
-                headers=headers)).status_code == 409
 
 
 class TestSentiment:

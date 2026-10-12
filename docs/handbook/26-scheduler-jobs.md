@@ -82,8 +82,7 @@ below use the usual 5 hours.
 - Installs `rclone` (with `dcron`, `curl`, `tzdata`, `jq` and the
   PostgreSQL 16 client) and copies `s3-remote.sh`, which defines the
   rclone remote `objectstore:` from the `S3_*` settings.
-- The mount points `/backups` and `/avatar-data` (and, for the one-off
-  `restore` service, `/objectstore-data`) are NOT created in the image on
+- The mount points `/backups` and `/avatar-data` are NOT created in the image on
   purpose: they must come from compose mounts, and `backup.sh` refuses to
   run (or skips avatars) when they are missing, instead of backing up an
   empty directory.
@@ -389,7 +388,7 @@ same ticker still runs.
 The ingestion helpers catch provider errors themselves (they return "no
 document" so that an analysis that calls them is not interrupted). To keep
 such an outage visible, each helper reports a failed source
-(`ai/ingestion/source_failures.py::report_source_failure`), and the
+(`ai/ingestion/digests.py::report_source_failure`), and the
 workflow collects the reports of one ticker and step with
 `track_source_failures()`. A ticker with at least one failed source counts
 as failed in that step, even when some of its documents were stored (log
@@ -583,8 +582,7 @@ differs from the backup (Alembic revisions, table and Qdrant point
 counts, every object by size and MD5, avatars). Through the Makefile:
 `make restore BACKUP=<name>` (dry run) or `make restore BACKUP=<name>
 CONFIRM=yes` (**DESTRUCTIVE**: stops auth-service, core-service,
-ai-service and scheduler, makes sure objectstore runs (it is stopped only
-for an old tarball backup), restores, runs `--verify`, starts everything
+ai-service and scheduler, makes sure objectstore runs, restores, runs `--verify`, starts everything
 again). Both forms run the one-off `restore` compose service with
 `docker compose run --rm --build`. `--build` makes sure the restore image
 is rebuilt, because `make up` does not rebuild it, and an old image would
@@ -779,7 +777,6 @@ with `FORCE=1`. The night jobs (02:00-04:20) are not guarded; inside
 | `BACKUP_DIR` | `/backups` | backup root | `docker-compose.yaml`, `backup.sh` |
 | `BACKUP_RETENTION_DAYS` | `7` | days of backups kept (the newest 3 are always kept) | `.env.example`, `backup.sh` |
 | `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | from `.env.docker` | object storage the backup copies through its S3 API (rclone remote `objectstore:`) | `.env.example`, `s3-remote.sh` |
-| `OBJECTSTORE_DATA_DIR` | `/objectstore-data` | SeaweedFS data directory, used only by `restore.sh` for an old tarball backup (`restore` service) | `docker-compose.yaml`, `restore.sh` |
 | `AVATAR_DATA_DIR` | `/avatar-data` | avatars to archive | `docker-compose.yaml`, `backup.sh` |
 | `LOGS_DIR` | `/logs` | log root for cleanup | `logs-cleanup.sh` |
 | `RETENTION_DAYS` (logs) | `14` | days of logs kept | `logs-cleanup.sh` |

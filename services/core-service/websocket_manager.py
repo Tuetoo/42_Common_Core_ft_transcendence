@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
 import json
-from collections.abc import Iterable
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 from uuid import uuid4
@@ -10,11 +12,111 @@ import structlog
 from config import settings
 from fastapi import WebSocket
 from pydantic import Field
+from starlette.websockets import WebSocketState
 from shared.events import run_pubsub_listener
 from shared.redis import get_events_client
 from shared.schemas import BaseSchema
+from shared.security import decode_token, is_uuid_claim
+from shared.user_state import get_user_state
 
 logger = structlog.get_logger(__name__)
+
+CLOSE_UNSUPPORTED_DATA = 1003
+CLOSE_POLICY_VIOLATION = 1008
+CLOSE_INTERNAL_ERROR = 1011
+CLOSE_BAD_REQUEST = 4400
+CLOSE_UNAUTHORIZED = 4401
+CLOSE_FORBIDDEN = 4403
+CLOSE_TOO_MANY_CONNECTIONS = 4429
+
+
+@dataclass(frozen=True)
+class SocketIdentity:
+    user_id: str
+    expires_at: float
+    role: str = "user"
+
+
+def authenticate(token: str | None) -> SocketIdentity | None:
+    try:
+        claims: dict[str, Any] = decode_token(token or "", settings)
+    except Exception:
+        return None
+    subject = claims.get("sub")
+    exp = claims.get("exp")
+    if claims.get("type") != "access" or not is_uuid_claim(subject):
+        return None
+    if not isinstance(exp, int | float):
+        return None
+    return SocketIdentity(
+        user_id=subject, expires_at=float(exp),
+        role=str(claims.get("role") or "user"))
+
+
+async def resolve_live_identity(
+        identity: SocketIdentity) -> SocketIdentity | None:
+    if not settings.USER_STATE_CHECK_ENABLED:
+        return identity
+    state = await get_user_state(settings, identity.user_id)
+    if state is None:
+        return identity
+    if not state.is_active:
+        return None
+    return SocketIdentity(
+        user_id=identity.user_id, expires_at=identity.expires_at,
+        role=state.role)
+
+
+async def open_identity(
+        websocket: WebSocket, token: str | None, *,
+        invalid_reason: str = "invalid or missing token"
+) -> SocketIdentity | None:
+    token_identity = authenticate(token)
+    if token_identity is None:
+        await accept_and_close(websocket, CLOSE_UNAUTHORIZED, invalid_reason)
+        return None
+    identity = await resolve_live_identity(token_identity)
+    if identity is None:
+        await accept_and_close(
+            websocket, CLOSE_UNAUTHORIZED, "account deactivated")
+    return identity
+
+
+async def accept_and_close(
+        websocket: WebSocket, code: int, reason: str) -> None:
+    try:
+        if websocket.application_state == WebSocketState.CONNECTING:
+            await websocket.accept()
+        await close_quietly(websocket, code, reason)
+    except Exception:
+        logger.debug("websocket_accept_close_failed", code=code, exc_info=True)
+
+
+async def close_quietly(
+        websocket: WebSocket, code: int, reason: str = "") -> None:
+    try:
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close(code=code, reason=reason)
+    except Exception:
+        logger.debug("websocket_close_failed", code=code, exc_info=True)
+
+
+async def serve_until_expiry(
+        websocket: WebSocket, identity: SocketIdentity,
+        receive_loop: Callable[[], Awaitable[None]]) -> None:
+    remaining = identity.expires_at - time.time()
+    if remaining <= 0:
+        await close_quietly(websocket, CLOSE_UNAUTHORIZED, "token expired")
+        return
+    timeout_cm = asyncio.timeout(remaining)
+    try:
+        async with timeout_cm:
+            await receive_loop()
+    except TimeoutError:
+        if not timeout_cm.expired():
+            raise
+        await close_quietly(websocket, CLOSE_UNAUTHORIZED, "token expired")
+
 
 MAX_CONNECTIONS_PER_USER = 20
 PRESENCE_HEARTBEAT_SECONDS = 60.0
@@ -133,21 +235,14 @@ class WebSocketManager:
                 await connection.close(code=1011)
         return sent
 
-    async def broadcast_many(
-            self, channels: Iterable[str], envelope: WebSocketEnvelope[Any], *,
-            cross_replica: bool = False) -> int:
-        channel_list = list(dict.fromkeys(channels))
-        text = envelope.model_dump_json()
-        sent = await self._deliver_local(channel_list, text)
-        if cross_replica:
-            await _publish_fanout(channel_list, text)
-        return sent
-
     async def broadcast(
             self, channel: str, envelope: WebSocketEnvelope[Any], *,
             cross_replica: bool = False) -> int:
-        return await self.broadcast_many([channel], envelope,
-                                         cross_replica=cross_replica)
+        text = envelope.model_dump_json()
+        sent = await self._deliver_local([channel], text)
+        if cross_replica:
+            await _publish_fanout([channel], text)
+        return sent
 
     async def deliver_remote(self, raw: str) -> int:
         try:
@@ -163,6 +258,16 @@ class WebSocketManager:
 
 
 manager = WebSocketManager()
+
+
+async def acquire_or_close(websocket: WebSocket, user_id: str) -> bool:
+    try:
+        manager.acquire_user(user_id)
+    except ConnectionLimitExceeded:
+        await accept_and_close(
+            websocket, CLOSE_TOO_MANY_CONNECTIONS, "too many connections")
+        return False
+    return True
 
 
 async def _publish_fanout(channels: list[str], text: str) -> None:

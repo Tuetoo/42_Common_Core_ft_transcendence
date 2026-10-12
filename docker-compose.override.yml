@@ -2,13 +2,10 @@
 # the services run from the `development` image stage with the source
 # bind-mounted, so a code change needs `docker compose restart <service>`.
 #
-# `command` is set explicitly on purpose: uvicorn runs WITHOUT --reload.
-# A reload watches the whole /app tree, so editing any file (even a script
-# the app never imports) would restart the service and kill in-progress
-# work: background analyses, WebSocket connections and in-memory Yjs rooms.
-# --proxy-headers: request.client / scheme come from the gateway's
-# X-Forwarded-* headers (the services are only reachable inside the Docker
-# network, so trusting every forwarder is safe).
+# The `development` stage's CMD runs uvicorn WITHOUT --reload: a reload
+# watches the whole /app tree, so editing any file would restart the
+# service and kill in-progress work (background analyses, WebSocket
+# connections, in-memory Yjs rooms).
 
 services:
   auth-service:
@@ -18,7 +15,6 @@ services:
       - ./shared:/app/shared
       - ./services/auth-service:/app
       - avatar_data:/app/data/avatars
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
 
   core-service:
     build:
@@ -26,7 +22,6 @@ services:
     volumes:
       - ./shared:/app/shared
       - ./services/core-service:/app
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
 
   ai-service:
     build:
@@ -36,4 +31,3 @@ services:
       - ./services/ai-service:/app
     environment:
       LOG_LEVEL: "DEBUG"
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, TypeVar
 import structlog
-from ai.ingestion.source_failures import (report_source_failure,
-                                          track_source_failures)
+from ai.ingestion.digests import (report_source_failure,
+                                  track_source_failures)
 from ai.knowledge.filing_records import store_filing_records
 from ai.knowledge.filing_summary import (FilingTooLargeError,
                                          extract_filing_records,

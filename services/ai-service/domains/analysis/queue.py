@@ -260,7 +260,7 @@ async def check_admission(
 async def fail_stale_analyses_on_startup() -> int:
     from database import SessionLocal
     from domains.analysis.repository import AnalysisRepository
-    from shared.events_registry import EventName
+    from shared.events import EventName
 
     reason = AnalysisFailureReason.SERVICE_RESTART.value
     async with SessionLocal() as session:

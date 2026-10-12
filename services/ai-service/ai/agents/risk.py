@@ -8,7 +8,7 @@ from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, has_successful_tool_evidence,
+                            combine_context, has_successful_tool_evidence,
                             is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.knowledge.filing_records import (LEGAL_STATUSES, TRANSACTION_STATUSES,
@@ -17,7 +17,6 @@ from ai.knowledge.filing_records import (LEGAL_STATUSES, TRANSACTION_STATUSES,
                                          record_title)
 from ai.knowledge.recycled_content import (prior_note_similarity,
                                            split_agent_note_passages)
-from ai.memory.procedural import combine_context
 from ai.rag.visibility import visibility_for_state
 from ai.tools.base import NON_EVIDENTIAL_TOOLS
 from ai.tools.filing_tool import SearchFilingsTool
@@ -27,7 +26,7 @@ from ai.tools.research_archive_tool import SearchResearchArchiveTool
 from ai.tools.risk_tool import GetVolatilityAndDrawdownTool
 from ai.tools.web_search_tool import WebSearchTool
 from config import settings
-from shared.enums import AgentStatus, DocumentCategory
+from shared.enums import DocumentCategory
 
 logger = structlog.get_logger(__name__)
 
@@ -839,22 +838,13 @@ class RiskAgent(BaseAgent):
                 "risk.final_answer_repeats_prior_note", ticker=state.ticker,
                 similarity=round(copy_ratio or 0.0, 3))
             disclosures.append(RISK_REUSED_DISCLOSURE)
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None,
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
             verification_warnings=verification_warnings,
-            recycled=reused_prior_note)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+            recycled=reused_prior_note, raw_output={
                 "risk_events": sourced_events,
                 "final_answer": result.final_answer,
                 "injected_context": injected_context,
-                "finish_meta": result.finish_meta,
                 "reused_prior_note": reused_prior_note,
                 "prior_note_similarity": (
                     round(copy_ratio, 3) if copy_ratio is not None else None),

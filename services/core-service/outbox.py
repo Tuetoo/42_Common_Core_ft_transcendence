@@ -6,12 +6,15 @@ from uuid import UUID, uuid4
 import structlog
 from config import settings
 from database import SessionLocal
-from outbox_model import EventOutbox
 from prometheus_client import Gauge
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import (DateTime, Index, Integer, String, Text, delete, func,
+                        select, text, update)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Mapped, mapped_column
+from shared.database import Base, UUIDPKMixin
 from shared.events import publish_durable_event
-from shared.metrics import get_or_create
+from shared.logging import get_or_create
 
 logger = structlog.get_logger(__name__)
 
@@ -25,6 +28,24 @@ OUTBOX_UNPUBLISHED = get_or_create(
     Gauge, "alphamind_outbox_unpublished_events",
     "Durable events written to core.event_outbox and not yet published to "
     "Redis (updated by the outbox dispatcher).")
+
+
+class EventOutbox(Base, UUIDPKMixin):
+    __tablename__ = "event_outbox"
+    __table_args__ = (
+        Index(
+            "ix_event_outbox_unpublished", "created_at",
+            postgresql_where=text("published_at IS NULL")), )
+
+    event_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 @dataclass(frozen=True)

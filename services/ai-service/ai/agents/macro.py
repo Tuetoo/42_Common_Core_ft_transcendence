@@ -3,23 +3,22 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 import structlog
-from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check,
                                      reported_number_issue)
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            derive_agent_quality, is_successful_tool_entry,
-                            prefetch_tool_call, prefetch_tool_calls)
+                            combine_context, flag_unresolved_issue,
+                            is_successful_tool_entry, prefetch_tool_call,
+                            prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.knowledge.recycled_content import recycled_share
-from ai.memory.procedural import combine_context
 from ai.rag.visibility import visibility_for_state
 from ai.tools.macro_tool import YOY_MIN_LOOKBACK_DAYS, GetMacroIndicatorsTool
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
 from ai.tools.web_search_tool import WebSearchTool
 from config import settings
-from shared.enums import AgentStatus, DocumentCategory
+from shared.enums import DocumentCategory
 
 logger = structlog.get_logger(__name__)
 
@@ -309,30 +308,17 @@ class MacroAgent(BaseAgent):
                 "macro.summary_near_duplicate_of_retrieved_note",
                 ticker=state.ticker, **reuse_measures)
             disclosures.append(MACRO_REUSED_DISCLOSURE)
-        if result.unresolved_finish_validation_issue is not None:
-            logger.warning(
-                "macro.unresolved_finish_issue_after_retries",
-                ticker=state.ticker,
-                issue=result.unresolved_finish_validation_issue)
-            reason = (
-                f"{result.unresolved_finish_validation_issue} -- this was not "
-                "corrected even after being flagged -- treat the rate "
-                "figures below as unverified until manually re-checked "
-                "against this run's live FRED data.")
-            summary = wrap_verification_warning(reason, summary)
-            verification_warnings.append(reason)
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None,
+        summary = flag_unresolved_issue(
+            result, summary, verification_warnings,
+            event="macro.unresolved_finish_issue_after_retries",
+            ticker=state.ticker, consequence=(
+                " -- this was not corrected even after being flagged -- treat "
+                "the rate figures below as unverified until manually "
+                "re-checked against this run's live FRED data."))
+        return self.completed_output(
+            result, feedback=feedback, summary=summary,
             verification_warnings=verification_warnings,
-            recycled=reused_prior_note)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
-                "verification_warnings": verification_warnings,
+            recycled=reused_prior_note, raw_output={
                 "live_fred": {
                     s.metric: ({
                         "value": readings[s.series_id].value,
@@ -341,7 +327,6 @@ class MacroAgent(BaseAgent):
                     for s in _LIVE_SERIES
                 },
                 "final_answer": result.final_answer,
-                "finish_meta": result.finish_meta,
                 "reused_prior_note": reused_prior_note,
                 "reuse_measures": reuse_measures,
                 "disclosures": disclosures

@@ -93,7 +93,8 @@ whom are the one exception).
 | `document:upload` | document upload, rename, delete | - | yes | yes | yes |
 | `note:write` | notes, collaborative editing | - | yes | yes | yes |
 | `comment:write` | comments | - | yes | yes | yes |
-| `organization:create` | create organizations, send invitations | - | yes | yes | yes |
+| `organization:create` | create, change and delete organizations, manage members, send and revoke invitations | - | yes | yes | yes |
+| `connection:write` | send and accept friend requests | - | yes | yes | yes |
 | `api_key:manage` | create, change, revoke API keys | - | yes | yes | yes |
 | `rag:ask` | RAG assistant (`/api/v1/rag/*`) | - | yes | yes | yes |
 | `content:moderate` | hide/unhide/delete anyone's notes and comments | - | - | yes | yes |
@@ -102,8 +103,8 @@ whom are the one exception).
 | `site:stats` | site statistics, analytics `scope=all` | - | - | - | yes |
 
 A guest is read-only: they can still read everything shared with them,
-manage their own account (profile, password, 2FA, friends) and accept an
-organization invitation. An unknown role has no permissions (fail closed).
+manage their own account (profile, password, 2FA), remove connections,
+leave organizations and accept an organization invitation. An unknown role has no permissions (fail closed).
 The first admin is created on the command line (see Administration below).
 
 **Live role and active check** (`shared/user_state.py`): an access token
@@ -268,10 +269,11 @@ organization's open invitations for the same email and removes its
 expired open invitations; accepted rows are kept. Replacing an open admin
 invitation is owner-only, like revoking it (an admin gets 403).
 
-Creating an organization and sending an invitation need
-`organization:create` (a guest gets 403); a guest may still accept an
-invitation. Accepting an invitation that grants the OWNER role returns
-**409** (ask for a new invitation). Create, update,
+Creating, changing and deleting an organization, removing a member,
+changing a member's role, and sending or revoking an invitation need
+`organization:create` (a guest gets 403); a guest may still leave an
+organization and accept an invitation. Organization names are stripped of
+leading and trailing spaces and must not be blank (422). Create, update,
 delete, member removed/left, role change, invitation and accept publish
 `organization.*` events after the commit, which core-service turns into
 notifications (§6).
@@ -287,7 +289,9 @@ DELETE /api/v1/connections/{connection_id}
 
 A block records who blocked; only the blocker can remove it, and
 the blocked user can neither delete it nor send a new request. Online status
-is shown only for accepted connections.
+is shown only for accepted connections. Sending and accepting need
+`connection:write` (a guest gets 403); blocking and `DELETE` (remove,
+decline, cancel, unblock) stay open to guests.
 
 Sending a request, accepting one, and removing an accepted
 friend publish `friend.requested` / `friend.accepted` / `friend.removed`
@@ -710,7 +714,7 @@ the user's `user:{id}` WebSocket channel. Rule: every create, update and
 delete a user performs notifies that user, and an action that affects
 someone else also notifies that person (never twice for one action).
 core-owned actions notify in-process after the commit
-(`domains/notification/actions.py::notify_after_commit` from a route,
+(`domains/notification/service.py::notify_after_commit` from a route,
 `notify_user(s)` from an event handler; commits, delivers and never
 raises); auth and ai actions arrive as events (§6).
 
@@ -757,6 +761,9 @@ DELETE /api/v1/public/watchlists/{watchlist_id}/items/{ticker}
 ```
 
 POST returns 201 and DELETE returns 204 (same as the JWT routes).
+Swagger (`/docs/core/`) declares the `X-API-Key` header as a security
+scheme, so its "Authorize" button sends the key with "Try it out"; the
+middleware in `apikeys.py` still does the actual check.
 At most 10 active keys per user; a key's per-minute limit defaults to and is
 capped by `PUBLIC_API_RATE_LIMIT_PER_MINUTE`, and the limit also applies per
 owner across all of their keys (fixed one-minute windows). Revoking a key
@@ -767,7 +774,7 @@ before the revoke can then keep the key working, for at most 30 seconds.
 Over the limit is **429**
 `rate_limited` with `Retry-After` (seconds to the next window); if Redis
 is unavailable the limiter lets the request through (logged), the same
-shared implementation as auth-service's limits (`shared/rate_limit.py`).
+shared implementation as auth-service's limits (`shared/redis.py`).
 
 `PUT .../holdings/{holding_id}` records `adjustment`
 transactions like the JWT route and returns `HoldingAdjustmentRead`
@@ -803,7 +810,11 @@ sockets are also closed when the token expires), 4403 (forbidden), 4400
 user online in auth-service; closing their last socket marks them offline.
 
 A deactivated or deleted account is refused
-with 4401 (live account state, same rule as HTTP). Every push reaches each
+with 4401 (live account state, same rule as HTTP). Open sockets follow
+access changes: on a role, deactivation, deletion or organization-membership
+event, a socket of a deactivated or deleted account is closed with 4401 and
+a socket whose channel the user can no longer read with 4403 (a failed
+check leaves it open). Every push reaches each
 socket at most once; a user's notifications arrive on every one of their
 `user:` sockets on any replica. Messages are `{"event": <event name>,
 "payload": <event payload>}`; the `analysis:{analysis_id}` channel
@@ -1056,8 +1067,11 @@ DELETE /api/v1/backtests/{backtest_id}
 removes the caller's own finished backtest (`completed` or `failed`) with all
 its results -> 204; another user's backtest is 404, one still `pending` or
 `running` is 409. `POST /api/v1/backtests/portfolio` needs at least two
-daily snapshots in the requested window (422 with the count otherwise; a new
-portfolio can be backtested after its second market close), and a run that
+daily snapshots in the requested window, counted from the first snapshot
+with a positive total value (422 with the count otherwise; a new
+portfolio can be backtested after its second market close; leading
+unfunded days are skipped, and without `start_date` the backtest starts on
+the first funded day), and a run that
 fails alignment names the days without a benchmark close (the newest daily
 bar can stay incomplete for hours after the close).
 
@@ -1080,7 +1094,7 @@ contract (`GET .../{backtest_id}` + `.../metrics`):
   window, the request fails fast with a real `422 ValidationAppError` —
   never a silent fall-back to a hypothetical trade.
 - `POST /api/v1/backtests/recommendation-replay`
-  (`ai/workflows/recommendation_replay_workflow.py`) — replays every
+  (`ai/workflows/backtest_workflow.py`) — replays every
   `RecommendationTier` of the caller's own analyses that actually reached
   `TRIGGERED` (a backtest without an owner replays every one), as a real chronological multi-ticker trade sequence.
   No request body fields beyond `benchmark_symbol`/`initial_capital` — the
@@ -1089,7 +1103,7 @@ contract (`GET .../{backtest_id}` + `.../metrics`):
   workflow counts only fills whose `triggered_at` falls inside
   that stored window.
 - `POST /api/v1/backtests/portfolio`
-  (`ai/workflows/portfolio_backtest_workflow.py`) — a real backtest of one
+  (`ai/workflows/backtest_workflow.py`) — a real backtest of one
   real portfolio's actual composition over time, sourced from
   `core.portfolio_snapshots` (a real daily NAV time series already written
   by the `market-close` scheduled job). It computes a time-weighted return
@@ -1386,7 +1400,7 @@ API).
 
 ## 6. Cross-service events (Redis pub/sub, not HTTP)
 
-Defined in `shared/events_registry.py::EventName` (owners in
+Defined in `shared/events.py::EventName` (owners in
 `EVENT_OWNERS`; payload shapes below and in
 `handbook/24-events.md` section 3.1). Plain pub/sub events
 are published via `shared/events.py::publish_cross_service` and consumed via

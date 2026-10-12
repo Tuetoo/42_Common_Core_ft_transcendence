@@ -74,13 +74,13 @@ in [chapter 16](16-ai-analysis-pipeline.md).
 `shared/enums.py::AgentRole` has the nine data roles plus `bull`
 and `bear` (the Supervisor, Judge and Reflection are graph nodes, not
 roles in that enum). The graph's generic
-node factory (`ai/agents/supervisor.py::AGENT_REGISTRY`) maps eight of them
+node factory (`ai/graph/nodes.py::AGENT_REGISTRY`) maps eight of them
 to classes: Market, News, Sentiment, Filing, Technical, Fundamental, Risk,
 Macro. Portfolio is built separately by `portfolio_node` because it needs
 a `portfolio_id`. Bull, Bear, Judge and Reflection have hand-written
 nodes. The supervisor node picks the others.
 
-`ai/agents/supervisor.py::select_agents` is pure code, no
+`ai/graph/nodes.py::select_agents` is pure code, no
 LLM:
 
 1. If `requested_agents` is given, it replaces the default set.
@@ -739,7 +739,7 @@ the tolerance of one allowed value.
 - **Tools:** `search_news` (lines carry the catalog field).
   `MAX_ITERATIONS = 4`. No prefetch.
 - **Ordering:** when News is selected, the graph runs Sentiment only
-  after News has finished (`ai/graph/edges.py::route_after_news`). This
+  after News has finished (`ai/graph/builder.py::route_after_news`). This
   also holds when Reflection retries News, alone or together with
   Sentiment: Sentiment then runs again after the retried News, so it
   always reads the current News summary, freshness signal and yield
@@ -992,7 +992,7 @@ the tolerance of one allowed value.
   changed on every retry: 68.2% -> 68.2% -> 66.8% in one case). Caught by
   the percentage check with a precise correction.
 
-### 3.16 Bull and Bear (`ai/agents/debate_side.py`, `debate_common.py`)
+### 3.16 Bull and Bear (`ai/agents/debate_common.py`)
 
 - **Purpose:** the strongest honest case for (Bull) and against (Bear),
   3-6 sentences, from the agents' evidence only.
@@ -1076,7 +1076,9 @@ the tolerance of one allowed value.
   (`{side}.ungrounded_figures`) the side writes once more with the list of
   figures (`DEBATE_MAX_REGENERATIONS = 1`, `{side}.combined_regeneration_done`);
   a regenerated draft that is still ungrounded is accepted and logged
-  (`{side}.final_draft_still_flagged`). There is no other LLM call and
+  (`{side}.final_draft_still_flagged`). If the regeneration call itself
+  fails (any `LLMError`), the first draft is kept, still flagged for
+  Reflection (`{side}.regeneration_failed_kept_draft`). There is no other LLM call and
   no other check: a Lite self-check of every draft would cost about 36
   calls per batch and gave more false than true positives when measured.
   Citations are the bracketed roles that
@@ -1501,6 +1503,7 @@ portfolio details.
 | `finish_checks.once_check_logged_only` | The same finding after the correction budget was spent: the answer was accepted. |
 | `finish_checks.internal_tokens_in_answer` | Record ids or tool labels in an answer (`rejected` says whether it went back). |
 | `bull.ungrounded_figures` / `bear.ungrounded_figures`, `*.final_draft_still_flagged` | A side's draft had figures with no match in the evidence; still flagged after the one regeneration. |
+| `bull.regeneration_failed_kept_draft` / `bear.regeneration_failed_kept_draft` | The one regeneration call failed (`attempt`, `error_type`, `error`, `ungrounded_figures`); the first draft is kept. |
 | `judge.ungrounded_figures`, `judge.ungrounded_figures_after_rewrite`, `judge.ungrounded_rewrite_failed` | The Judge figure check and its one rewrite. |
 | want the Judge's deciding factor, change basis or opposing points | Not stored, only logged: `bash scripts/logs.sh ai-service grep judge.deciding_factor` and `judge.opposing_points`, then filter by the analysis id. |
 | `portfolio.unverified_percentage_in_final_answer` | A percentage without a tool source survived. |
@@ -1682,9 +1685,9 @@ creating one writes data). Everything below is read-only.
 |---|---|
 | `services/ai-service/ai/agents/loop.py` | `BaseAgent`, `ReActAgentLoop`, `ScratchpadEntry`, prefetch, finish gates, peer-ticker tagging, `is_successful_tool_entry`, `tool_reported_error`, `derive_agent_quality`, `SCORE_UNRESOLVED`, `evidence_reference_text`. |
 | `services/ai-service/ai/agents/finish_checks.py` | `InternalTokenValidator`, `RejectOnceBudget`, the internal-token and own-evidence figure checks (`primary_reference_text`, `ungrounded_counts`), `reported_number_issue`. |
-| `services/ai-service/ai/agents/supervisor.py` | `AGENT_REGISTRY` (eight generic roles), `select_agents`, `DEFAULT_AGENTS_BY_TYPE`. |
+| `services/ai-service/ai/graph/nodes.py` | `AGENT_REGISTRY` (eight generic roles), `select_agents`, `DEFAULT_AGENTS_BY_TYPE`, `make_agent_node`. |
 | `services/ai-service/ai/agents/market.py` ... `portfolio.py` | The nine data agents with prompts and validators. |
-| `services/ai-service/ai/agents/debate_side.py`, `debate_common.py` | Debate sides (`DebateSideAgent`), the shared prompt rules, `format_evidence` and the code-built lines, `find_ungrounded_figures`. |
+| `services/ai-service/ai/agents/debate_common.py` | Debate sides (`DebateSideAgent`), the shared prompt rules, `format_evidence` and the code-built lines, `find_ungrounded_figures`. |
 | `services/ai-service/ai/agents/judge.py` | The Judge. |
 | `services/ai-service/ai/agents/reflection.py` | Reflection's mechanical and LLM checks. |
 | `services/ai-service/ai/agents/evidence_grounding.py` | Percentage grounding, warning banner, English detector. |

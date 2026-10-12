@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
-import rate_limit
 import security
 from config import settings
 from events_out import (MEMBERSHIP_EVENTS, PendingEvent,
@@ -18,10 +17,10 @@ from domains.organization.schema import (InvitationAcceptResult,
                                          OrganizationMemberRead,
                                          OrganizationRead, OrganizationUpdate)
 from shared.enums import OrganizationRole
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
-from shared.org_membership_cache import invalidate_membership_cache
+from shared.user_state import invalidate_membership_cache
 
 _MANAGER_ROLES = {OrganizationRole.OWNER, OrganizationRole.ADMIN}
 
@@ -207,7 +206,7 @@ class OrganizationService:
                 and requester_id != org.owner_id):
             raise PermissionDeniedError(
                 "Only the organization owner can invite admins.")
-        await rate_limit.hit(
+        await security.hit(
             "invite:org", str(org_id),
             limit=settings.RATE_LIMIT_INVITATIONS_PER_ORG,
             window=settings.RATE_LIMIT_INVITATIONS_WINDOW_SECONDS)
@@ -268,22 +267,14 @@ class OrganizationService:
 
     async def accept_invitation(
             self, token: str, current_user_id: UUID) -> InvitationAcceptResult:
-        try:
-            payload = security.decode_special_token(
-                token, security.ORGANIZATION_INVITATION_TOKEN_TYPE)
-        except security.SpecialTokenError as exc:
-            raise ValidationAppError(str(exc)) from exc
+        payload = security.decode_or_invalid(
+            token, security.ORGANIZATION_INVITATION_TOKEN_TYPE)
 
         invitation = await self.orgs.get_invitation_by_id(UUID(payload["sub"]))
         if invitation is None:
             raise NotFoundError("Invitation no longer exists.")
         if invitation.accepted_at is not None:
             raise ConflictError("This invitation has already been accepted.")
-        if invitation.role == OrganizationRole.OWNER:
-            raise ConflictError(
-                "This invitation grants the owner role, which can no longer "
-                "be given through an invitation. Ask the organization for a "
-                "new invitation.")
         if invitation.expires_at < datetime.now(UTC):
             raise ValidationAppError("This invitation has expired.")
 

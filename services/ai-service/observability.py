@@ -2,7 +2,7 @@ import contextlib
 from typing import Any, Protocol
 from prometheus_client import Counter, Gauge
 from shared.enums import AnalysisFailureReason
-from shared.metrics import get_or_create
+from shared.logging import get_or_create
 
 KNOWN_FAILURE_REASONS = frozenset(
     reason.value for reason in AnalysisFailureReason)

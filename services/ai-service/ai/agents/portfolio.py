@@ -8,11 +8,10 @@ from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check)
 from ai.agents.loop import (SCORE_UNRESOLVED, BaseAgent, ReActAgentLoop,
-                            ScratchpadEntry, derive_agent_quality,
-                            is_successful_tool_entry, prefetch_tool_call,
-                            prefetch_tool_calls)
+                            ScratchpadEntry, combine_context,
+                            derive_agent_quality, is_successful_tool_entry,
+                            prefetch_tool_call, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.memory.procedural import combine_context
 from ai.tools.portfolio_tool import (GetPortfolioCompositionTool,
                                      RecomputeScenarioTool)
 from shared.enums import AgentRole, AgentStatus

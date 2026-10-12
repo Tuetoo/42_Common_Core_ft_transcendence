@@ -341,19 +341,12 @@ def google_batches(texts: list[str]) -> list[list[str]]:
     return batches
 
 
-async def google_embed_texts_with(
-        texts: list[str], purpose: EmbeddingPurpose, *, model: str,
-        dimensions: int) -> list[list[float]]:
+async def _google_embed_texts(texts: list[str],
+                              purpose: EmbeddingPurpose) -> list[list[float]]:
     vectors: list[list[float]] = []
     for batch in google_batches(texts):
         vectors.extend(
             await google_embed_batch(
-                batch, purpose, model=model, dimensions=dimensions))
+                batch, purpose, model=settings.GOOGLE_EMBEDDING_MODEL,
+                dimensions=settings.GOOGLE_EMBEDDING_DIMENSIONS))
     return vectors
-
-
-async def _google_embed_texts(texts: list[str],
-                              purpose: EmbeddingPurpose) -> list[list[float]]:
-    return await google_embed_texts_with(
-        texts, purpose, model=settings.GOOGLE_EMBEDDING_MODEL,
-        dimensions=settings.GOOGLE_EMBEDDING_DIMENSIONS)

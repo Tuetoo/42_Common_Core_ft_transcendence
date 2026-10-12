@@ -128,7 +128,7 @@ class _FakeClient:
 
 @pytest.fixture
 def yjs_env(monkeypatch, mock_cross_service):
-    import api.yjs_websocket as yjs_ws
+    import api.websocket as yjs_ws
     import clients.auth_client as auth_client
     import yjs_relay
     from domains.research.service import NoteAccess
@@ -223,8 +223,8 @@ class _FakeSocket:
 
 
 def _session(user_id: str, *, can_write: bool):
-    import api.yjs_websocket as yjs_ws
-    from api.ws_common import SocketIdentity
+    import api.websocket as yjs_ws
+    from websocket_manager import SocketIdentity
     from domains.research.service import NoteAccess
 
     session = yjs_ws._YjsSession(
@@ -238,9 +238,10 @@ def _session(user_id: str, *, can_write: bool):
 
 @pytest.fixture
 def note_access(monkeypatch):
-    import api.yjs_websocket as yjs_ws
+    import api.websocket as yjs_ws
 
     monkeypatch.setattr(yjs_ws, "_sessions_by_user", {})
+    monkeypatch.setattr(yjs_ws, "_channel_sessions_by_user", {})
     access: dict[UUID, tuple[bool, bool]] = {}
 
     async def _access(note_id, identity):
@@ -334,7 +335,7 @@ class _Committed:
 @pytest.fixture
 async def committed_outbox_rows(_schema_ready):
     from database import SessionLocal
-    from outbox_model import EventOutbox
+    from outbox import EventOutbox
     from sqlalchemy import delete
 
     made = _Committed([])
@@ -363,7 +364,7 @@ async def committed_outbox_rows(_schema_ready):
 
 async def _rows_by_id(ids):
     from database import SessionLocal
-    from outbox_model import EventOutbox
+    from outbox import EventOutbox
     from sqlalchemy import select
 
     async with SessionLocal() as session:
@@ -376,7 +377,7 @@ async def _rows_by_id(ids):
 
 @pytest.fixture
 def notified_user_calls(monkeypatch):
-    from domains.notification import actions
+    from domains.notification import service as actions
 
     calls: list[dict[str, Any]] = []
 
@@ -405,16 +406,6 @@ def event_broadcasts(monkeypatch):
 
     monkeypatch.setattr(event_listener.manager, "broadcast", _broadcast)
     return sent
-
-
-@pytest.fixture
-def no_sentiment_analysis(monkeypatch):
-    import clients.ai_client as ai_client
-
-    async def _none(text, kind):
-        return None
-
-    monkeypatch.setattr(ai_client, "analyze_sentiment", _none)
 
 
 def _types(calls, user_id=None):
@@ -464,8 +455,8 @@ class TestConnectionManager:
         await manager.connect(tab_a, analysis)
         await manager.connect(dead, user)
 
-        sent = await manager.broadcast_many([user, analysis, user],
-                                            _envelope())
+        sent = await manager._deliver_local(
+            [user, analysis, user], _envelope().model_dump_json())
         assert sent == 2
         assert len(tab_a.sent) == 1 and len(tab_b.sent) == 1
         assert dead not in manager._connections[user]
@@ -697,7 +688,7 @@ class TestWebSocketEndpoints:
 
     async def test_deactivated_user_refused_and_live_role_used(
             self, yjs_env, monkeypatch):
-        import api.ws_common as ws_common
+        import websocket_manager as ws_common
         import main
         from fastapi.testclient import TestClient
         from shared.user_state import UserState
@@ -973,7 +964,7 @@ class TestNotificationService:
 
         from database import SessionLocal
         from sqlalchemy import func, select
-        from domains.notification import actions
+        from domains.notification import service as actions
         from domains.notification.model import Notification
 
         preferences: dict = {"in_app": False, "email": True, "websocket": True}
@@ -1361,7 +1352,7 @@ class TestNotificationEvents:
     async def test_event_handlers_exist_and_claims_dedupe_replicas(
             self, notified_user_calls, _schema_ready, monkeypatch):
         import event_listener
-        from shared.events_registry import EVENT_OWNERS, EventName
+        from shared.events import EVENT_OWNERS, EventName
 
         handled = set(event_listener._PUBSUB_HANDLERS)
         for event, owner in EVENT_OWNERS.items():
@@ -1702,7 +1693,7 @@ class TestYjsCollaboration:
         worker.kill()
         assert worker._process is None
 
-        import api.yjs_websocket as yjs_ws
+        import api.websocket as yjs_ws
         import main
         import yjs_relay
         from fastapi.testclient import TestClient
@@ -1768,14 +1759,15 @@ class TestYjsCollaboration:
                         c.send_bytes(payload)
                         assert _bytes_close_code(c) == 1008
 
-                original_limit = yjs_relay.max_update_bytes
-                monkeypatch.setattr(yjs_relay, "max_update_bytes", lambda: 64)
+                original_limit = yjs_relay.settings.YJS_MAX_UPDATE_BYTES
+                monkeypatch.setattr(
+                    yjs_relay.settings, "YJS_MAX_UPDATE_BYTES", 64)
                 with client.websocket_connect(url + token_c) as c:
                     c.receive_bytes()
                     c.send_bytes(_update("x" * 200))
                     assert _bytes_close_code(c) == 1008
                 monkeypatch.setattr(
-                    yjs_relay, "max_update_bytes", original_limit)
+                    yjs_relay.settings, "YJS_MAX_UPDATE_BYTES", original_limit)
 
                 second = editor.type(" world")
                 a.send_bytes(second)
@@ -1817,7 +1809,7 @@ class TestYjsCollaboration:
             with client.websocket_connect(url + stranger_token) as s:
                 assert _bytes_close_code(s) == 4403
 
-        import api.yjs_websocket as yjs_ws
+        import api.websocket as yjs_ws
 
         writer, writer_token = _token()
         member, member_token = _token()
@@ -1880,6 +1872,21 @@ class TestYjsCollaboration:
             await task
         assert marked and set(marked) == {"n1"}
 
+        unmarked: list[str] = []
+
+        async def _unmark(note_id):
+            unmarked.append(note_id)
+
+        async def _load_fails(note_id):
+            raise ConnectionError("db down")
+
+        monkeypatch.setattr(yjs_relay, "_mark_room_inactive", _unmark)
+        monkeypatch.setattr(yjs_relay, "_load_snapshot", _load_fails)
+        with pytest.raises(ConnectionError):
+            await yjs_relay.relay.connect(_FakeSocket(), "n-broken")
+        assert unmarked == ["n-broken"]
+        assert "n-broken" not in yjs_relay.relay._rooms
+
         import shared.events as events
 
         applied: list[tuple[str, bytes]] = []
@@ -1910,7 +1917,7 @@ class TestYjsCollaboration:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        import api.yjs_websocket as yjs_ws
+        import api.websocket as yjs_ws
 
         user = str(uuid4())
         revoked = _session(user, can_write=True)
@@ -1941,6 +1948,35 @@ class TestYjsCollaboration:
         session = _session(user, can_write=True)
         assert await yjs_ws.recheck_user_sessions(user, reason="test") == 0
         assert session.websocket.closed is None and session.access.can_write
+
+        from websocket_manager import SocketIdentity
+
+        def _channel(user_id, channel):
+            session = yjs_ws._ChannelSession(
+                websocket=_FakeSocket(), channel=channel,
+                identity=SocketIdentity(user_id=user_id, expires_at=4e9))
+            yjs_ws._register(yjs_ws._channel_sessions_by_user, session)
+            return session
+
+        async def _allowed(channel, requester_id):
+            if channel == "document:down":
+                raise ConnectionError("db down")
+            return not channel.startswith("analysis:")
+
+        monkeypatch.setattr(yjs_ws, "_channel_allowed", _allowed)
+        user = str(uuid4())
+        own = _channel(user, f"user:{user}")
+        analysis = _channel(user, "analysis:a1")
+        unknown = _channel(user, "document:down")
+        assert await yjs_ws.recheck_user_sessions(user, reason="test") == 1
+        assert analysis.websocket.closed == (
+            4403, "access to this channel was revoked")
+        assert own.websocket.closed is None
+        assert unknown.websocket.closed is None
+        assert await yjs_ws.recheck_user_sessions(
+            user, reason="test", deactivated=True) == 2
+        assert own.websocket.closed == (4401, "account deactivated")
+        assert user not in yjs_ws._channel_sessions_by_user
 
     async def test_room_saves_and_failed_sends(self, monkeypatch):
         import y_py as Y

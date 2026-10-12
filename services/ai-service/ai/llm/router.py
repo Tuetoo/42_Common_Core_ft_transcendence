@@ -10,15 +10,17 @@ from ai.llm.base import (ConcurrencyGate, LLMConfigError, LLMError,
                          LLMInvalidRequestError, LLMMessage,
                          LLMNonEnglishOutputError, LLMProviderAdapter,
                          LLMProviderTimeoutError, LLMRateLimitError,
-                         LLMRequestError, LLMResponse,
-                         LLMServerOverloadedError, LLMTier,
+                         LLMRequestError, LLMRequestTimeoutError,
+                         LLMResponse, LLMServerOverloadedError, LLMTier,
                          rate_limit_backoff_seconds, request_pacer)
 from ai.llm.google_provider import (GOOGLE_LITE_COOLDOWN_DEFAULT_WAIT_SECONDS,
                                     GoogleAdapter, google_is_lite_model,
                                     google_model_confirmed_overloaded,
                                     google_model_pool_exhausted,
                                     google_model_recently_timed_out,
-                                    google_pool_cooldown)
+                                    google_model_timeout_wait,
+                                    google_pool_cooldown,
+                                    google_server_error_wait)
 from ai.llm.mistral_provider import MistralAdapter, mistral_key_count
 from ai.llm.openai_provider import OpenAIAdapter
 from config import settings
@@ -28,7 +30,7 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_SECONDS = 0.5
 
-_GOOGLE_LITE_TIMEOUT_RETRIES = 1
+_GOOGLE_TIMEOUT_RETRIES = 1
 _GOOGLE_LITE_COOLDOWN_JITTER_SECONDS = 3.0
 
 
@@ -37,11 +39,12 @@ def router_retry_limit(
         retries: int) -> int:
     if isinstance(exc, LLMInvalidRequestError):
         return 0
-    if provider_name == "google" and google_is_lite_model(model):
-        if isinstance(exc, LLMRateLimitError):
-            return 0
-        if isinstance(exc, LLMProviderTimeoutError):
-            return min(retries, _GOOGLE_LITE_TIMEOUT_RETRIES)
+    if provider_name != "google":
+        return retries
+    if isinstance(exc, LLMProviderTimeoutError):
+        return min(retries, _GOOGLE_TIMEOUT_RETRIES)
+    if google_is_lite_model(model) and isinstance(exc, LLMRateLimitError):
+        return 0
     return retries
 
 
@@ -190,6 +193,51 @@ def tier_model_chain(tier: LLMTier, provider: str | None = None) -> list[str]:
     return [primary] if fallback is None else [primary, fallback]
 
 
+async def chain_model_wait(model: str) -> tuple[float, str]:
+    wait, scale = await google_pool_cooldown(model)
+    if wait > 0:
+        return wait, scale
+    server_wait = await google_server_error_wait(model)
+    if server_wait > 0:
+        return server_wait, "server_error"
+    timeout_wait = await google_model_timeout_wait(model)
+    return (timeout_wait, "timeout") if timeout_wait > 0 else (0.0, "")
+
+
+async def chain_capacity(chain: list[str]) -> tuple[float, str, str] | None:
+    waits: list[tuple[float, str, str]] = []
+    for model in chain:
+        if await google_model_pool_exhausted(model):
+            continue
+        wait, scale = await chain_model_wait(model)
+        if wait <= 0:
+            return None
+        waits.append((wait, scale, model))
+    if not waits:
+        return 0.0, "day", chain[0]
+    return min(waits)
+
+
+async def free_chain_model(tier: LLMTier) -> str | None:
+    if settings.LLM_DEFAULT_PROVIDER != "google":
+        return None
+    for model in tier_model_chain(tier):
+        if await google_model_pool_exhausted(model):
+            continue
+        wait, _ = await chain_model_wait(model)
+        if wait <= 0:
+            return model
+    return None
+
+
+async def capacity_aware_delay(tier: LLMTier,
+                               delay: float) -> tuple[float, str | None]:
+    if delay <= 0:
+        return 0.0, None
+    free = await free_chain_model(tier)
+    return (0.0, free) if free is not None else (delay, None)
+
+
 class LLMRouter:
 
     def __init__(
@@ -311,6 +359,7 @@ class LLMRouter:
                         rate_limited = True
                         if fallback and (
                                 _sent_nothing(failure)
+                                or isinstance(failure, LLMRequestTimeoutError)
                                 or await _known_unavailable(
                                     provider_name, model) is not None):
                             logger.warning(

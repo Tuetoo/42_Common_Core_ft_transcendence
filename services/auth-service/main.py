@@ -4,14 +4,13 @@ from pathlib import Path
 import structlog
 from api.internal import router as internal_router
 from config import settings
-from database import SessionLocal, engine
-from db_bootstrap import ensure_schema
+from database import SessionLocal, engine, ensure_schema
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
-from rate_limit import RateLimitedError, rate_limited_handler
+from security import RateLimitedError, rate_limited_handler
 from user_state_sync import mirror_all_users_safely
 from domains.admin.api import router as admin_router
 from domains.auth.api import router as auth_router
@@ -20,9 +19,8 @@ from domains.social.api import router as social_router
 from shared.database import check_database_connection
 from shared.exceptions import register_exception_handlers
 from shared.http_client import close_http_clients
-from shared.logging import configure_logging
+from shared.logging import RequestIdMiddleware, configure_logging
 from shared.redis import check_redis_connection, close_redis_connections
-from shared.request_id import RequestIdMiddleware
 
 logger = structlog.get_logger(__name__)
 

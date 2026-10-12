@@ -17,9 +17,9 @@ from ai.agents import filing as filing_module
 from ai.agents import risk as risk_module
 from ai.agents.filing import (prior_year_unusual_item_lines,
                               year_to_date_unusual_item_lines)
+from ai.graph import nodes as nodes_module
 from ai.ingestion.sec_edgar_filings import NewFiling
 from ai.knowledge import filing_records as frec
-from ai.knowledge import fresh_filings
 from ai.llm.base import LLMError, LLMResponse, LLMTier, LLMUsage
 from ai.providers import sec_edgar
 from ai.providers.sec_edgar import FilingPeriod, QuarterResults
@@ -400,7 +400,7 @@ class TestFilingIngestion:
     async def test_concurrent_ingests_of_one_ticker_share_one_run(
             self, monkeypatch):
         import asyncio
-        from ai.ingestion.source_failures import track_source_failures
+        from ai.ingestion.digests import track_source_failures
 
         listed: list[str] = []
         created: list[str] = []
@@ -538,8 +538,8 @@ class TestFilingIngestion:
                     "X_10-Q_2026-05-05.txt", "q1 text", "10-Q", "2026-05-05")
             ])
 
-        monkeypatch.setattr(fresh_filings, "ingest_new_filings", _ingest)
-        context = await fresh_filings.check_for_fresh_filing_content("X")
+        monkeypatch.setattr(nodes_module, "ingest_new_filings", _ingest)
+        context = await nodes_module.load_fresh_filing_context("X")
         assert context is not None
         assert "quarter text" in context
         assert "annual text" not in context and "q1 text" not in context
@@ -551,8 +551,8 @@ class TestFilingIngestion:
             return _Result(
                 [NewFiling("X_10-Q_a.txt", "only", "10-Q", "2026-08-05")])
 
-        monkeypatch.setattr(fresh_filings, "ingest_new_filings", _one)
-        context = await fresh_filings.check_for_fresh_filing_content("X")
+        monkeypatch.setattr(nodes_module, "ingest_new_filings", _one)
+        context = await nodes_module.load_fresh_filing_context("X")
         assert context is not None and "older new filing" not in context
 
 
@@ -2580,7 +2580,7 @@ class TestRagGoldenSet:
 
     async def test_generate_requested_uncovered_categories_or_raise(
             self, monkeypatch):
-        import ai.evaluation.golden_set as gs
+        import ai.evaluation.rag_recall as gs
 
         chunks = [
             _golden_chunk("n1", "news"),
@@ -2616,14 +2616,14 @@ class TestRagGoldenSet:
                 categories=frozenset({"news"}))
 
     def test_delay_survives_zero_mistral_keys(self, monkeypatch):
-        import ai.evaluation.golden_set as gs
+        import ai.evaluation.rag_recall as gs
 
         monkeypatch.setattr(gs, "mistral_key_count", lambda: 0)
         assert gs._inter_chunk_delay_seconds() == (
             gs._INTER_CHUNK_DELAY_SECONDS_PER_KEY)
 
     async def test_script_merges_new_chunks_and_rejects_unknown_category(self):
-        from ai.evaluation.golden_set import GoldenQAPair
+        from ai.evaluation.rag_recall import GoldenQAPair
 
         script = _load_golden_set_script()
 

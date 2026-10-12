@@ -132,7 +132,7 @@ Behind the gateway the services speak plain HTTP on the Docker network.
 uvicorn runs with `--proxy-headers --forwarded-allow-ips=*` (each
 service's `Dockerfile` and `docker-compose.override.yml`), so
 `request.client.host` is the address the gateway reports
-(`services/auth-service/rate_limit.py::client_ip` reads it). The gateway
+(`services/auth-service/security.py::client_ip` reads it). The gateway
 **replaces** `X-Forwarded-For` with `$remote_addr` instead of appending.
 uvicorn takes the left-most entry, so with an appended header a client
 could choose its own address and so dodge, or aim at someone else, every
@@ -481,10 +481,10 @@ Solution (`shared/user_state.py`, `services/auth-service/user_state_sync.py`):
   is a deliberate fail-open: an auth outage must not lock everyone out of
   core and ai.
 
-The same check runs for WebSockets (`services/core-service/api/ws_common.py`,
-at connect time) and for API keys (the key owner's state, `middleware.py`).
+The same check runs for WebSockets (`services/core-service/websocket_manager.py`,
+at connect time) and for API keys (the key owner's state, `apikeys.py`).
 Because a WebSocket is checked only when it connects, core-service also
-re-checks open Yjs editor sockets when auth-service publishes a role,
+re-checks open sockets (Yjs editors and `/ws/{channel}` channels) when auth-service publishes a role,
 deactivation, deletion or organization-membership event: the socket is
 closed (4401 or 4403) or made read-only at once
 ([25-realtime-yjs.md](25-realtime-yjs.md)). The analysis queue also checks
@@ -500,8 +500,8 @@ role names are mapped):
 
 | Role | Permissions |
 |---|---|
-| `guest` | none (read-only; can still manage their own account and accept invitations) |
-| `user` | `portfolio:write`, `analysis:create`, `document:upload`, `note:write`, `comment:write`, `organization:create`, `api_key:manage`, `rag:ask` |
+| `guest` | none (read-only; can still manage their own account, leave organizations, remove connections and accept invitations) |
+| `user` | `portfolio:write`, `analysis:create`, `document:upload`, `note:write`, `comment:write`, `organization:create`, `connection:write`, `api_key:manage`, `rag:ask` |
 | `moderator` | user's + `content:moderate`, `user:deactivate` |
 | `admin` | moderator's + `user:manage`, `site:stats` |
 
@@ -555,7 +555,7 @@ and see site statistics, but cannot change another user's portfolio.
 
 Organization membership is read from auth-service
 (`GET /internal/users/{id}/organizations`) through
-`shared/org_membership_cache.py`, cached 60 seconds per user; auth-service
+`shared/user_state.py`, cached 60 seconds per user; auth-service
 deletes the cache entry when a membership changes (once before its commit
 and once more after it, see [24-events.md](24-events.md) section 3.5).
 
@@ -592,18 +592,18 @@ answers 401 `Internal token not configured` (fail closed).
 | Where | Key | Limit | On failure of the store | Code |
 |---|---|---|---|---|
 | Gateway, `/api/v1/auth` | client address | 10 requests/s, burst 20, `nodelay` -> 429 | - | `infra/gateway/nginx.conf` (`auth_zone`) |
-| Login | per address / per email | 30 / 10 per 15 min | fail open | `services/auth-service/domains/auth/api.py`, `rate_limit.py` |
+| Login | per address / per email | 30 / 10 per 15 min | fail open | `services/auth-service/domains/auth/api.py`, `security.py` |
 | Registration | per address | 10 per hour | fail open | same |
 | Password reset request | per address / per email | 10 / 3 per hour | fail open | same |
 | Resend verification | per email | 3 per hour | fail open | same |
 | Invitations | per organization | 20 per hour | fail open | `domains/organization/service.py` |
-| 2FA failures | per user | 5 failures in 5 min -> 15 min lock | fail open | `rate_limit.two_factor_*` |
-| Public API (`/api/v1/public`) | per key and per key owner | key: its `rate_limit_per_minute` (at most 60); owner: 60 per minute across all keys | fail open | `services/core-service/middleware.py` |
+| 2FA failures | per user | 5 failures in 5 min -> 15 min lock | fail open | `security.two_factor_*` |
+| Public API (`/api/v1/public`) | per key and per key owner | key: its `rate_limit_per_minute` (at most 60); owner: 60 per minute across all keys | fail open | `services/core-service/apikeys.py` |
 | RAG assistant (`/api/v1/rag/ask`, `/ask/stream`) | per user | 10 per clock minute, 200 per UTC day | fail open | `services/ai-service/domains/rag/qa.py`, `check_rate_limit` |
 | Backtests (all three create routes) | per user | at most `BACKTEST_MAX_ACTIVE_PER_USER` (2) pending or running backtests -> 429 `rate_limit_exceeded` (log `backtest_rejected_limit`) | counted in PostgreSQL under a per-user advisory lock, so two concurrent creates cannot both pass | `services/ai-service/domains/backtest/api.py`, `repository.py::count_active_for_user` |
 
 auth-service and the public API share one counter, `fixed_window_hits` in
-`shared/rate_limit.py`: in one Redis transaction it runs `SET key 0 EX
+`shared/redis.py`: in one Redis transaction it runs `SET key 0 EX
 window NX`, `INCR`, `TTL`, so a key can never be left without an expiry.
 The 429 uses the project's error body and a `Retry-After` header
 (`rate_limited_response`). auth-service hashes emails and addresses into
@@ -646,7 +646,7 @@ gateway limit lives in nginx memory and needs no store.
   GET/HEAD), a deactivated owner's key gets 401 `account_deactivated`. An
   unknown owner state (Redis and auth down) is allowed and logged
   (`public_api.owner_state_unknown`).
-- `PublicAPIRateLimitMiddleware` (`middleware.py`) checks every
+- `PublicAPIRateLimitMiddleware` (`apikeys.py`) checks every
   `/api/v1/public/*` request, in this order: a CORS preflight (`OPTIONS`,
   which carries no key) passes through to the CORS middleware; missing key
   401 `missing_api_key`; unknown or revoked key 401 `invalid_api_key`;
@@ -678,7 +678,7 @@ gateway limit lives in nginx memory and needs no store.
   (`first_name`/`last_name` 100, `bio` 500), API key `name` 128, a RAG
   question 2000 characters (`MAX_QUESTION_CHARS`), usernames
   `^[A-Za-z0-9_.-]{3,32}$`, a 2FA code at most 16 characters.
-- Tickers: one rule for every service, `shared/tickers.py`:
+- Tickers: one rule for every service, `shared/schemas.py`:
   `TICKER_RE = ^[A-Z0-9.\-]{1,10}$` after strip and upper-case
   (`normalize_ticker`, ValueError -> 422).
 - Pagination: `page <= 100000` (`MAX_PAGE`) and `page_size <= 100`
@@ -686,8 +686,8 @@ gateway limit lives in nginx memory and needs no store.
 - Uploads: the gateway accepts bodies up to 25 MB
   (`client_max_body_size 25m`); core-service accepts research documents up
   to 20 MB (`MAX_UPLOAD_SIZE_BYTES`) with extensions `.pdf`, `.txt`, `.md`;
-  avatars up to 5 MB, and their real type is checked from the file's first
-  bytes, not only the declared Content-Type.
+  avatars up to 5 MB (checked in the browser too), and their real type is
+  checked from the file's first bytes, not only the declared Content-Type.
 - Yjs collaboration frames above `YJS_MAX_UPDATE_BYTES` (1 MiB) close the
   socket with code 1008.
 
@@ -698,7 +698,7 @@ with bound parameters (for example `text("SELECT pg_advisory_xact_lock(hashtext(
 Bound parameters are sent separately from the SQL, so user input is never
 parsed as SQL. The only f-string SQL in application code builds schema
 names from settings (`CREATE SCHEMA IF NOT EXISTS "{schema}"` in
-`shared/alembic_bootstrap.py`, and the test fixtures), never from request
+`shared/database.py`, and the test fixtures), never from request
 data.
 
 ### 3.15 CORS
@@ -1178,16 +1178,15 @@ or if any container could be compromised, you would add `requirepass`.
 | `shared/exceptions.py` | The `{"error": {...}}` envelope and the application error classes. |
 | `shared/permissions.py` | `Permission`, `ROLE_PERMISSIONS`, `permissions_for`, `has_permission`, `sorted_permissions`. |
 | `shared/user_state.py` | Live role/active state: `UserState`, `store_user_state`, `get_user_state`. |
-| `shared/rate_limit.py` | `fixed_window_hits`, `rate_limited_response`. |
+| `shared/redis.py` | `fixed_window_hits`, `rate_limited_response`. |
 | `shared/http_client.py` | Internal-token request hook, `internal_headers`. |
 | `shared/config.py` | Security settings and the startup checks for weak secrets. |
-| `shared/tickers.py` | The ticker rule. |
-| `services/auth-service/security.py` | bcrypt, token creation, special tokens, TOTP, Fernet encryption of stored TOTP secrets. |
+| `shared/schemas.py` | The ticker rule. |
+| `services/auth-service/security.py` | bcrypt, token creation, special tokens, TOTP, Fernet encryption of stored TOTP secrets; auth limits and 2FA lockout. |
 | `services/auth-service/domains/auth/service.py` | Login, refresh rotation and reuse detection, 2FA, OAuth. |
 | `services/auth-service/domains/auth/repository.py` | `claim_session_for_rotation`, `revoke_all_sessions`, `consume_totp_step`. |
-| `services/auth-service/rate_limit.py` | Auth limits and 2FA lockout. |
 | `services/auth-service/user_state_sync.py` | Writer side of the live state. |
-| `services/core-service/apikeys.py`, `api/apikeys_api.py`, `middleware.py` | API keys and the public API guard. |
+| `services/core-service/apikeys.py`, `api/apikeys_api.py` | API keys and the public API guard. |
 | `services/core-service/domains/portfolio/service.py` | `_require_readable`, `_require_owner`. |
 | `services/ai-service/deps.py` | `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
 | `services/ai-service/domains/rag/qa.py` | RAG ask rate limit. |

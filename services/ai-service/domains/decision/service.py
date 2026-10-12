@@ -25,7 +25,7 @@ from domains.decision.schema import (DecisionOutcomeRead, DecisionReviewRead,
                                      InvestmentDecisionCreate,
                                      InvestmentDecisionRead)
 from shared.enums import RecommendationAction, TierSide, TierStatus
-from shared.events_registry import EventName
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                ServiceUnavailableError, ValidationAppError)
 from shared.schemas import PaginatedResponse, PaginationParams

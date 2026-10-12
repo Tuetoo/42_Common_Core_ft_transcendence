@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 from ai.llm.base import (LLMConfigError, LLMMessage, LLMProviderAdapter,
                          LLMRequestError, LLMResponse, LLMUsage)
-from anthropic import AsyncAnthropic
+from anthropic import NOT_GIVEN, AsyncAnthropic
 from anthropic.types import MessageParam
 from config import settings
 
@@ -40,10 +40,12 @@ class AnthropicAdapter(LLMProviderAdapter):
             response_schema: dict[str, Any] | None = None) -> LLMResponse:
         client = _get_client()
         system, turns = _split_system_and_turns(messages)
+        timeout = NOT_GIVEN if timeout_seconds is None else timeout_seconds
         try:
             resp = await client.messages.create(
                 model=model, system=system, messages=turns,
-                temperature=temperature, max_tokens=max_tokens)
+                temperature=temperature, max_tokens=max_tokens,
+                timeout=timeout)
         except Exception as exc:
             raise LLMRequestError(
                 f"Anthropic completion failed for model {model!r}") from exc

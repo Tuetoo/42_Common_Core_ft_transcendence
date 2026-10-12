@@ -103,6 +103,14 @@ These steps were done once; repeat them only for a new host.
   run without `.env.docker` or the certificate. Compose restarts only
   services whose image or configuration changed; a restart of ai-service
   ends an analysis that is still running.
+- The scheduler keeps the state it had before the deploy. The host keeps
+  it stopped (the cloud and the local stack share the LLM and news
+  quotas). When it is not running, `deploy.sh` rebuilds its image but
+  leaves it out of `docker compose up`, so it never starts, not even for
+  a minute; `--wait` then waits for every other service. The script prints
+  `scheduler was not running before the deploy: kept stopped`. To start
+  it: `docker compose --env-file .env.docker up -d scheduler`. When it was
+  running, it is restarted like any other service.
 - Quick check after a deploy, from any machine:
   `curl -sk https://alphamind-research.duckdns.org:8443/healthz`. It
   answers `{"status":"ok"}` only when the frontend runs and its server

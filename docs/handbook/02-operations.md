@@ -607,7 +607,6 @@ checks the clock.
 | Script | Service | Writes? | What it does | Chapter |
 |---|---|---|---|---|
 | `set_system_role --email E --role guest\|user\|moderator\|admin [--dry-run]` | auth | yes | Sets a user's system role in the database and in the live Redis mirror, so issued tokens get it at once. How the first admin is made. Refuses an unknown email, a deleted account and demoting the last active admin (exit 1). | 11 |
-| `alembic_convert [--apply]` | auth, core, ai | with `--apply` | One-time conversion of a schema from the archived migration chain to the current baseline, in one transaction. Take a backup first. Exit 0 when converted, already converted, or preview done; 1 when refused. Kept only until no backup from before the baseline is left, then deleted. | 20 |
 | `delete_documents --id U [--id U ...] [--confirm]` | core | with `--confirm` | Deletes documents like the API does, but without the owner check (for documents owned by the ingestion user or the system): the row and a `document.deleted` outbox entry in one commit, the event published at once (or later by the outbox dispatcher), then the S3 object. Each document is committed on its own; ids already gone are reported as not found. | 12, 22 |
 | `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
 | `recompute_snapshots` (through `scripts/snapshots.sh`) | core | with `--confirm` | Rebuilds NAV snapshots from the ledger and official closes; see section 3.5. | 12 |
@@ -632,7 +631,7 @@ scripts' output, not a command.
 ### 3.6 Deploying a change: restart, rebuild or recreate
 
 In development the Python source is bind-mounted and uvicorn runs
-**without** `--reload` (`docker-compose.override.yml`; the reason is in
+**without** `--reload` (the Dockerfile development stage `CMD`; the reason is in
 [chapter 01](01-architecture.md), section 3.9). So nothing changes in a
 running service until you act. What to do depends on what changed:
 
@@ -654,18 +653,14 @@ running service until you act. What to do depends on what changed:
 | `docker-compose.yaml` | apply the new configuration | `docker compose --env-file .env.docker up -d` |
 
 **How do migrations run?** Not by hand. Each service's `lifespan` calls
-`db_bootstrap.ensure_schema` (for example
-`services/core-service/db_bootstrap.py`), which calls
-`shared/alembic_bootstrap.py::bootstrap_schema`:
+`database.ensure_schema` (for example
+`services/core-service/database.py`), which calls
+`shared/database.py::bootstrap_schema`:
 
 1. `CREATE SCHEMA IF NOT EXISTS "<schema>"`.
-2. If the schema still has a revision from the migration chain that was
-   archived (`migrations/archive/`), refuse to start and print the
-   one-time conversion command (`python -m scripts.alembic_convert`,
-   preview first, then `--apply`).
-3. If the schema has tables but no Alembic revision, refuse: nothing can
+2. If the schema has tables but no Alembic revision, refuse: nothing can
    tell what state those tables are in.
-4. Otherwise run `alembic upgrade head` (in a worker thread) and log
+3. Otherwise run `alembic upgrade head` (in a worker thread) and log
    `schema_bootstrap_complete` with `revision_before` and
    `revision_after`.
 
@@ -884,7 +879,7 @@ What it does, per ticker, one after another (`scripts/run_analysis.sh`):
 2. **Poll** `analysis_cli status <id>` every 5 seconds, for up to 3600
    seconds. The wide limit allows for a ticker whose newest filing is
    not summarised yet: it is summarised inline first (up to 300 s per
-   attempt, `_FILING_SUMMARY_TIMEOUT_SECONDS` in
+   attempt, at most 2 attempts, `_FILING_SUMMARY_TIMEOUT_SECONDS` in
    `ai/knowledge/filing_summary.py`). The analysis itself has a hard
    45-minute limit (`ANALYSIS_TIMEOUT_SECONDS=2700`) in ai-service. The
    script's limit does not count time the analysis spent waiting in the
@@ -1014,7 +1009,7 @@ make e2e PART=core ARGS="--verbose"
   deleted. It watches the `analysis:<id>` WebSocket and the admin's
   notifications. It cleans up its synthetic rows unless `--keep`.
 - **Only one e2e run at a time.** Both scripts take the Redis lock
-  `e2e:run_lock` (`shared/e2e_lock.py`, 45-minute expiry). After a run
+  `e2e:run_lock` (`shared/redis.py::acquire_e2e_lock`, 45-minute expiry). After a run
   was killed, remove the lock at once with `--break-lock`
   (`bash scripts/e2e.sh core --break-lock`).
 
@@ -1105,8 +1100,7 @@ make restore BACKUP=2026-10-01_0230 CONFIRM=yes  # DESTRUCTIVE real restore
 ```
 
 The real restore stops `auth-service core-service ai-service scheduler`,
-makes sure `objectstore` is running (`up -d --wait`; it is stopped
-instead for an older backup that holds `objectstore-data.tar.gz`), runs
+makes sure `objectstore` is running (`up -d --wait`), runs
 `restore.sh --yes` in the `restore` container (with `run --rm --build`),
 then `restore.sh --verify`, which compares the running data with the
 backup and stops the target on any difference, and finally `up -d`. What
@@ -1127,12 +1121,9 @@ backup and stops the target on any difference, and finally `up -d`. What
   bucket if needed and makes it identical to the folder through the S3
   API (`rclone sync --checksum`: missing or changed objects are uploaded,
   objects newer than the backup are deleted). Needs `objectstore`
-  running. An older backup with `objectstore-data.tar.gz` is extracted
-  into the `objectstore_data` volume instead (needs the service stopped;
-  `restore.sh` refuses while the S3 API answers). A backup made while the
-  stack still used MinIO holds `minio-data.tar.gz`, which SeaweedFS
-  cannot read: that part is skipped (and refused with `--only
-  objectstore`).
+  running. `restore.sh` reads only the current backup format 3; a backup
+  without an `objectstore/` folder skips this part (and is refused with
+  `--only objectstore`).
 - `avatars`: empties the `avatar_data` volume and extracts
   `avatars.tar.gz` (needs the volume read-write, which is why it runs in
   the `restore` container, not the scheduler; stop auth-service first).
@@ -1244,7 +1235,6 @@ disappears on a server.
 | `BACKUP_RETENTION_DAYS` | `7` | days of backups kept (newest 3 always kept) | `.env.example`, `infra/scheduler/backup.sh` |
 | `BACKUP_DIR` | `/backups` | backup folder inside scheduler/restore (host `./backups`) | `docker-compose.yaml` |
 | `AVATAR_DATA_DIR` | `/avatar-data` | avatar volume, read-only in the scheduler (backup), read-write in `restore` | `docker-compose.yaml` |
-| `OBJECTSTORE_DATA_DIR` | `/objectstore-data` | SeaweedFS data volume, mounted read-write in `restore` only, for backups that hold `objectstore-data.tar.gz` | `docker-compose.yaml` |
 | `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | from `.env.docker` | the object storage's S3 API, used by `backup.sh` and `restore.sh` through rclone | `infra/scheduler/s3-remote.sh` |
 | `RETENTION_DAYS` (log cleanup) | `14` | days of `./logs` kept | `infra/scheduler/logs-cleanup.sh` |
 | `TZ` (scheduler) | `America/New_York` | cron time zone | `infra/scheduler/Dockerfile` |
@@ -1252,7 +1242,7 @@ disappears on a server.
 | Docker log limit | `max-size: 20m`, `max-file: 5` | per container | `docker-compose.yaml` |
 | `ANALYSIS_TIMEOUT_SECONDS` | `2700.0` | hard limit of one analysis | `services/ai-service/config.py` |
 | `ANALYSIS_QUEUE_MAX_PENDING` | `50` | global cap of pending analyses (503) | `services/ai-service/config.py` |
-| e2e lock | key `e2e:run_lock`, 45 min | one e2e run at a time | `shared/e2e_lock.py` |
+| e2e lock | key `e2e:run_lock`, 45 min | one e2e run at a time | `shared/redis.py` |
 
 ## 5. Design decisions and why
 
@@ -1309,7 +1299,7 @@ a gateway failure). Every command in this chapter stands alone.
 | `required variable ... set GRAFANA_ADMIN_PASSWORD in .env.docker` (or `S3_ACCESS_KEY`) | Compose ran without `--env-file .env.docker`, or the value is empty. | Always use `docker compose --env-file .env.docker ...` or the make targets. Fill the value. |
 | The browser says the connection is not private | Self-signed certificate. | Accept it for localhost; use `curl -k`. Regenerate with `sh infra/gateway/gen-certs.sh --force` if expired (825 days). |
 | `https://localhost:8443` refuses the connection | The gateway is not running, usually because a service is not healthy. | `docker compose --env-file .env.docker ps`; `bash scripts/logs.sh <unhealthy service>`. |
-| A service restarts in a loop with `SchemaBootstrapError` | The schema is on the archived migration chain, or has tables but no Alembic revision. | Follow the printed command (`python -m scripts.alembic_convert`, preview, then `--apply`), or restore a backup. If the container keeps restarting, use `docker compose --env-file .env.docker run --rm <svc> python -m scripts.alembic_convert`. See [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 8. |
+| A service restarts in a loop with `SchemaBootstrapError` | The schema has tables but no Alembic revision, or a revision Alembic does not know ("Can't locate revision", for example a backup from before round 116). | Restore a backup made by the current code. See [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 8. |
 | ai-service fails at startup about the embedding provider or vector size | `EMBEDDING_PROVIDER`, `QDRANT_VECTOR_SIZE` and `QDRANT_COLLECTION_RESEARCH` do not match (`check_embedding_configuration`, `ensure_collection`). | Set the three together (see `.env.example`). |
 | A code change has no effect | No auto-reload. | `RESTART_ONLY=1 bash scripts/rebuild.sh <svc>`; then confirm a log line from the new code. |
 | A `.env.docker` change has no effect | `restart` keeps the old environment. | `docker compose --env-file .env.docker up -d --force-recreate <services>`, then read the value back inside the container. |
@@ -1561,8 +1551,8 @@ one exporter for about two minutes; no data is touched):
 | `shared/scheduled_jobs.py` | The 200/500 answer rule of the scheduler-triggered routes. |
 | `services/core-service/scripts/e2e_check.py` | Whole-stack end-to-end check. |
 | `services/core-service/scripts/recompute_snapshots.py` | NAV snapshot recompute. |
-| `shared/e2e_lock.py` | The e2e run lock. |
-| `shared/alembic_bootstrap.py`, `services/*/db_bootstrap.py` | Migrations at startup. |
+| `shared/redis.py` | The e2e run lock (`acquire_e2e_lock`). |
+| `shared/database.py`, `services/*/database.py` | Migrations at startup. |
 | `infra/gateway/gen-certs.sh` | Self-signed certificate. |
 | `infra/scheduler/crontab`, `entrypoint.sh`, `heartbeat.sh`, `call-job.sh`, `logs-cleanup.sh` | The scheduler and its jobs. |
 | `infra/scheduler/backup.sh`, `infra/scheduler/restore.sh`, `infra/scheduler/s3-remote.sh` | Backup, restore and verify (`--verify`); the rclone remote for the object storage's S3 API. |

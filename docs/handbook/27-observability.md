@@ -113,7 +113,7 @@ Two kinds of context fields are added automatically through
 `merge_contextvars`:
 
 - `request_id` on every line logged while an HTTP request is handled, in
-  all three services (`shared/request_id.py::RequestIdMiddleware`). It is
+  all three services (`shared/logging.py::RequestIdMiddleware`). It is
   the caller's `X-Request-ID` when that matches `[A-Za-z0-9._-]{1,64}`
   (the gateway or a client may set one), otherwise a new `uuid4` hex. The
   middleware stores it in `request.state.request_id`, binds it as a
@@ -335,7 +335,7 @@ Details:
 These files create a collector only if one with that name does not exist
 yet, so importing a module twice (as tests do) does not raise "Duplicated
 timeseries". core-service and ai-service both use
-`shared/metrics.py::get_or_create(cls, name, doc, labels)`. It looks the
+`shared/logging.py::get_or_create(cls, name, doc, labels)`. It looks the
 name up in the default registry, which lists a counter under both
 `<name>` and `<name>_total`.
 
@@ -790,7 +790,7 @@ it is configured in files under infra/ and tested where it can be."
 
 | File | What it holds |
 |---|---|
-| `shared/logging.py` | `configure_logging`: structlog processors, JSON renderer, noisy loggers |
+| `shared/logging.py` | `configure_logging`: structlog processors, JSON renderer, noisy loggers; `RequestIdMiddleware`, `X-Request-ID`; `get_or_create` for Prometheus collectors |
 | `shared/config.py` | `LOG_LEVEL`, `LOG_JSON` |
 | `docker-compose.yaml` | `x-logging` caps; prometheus, alertmanager, exporters, grafana, mailhog, vector services |
 | `docker-compose.override.yml` | `LOG_LEVEL: "DEBUG"` for ai-service in development |
@@ -806,8 +806,6 @@ it is configured in files under infra/ and tested where it can be."
 | `services/ai-service/observability.py` | analysis and LLM metrics |
 | `services/core-service/job_health.py` | job heartbeat and market-close gauges |
 | `services/core-service/outbox.py` | `alphamind_outbox_unpublished_events` |
-| `shared/metrics.py` | `get_or_create` for Prometheus collectors |
-| `shared/request_id.py` | `RequestIdMiddleware`, `X-Request-ID` |
 | `scripts/health.sh`, `scripts/logs.sh` | operator views of alerts, jobs and logs |
 | `Makefile` (`promtool-test`) | rule checks |
 

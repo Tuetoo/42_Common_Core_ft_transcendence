@@ -4,8 +4,6 @@ from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 import structlog
-from ai_events import (PORTFOLIO_SNAPSHOT_STRATEGY,
-                       RECOMMENDATION_REPLAY_STRATEGY)
 from clients.core_client import get_portfolio_snapshots
 from database import get_db
 from deps import ensure_portfolio_access, get_analysis_writer, get_current_user
@@ -14,7 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.repository import RecommendationTierRepository
 from domains.backtest.model import Backtest
 from domains.backtest.repository import BacktestRepository
-from domains.backtest.schema import (BacktestCreate, BacktestDetailRead,
+from domains.backtest.schema import (PORTFOLIO_SNAPSHOT_STRATEGY,
+                                     RECOMMENDATION_REPLAY_STRATEGY,
+                                     BacktestCreate, BacktestDetailRead,
                                      BacktestMetricsRead, BacktestRead,
                                      BenchmarkResultRead,
                                      PortfolioBacktestCreate,
@@ -155,7 +155,7 @@ async def create_recommendation_replay(
         end_date=datetime.now(UTC).date(),
         initial_capital=payload.initial_capital)
     await db.commit()
-    from ai.workflows.recommendation_replay_workflow import \
+    from ai.workflows.backtest_workflow import \
         run_recommendation_replay_workflow
 
     _start_background(run_recommendation_replay_workflow(str(backtest.id)))
@@ -188,11 +188,19 @@ async def create_portfolio_backtest(
             "trading days), so a new portfolio can be backtested after its "
             "second market close.")
     snapshots.sort(key=lambda s: s["snapshot_date"])
+    funded = next(
+        (i for i, s in enumerate(snapshots) if float(s["total_value"]) > 0),
+        len(snapshots))
+    if len(snapshots) - funded < 2:
+        raise ValidationAppError(
+            f"This portfolio has {len(snapshots) - funded} daily snapshot(s) "
+            "with a positive total value in the requested window, counted "
+            "from its first funded day; a backtest needs at least 2.")
     resolved_start = payload.start_date or date.fromisoformat(
-        snapshots[0]["snapshot_date"])
+        snapshots[funded]["snapshot_date"])
     resolved_end = payload.end_date or date.fromisoformat(
         snapshots[-1]["snapshot_date"])
-    initial_capital = float(snapshots[0]["total_value"])
+    initial_capital = float(snapshots[funded]["total_value"])
 
     await _ensure_backtest_capacity(db, user)
     backtest = await BacktestRepository(db).create(
@@ -200,7 +208,7 @@ async def create_portfolio_backtest(
         benchmark_symbol=payload.benchmark_symbol, start_date=resolved_start,
         end_date=resolved_end, initial_capital=initial_capital)
     await db.commit()
-    from ai.workflows.portfolio_backtest_workflow import \
+    from ai.workflows.backtest_workflow import \
         run_portfolio_backtest_workflow
 
     _start_background(

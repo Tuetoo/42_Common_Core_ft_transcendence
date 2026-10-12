@@ -143,7 +143,12 @@ export async function deleteNote(
   if (!NOTE_ID_RE.test(noteId)) return { error: "Invalid note id" };
   const accessToken = await getAccessToken();
   if (!accessToken) redirect("/login");
-  const res = await backendFetch(`/research/notes/${noteId}`, accessToken, { method: "DELETE" });
+  let res: Response;
+  try {
+    res = await backendFetch(`/research/notes/${noteId}`, accessToken, { method: "DELETE" });
+  } catch {
+    return { error: "Could not reach the server. Is the backend running?" };
+  }
   if (res.status === 401) redirect("/login");
   if (!res.ok && res.status !== 404) {
     return { error: await extractErrorMessage(res, "Could not delete the note") };

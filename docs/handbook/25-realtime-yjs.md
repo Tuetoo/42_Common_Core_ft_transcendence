@@ -21,7 +21,7 @@
  wss://localhost:8443/ws/document:<id>?token=...                               v
  wss://localhost:8443/ws/presence:<friend>?token=...           websocket_manager.manager
                                                                channel -> set of sockets
- wss://localhost:8443/ws/yjs/<note_id>?token=... --/ws--> api/yjs_websocket.py
+ wss://localhost:8443/ws/yjs/<note_id>?token=... --/ws--> api/websocket.py (yjs)
                                                           yjs_relay.relay
                                                           note_id -> YjsRoom (y_py.YDoc)
                                                                     |
@@ -74,11 +74,11 @@ ai-service and auth-service never hold WebSockets. They publish events
 ### 3.1 The JSON endpoint: `/ws/{channel}`
 
 File: `services/core-service/api/websocket.py::websocket_endpoint`.
-Shared helpers: `services/core-service/api/ws_common.py`.
+Shared helpers: `services/core-service/websocket_manager.py`.
 
 Step by step:
 
-1. **Token check** (`ws_common.authenticate`). The token is decoded with
+1. **Token check** (`websocket_manager.authenticate`). The token is decoded with
    `shared.security.decode_token`. It must be an access token
    (`type == "access"`), its `sub` must be a UUID, and `exp` must be a
    number. Otherwise: close **4401** "invalid or missing token".
@@ -127,7 +127,7 @@ handshake and never the application code. `accept_and_close` and
 `websocket_accept_close_failed` / `websocket_close_failed`), and
 `close_quietly` only closes a socket that is still connected.
 
-Close codes in one table (`ws_common.py`):
+Close codes in one table (`websocket_manager.py`):
 
 | Code | Name in code | When |
 |---|---|---|
@@ -209,9 +209,10 @@ would miss them.
 
 Delivery rules:
 
-- `broadcast_many(channels, envelope, cross_replica=False)` collects the
-  distinct sockets of all target channels first (`sockets_for`, keyed by
-  object id), so a socket is written at most once per push. It returns the
+- `broadcast(channel, envelope, cross_replica=False)` delivers through
+  `_deliver_local`, which collects the distinct sockets of all target
+  channels first (`sockets_for`, keyed by object id), so a socket is
+  written at most once per push. It returns the
   number of local sockets reached (logged as `sockets=` in
   `websocket_analysis_broadcast`).
 - `_deliver_local` sends to each socket. A socket whose `send_text` fails
@@ -266,7 +267,7 @@ accepted friends watching them.
 
 ### 3.6 Yjs collaborative editing: `/ws/yjs/{note_id}`
 
-Files: `services/core-service/api/yjs_websocket.py` (endpoint),
+Files: `services/core-service/api/websocket.py` (`yjs_router`, endpoint),
 `services/core-service/yjs_relay.py` (rooms, merge, snapshots),
 `services/core-service/domains/research/yjs_guard.py` (safe decoding).
 
@@ -402,7 +403,7 @@ reconnect. The call only reaches sockets on this replica (one core-service
 replica is assumed; an accepted limitation).
 
 **Rights change while a socket is open**
-(`api/yjs_websocket.py::recheck_user_sessions(user_id, *, reason,
+(`api/websocket.py::recheck_user_sessions(user_id, *, reason,
 deactivated=False)`). A WebSocket is authorized only when it connects. So
 that a removed, demoted or deactivated user does not keep editing until
 their token expires (up to 15 minutes), core-service re-checks the open Yjs
@@ -429,7 +430,12 @@ user:
    elsewhere).
 
 Closings are logged as `yjs_session_closed_on_access_change` (with `code`
-and `reason` = the event name). auth-service drops the membership cache and
+and `reason` = the event name). The same call also re-checks the user's
+`/ws/{channel}` sockets: 4401 "account deactivated" for a deactivated or
+deleted user, 4403 "access to this channel was revoked" when the channel
+check now fails (log `websocket_session_closed_on_access_change` with
+`channel`, `code`, `reason`); if the check itself fails, the socket stays
+open (`websocket_session_recheck_failed`). auth-service drops the membership cache and
 mirrors the new user state before it publishes, so the re-check sees the
 new rights. Like `close_note_sessions`, it reaches only sockets on this
 replica. JSON channel sockets (`/ws/{channel}`) are not re-checked: they
@@ -553,6 +559,9 @@ overwritten by the next snapshot. So:
   "now + `_ACTIVE_TTL_SECONDS` (90)", and sets the key to expire after 90 s.
 - `run_active_room_heartbeat` refreshes the markers every
   `ACTIVE_HEARTBEAT_SECONDS = 30`.
+- If loading the room fails (for example a database error),
+  `relay.connect` removes this replica's marker at once, so the note does
+  not answer a false 409 for up to 90 s.
 - When the room is evicted, `_mark_room_inactive` removes the member.
   A room is evicted only when nobody is connected and its edits are
   saved, so a dirty room keeps its marker.
@@ -622,8 +631,8 @@ Rooms live only in the process memory (`YjsRelay._rooms`). On a restart:
   the socket was down are not replayed. The `analysis.status` snapshot on
   reconnect covers the analysis channel; for notifications the client can
   read `GET /api/v1/notifications`.
-- This is also why the development override
-  (`docker-compose.override.yml`) runs uvicorn without `--reload`: copying
+- This is also why the development image stage (the Dockerfile
+  development `CMD`) runs uvicorn without `--reload`: copying
   a set of changed files makes an auto-reloading server restart several
   times in a few seconds, and every reload drops every WebSocket and
   in-memory Yjs room. A code change therefore needs
@@ -651,7 +660,7 @@ Rooms live only in the process memory (`YjsRelay._rooms`). On a restart:
 | `_REDIS_CHANNEL_PREFIX` | `"yjs:note:"` | cross-replica Yjs channel | `yjs_relay.py` |
 | `_VALIDATION_WORKERS` | `2` | decoder child processes | `domains/research/yjs_guard.py` |
 | `_VALIDATION_TIMEOUT_SECONDS` | `5.0` | decode time limit per update | `domains/research/yjs_guard.py` |
-| `_READ_ONLY_LOG_INTERVAL_SECONDS` | `30.0` | log throttle for dropped reader updates | `api/yjs_websocket.py` |
+| `_READ_ONLY_LOG_INTERVAL_SECONDS` | `30.0` | log throttle for dropped reader updates | `api/websocket.py` |
 | `proxy_read_timeout` (`/ws`) | `3600s` | gateway idle limit for a socket | `infra/gateway/nginx.conf` |
 
 ## 5. Design decisions and why
@@ -707,6 +716,7 @@ that exist nowhere else on the server.
 | Client closes immediately with 4401 | expired/invalid token, refresh token used instead of access, deactivated user | make a new token: `bash scripts/token.sh owner` |
 | 4403 on `analysis:` | not the owner; ai-service unreachable (any error means deny) | core log `websocket_channel_auth_denied` |
 | 4403 on an open Yjs socket | a moderator hid the note, it was deleted, or the user lost access (removed from the organization) | core log `yjs_note_sessions_closed` with `note_id` and `reason`, or `yjs_session_closed_on_access_change` |
+| 4401 or 4403 on an open `/ws/{channel}` socket | the account was deactivated or deleted, or the user lost access to the channel | `websocket_session_closed_on_access_change` with `channel`, `code` and `reason` |
 | 4401 on an open Yjs socket | token expired, or the account was deactivated or deleted | `yjs_session_closed_on_access_change` with `code=4401`; otherwise refresh the token |
 | A writer's edits stop being applied | the user was demoted (organization VIEWER, or lost `NOTE_WRITE`) | `yjs_session_downgraded_to_read_only`, then `yjs_read_only_update_dropped` |
 | 4400 | channel family not in the allowlist, or `analysis:` with empty id | check the URL |
@@ -904,14 +914,13 @@ and isolates the risky decoding in child processes."
 | File | What it holds |
 |---|---|
 | `services/core-service/api/websocket.py` | `/ws/{channel}`, channel allowlist, `authorize_channel`, `send_analysis_status` |
-| `services/core-service/api/ws_common.py` | close codes, `authenticate`, `resolve_live_identity`, `accept_and_close`, `serve_until_expiry` |
-| `services/core-service/websocket_manager.py` | `WebSocketEnvelope`, `WebSocketManager`, per-user cap, presence loop, `ws:fanout` relay |
+| `services/core-service/websocket_manager.py` | `WebSocketEnvelope`, `WebSocketManager`, per-user cap, presence loop, `ws:fanout` relay; close codes, `authenticate`, `resolve_live_identity`, `open_identity`, `acquire_or_close`, `accept_and_close`, `serve_until_expiry` |
 | `services/core-service/event_listener.py` | event handlers that call `manager.broadcast` |
 | `services/core-service/domains/notification/service.py` | `deliver_notification` (push to `user:<id>`) |
 | `services/core-service/clients/auth_client.py` | `set_user_presence`, `are_users_connected` |
 | `services/auth-service/api/internal.py` | `POST /internal/users/{id}/presence`, `GET /internal/connections/check` |
 | `services/auth-service/domains/auth/service.py` | `set_presence`, `_mark_online`, `presence_event` |
-| `services/core-service/api/yjs_websocket.py` | `/ws/yjs/{note_id}`, read-only handling, `_YjsSession` registry, `recheck_user_sessions` |
+| `services/core-service/api/websocket.py` (`yjs_router`) | `/ws/yjs/{note_id}`, read-only handling, `_YjsSession` registry, `recheck_user_sessions` |
 | `services/core-service/yjs_relay.py` | `YjsRoom`, `YjsRelay` (`_in_use`, `flush_due_snapshots`, `persist_all_dirty`), snapshots, cross-replica listener, active-room markers |
 | `services/core-service/domains/research/yjs_guard.py` | decoder worker pool, `guarded`, `seed_state`, `replace_text` (REST body edits), `merge_states`, `extract_text` |
 | `services/core-service/domains/research/model.py` | `ResearchNote` (`yjs_state`, `content`, `search_vector`) |

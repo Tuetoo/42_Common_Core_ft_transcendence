@@ -103,7 +103,7 @@ turned into `UpstreamServiceError` (502) so a raw `httpx` error never
 reaches domain code. The gateway never proxies `/internal`.
 
 **Events.** "Something happened" signals go through Redis
-(`shared/events.py`, names and payloads in `shared/events_registry.py`):
+(`shared/events.py`, names and payloads in `shared/events.py`):
 - pub/sub for notifications and live updates (a missed one loses only a
   message a user can still find by refreshing);
 - durable streams with consumer groups for the events that must not be
@@ -177,7 +177,7 @@ load off the database the other services use.
 - **Public API.** `X-API-Key`; keys are stored hashed; per-key and
   per-owner limits (fixed one-minute windows, 429 with `Retry-After`).
   Rate limits of auth and core share one implementation
-  (`shared/rate_limit.py`) that lets requests through when Redis is down.
+  (`shared/redis.py`) that lets requests through when Redis is down.
 - **Transport and secrets.** TLS at the gateway; plain HTTP only inside
   the Docker network; `/internal` needs the shared internal token and is
   never exposed; secrets come from `.env.docker` (never committed;

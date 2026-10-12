@@ -17,9 +17,9 @@ from typing import Any, ClassVar
 from uuid import uuid4
 import ai.agents.loop as loop_module
 import ai.knowledge.archival as archival_module
+import ai.providers.base as provider_base_module
 import ai.providers.fred as fred_module
 import ai.providers.news_relevance as relevance_module
-import ai.providers.retry as retry_module
 import ai.rag.indexing as indexing_module
 import ai.rag.retriever as retriever_module
 import ai.recommendation.position_sizing as sizing_module
@@ -165,7 +165,7 @@ def _chunk(
 
 
 def _web_classified(fn):
-    from ai.tools.search_relevance import ClassifiedResult
+    from ai.tools.web_search_tool import ClassifiedResult
 
     async def wrapper(query, results, **kwargs):
         kept = await fn(query, results)
@@ -1265,7 +1265,7 @@ class TestMacroData:
         monkeypatch.setattr(fred_module.settings, "FRED_API_KEY", "secret-key")
         monkeypatch.setattr(
             fred_module, "get_http_client", lambda: _mock_client(_handler))
-        monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(provider_base_module.asyncio, "sleep", _no_sleep)
 
         points = await FredProvider().get_indicator("fed_funds_rate")
 
@@ -1287,7 +1287,7 @@ class TestMacroData:
         with pytest.raises(ProviderRequestError,
                            match="ReadTimeout: timed out"):
             await FredProvider().get_indicator("fed_funds_rate")
-        assert calls["n"] == retry_module.DEFAULT_MAX_ATTEMPTS
+        assert calls["n"] == provider_base_module.DEFAULT_MAX_ATTEMPTS
 
     @pytest.mark.asyncio
     async def test_fred_bad_body_raises_provider_request_error(

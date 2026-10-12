@@ -2,10 +2,10 @@ import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
+import ai.graph.nodes as nodes_module
 import ai.ingestion.sec_edgar_filings as sec_edgar_filings
 import ai.knowledge.archival as archival_module
 import ai.knowledge.extraction as extraction_module
-import ai.knowledge.fresh_filings as fresh_filings_module
 import ai.workflows.auto_ingestion_workflow as auto_workflow
 import config
 import pytest
@@ -774,8 +774,7 @@ class TestFilingFallbackNotPersisted:
         assert created == ["AMD_10-K_b.txt"]
 
         created.clear()
-        context = await fresh_filings_module.check_for_fresh_filing_content(
-            "AMD")
+        context = await nodes_module.load_fresh_filing_context("AMD")
         assert created == ["AMD_10-K_b.txt"]
         assert context is not None and "excerpt" in context
 
@@ -798,7 +797,7 @@ class TestResolveTickerName:
     async def test_not_found_cached_race_tolerated_and_read_failure_safe(
             self, monkeypatch):
         import ai.providers.sec_edgar as sec_edgar_module
-        from ai.knowledge.ticker_names import resolve_ticker_name
+        from ai.knowledge.kg_context import resolve_ticker_name
         from domains.knowledge.model import TickerName
         from domains.knowledge.repository import TickerNameRepository
 

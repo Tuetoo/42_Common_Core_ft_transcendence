@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
 async def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
-    from ai.evaluation.golden_set import (GoldenQAPair,
+    from ai.evaluation.rag_recall import (GoldenQAPair,
                                           _drop_near_duplicate_chunks,
                                           _real_indexed_chunk_count,
                                           _sample_indexed_chunks,

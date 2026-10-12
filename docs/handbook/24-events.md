@@ -64,7 +64,7 @@ message to the browsers that are connected (see
 
 | Term | Meaning here |
 |---|---|
-| Event | A named JSON message saying "this happened". Names are in `shared/events_registry.py::EventName`. |
+| Event | A named JSON message saying "this happened". Names are in `shared/events.py::EventName`. |
 | Producer / consumer | The service that publishes / the service that reacts. |
 | Redis pub/sub | `PUBLISH channel message` sends to every client currently `SUBSCRIBE`d to that channel. No storage, no retry. "At most once" delivery. |
 | Channel | The pub/sub "address". AlphaMind uses `events:<event name>`, e.g. `events:analysis.completed`. |
@@ -84,7 +84,7 @@ message to the browsers that are connected (see
 
 ## 3. How it works in AlphaMind
 
-### 3.1 The registry: `shared/events_registry.py`
+### 3.1 The registry: `shared/events.py`
 
 `EventName` is a `StrEnum` with every event name. `EVENT_OWNERS` maps each
 name to the one service that publishes it. The map documents ownership;
@@ -107,7 +107,7 @@ field on the wire (section 3.4).
 | `document.deleted` | core (`ResearchService.delete_document`, also `scripts/delete_documents.py`) | durable | ai (`_handle_document_deleted`) | `document_id` | `ai/rag/indexing.py::delete_document_completely`: Qdrant points, BM25, `ai.document_chunks`, `ai.embedding_jobs`. `ai.filing_records` is keyed by the filing's filename, not by document id, and is NOT deleted: when the same filing is ingested again, its row is overwritten (upsert by `filename`) |
 | `portfolio.deleted` | core (`domains/portfolio/api.py::delete_portfolio`) | durable | ai (`_handle_portfolio_deleted`) | `portfolio_id, user_id` (owner) | closes unfilled tiers (status `expired`), then publishes `tier.cancelled` per tier |
 | `document.status_changed` | ai (`rag_ingestion_workflow.py::_publish_status`) | durable AND pub/sub | core: durable `_persist_document_status`; pub/sub `_broadcast_document_status_changed` | `document_id, status` | durable: writes `core.documents.status` and notifies owner on `ready`/`failed`; pub/sub: push to `document:<id>` |
-| `analysis.started` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_analysis_started` | `analysis_id, user_id ("" = system), ticker, portfolio_id` | push to `analysis:<id>`, notification |
+| `analysis.started` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_analysis_started` | `analysis_id, user_id ("" = system), ticker, portfolio_id` | push to `analysis:<id>` (the analysis page refreshes on it), notification |
 | `analysis.completed` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_analysis_completed` | same as started | push, notification |
 | `analysis.failed` | ai (`mark_analysis_failed`, `domains/analysis/queue.py` at startup) | pub/sub | core `_handle_analysis_failed` | same + `failure_reason` | push, notification with the reason |
 | `recommendation.ready` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_recommendation_ready` | `id, analysis_id, ticker, action, confidence, user_id (None = system)` | push, notification |
@@ -120,20 +120,20 @@ field on the wire (section 3.4).
 | `backtest.failed` | ai (same) | pub/sub | core `_handle_backtest_failed` | same | notification |
 | `organization.created` | auth (`domains/organization/service.py`) | pub/sub | core `_handle_organization_created` | `organization_id, organization_name, actor_id, user_id` (the affected member, or `None`), `role` (or `None`), `member_ids` (members to notify, sorted, unique) | notification to members |
 | `organization.updated` | auth | pub/sub | core | same | notification to members |
-| `organization.deleted` | auth | pub/sub | core | same | open Yjs sockets of every former member are re-checked (section 3.8); notification to former members |
+| `organization.deleted` | auth | pub/sub | core | same | open sockets (Yjs and channels) of every former member are re-checked (section 3.8); notification to former members |
 | `organization.member.joined` | auth (invitation accept) | pub/sub | core | same | welcome to the new member, notice to others |
-| `organization.member.left` | auth | pub/sub | core | same | Yjs sockets of the member re-checked; affected member + others notified |
-| `organization.member.removed` | auth | pub/sub | core | same | Yjs sockets of the member re-checked; affected member + others notified |
-| `organization.role.changed` | auth | pub/sub | core | same | Yjs sockets of the member re-checked; affected member + others notified |
+| `organization.member.left` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
+| `organization.member.removed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
+| `organization.role.changed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.invitation.created` | auth | pub/sub | core | same | notification to the invited user (when the invitation names one) |
 | `friend.requested` | auth (`domains/social/service.py`) | pub/sub | core `_handle_friend_requested` | `actor_id, user_id, actor_username` | notification to `user_id` |
 | `friend.accepted` | auth | pub/sub | core | same | notification |
 | `friend.removed` | auth | pub/sub | core | same | notification |
 | `user.updated` | auth (`domains/auth/service.py`, `domains/admin/service.py`) | pub/sub | core `_handle_user_updated` | `user_id, actor_id, role, is_active, changed` (sorted field names only, never values) | notification |
-| `user.role.changed` | auth (admin) | pub/sub | core | same | Yjs sockets of the user re-checked; notification |
-| `user.deactivated` | auth (admin) | pub/sub | core | same | every open Yjs socket of the user closed (4401); notification |
+| `user.role.changed` | auth (admin) | pub/sub | core | same | open sockets of the user re-checked; notification |
+| `user.deactivated` | auth (admin) | pub/sub | core | same | every open socket of the user closed (4401); notification |
 | `user.reactivated` | auth (admin) | pub/sub | core | same | notification |
-| `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same | every open Yjs socket of the user closed (4401); logged `user_deleted_received` (nobody to notify) |
+| `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same | every open socket of the user closed (4401); logged `user_deleted_received` (nobody to notify) |
 | `user.presence.changed` | auth (`domains/auth/service.py::presence_event`, published after the commit) | pub/sub | core `_handle_user_presence_changed` | `user_id, is_online` | push to `presence:<user_id>` |
 
 Notes on the table:
@@ -156,7 +156,7 @@ Notes on the table:
   it, so a notification would read "sell 1.0E+5 AMD". `price` is the fill
   price for `tier.executed`, otherwise the tier's target price.
 - Backtest `kind` is derived from the strategy name
-  (`ai_events.backtest_kind`): `ai_recommendation_replay` ->
+  (`domains/backtest/schema.py::backtest_kind`): `ai_recommendation_replay` ->
   `recommendation_replay`, `portfolio_snapshot_backtest` -> `portfolio`,
   anything else -> `ticker`. A failed backtest without an error text gets
   `error = "backtest_failed"`.
@@ -475,7 +475,7 @@ portfolio's tiers still open.
 core-service uses an outbox for its three durable events
 (`document.uploaded`, `document.deleted`, `portfolio.deleted`). The code is
 in `services/core-service/outbox.py`, the table model in
-`services/core-service/outbox_model.py` and the migration in
+the same file and the migration in
 `services/core-service/migrations/versions/f1200c000001_event_outbox.py`.
 
 ```
@@ -670,7 +670,7 @@ core-service's handlers in `event_listener.py` do up to three things:
    on every replica for its own sockets and are not relayed between
    replicas. The browser receives the payload unchanged, including the
    `event_id` field.
-2. **Notification** with `domains/notification/actions.py::notify_user`
+2. **Notification** with `domains/notification/service.py::notify_user`
    (after `_claim_event`). It first reads the user's delivery preferences.
    If the user turned in-app notifications off, no row is written and only
    the optional email is sent. Otherwise it writes a row in
@@ -679,9 +679,9 @@ core-service's handlers in `event_listener.py` do up to three things:
    `{"event": "notification", "payload": <row>}` to `user:<user_id>` with
    `cross_replica=True` (relayed to other replicas through the Redis
    channel `ws:fanout`) and sends an email if the user enabled it.
-3. **Access re-check of open Yjs sockets** (`_recheck_yjs_sessions`, which
-   calls `api/yjs_websocket.py::recheck_user_sessions`). Seven events
-   change what a user may do with a note: `organization.member.removed`,
+3. **Access re-check of open sockets** (`_recheck_sessions`, which
+   calls `api/websocket.py::recheck_user_sessions`). Seven events
+   change what a user may do with a note or a channel: `organization.member.removed`,
    `organization.member.left`, `organization.role.changed`,
    `organization.deleted` (for every id in `member_ids`),
    `user.role.changed`, `user.deactivated` and `user.deleted` (the last
@@ -690,14 +690,20 @@ core-service's handlers in `event_listener.py` do up to three things:
    never raises: a failure is logged (`yjs_session_recheck_failed`) and the
    notification still goes out. auth-service drops the membership cache
    and mirrors the user state before it publishes, so the re-check already
-   sees the new rights. Details in [25-realtime-yjs.md](25-realtime-yjs.md).
+   sees the new rights. The same re-check covers the user's `/ws/{channel}`
+   sockets: 4401 "account deactivated" for a deactivated or deleted user,
+   4403 "access to this channel was revoked" for a channel the user can no
+   longer read (log `websocket_session_closed_on_access_change`); if the
+   check itself fails the socket stays open (`websocket_session_recheck_failed`).
+   Details in [25-realtime-yjs.md](25-realtime-yjs.md).
 
 Handlers that need a recipient and find none log a warning and stop:
-`analysis_completed_missing_user_id`,
-`recommendation_ready_missing_user_id` (a system analysis),
+the notify handlers (friend, user, analysis, recommendation, decision,
+backtest and invitation events) log one event, `event_missing_user_id`
+(fields `event_name`, `analysis_id`; for example a system analysis);
 `organization_member_joined_missing_user_id`,
-`user_presence_changed_missing_user_id`, `tier_event_without_recipient`.
-Other handlers without a recipient return silently.
+`user_presence_changed_missing_user_id` and `tier_event_without_recipient`
+stay as they are.
 
 The WebSocket side (channels, authorization, message shapes) is in
 [25-realtime-yjs.md](25-realtime-yjs.md).
@@ -1007,17 +1013,16 @@ only where losing a message would leave the data wrong."
 
 | File | What it holds |
 |---|---|
-| `shared/events_registry.py` | `EventName` (all event names), `EVENT_OWNERS` |
-| `shared/events.py` | `publish_cross_service`, `CrossServiceSubscriber`, `publish_durable_event`, `DurableEventSubscriber`, reconnect backoff |
+| `shared/events.py` | `EventName` (all event names), `EVENT_OWNERS`, `publish_cross_service`, `CrossServiceSubscriber`, `publish_durable_event`, `DurableEventSubscriber`, reconnect backoff |
 | `shared/redis.py` | Redis clients per logical DB, `socket_timeout=15` |
-| `services/core-service/event_listener.py` | `_claim_event`, every core handler, `_recheck_yjs_sessions`, `_PUBSUB_HANDLERS`, `build_subscriber`, `build_durable_subscriber` |
-| `services/core-service/api/yjs_websocket.py` | `recheck_user_sessions` (open editor sockets follow access changes) |
+| `services/core-service/event_listener.py` | `_claim_event`, every core handler, `_recheck_sessions`, `_PUBSUB_HANDLERS`, `build_subscriber`, `build_durable_subscriber` |
+| `services/core-service/api/websocket.py` | `recheck_user_sessions` (open editor and channel sockets follow access changes) |
 | `services/core-service/main.py` | starts the subscribers, listeners and the outbox dispatcher in the lifespan |
-| `services/core-service/outbox.py`, `outbox_model.py` | transactional outbox: `enqueue`, `publish_now`, `dispatch_pending`, `purge_published`, `run_outbox_dispatcher`, table `core.event_outbox` |
+| `services/core-service/outbox.py` | transactional outbox: `enqueue`, `publish_now`, `dispatch_pending`, `purge_published`, `run_outbox_dispatcher`, table `core.event_outbox` |
 | `services/core-service/domains/research/service.py` | `document.uploaded` / `document.deleted` written to the outbox, stuck-upload republish |
 | `services/core-service/domains/research/repository.py` | `transition_status`, `is_forward_status_transition` |
 | `services/core-service/domains/portfolio/api.py` | `portfolio.deleted` written to the outbox |
-| `services/core-service/domains/notification/actions.py` | `notify_user`, `notify_users`, `notify_after_commit` |
+| `services/core-service/domains/notification/service.py` | `notify_user`, `notify_users`, `notify_after_commit` |
 | `services/core-service/websocket_manager.py` | channel fan-out, `ws:fanout` relay |
 | `services/ai-service/event_listener.py` | the three durable handlers |
 | `services/ai-service/ai_events.py` | payload builders, `publish_event`, `publish_events`, tier cancel reasons |

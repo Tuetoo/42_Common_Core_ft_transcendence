@@ -7,9 +7,8 @@ from domains.market.repository import MAX_PRICE_LOOKBACK_DAYS
 from domains.market.schema import PriceBarRead
 from domains.market.service import NoPriceDataError
 from shared.exceptions import NotFoundError, ValidationAppError
-from shared.schemas import APIResponse
+from shared.schemas import APIResponse, normalize_ticker
 from shared.security import CurrentUser
-from shared.tickers import normalize_ticker
 
 router = APIRouter(tags=["market"])
 

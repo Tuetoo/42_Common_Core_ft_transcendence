@@ -70,13 +70,7 @@ case "$cmd" in
     started=$(date +%s)
     echo "restore drill of $name in the compose project $project"
     "${drill[@]}" up -d --wait postgres qdrant objectstore
-    if [ -f "backups/$name/objectstore-data.tar.gz" ]; then
-      "${drill[@]}" stop objectstore
-    fi
     "${drill[@]}" run --rm --build restore /scripts/restore.sh --yes "/backups/$name"
-    if [ -f "backups/$name/objectstore-data.tar.gz" ]; then
-      "${drill[@]}" up -d --wait objectstore
-    fi
     "${drill[@]}" run --rm restore /scripts/restore.sh --verify "/backups/$name"
     echo "restore drill of $name passed in $(( $(date +%s) - started )) s"
     ;;

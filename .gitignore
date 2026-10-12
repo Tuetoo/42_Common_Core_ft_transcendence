@@ -48,3 +48,10 @@ infra/gateway/certs/*
 # reports, news), kept locally and never committed. See
 # docs/handbook/17-ai-rag.md section 3.14.
 /rag_seed_documents/
+
+# Redis snapshot written when redis-server runs from the repository root
+dump.rdb
+
+# Drafts written by services/ai-service/scripts/regenerate_filing_summaries.py
+# (/app/_regenerated through the development bind mount)
+services/ai-service/_regenerated/

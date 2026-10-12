@@ -1,18 +1,13 @@
-import asyncio
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
+from functools import partial
 from typing import Any, ClassVar
 from uuid import uuid4
-import ai.agents.debate_side as side_module
 import ai.agents.judge as judge_module
 import ai.agents.reflection as reflection_module
-import ai.llm.google_provider as google_module
 import ai.recommendation.position_sizing as sizing_module
 import ai.tools.portfolio_tool as portfolio_tool_module
-import config
 import pytest
 from ai.agents import debate_common as dc
 from ai.agents.fundamental import _TOOL_NOTE_RE
@@ -25,12 +20,9 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, ISSUE_NO_EVIDENCE_NOT_RETRIED,
                             EpisodicMemoryHit, JudgeVerdict,
                             PriorRecommendation, ReflectionIssue,
                             ReflectionVerdict)
-from ai.llm.base import (LLMConfigError, LLMMessage, LLMProviderAdapter,
-                         LLMRequestError, LLMRequestTimeoutError, LLMResponse,
-                         LLMServerOverloadedError, LLMTier, LLMUsage,
-                         request_pacer)
+from ai.llm.base import (LLMConfigError, LLMNonEnglishOutputError, LLMResponse,
+                         LLMServerOverloadedError, LLMTier, LLMUsage)
 from ai.llm.json_fence import parse_json_object
-from ai.llm.router import LLMRouter
 from ai.providers import sec_edgar
 from ai.providers.base import PriceQuote, ProviderRequestError
 from ai.recommendation.engine import (build_final_recommendation,
@@ -38,11 +30,11 @@ from ai.recommendation.engine import (build_final_recommendation,
 from ai.recommendation.position_sizing import (_validated_sizing,
                                                generate_position_sizing)
 from ai.tools.base import Tool
-from google.genai import errors as genai_errors
 from helpers import _ALL_ROLES, _BUY, _P
-from helpers import _amd_state as _state
 from helpers import (_args, _make_decision_with_outcome, _ok,
-                     _ScriptedReviewRouter, _tool_entry, _verdict)
+                     _ScriptedReviewRouter)
+from helpers import _state as _base_state
+from helpers import _tool_entry, _verdict
 from structlog.testing import capture_logs
 from domains.analysis.repository import (AnalysisPersistenceRepository,
                                          AnalysisRepository)
@@ -59,17 +51,7 @@ _S = TierStatus.SUPERSEDED.value
 _SELL = TierSide.SELL.value
 _NINE = list(_ALL_ROLES)
 _T0 = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
-
-
-@pytest.fixture
-def clean_pacer(monkeypatch):
-    request_pacer.reset()
-    for name in ("LLM_GOOGLE_CHEAP_MIN_INTERVAL_SECONDS",
-                 "LLM_GOOGLE_HIGHEST_ACCURACY_MIN_INTERVAL_SECONDS",
-                 "LLM_GOOGLE_LITE_POOL_MIN_DISPATCH_INTERVAL_SECONDS"):
-        monkeypatch.setattr(config.settings, name, 0.0)
-    yield
-    request_pacer.reset()
+_state = partial(_base_state, ticker="AMD")
 
 
 def _final(state: AnalysisState):
@@ -935,7 +917,7 @@ class TestPrompts:
 
     def test_debate_side_prompts_and_shared_rule_texts(self) -> None:
         for side in ("bull", "bear"):
-            prompt = side_module._SYSTEM_PROMPTS[side]  # type: ignore[index]
+            prompt = dc._SYSTEM_PROMPTS[side]  # type: ignore[index]
             for rule in (dc.UNUSUAL_ITEMS_RULE, dc.SOURCE_WORDING_RULE,
                          dc.LEGAL_AMOUNT_RULE, dc.OVERLAP_RULE,
                          dc.FREE_CASH_FLOW_RULE):
@@ -1343,8 +1325,8 @@ class TestDebateSides:
         for side in ("bull", "bear"):
             router = _Router("Growth 25% [market].", "Still 25% [market].")
             monkeypatch.setattr(
-                side_module, "LLMRouter", lambda router=router: router)
-            argument = await side_module.DebateSideAgent(side).make_argument(
+                dc, "LLMRouter", lambda router=router: router)
+            argument = await dc.DebateSideAgent(side).make_argument(
                 _both_sides_flagged_state())
             assert argument.argument == "Still 25% [market].", side
             assert len(router.calls) == 2, side
@@ -1353,8 +1335,8 @@ class TestDebateSides:
 
             router = _Router("Growth 25% [market].", "Up 4% [market].")
             monkeypatch.setattr(
-                side_module, "LLMRouter", lambda router=router: router)
-            argument = await side_module.DebateSideAgent(side).make_argument(
+                dc, "LLMRouter", lambda router=router: router)
+            argument = await dc.DebateSideAgent(side).make_argument(
                 _both_sides_flagged_state())
             assert argument.argument == "Up 4% [market].", side
             assert len(router.calls) == 2, side
@@ -1379,6 +1361,23 @@ class TestDebateSides:
         assert events[0]["ungrounded_figures"] == ["$88.8B"]
         assert _events(logs, "debate.regenerated_still_ungrounded") == []
         assert _events(logs, "debate.contradicted_regenerated") == []
+
+        for failure in (LLMServerOverloadedError("503"),
+                        LLMNonEnglishOutputError("x", reason="script")):
+            router = _Router("Revenue rose to $99.9B [filing].", failure)
+            with capture_logs() as logs:
+                argument = await dc.generate_debate_argument(
+                    side="bear",
+                    state=state,
+                    llm_router=router,  # type: ignore[arg-type]
+                    llm_tier=LLMTier.CHEAP,
+                    system_prompt="s")
+            assert argument.argument == "Revenue rose to $99.9B [filing].", (
+                failure)
+            assert len(router.calls) == 2
+            kept = _events(logs, "bear.regeneration_failed_kept_draft")
+            assert len(kept) == 1
+            assert kept[0]["ungrounded_figures"] == ["$99.9B"]
 
     @pytest.mark.asyncio
     async def test_prior_issues_are_split_by_side(self) -> None:
@@ -1646,157 +1645,6 @@ class TestReflection:
                                              "general") == ("(issue) general")
 
 
-class _GeminiReply:
-
-    class _Usage:
-        prompt_token_count = 1
-        candidates_token_count = 1
-        thoughts_token_count = None
-
-    class _Candidate:
-        finish_reason = "STOP"
-
-    text = "ok"
-    usage_metadata = _Usage()
-    candidates = (_Candidate(), )
-
-
-class _ScriptedKeyPool:
-
-    def __init__(self, labels: list[str], script: list[str]) -> None:
-        self.labels = labels
-        self.script = list(script)
-        self.used: list[str] = []
-
-        async def generate_content(*, model, contents, config):
-            if len(self.script) > 1:
-                outcome = self.script.pop(0)
-            else:
-                outcome = self.script[0]
-            if outcome == "503":
-                raise genai_errors.ServerError(
-                    503, {
-                        "error": {
-                            "code": 503,
-                            "status": "UNAVAILABLE",
-                            "message": "busy"
-                        }
-                    })
-            if outcome == "hang":
-                await asyncio.sleep(3600)
-            return _GeminiReply()
-
-        self._client = SimpleNamespace(
-            aio=SimpleNamespace(
-                models=SimpleNamespace(generate_content=generate_content)))
-
-    def key_count(self) -> int:
-        return len(self.labels)
-
-    def available_labels_excluding(self, excluded):
-        return [lbl for lbl in self.labels if lbl not in excluded]
-
-    def client_for(self, label):
-        self.used.append(label)
-        return self._client
-
-
-class _ChainAdapter(LLMProviderAdapter):
-    name = "google"
-
-    def __init__(self, script: dict[str, list[str]]) -> None:
-        self.script = {m: list(v) for m, v in script.items()}
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def complete(
-            self, messages, *, model, temperature=0.2, max_tokens=1024,
-            response_format=None, timeout_seconds=None, response_schema=None,
-            **extra: Any) -> LLMResponse:
-        self.calls.append((model, extra))
-        outcomes = self.script[model]
-        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
-        if outcome == "503":
-            raise LLMServerOverloadedError(f"{model} 503")
-        if outcome == "timeout":
-            await request_pacer.mark_unavailable_until(
-                ("google", "timeout", model),
-                time.monotonic() + 300.0)
-            raise LLMRequestTimeoutError(f"{model} timed out")
-        return LLMResponse(
-            content=f"answer from {model}", provider="google", model=model,
-            usage=LLMUsage(prompt_tokens=1,
-                           completion_tokens=1), finish_reason="stop")
-
-    async def stream(
-            self, messages, *, model, temperature=0.2, max_tokens=1024):
-        yield "x"
-
-    @property
-    def models(self) -> list[str]:
-        return [m for m, _ in self.calls]
-
-
-async def _no_sleep(seconds: float) -> None:
-    return None
-
-
-def _hi() -> list[LLMMessage]:
-    return [LLMMessage(role="user", content="hi")]
-
-
-@pytest.mark.usefixtures("clean_pacer")
-class TestHighestAccuracyModels:
-
-    @pytest.mark.asyncio
-    async def test_default_timeouts_and_timeouts_without_cooldown(
-            self, monkeypatch):
-        assert google_module._default_request_timeout(
-            "gemini-3.8-flash") == 30.0
-        assert google_module._default_request_timeout(
-            "gemini-3.6-flash", fallback=True) == 60.0
-        assert google_module._default_request_timeout(
-            "gemini-3.5-flash-lite", fallback=True) == 60.0
-        monkeypatch.setattr(
-            google_module, "_pool", _ScriptedKeyPool(["primary"], ["hang"]))
-        with pytest.raises(LLMRequestError) as info:
-            await google_module.GoogleAdapter().complete(
-                _hi(), model="gemini-3.8-flash", timeout_seconds=0.05)
-        assert not isinstance(info.value, LLMRequestTimeoutError)
-        assert not await google_module.google_model_recently_timed_out(
-            "gemini-3.8-flash")
-        monkeypatch.setattr(
-            config.settings, "LLM_GOOGLE_HIGHEST_REQUEST_TIMEOUT_SECONDS",
-            0.05)
-        monkeypatch.setattr(
-            config.settings, "LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS", 0.0)
-        monkeypatch.setattr(
-            google_module, "_pool", _ScriptedKeyPool(["primary"], ["hang"]))
-        with pytest.raises(LLMRequestTimeoutError):
-            await google_module.GoogleAdapter().complete(
-                _hi(), model="gemini-3.8-flash")
-        assert not await google_module.google_model_recently_timed_out(
-            "gemini-3.8-flash")
-
-    @pytest.mark.asyncio
-    async def test_timed_out_model_is_skipped_by_later_calls(
-            self, monkeypatch):
-        monkeypatch.setattr(
-            config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY", "m1")
-        monkeypatch.setattr(
-            config.settings, "LLM_GOOGLE_MODEL_HIGHEST_ACCURACY_FALLBACK",
-            "m2")
-        monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
-        adapter = _ChainAdapter({"m1": ["timeout"], "m2": ["ok"]})
-        router = LLMRouter(providers={"google": adapter})
-        first = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4)
-        second = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _hi(), provider="google", retries=4)
-        assert first.content == second.content == "answer from m2"
-        assert adapter.models == ["m1", "m2", "m2"]
-
-
-@pytest.mark.usefixtures("clean_pacer")
 class TestFinishAnswerValidation:
 
     @pytest.mark.asyncio

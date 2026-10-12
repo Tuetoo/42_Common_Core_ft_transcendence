@@ -6,13 +6,12 @@ from typing import Any, ClassVar
 import structlog
 from ai.knowledge.recycled_content import scratchpad_field
 from ai.providers.base import NewsArticle, NewsProvider, ProviderError
-from ai.providers.news_filters import (build_ticker_news_query,
-                                       company_search_name)
+from ai.providers.news_filters import build_ticker_news_query
 from ai.providers.news_relevance import (COMPANY_BUSINESS, CONSUMER_PRODUCT,
                                          EVIDENCE_KINDS, OPINION_LISTICLE,
                                          STOCK_MARKET, UNCLASSIFIED,
                                          UNVERIFIED, cap_consumer_items,
-                                         clean_articles, lookup_company_name)
+                                         clean_articles, lookup_search_name)
 from ai.providers.newsapi import (NewsApiArticle, NewsApiProvider,
                                   SourceCatalog, catalog_flag, source_catalog)
 from ai.providers.registry import get_news_provider
@@ -236,8 +235,7 @@ class SearchNewsTool(Tool):
         limit = clamp_int(limit, default=20, lo=1, hi=100)
         company_name: str | None = None
         if self.ticker is not None:
-            resolved = await lookup_company_name(self.ticker)
-            company_name = company_search_name(resolved) if resolved else None
+            company_name = await lookup_search_name(self.ticker)
             model_query = query
             query = build_ticker_news_query(
                 model_query, ticker=self.ticker, company_name=company_name)

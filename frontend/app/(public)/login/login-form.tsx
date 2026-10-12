@@ -3,7 +3,7 @@
 import { useActionState, useState } from "react";
 import Link from "next/link";
 import { login, type LoginState } from "@/app/lib/actions/auth";
-import { EMAIL_MAX, PASSWORD_MAX_BYTES } from "../field-rules";
+import { EMAIL_MAX, PASSWORD_MAX_BYTES, TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../field-rules";
 
 const initialState: LoginState = {};
 
@@ -55,6 +55,8 @@ export function LoginForm({ next }: { next: string }) {
             inputMode="numeric"
             autoComplete="one-time-code"
             maxLength={6}
+            pattern={TOTP_CODE_PATTERN}
+            title={TOTP_CODE_TITLE}
             autoFocus
             required
           />

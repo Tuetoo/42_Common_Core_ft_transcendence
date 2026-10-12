@@ -5,18 +5,16 @@ import structlog
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check)
-from ai.agents.loop import (BaseAgent, ReActAgentLoop, derive_agent_quality,
+from ai.agents.loop import (BaseAgent, ReActAgentLoop, combine_context,
                             prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.knowledge.filing_records import (display_amounts, load_filing_records,
                                          ordered_rows, period_months_value,
                                          quote_evidence, record_by_id,
                                          unusual_item_period)
-from ai.memory.procedural import combine_context
 from ai.rag.visibility import visibility_for_state
 from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.knowledge_graph_tool import QueryKnowledgeGraphTool
-from shared.enums import AgentStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -350,20 +348,12 @@ class FilingAgent(BaseAgent):
                 feedback, state.procedural_hints.get(self.role),
                 state.fresh_filing_context, kg_context),
             prefetched_evidence=prefetched)
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None)
-        final_answer = result.final_answer
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=final_answer,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": [vars(e) for e in result.scratchpad],
+        return self.completed_output(
+            result, feedback=feedback, summary=result.final_answer,
+            raw_output={
                 "injected_context": combine_context(
                     state.fresh_filing_context, kg_context),
-                "final_answer": final_answer,
-                "finish_meta": result.finish_meta,
+                "final_answer": result.final_answer,
                 "one_off_items": await
                 one_off_items_for(state.ticker, records, role=self.role.value),
                 "key_records": await

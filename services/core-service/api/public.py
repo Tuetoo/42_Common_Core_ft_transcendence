@@ -1,7 +1,9 @@
 from typing import cast
 from uuid import UUID
 from database import get_db
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
+from fastapi import (APIRouter, BackgroundTasks, Depends, Query, Request,
+                     Security, status)
+from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.portfolio.api import (notify_holding_adjustment,
                                    notify_watchlist_item)
@@ -12,7 +14,9 @@ from domains.portfolio.service import PortfolioService
 from shared.schemas import (MAX_PAGE, APIResponse, PaginatedResponse,
                             PaginationParams)
 
-router = APIRouter(prefix="/public", tags=["public-api"])
+router = APIRouter(
+    prefix="/public", tags=["public-api"],
+    dependencies=[Security(APIKeyHeader(name="X-API-Key", auto_error=False))])
 
 
 def _owner_user_id(request: Request) -> UUID:

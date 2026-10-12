@@ -42,19 +42,18 @@ anywhere under `shared/`). Within `shared/`, `config.py` is the root that
 almost everything else depends on.
 
 ```
- config.py <- database.py <- alembic_bootstrap.py <-> alembic_convert.py
-     ^                         (these two import each other inside functions)
-     |    <- redis.py <- events.py, rate_limit.py, user_state.py,
-     |                   org_membership_cache.py, e2e_lock.py
+ config.py <- database.py
+     ^
+     |    <- redis.py <- events.py, user_state.py
      |    <- http_client.py <- user_state.py, security.py
      |    <- security.py (uses permissions.py, user_state.py,
      |                    INTERNAL_TOKEN_HEADER from http_client.py)
-     |    <- logging.py, storage.py, email.py
- exceptions.py <- org_membership_cache.py, rate_limit.py (error_response)
+     |    <- logging.py <- schemas.py (current_request_id)
+     |    <- storage.py, email.py
+ exceptions.py <- redis.py (error_response), user_state.py
  enums.py <- permissions.py, schemas.py
- (no shared imports at all): exceptions.py, tickers.py, market_calendar.py,
-                             concurrency.py, events_registry.py,
-                             request_id.py, metrics.py, scheduled_jobs.py
+ (no shared imports at all): exceptions.py, enums.py, market_calendar.py,
+                             concurrency.py, scheduled_jobs.py
 ```
 
 Read `A <- B` as "B imports A".
@@ -233,9 +232,9 @@ the settings, because pydantic settings objects are not hashable. Also
 Used by: all three services (caches, limits, events), and most other
 shared modules.
 
-#### `events.py` and `events_registry.py` -- events between services
+#### `events.py` -- events between services
 
-`events_registry.py` is the list of every event name (`EventName`, a
+`events.py` holds the list of every event name (`EventName`, a
 `StrEnum`, for example `document.uploaded`, `analysis.completed`,
 `user.deactivated`) and `EVENT_OWNERS`, which service publishes each one.
 The payload of every event is documented in the table of chapter 24,
@@ -335,7 +334,7 @@ ancestor gets 400. `register_exception_handlers(app)` turns them into
 and turns any other exception into a 500 with code
 `internal_server_error` (logged as `unhandled_exception`).
 `error_response(request, status_code, code, message, headers=None)` is
-the one builder of that body (also used by `rate_limit.py` and core's
+the one builder of that body (also used by the rate limiter in `redis.py` and core's
 API key middleware). FastAPI's own `HTTPException` (used by
 `security.py`) keeps FastAPI's `{"detail": ...}` body.
 
@@ -350,7 +349,7 @@ but the account requires a TOTP code."). A subclass that sets no
 one, so a bare `AppError()` falls back to the code (`app_error`).
 
 The `request_id` comes from `request.state.request_id`, which
-`request_id.py` sets for every HTTP request (a random UUID is used only
+`RequestIdMiddleware` (`logging.py`) sets for every HTTP request (a random UUID is used only
 if it is missing). So the id in an error body is the same id that is on
 every log line of that request. The 500 handler logs it explicitly with
 `unhandled_exception` (it runs outside the middleware's log context) and
@@ -358,7 +357,7 @@ also returns it in the `X-Request-ID` header.
 
 Used by: all three services (domain code raises these).
 
-#### `request_id.py` -- one id per HTTP request
+#### `logging.py`: request id -- one id per HTTP request
 
 `RequestIdMiddleware` is pure ASGI middleware (streaming and SSE responses
 are not buffered), added in all three `main.py` files. For HTTP requests
@@ -393,7 +392,7 @@ special-token decoding.
 
 #### `permissions.py` -- roles to permissions
 
-`Permission` (12 values such as `portfolio:write`, `rag:ask`,
+`Permission` (13 values such as `portfolio:write`, `rag:ask`,
 `user:manage`), `ROLE_PERMISSIONS`, `permissions_for`, `has_permission`,
 `sorted_permissions`. The single source of truth: route code never
 checks role names. Role summary: `admin` = everything a user can do plus
@@ -402,19 +401,19 @@ reactivate, delete) and site statistics; `moderator` = everything a user
 can do plus hiding or deleting anyone's notes and comments and
 deactivating (not deleting or re-roling) users, never acting on an admin
 or another moderator; `user` = normal use; `guest` = read-only (own
-account, password, 2FA, friends, and accepting invitations so shared
-content becomes visible). Used by all three services (route dependencies, the
+account, password, 2FA, removing connections, leaving organizations, and
+accepting invitations so shared content becomes visible). Used by all three services (route dependencies, the
 `/me` response, core's public API middleware, ai-service internal routes).
 
-#### `rate_limit.py` -- the shared fixed-window counter
+#### `redis.py`: rate limits -- the shared fixed-window counter
 
 `fixed_window_hits(settings, keys, window)` counts one hit per key in a
 Redis transaction (`SET NX EX`, `INCR`, `TTL`) and returns
 `(count, seconds_left)` per key, or `None` when Redis fails (the caller
 allows the request; logged `rate_limit_unavailable`). The window starts
 at the first hit. A non-positive TTL is reported as the full window. `rate_limited_response` builds the 429 with
-`Retry-After` through `shared.exceptions.error_response`. Used by auth-service (`rate_limit.py`) and core-service
-(`middleware.py`). ai-service's RAG limit has its own per-minute and
+`Retry-After` through `shared.exceptions.error_response`. Used by auth-service (`security.py`) and core-service
+(`apikeys.py`). ai-service's RAG limit has its own per-minute and
 per-day counters in `domains/rag/qa.py`.
 
 #### `storage.py` -- object storage (S3 API)
@@ -473,7 +472,7 @@ ledger, snapshots, `ai_client`), ai-service (tier monitoring, market data
 cache, internal routes, a verification script). This is how the 09:30
 and 17:30 New York jobs (14:30 and 22:30 London) skip exchange holidays.
 
-#### `tickers.py` -- the ticker rule
+#### `schemas.py`: tickers -- the ticker rule
 
 `TICKER_RE = ^[A-Z0-9.\-]{1,10}$` and `normalize_ticker(value)` (strip,
 upper-case, validate; `ValueError` otherwise, which pydantic turns into a
@@ -498,7 +497,7 @@ public API middleware and internal routes, and ai-service's internal
 routes; written by `services/auth-service/user_state_sync.py`. Chapter 29,
 section 3.8.
 
-#### `org_membership_cache.py` -- organization roles of a user
+#### `user_state.py`: membership cache -- organization roles of a user
 
 `organization_roles(settings, client, auth_service_url, user_id)` returns
 `{organization_id: role}` from
@@ -530,11 +529,11 @@ portfolio service (building list responses, `limit=20`) and research
 service, so a page of results does not open dozens of simultaneous calls
 to other services.
 
-#### `e2e_lock.py` -- one end-to-end run at a time
+#### `redis.py`: e2e lock -- one end-to-end run at a time
 
-`acquire(settings, holder, *, break_lock=False)` sets `e2e:run_lock` (cache
-database) with `NX` and a 45-minute expiry (`LOCK_TTL_SECONDS`); it
-returns the current holder when the lock is taken. `release` deletes the
+`acquire_e2e_lock(settings, holder, *, break_lock=False)` sets `e2e:run_lock` (cache
+database, `E2E_LOCK_KEY`) with `NX` and a 45-minute expiry (`E2E_LOCK_TTL_SECONDS`); it
+returns the current holder when the lock is taken. `release_e2e_lock` deletes the
 key only if it still holds this run's value (a small Lua script). Used by
 `services/core-service/scripts/e2e_check.py` and
 `services/ai-service/scripts/e2e_tier_check.py`. Two runs at the same time
@@ -544,12 +543,11 @@ increased" check fails), and `e2e_tier_check` creates and deletes a
 portfolio. The 45-minute expiry means a killed run does not block the
 next one for long; `--break-lock` removes the lock at once.
 
-#### `alembic_bootstrap.py` and `alembic_convert.py` -- schema at startup
+#### `database.py`: schema bootstrap -- schema at startup
 
 `bootstrap_schema(engine, *, schema, alembic_ini, register_models)` runs at
-every service start (from each `db_bootstrap.py`): it creates the schema
-if needed, refuses a schema that has tables but no Alembic revision, or a
-revision from the old archived migration chain, and otherwise runs
+every service start (from each service's `database.py`): it creates the schema
+if needed, refuses a schema that has tables but no Alembic revision, and otherwise runs
 `alembic upgrade head` in a worker thread. `build_alembic_config` builds
 the Alembic config in memory so Alembic does not reset the service's
 logging. `schema_differences` compares the database with the models,
@@ -563,17 +561,11 @@ files are synchronous (psycopg), so the Alembic commands run in a worker
 thread (`asyncio.to_thread`). The baseline migration of each service
 creates every table; there is no `create_all` path.
 
-`alembic_convert.py` holds `CONVERSIONS` (one per schema) and `convert`,
-the one-time conversion of a database from the old migration chain to the
-current baselines. All four steps (align definitions, rewrite the
-`alembic_version` row, run later migrations, compare with the models) run
-in one transaction; without `--apply` it is rolled back, so the preview
-shows exactly what would happen. It is kept only for restoring an old
-backup. Run per service as
-`python -m scripts.alembic_convert [--apply]`. Chapter 20 has the
-details.
+A database from before the current baselines (a revision Alembic does
+not know) fails at `alembic upgrade head` with "Can't locate revision".
+Chapter 20 has the details.
 
-#### `metrics.py` -- Prometheus collectors
+#### `logging.py`: metrics -- Prometheus collectors
 
 `get_or_create(cls, name, doc, labels=())` returns the `Counter`, `Gauge`
 or `Histogram` already registered under `name` in the default
@@ -695,14 +687,14 @@ The code shows a consistent rule. A module belongs in `shared/` when
 
 1. **More than one service needs the same behaviour**, and it must stay
    identical. Several modules exist precisely because copies drifted:
-   five ticker regexes (`tickers.py`), seven "today in New York" helpers
+   five ticker regexes (now in `schemas.py`), seven "today in New York" helpers
    (`market_calendar.py`), two rate-limit counters with different failure
-   behaviour (`rate_limit.py`), two membership caches with different TTLs
-   (`org_membership_cache.py`).
+   behaviour (now in `redis.py`), two membership caches with different TTLs
+   (now in `user_state.py`).
 2. **It depends on nothing service-specific.** It takes a
    `BaseServiceSettings` (or plain values) as an argument and never
    imports a service's `config`, `database` or `domains`. `email.py` takes
-   finished links, not a service's settings shape; `org_membership_cache`
+   finished links, not a service's settings shape; `organization_roles`
    takes the caller's HTTP client and auth URL.
 
 What does **not** belong: domain logic of one service (portfolio ledger,
@@ -731,8 +723,8 @@ deployed to all three.
 | Durable stream length, consumer group, max deliveries, reclaim idle | 10000, `workers`, 5, 60 s | `shared/events.py` |
 | Reconnect backoff (pub/sub listeners and the durable subscriber) | 1, 2, 5, 10, 30 s | `shared/events.py` |
 | User-state lookup timeout | 2 s | `shared/user_state.py` |
-| Membership cache TTL | 60 s | `shared/org_membership_cache.py` |
-| E2E lock key / TTL | `e2e:run_lock` / 45 min | `shared/e2e_lock.py` |
+| Membership cache TTL | 60 s | `shared/user_state.py` |
+| E2E lock key / TTL | `e2e:run_lock` / 45 min | `shared/redis.py` |
 | Page limits | page <= 100000, page_size <= 100, default 20 | `shared/schemas.py` |
 | JWT secret minimum length | 32 characters | `shared/config.py` |
 | Answer status when every unit of a scheduled job failed | 500 | `shared/scheduled_jobs.py` |
@@ -778,7 +770,7 @@ shared, but each service picks its keys and limits.
 | mypy reports `Duplicate module named ...` | `--explicit-package-bases` missing, or mypy run from the wrong directory. | Use the Makefile targets (chapter 31). |
 | Redis data "missing" | Looking in the wrong database number. | Use `-n 0..3` with `bash scripts/redis-cli.sh` (table in 3.2). |
 | `e2e_check` exits with code 2 and names another run | `e2e:run_lock` is held. | Wait, or `--break-lock` if that run is really gone. |
-| A service refuses to start with `SchemaBootstrapError` | The schema has tables but no revision, or an archived revision. | Follow the message (chapter 20). |
+| A service refuses to start with `SchemaBootstrapError` | The schema has tables but no revision (or Alembic cannot locate the revision of an old backup). | Follow the message (chapter 20). |
 
 ---
 
@@ -801,7 +793,7 @@ All read-only.
 
    ```bash
    docker compose --env-file .env.docker exec -T ai-service python -c "
-   from shared.tickers import normalize_ticker
+   from shared.schemas import normalize_ticker
    print(normalize_ticker(' brk.b '))
    try:
        normalize_ticker('NOT A TICKER')
@@ -856,7 +848,7 @@ package; it has no `__init__.py`).
 </details>
 
 <details>
-<summary>2. You change <code>shared/tickers.py</code>. What must you run and deploy?</summary>
+<summary>2. You change the ticker rule in <code>shared/schemas.py</code>. What must you run and deploy?</summary>
 
 Type checks and tests for all three services (`make mypy`, `make test`),
 then rebuild all three images (or restart all three in development).
@@ -877,7 +869,7 @@ database 0 and the durable stream ended up in the wrong place.
 </details>
 
 <details>
-<summary>5. Why is the RAG assistant's limit not in <code>shared/rate_limit.py</code>?</summary>
+<summary>5. Why is the RAG assistant's limit not in <code>shared/redis.py</code>?</summary>
 
 It is used by one service only and has a different shape (per clock
 minute plus per UTC day). Shared code is for rules several services need.
@@ -904,30 +896,22 @@ service-specific (settings come in as parameters).
 | File | What it holds |
 |---|---|
 | `shared/config.py` | `BaseServiceSettings`, `get_settings`, secret checks |
-| `shared/database.py` | `Base`, `UUIDPKMixin`, `TimestampColumnsMixin`, engine and session factories, `make_get_db`, `count_query` |
-| `shared/logging.py` | `configure_logging` |
-| `shared/redis.py` | Four Redis clients and pools |
-| `shared/events.py` | Pub/sub and Redis Streams publishers and subscribers |
-| `shared/events_registry.py` | `EventName`, `EVENT_OWNERS` |
+| `shared/database.py` | `Base`, `UUIDPKMixin`, `TimestampColumnsMixin`, engine and session factories, `make_get_db`, `count_query`; schema bootstrap (`bootstrap_schema`, `schema_differences`) |
+| `shared/logging.py` | `configure_logging`; `RequestIdMiddleware`, `current_request_id`: request id in logs, error and success bodies and `X-Request-ID` header; `get_or_create` for Prometheus collectors |
+| `shared/redis.py` | Four Redis clients and pools; fixed-window counter, 429 response; end-to-end run lock |
+| `shared/events.py` | `EventName`, `EVENT_OWNERS`; pub/sub and Redis Streams publishers and subscribers |
 | `shared/http_client.py` | Pooled httpx clients, internal-token hook |
 | `shared/exceptions.py` | `AppError` hierarchy, error handlers |
-| `shared/request_id.py` | `RequestIdMiddleware`, `current_request_id`: request id in logs, error and success bodies and `X-Request-ID` header |
 | `shared/security.py` | Current user, permission dependencies, internal token |
 | `shared/permissions.py` | Role -> permission map |
-| `shared/rate_limit.py` | Fixed-window counter, 429 response |
 | `shared/storage.py` | S3 client functions |
 | `shared/email.py` | SMTP sender and templates |
 | `shared/market_calendar.py` | `MARKET_TZ`, `market_today`, NYSE holidays |
-| `shared/tickers.py` | `TICKER_RE`, `normalize_ticker` |
-| `shared/user_state.py` | Live role/active state |
-| `shared/org_membership_cache.py` | Organization roles cache and invalidation |
+| `shared/user_state.py` | Live role/active state; organization roles cache and invalidation |
 | `shared/concurrency.py` | `gather_bounded` |
-| `shared/e2e_lock.py` | End-to-end run lock |
-| `shared/alembic_bootstrap.py`, `shared/alembic_convert.py` | Schema bootstrap and one-time conversion |
-| `shared/metrics.py` | `get_or_create` for Prometheus collectors |
 | `shared/scheduled_jobs.py` | `job_response`, `all_units_failed` |
 | `shared/enums.py` | Shared `StrEnum` vocabularies |
-| `shared/schemas.py` | Response envelopes, cross-service refs |
+| `shared/schemas.py` | Response envelopes, cross-service refs; `TICKER_RE`, `normalize_ticker` |
 
 ---
 
@@ -940,7 +924,7 @@ service-specific (settings come in as parameters).
 - [24-events.md](24-events.md): `events.py` and the event registry.
 - [28-email.md](28-email.md): `email.py`.
 - [29-security.md](29-security.md): `security.py`, `permissions.py`,
-  `user_state.py`, `rate_limit.py`.
+  `user_state.py`, the rate limiter in `redis.py`.
 - [31-testing-quality.md](31-testing-quality.md): how `shared/` is tested
   and type-checked.
 - [../PROJECT_STRUCTURE.md](../PROJECT_STRUCTURE.md).

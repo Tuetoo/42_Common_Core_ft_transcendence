@@ -3,7 +3,7 @@
 // Sources (the backend stays the source of truth):
 // - services/core-service/domains/research/schema.py (notes, tags, comments)
 // - services/core-service/config.py (document size, extensions, categories)
-// - shared/tickers.py (ticker pattern), shared/enums.py (document enums)
+// - shared/schemas.py (ticker pattern), shared/enums.py (document enums)
 // - services/ai-service/domains/rag/schema.py (question length)
 
 export const NOTE_TITLE_MAX = 256;

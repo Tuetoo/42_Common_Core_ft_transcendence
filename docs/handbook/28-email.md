@@ -144,7 +144,7 @@ find them all by searching the code for the four helpers and for
 | 3 | Verification of a new address | `PATCH /api/v1/admin/users/{user_id}` when an admin changes a user's email (`services/auth-service/domains/admin/service.py`, `AdminService.update_user`) | sets `is_verified = False` and `self.email_dispatch` (only when the same request does not also set `is_verified` itself); the route adds `send_verification_email_safely` | same | 24 h |
 | 4 | Password reset | `POST /api/v1/auth/password-reset/request` | `AuthService.request_password_reset` (returns `None` for an unknown or deleted account) | `{FRONTEND_BASE_URL}/reset-password?token=...` | `PASSWORD_RESET_TOKEN_EXPIRE_HOURS` = 1 h |
 | 5 | Organization invitation | `POST /api/v1/organizations/{org_id}/invitations` | `OrganizationService.invite` (`services/auth-service/domains/organization/service.py`) appends to `pending_invitation_emails`; the route adds `send_quietly` with `send_organization_invitation_email` for each. A new invitation to the same address in the same organization replaces the open one, so only the newest email's link works | `{FRONTEND_BASE_URL}/invitations/accept?token=...` | `ORGANIZATION_INVITATION_EXPIRE_DAYS` = 7 days (not stated in the email); ends earlier when revoked (`DELETE /api/v1/organizations/{org_id}/invitations/{id}`) or replaced |
-| 6 | Notification copy | any core-service notification (`services/core-service/domains/notification/actions.py`, `notify_user`) | `send_email_if_enabled` in `services/core-service/domains/notification/service.py` | none | - |
+| 6 | Notification copy | any core-service notification (`services/core-service/domains/notification/service.py`, `notify_user`) | `send_email_if_enabled` in `services/core-service/domains/notification/service.py` | none | - |
 
 A user changing their own profile through `PATCH /api/v1/auth/me` cannot
 change their email (`MeUpdate` has no email field), so that route sends
@@ -241,7 +241,7 @@ gone. The user-facing response is never affected.
 ### 3.6 Notification emails (core-service)
 
 core-service creates an in-app notification for most user actions
-(chapter 12 and `services/core-service/domains/notification/actions.py`).
+(chapter 12 and `services/core-service/domains/notification/service.py`).
 For each notification it asks auth-service for the user's channels
 (`GET /internal/users/{id}/notification-settings`, which returns the
 account email and `user_settings.notification_preferences`):
@@ -595,8 +595,7 @@ No. The `email` channel is opt-in (default off in `DeliveryPreferences`).
 | `services/auth-service/domains/organization/service.py`, `api.py` | `invite`, `pending_invitation_emails` (the route sends each with `send_quietly`). |
 | `services/auth-service/security.py` | The single-purpose link tokens. |
 | `services/auth-service/config.py` | Link lifetimes and rate limits. |
-| `services/core-service/domains/notification/service.py` | `DeliveryPreferences`, `delivery_preferences`, `send_email_if_enabled`, `deliver_notification`. |
-| `services/core-service/domains/notification/actions.py` | `notify_user`, `notify_users`, `notify_after_commit`. |
+| `services/core-service/domains/notification/service.py` | `DeliveryPreferences`, `delivery_preferences`, `send_email_if_enabled`, `deliver_notification`, `notify_user`, `notify_users`, `notify_after_commit`. |
 | `infra/alertmanager/alertmanager.yml` | Alert email routing and SMTP. |
 | `docker-compose.yaml` (`mailhog`) | The MailHog container. |
 | `tests/auth-service/conftest.py` (`mock_email`) | Captures emails in tests. |

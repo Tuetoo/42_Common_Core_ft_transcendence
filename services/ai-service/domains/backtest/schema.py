@@ -1,9 +1,19 @@
 from datetime import date, datetime
 from uuid import UUID
-from ai_events import RESERVED_STRATEGY_NAMES
 from pydantic import ConfigDict, Field, field_validator
-from shared.schemas import BaseSchema, IDMixin
-from shared.tickers import Ticker
+from shared.schemas import BaseSchema, IDMixin, Ticker
+
+RECOMMENDATION_REPLAY_STRATEGY = "ai_recommendation_replay"
+PORTFOLIO_SNAPSHOT_STRATEGY = "portfolio_snapshot_backtest"
+_BACKTEST_KIND_BY_STRATEGY = {
+    RECOMMENDATION_REPLAY_STRATEGY: "recommendation_replay",
+    PORTFOLIO_SNAPSHOT_STRATEGY: "portfolio"
+}
+RESERVED_STRATEGY_NAMES = frozenset(_BACKTEST_KIND_BY_STRATEGY)
+
+
+def backtest_kind(strategy_name: str | None) -> str:
+    return _BACKTEST_KIND_BY_STRATEGY.get(strategy_name or "", "ticker")
 
 
 class BacktestCreate(BaseSchema):

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { wsUrl } from "@/app/lib/ws-url";
-import { closeSocket } from "./close-socket";
+import { CLOSE_UNAUTHORIZED, closeSocket } from "./close-socket";
 
 // One WebSocket for as long as any signed-in page is open. It does two
 // jobs: the backend counts a user as online while they have an open socket
@@ -42,17 +42,19 @@ export function useLiveUnread({
         attempts = 0;
       };
       ws.onmessage = () => setExtra((n) => n + 1);
-      // The server closes the socket when the access token expires. The
-      // browser can't refresh the token itself (httpOnly cookie), so ask the
-      // server to re-render: the proxy swaps in a fresh token, the layout
-      // passes it down, and this effect reconnects with it. A drop for any
-      // other reason (network blip) just reconnects. Waits grow (5s, 10s,
-      // 20s ... 60s) so a socket that can't connect doesn't spin.
-      ws.onclose = () => {
+      // The server closes the socket with 4401 when the access token
+      // expires. The browser can't refresh the token itself (httpOnly
+      // cookie), so ask the server to re-render: the proxy swaps in a fresh
+      // token, the layout passes it down, and this effect reconnects with
+      // it. A drop for any other reason (network blip, core-service restart)
+      // only reconnects: re-rendering then could turn the page into the
+      // error page while the backend is down. Waits grow (5s, 10s, 20s ...
+      // 60s) so a socket that can't connect doesn't spin.
+      ws.onclose = (event) => {
         const delay = Math.min(5000 * 2 ** attempts, 60_000);
         attempts += 1;
         retryTimer = setTimeout(() => {
-          router.refresh();
+          if (event.code === CLOSE_UNAUTHORIZED) router.refresh();
           connect();
         }, delay);
       };

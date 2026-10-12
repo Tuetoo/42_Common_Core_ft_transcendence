@@ -17,11 +17,10 @@ from domains.decision.repository import (DecisionOutcomeRepository,
                                          InvestmentDecisionRepository)
 from domains.memory.repository import EpisodicMemoryRepository
 from shared.enums import RecommendationAction
-from shared.events_registry import EventName
+from shared.events import EventName
 
 logger = structlog.get_logger(__name__)
 
-_AI_ACCURACY_EVALUATION_DAYS = settings.AI_ACCURACY_EVALUATION_DAYS
 _DECISION_EVALUATION_WINDOWS = [7, 30, 90]
 _DEFAULT_BENCHMARK = "SPY"
 _HOLD_FLAT_BAND = 0.02
@@ -74,7 +73,7 @@ async def _score_one_recommendation(
         analyzed_on = analysis.created_at.date()
 
     realized_return = await _realized_return(
-        ticker, analyzed_on, _AI_ACCURACY_EVALUATION_DAYS)
+        ticker, analyzed_on, settings.AI_ACCURACY_EVALUATION_DAYS)
     if realized_return is None:
         logger.warning(
             "review.no_price_data", ticker=ticker,
@@ -102,7 +101,7 @@ async def review_ai_accuracy() -> StepCounts:
     async with SessionLocal() as session:
         pending = await AnalyticsRepository(
             session).list_recommendations_pending_metric(
-                min_age_days=_AI_ACCURACY_EVALUATION_DAYS)
+                min_age_days=settings.AI_ACCURACY_EVALUATION_DAYS)
         pending_items = [(rec.id, rec.analysis_id, rec.recommendation)
                          for rec in pending]
 

@@ -1,35 +1,110 @@
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any, Protocol
 import structlog
-from ai.agents.debate_side import DebateSide, DebateSideAgent
+from ai.agents.debate_common import DebateSideAgent
 from ai.agents.evidence_grounding import non_english_reason
+from ai.agents.filing import FilingAgent
+from ai.agents.fundamental import FundamentalAgent
 from ai.agents.judge import JudgeAgent
 from ai.agents.loop import BaseAgent
+from ai.agents.macro import MacroAgent
+from ai.agents.market import MarketAgent
+from ai.agents.news import NewsAgent
 from ai.agents.portfolio import PortfolioAgent
 from ai.agents.reflection import ReflectionAgent
-from ai.agents.supervisor import select_agents
-from ai.graph.edges import MAX_REFLECTION_RETRIES, node_name
-from ai.graph.state import (ISSUE_REFLECTION_CRASHED,
+from ai.agents.risk import RiskAgent
+from ai.agents.sentiment import SentimentAgent
+from ai.agents.technical import TechnicalAgent
+from ai.graph.state import (AVAILABILITY_FAILURE_KINDS,
+                            ISSUE_REFLECTION_CRASHED,
                             ISSUE_RETRY_DELAYED_CAPACITY,
                             ISSUE_RETRY_NO_PROGRESS,
-                            ISSUE_RETRY_SKIPPED_CAPACITY, AgentOutput,
-                            AnalysisState, DebateArgument, DebateState,
-                            FailureKind, JudgeVerdict, ReflectionIssue,
-                            ReflectionVerdict, merge_debate_state)
+                            ISSUE_RETRY_SKIPPED_CAPACITY,
+                            MAX_REFLECTION_RETRIES, AgentOutput, AgentSkip,
+                            AnalysisState, DebateArgument, DebateSide,
+                            DebateState, FailureKind, JudgeVerdict,
+                            ReflectionIssue, ReflectionVerdict,
+                            merge_debate_state, node_name)
+from ai.ingestion.sec_edgar_filings import ingest_new_filings
 from ai.llm.base import (LLMNonEnglishOutputError, LLMProviderTimeoutError,
                          LLMRateLimitError, LLMServerOverloadedError, LLMTier)
-from ai.llm.capacity import (capacity_aware_delay, chain_capacity,
-                             free_chain_model)
-from ai.llm.router import tier_model_chain
+from ai.llm.router import (capacity_aware_delay, chain_capacity,
+                           free_chain_model, tier_model_chain)
 from ai.recommendation.engine import (build_final_recommendation,
                                       no_verdict_reason)
 from config import settings
 from shared.enums import (AgentRole, AgentStatus, AnalysisFailureReason,
-                          RecommendationAction)
+                          AnalysisType, RecommendationAction)
 
 logger = structlog.get_logger(__name__)
+
+AGENT_REGISTRY: dict[AgentRole, type[BaseAgent]] = {
+    AgentRole.MARKET: MarketAgent,
+    AgentRole.NEWS: NewsAgent,
+    AgentRole.SENTIMENT: SentimentAgent,
+    AgentRole.FILING: FilingAgent,
+    AgentRole.TECHNICAL: TechnicalAgent,
+    AgentRole.FUNDAMENTAL: FundamentalAgent,
+    AgentRole.RISK: RiskAgent,
+    AgentRole.MACRO: MacroAgent
+}
+
+_ALL_DATA_ROLES: list[AgentRole] = list(AGENT_REGISTRY)
+
+DEFAULT_AGENTS_BY_TYPE: dict[AnalysisType, list[AgentRole]] = {
+    AnalysisType.FULL: list(_ALL_DATA_ROLES),
+    AnalysisType.TECHNICAL: [AgentRole.MARKET, AgentRole.TECHNICAL],
+    AnalysisType.FUNDAMENTAL: [
+        AgentRole.MARKET, AgentRole.FUNDAMENTAL, AgentRole.FILING
+    ],
+    AnalysisType.SENTIMENT: [AgentRole.NEWS, AgentRole.SENTIMENT],
+    AnalysisType.RISK: [AgentRole.MARKET, AgentRole.RISK],
+    AnalysisType.MACRO: [AgentRole.MACRO, AgentRole.MARKET],
+    AnalysisType.NEWS: [AgentRole.NEWS, AgentRole.SENTIMENT],
+    AnalysisType.FILING: [AgentRole.FILING, AgentRole.FUNDAMENTAL]
+}
+
+
+def select_agents(
+        *, requested_agents: list[AgentRole] | None,
+        analysis_type: AnalysisType,
+        holdings_count: int) -> tuple[list[AgentRole], list[AgentSkip]]:
+    if requested_agents is not None:
+        base_selected = [
+            r for r in dict.fromkeys(requested_agents) if r in _ALL_DATA_ROLES
+        ]
+        skip_reason = "user's explicit agent selection did not include it"
+    else:
+        base_selected = list(DEFAULT_AGENTS_BY_TYPE[analysis_type])
+        skip_reason = (
+            "not part of the default agent set for "
+            f"analysis_type={analysis_type.value}")
+
+    selected = list(base_selected)
+    skipped = [
+        AgentSkip(role=role, reason=skip_reason) for role in _ALL_DATA_ROLES
+        if role not in selected
+    ]
+
+    if holdings_count >= 1:
+        if (requested_agents is not None
+                and AgentRole.PORTFOLIO not in requested_agents):
+            skipped.append(
+                AgentSkip(
+                    role=AgentRole.PORTFOLIO, reason=(
+                        "user's explicit agent selection did not include it")))
+        else:
+            selected.append(AgentRole.PORTFOLIO)
+    else:
+        skipped.append(
+            AgentSkip(
+                role=AgentRole.PORTFOLIO,
+                reason="no holdings in the analysis context"))
+
+    return selected, skipped
+
 
 _FAN_OUT_STAGGER_ORDER: tuple[AgentRole, ...] = (
     AgentRole.MARKET, AgentRole.NEWS, AgentRole.SENTIMENT, AgentRole.FILING,
@@ -88,31 +163,32 @@ def _failure_kind_of(exc: BaseException) -> FailureKind:
     return "other"
 
 
-def _make_node(role: AgentRole,
-               agent_cls: type[BaseAgent]) -> Callable[[AnalysisState], Any]:
+class _StateNode(Protocol):
+
+    def __call__(self,
+                 state: AnalysisState) -> Coroutine[Any, Any, dict[str, Any]]:
+        ...
+
+
+def _build_agent(role: AgentRole, state: AnalysisState) -> BaseAgent:
+    if role == AgentRole.PORTFOLIO:
+        return PortfolioAgent(role=role, portfolio_id=state.portfolio_id)
+    return AGENT_REGISTRY[role](role=role)
+
+
+def make_agent_node(role: AgentRole) -> _StateNode:
 
     async def _node(state: AnalysisState) -> dict[str, Any]:
-        agent = agent_cls(role=role)
-        output = await _run_agent_safely(role, agent, state)
+        output = await _run_agent_safely(
+            role, _build_agent(role, state), state)
         return {"agent_outputs": {role: output}}
 
     _node.__name__ = node_name(role)
     return _node
 
 
-def portfolio_node_factory() -> Callable[[AnalysisState], Any]:
-
-    async def portfolio_node(state: AnalysisState) -> dict[str, Any]:
-        agent = PortfolioAgent(
-            role=AgentRole.PORTFOLIO, portfolio_id=state.portfolio_id)
-        output = await _run_agent_safely(AgentRole.PORTFOLIO, agent, state)
-        return {"agent_outputs": {AgentRole.PORTFOLIO: output}}
-
-    return portfolio_node
-
-
 async def episodic_memory_node(state: AnalysisState) -> dict[str, Any]:
-    from ai.memory.episodic import retrieve_episodic_context
+    from ai.memory.agent_memory import retrieve_episodic_context
 
     if settings.EPISODIC_CONTEXT_LIMIT <= 0:
         return {"episodic_context": []}
@@ -134,7 +210,8 @@ async def episodic_memory_node(state: AnalysisState) -> dict[str, Any]:
 async def _procedural_hints(
         selected: list[AgentRole], ticker: str,
         user_id: str) -> dict[AgentRole, str]:
-    from ai.memory.procedural import owner_uuid, retrieve_procedural_hints
+    from ai.memory.agent_memory import (owner_uuid,
+                                        retrieve_procedural_hints)
 
     owner_id = owner_uuid(user_id)
     hints: dict[AgentRole, str] = {}
@@ -152,16 +229,36 @@ async def _procedural_hints(
     return hints
 
 
-async def _fresh_filing_context(state: AnalysisState) -> str | None:
-    from ai.knowledge.fresh_filings import check_for_fresh_filing_content
-
+async def load_fresh_filing_context(ticker: str) -> str | None:
     try:
-        return await check_for_fresh_filing_content(state.ticker)
+        new_filings = (await ingest_new_filings(ticker)).new_filings
     except Exception as exc:
         logger.warning(
-            "supervisor_node.fresh_filing_check_failed", ticker=state.ticker,
+            "fresh_filing_check.sec_check_failed", ticker=ticker,
             error=str(exc))
         return None
+
+    if not new_filings:
+        return None
+
+    newest = max(new_filings, key=lambda filing: str(filing.filing_date))
+    older = len(new_filings) - 1
+    if older:
+        logger.info(
+            "fresh_filing_check.older_new_filings_not_pasted", ticker=ticker,
+            count=older, pasted=newest.filename)
+    others = (
+        f" {older} older new filing(s) for {ticker} are being indexed too and "
+        "will be searchable with search_filings soon." if older else "")
+    logger.info(
+        "fresh_filing_check.found_new_content", ticker=ticker,
+        count=len(new_filings))
+    return (
+        f"A real {newest.form} filed on {newest.filing_date} for {ticker} "
+        f"(freshly fetched; it may not be in the searchable filing corpus "
+        f"yet -- search_filings may still have OTHER, older filing content "
+        f"worth checking too; where an older filing says something different "
+        f"on the same topic, this newer filing wins).{others}\n{newest.text}")
 
 
 async def _ticker_kg_context(state: AnalysisState) -> str | None:
@@ -229,7 +326,8 @@ async def supervisor_node(state: AnalysisState) -> dict[str, Any]:
 
     needs_filing_context = bool(_FILING_CONTEXT_ROLES & set(selected))
     fresh_filing_context = (
-        await _fresh_filing_context(state) if needs_filing_context else None)
+        await load_fresh_filing_context(state.ticker)
+        if needs_filing_context else None)
     kg_context = (
         await _ticker_kg_context(state) if needs_filing_context else None)
 
@@ -262,15 +360,12 @@ async def agent_join_node(state: AnalysisState) -> dict[str, Any]:
     return {}
 
 
-_REPAIRABLE_UNAVAILABLE_KINDS = frozenset({"server_overload", "rate_limit"})
-
-
 def _repairable_missing_sides(debate: DebateState) -> list[DebateSide]:
     sides: list[DebateSide] = []
     for side in debate.unavailable_latest_sides():
         failed = debate.latest_argument(side)
         if (failed is not None
-                and failed.unavailable_kind in _REPAIRABLE_UNAVAILABLE_KINDS):
+                and failed.unavailable_kind in AVAILABILITY_FAILURE_KINDS):
             sides.append(side)
     return sides
 
@@ -333,13 +428,6 @@ async def _side_argument(
             available=False, unavailable_kind=kind)
 
 
-class _StateNode(Protocol):
-
-    def __call__(self,
-                 state: AnalysisState) -> Coroutine[Any, Any, dict[str, Any]]:
-        ...
-
-
 def _debate_side_node(side: DebateSide) -> _StateNode:
     name = f"{side}_node"
 
@@ -355,7 +443,7 @@ def _debate_side_node(side: DebateSide) -> _StateNode:
             side, state, failed_event=f"{name}.failed")
         previous = state.debate.latest_argument(side)
         if (not argument.available
-                and argument.unavailable_kind in _REPAIRABLE_UNAVAILABLE_KINDS
+                and argument.unavailable_kind in AVAILABILITY_FAILURE_KINDS
                 and _is_single_side_correction_pass(state)
                 and previous is not None and previous.available):
             logger.warning(

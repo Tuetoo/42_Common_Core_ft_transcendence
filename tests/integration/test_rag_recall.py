@@ -19,8 +19,8 @@ async def test_recall_at_5_meets_baseline():
             "scripts/generate_rag_golden_set.py first (requires real "
             "indexed Qdrant data and an LLM key)")
 
-    from ai.evaluation.golden_set import load_golden_set
-    from ai.evaluation.recall import compute_all_recall_curves
+    from ai.evaluation.rag_recall import (compute_all_recall_curves,
+                                          load_golden_set)
 
     golden_set = load_golden_set(_GOLDEN_SET_PATH)
     curves = await compute_all_recall_curves(golden_set, top_k=5)
