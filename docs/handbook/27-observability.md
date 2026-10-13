@@ -391,7 +391,7 @@ when the exporter runs but cannot reach the database.
 | Alert | Expression (summary) | For | Severity |
 |---|---|---|---|
 | `High5xxRate` | per service, 5xx share of `rate(http_requests_total{handler!~"/metrics\|/health"}[5m])` > 5%, AND that rate > 0.05 req/s | 5m | warning |
-| `HighLatencyP95` | `histogram_quantile(0.95, ...)` of `http_request_duration_seconds_bucket` over 10m > 2 s, excluding handlers `/internal/.*`, `/metrics`, `/health` | 10m | warning |
+| `HighLatencyP95` | `histogram_quantile(0.95, ...)` of `http_request_duration_seconds_bucket` over 10m > 2 s, excluding handlers `/internal/.*`, `/metrics`, `/health` and the RAG ask handlers `/api/v1/rag/ask.*` (an LLM call; the streamed answer is timed until its last token) | 10m | warning |
 
 Both HTTP alerts leave out the `/metrics` scrapes and `/health` checks:
 Prometheus scrapes every 15 s and the Docker healthcheck calls `/health`
@@ -399,8 +399,12 @@ every 15 s, about 0.13 req/s per idle service. Counted as traffic, they
 would always meet the minimum and dilute the 5xx share. The minimum of
 0.05 real requests per second stops one failed request on an idle service
 from firing. Internal scheduler jobs are slow by design and excluded from
-the latency alert. Creating an analysis or a backtest only stores the row
-and starts the work in the background, so both stay included.
+the latency alert, and so are the RAG ask handlers (they wait for the
+LLM). Creating an analysis or a backtest only stores the row
+and starts the work in the background, so both stay included. The
+measured duration includes a request's FastAPI background tasks (core's
+notifications and emails); the note and comment sentiment call runs in
+its own asyncio task and is not counted.
 
 **Group `ai-pipeline`**
 
@@ -477,9 +481,11 @@ expected ones. The file (`evaluation_interval: 1m`) has seven test groups:
    one real request per minute that fails -> no `High5xxRate` at 12m
    (the probes are not traffic, 1 req/min is below the minimum).
 4. Every `POST /api/v1/backtests` of ai-service takes 2-5 s, and so does
-   core-service's `/internal/scheduler/market-close` -> at 25m
+   core-service's `/internal/scheduler/market-close`; ai-service's
+   `/api/v1/rag/ask/stream` takes 5-30 s -> at 25m
    `HighLatencyP95` fires for ai-service only, with "has been 4.85s"
-   (2 + 3 x 0.95, linear interpolation inside the 2-5 s bucket).
+   (2 + 3 x 0.95, linear interpolation inside the 2-5 s bucket; the
+   excluded handlers do not change the value).
 5. 3 jobs pending, nothing finished -> no `AnalysisQueueBacklog` at 20m
    (still within `for: 30m`), firing at 65m.
 6. Job gauges stuck at time 0: `DailyJobStale` for `backup` silent at 20h

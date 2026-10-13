@@ -126,8 +126,11 @@ Before it changes anything, a real restore runs a **preflight** of every
 chosen part: PostgreSQL and Qdrant answer; for an `objectstore/` backup
 the object storage's S3 API answers (objectstore running); the avatars
 directory is mounted writable. If one check fails, the restore stops with "nothing was
-changed", so a restore never stops half-way with the database from the
-backup and the object storage from now.
+changed", so a part that cannot run stops the restore before anything
+changes. A part that fails while it runs (for example a Qdrant upload
+error or an object storage sync error) leaves the parts before it
+restored; fix the cause and run the same restore again (it is
+repeatable, because each part replaces its data).
 
 After a real restore, `restore.sh --verify <backup>` compares the running
 data services with the backup without changing anything, and exits 1 on

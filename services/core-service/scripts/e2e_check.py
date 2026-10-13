@@ -35,6 +35,7 @@ TOKEN_REFRESH_AFTER_SECONDS = 600.0
 DEFAULT_CHECK_TIMEOUT = 60.0
 DOCUMENT_READY_TIMEOUT = 180.0
 ANALYSIS_TIMEOUT = 15 * 60.0
+SENTIMENT_TIMEOUT = 280.0
 YJS_SNAPSHOT_DEBOUNCE_SECONDS = 30.0
 
 SECTIONS: tuple[str, ...] = (
@@ -1856,11 +1857,11 @@ class E2E:
                 note = _data(resp)
                 return note if note.get("sentiment_label") else None
 
-            note = await poll(attempt, 60.0, 3.0)
+            note = await poll(attempt, SENTIMENT_TIMEOUT, 3.0)
             if note is None:
                 raise CheckFailed(
-                    "sentiment still null after 60s (ai-service "
-                    "/internal/sentiment needs the LLM)")
+                    f"sentiment still null after {SENTIMENT_TIMEOUT:.0f}s "
+                    "(ai-service /internal/sentiment needs the LLM)")
             return f"{note['sentiment_label']} score={note['sentiment_score']}"
 
         async def comment_sentiment() -> str:
@@ -1875,19 +1876,23 @@ class E2E:
                         return dict(c)
                 return None
 
-            comment = await poll(attempt, 60.0, 3.0)
+            comment = await poll(attempt, SENTIMENT_TIMEOUT, 3.0)
             if comment is None:
-                raise CheckFailed("comment sentiment still null after 60s")
+                raise CheckFailed(
+                    "comment sentiment still null after "
+                    f"{SENTIMENT_TIMEOUT:.0f}s")
             return (
                 f"{comment['sentiment_label']} "
                 f"score={comment['sentiment_score']}")
 
         await self.check(
             "research.note_sentiment", note_sentiment,
-            requires=("research.note_create", ), timeout=90.0)
+            requires=("research.note_create", ),
+            timeout=SENTIMENT_TIMEOUT + 30.0)
         await self.check(
             "research.comment_sentiment", comment_sentiment,
-            requires=("research.comment_create", ), timeout=90.0)
+            requires=("research.comment_create", ),
+            timeout=SENTIMENT_TIMEOUT + 30.0)
 
         async def summary() -> str:
             resp = await self.req(

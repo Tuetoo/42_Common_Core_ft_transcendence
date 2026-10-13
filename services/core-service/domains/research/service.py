@@ -178,6 +178,10 @@ class ResearchService:
             if existing.status != "failed":
                 return UploadOutcome(
                     DocumentRead.model_validate(existing), duplicate=True)
+            if existing.owner_id != owner_id:
+                raise ConflictError(
+                    "A document with this name already exists in the "
+                    "organization.")
             await upload_bytes(
                 settings, bucket=settings.S3_BUCKET_DOCUMENTS,
                 key=existing.storage_url, content=content,

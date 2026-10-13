@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 from typing import Literal
@@ -93,6 +94,20 @@ async def analyze_user_sentiment(
         LLMMessage(role="system", content=_SYSTEM_PROMPT.format(kind=kind)),
         LLMMessage(role="user", content=f"<text>\n{body}\n</text>")
     ]
+    try:
+        async with asyncio.timeout(settings.SENTIMENT_TIMEOUT_SECONDS):
+            return await _score(router, messages, kind, len(text))
+    except TimeoutError as exc:
+        logger.warning(
+            "user_sentiment.timed_out", kind=kind, text_length=len(text),
+            timeout_seconds=settings.SENTIMENT_TIMEOUT_SECONDS)
+        raise SentimentUnavailableError(
+            "sentiment model unavailable (timeout)") from exc
+
+
+async def _score(
+        router: LLMRouter, messages: list[LLMMessage], kind: str,
+        text_length: int) -> SentimentResult:
     last_error = "no usable answer"
     for attempt in range(2):
         try:
@@ -102,7 +117,7 @@ async def analyze_user_sentiment(
         except LLMError as exc:
             logger.warning(
                 "user_sentiment.llm_unavailable", kind=kind,
-                text_length=len(text), error_type=type(exc).__name__)
+                text_length=text_length, error_type=type(exc).__name__)
             raise SentimentUnavailableError(
                 f"sentiment model unavailable ({type(exc).__name__})") from exc
         score = parse_score(response.content)
@@ -113,5 +128,5 @@ async def analyze_user_sentiment(
         last_error = "the model's answer was not the requested JSON"
         logger.warning(
             "user_sentiment.unparseable_answer", kind=kind,
-            attempt=attempt + 1, text_length=len(text))
+            attempt=attempt + 1, text_length=text_length)
     raise SentimentUnavailableError(f"sentiment unavailable: {last_error}")

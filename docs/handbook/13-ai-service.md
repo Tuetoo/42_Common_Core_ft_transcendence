@@ -461,7 +461,7 @@ groups below summarise them. Chapter 14 has the full LLM table.
 | Memory and review | `EPISODIC_CONTEXT_LIMIT` (3), `AI_ACCURACY_EVALUATION_DAYS` (30) | Chapters 18 and 19. |
 | Data providers | `SEC_EDGAR_USER_AGENT`, `FRED_API_KEY`, `NEWSAPI_API_KEY`, `TAVILY_API_KEY` (empty), `NEWSAPI_SEARCH_IN` (`title,description`), `NEWSAPI_SORT_BY` (`relevancy`), `NEWSAPI_RECENT_EXTRA_LIMIT` (10), `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600.0) | Section 3.6. |
 | RAG assistant | `RAG_TOP_K_RESULTS` (5), `RAG_ASK_RATE_LIMIT_PER_MINUTE` (10), `RAG_ASK_RATE_LIMIT_PER_DAY` (200), `RAG_ASK_LLM_TIER` (`cheap`), `RAG_ASK_MAX_OUTPUT_TOKENS` (1024), `RAG_ASK_SNIPPET_CHARS` (300), `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120.0) | Chapter 17. |
-| User sentiment | `SENTIMENT_MAX_INPUT_CHARS` (6000) | `POST /internal/sentiment`. |
+| User sentiment | `SENTIMENT_MAX_INPUT_CHARS` (6000), `SENTIMENT_TIMEOUT_SECONDS` (240) | `POST /internal/sentiment`. |
 | Shared (from `shared/config.py`) | `LOG_LEVEL` (`INFO`), `LOG_JSON` (True), `INTERNAL_API_TOKEN` (empty), `USER_STATE_CHECK_ENABLED` (True), database/Redis/storage URLs | Chapter 30. |
 
 ## 5. Design decisions and why

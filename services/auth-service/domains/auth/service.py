@@ -546,6 +546,7 @@ class AuthService:
                                                                   step):
             await security.two_factor_failed(str(user_id))
             raise error
+        await security.two_factor_succeeded(str(user_id))
         if not security.is_encrypted(row.secret):
             row.secret = security.encrypt_secret(secret)
             await self._db.flush()

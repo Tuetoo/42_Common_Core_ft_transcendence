@@ -460,7 +460,11 @@ optional `portfolio_id`.
 - The workflow walks the benchmark's trading days. Each trade adjusts cash
   and quantity; SELLs are matched first-in-first-out (FIFO) against earlier
   BUY lots to get per-trade returns for the win rate. Each day's equity is
-  cash plus quantity times the last close.
+  cash plus quantity times the last close. If a traded ticker has no
+  price history in the window, the backtest fails with "no price history
+  for <TICKER> between <start> and <end>" instead of valuing the position
+  at its fill price. The same rule applies to the recommendation replay
+  (B).
 - Cash never goes below zero: when the replayed BUYs need more cash than
   `initial_capital` at any point, the backtest fails with
   `InsufficientCapitalError` ("the replayed buys need N of cash but
@@ -594,9 +598,13 @@ stores `sentiment_label`, `sentiment_score`, `sentiment_model` and
 - Only the numeric `score` is taken from the model, clamped to -1..1. The
   label is derived in code: `>= 0.15` positive, `<= -0.15` negative,
   otherwise neutral. Label and score therefore never disagree.
-- An unusable answer is retried once; any LLM failure gives 503 with
-  `Retry-After: 60`, and core-service leaves the fields empty (they can be
-  filled later by `services/core-service/scripts/backfill_sentiment.py`).
+- An unusable answer is retried once; the whole call is limited to
+  `SENTIMENT_TIMEOUT_SECONDS` (240). Any LLM failure or that limit gives 503 with
+  `Retry-After: 60`, and core-service stores nothing: a new note or
+  comment stays without a label (filled later by the next edit or
+  `services/core-service/scripts/backfill_sentiment.py`), and an edited
+  one keeps its previous label until the next successful refresh (the
+  backfill only fills rows that have no label).
 - The text is never logged, only its length.
 
 core-service aggregates the scores at `GET /api/v1/research/sentiment/summary`.
@@ -673,6 +681,7 @@ layers on synthetic price series from a fake market-data provider.
 | `ANALYSIS_TIMEOUT_SECONDS` | 2700.0 | same | per analysis |
 | `SYSTEM_TIER_ACCEPTANCE_HOURS` | 72 | same | pending tier of a system analysis waits this long for acceptance (3.3) |
 | `SENTIMENT_MAX_INPUT_CHARS` | 6000 | same | text cut for sentiment |
+| `SENTIMENT_TIMEOUT_SECONDS` | 240 | same | limit of one sentiment call, retries and fallback included |
 | `_DECISION_EVALUATION_WINDOWS` | 7, 30, 90 | `ai/workflows/review_workflow.py` | decision outcome windows |
 | `_DEFAULT_BENCHMARK` | `SPY` | same | decision outcome benchmark |
 | `_HOLD_FLAT_BAND` | 0.02 | same | HOLD correct within +-2% |
@@ -805,7 +814,9 @@ destructive; it can be deleted afterwards).
    ```
 
 4. **Create a backtest through the API and read its metrics (writes one
-   backtest row).** A backtest belongs to its creator, and the route checks
+   backtest row).** In the app, the same portfolio backtest runs from the
+   Backtest section of a portfolio page, and its result page refreshes
+   until the run ends. A backtest belongs to its creator, and the route checks
    portfolio access, so use a token of a user who may use the portfolio.
    For the test portfolio that is its owner (an admin token gets 404 for a
    portfolio it does not own or share):

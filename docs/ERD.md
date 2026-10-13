@@ -144,7 +144,7 @@ nullable), `filename`, `document_type` (`pdf`/`txt`/`md` — file format),
 `document_type`; user-supplied at upload since there's no reliable way to
 infer document semantics from bytes alone), **`ticker`** (nullable — not
 every category is about one company), `storage_url` (an object *key* into
-S3-compatible object storage via `shared/storage.py`, not a fetchable URL — see §6 for why), and
+S3-compatible object storage via `shared/storage.py`, not a fetchable URL — see §5 for why), and
 `status` (`uploaded`→`parsing`→`chunking`→`embedding`→`ready`/`failed`,
 driven by ai-service's ingestion workflow), `uploaded_at` (default `now()`),
 `status_changed_at` (default `now()`, set on every applied status change;
@@ -184,9 +184,11 @@ every list, search and detail except for their author and moderators —
 and `sentiment_label` (VARCHAR(16): `positive`/`neutral`/`negative`),
 `sentiment_score` (DOUBLE PRECISION, -1..1), `sentiment_model`
 (VARCHAR(128)), `sentiment_analyzed_at` — all NULL until ai-service
-(`POST /internal/sentiment`) has analysed the current text; rows without
-a sentiment are filled by `scripts/backfill_sentiment.py --apply` or at
-their next edit.
+(`POST /internal/sentiment`) has analysed the text once. After an edit
+they keep the previous result until a refresh succeeds, so a failed
+refresh leaves the previous label in place until the next successful
+one. `scripts/backfill_sentiment.py --apply` fills only rows that have no
+label.
 
 **research_tags** — `id`, `name` (unique). **note_tags** — plain many-to-many
 join table, `note_id` + `tag_id` (both FK).
@@ -426,8 +428,8 @@ are computed on the fly (`ai/tools/indicators.py`); they are not stored.
 
 Research documents' raw bytes live in S3-compatible object storage, not
 in any database: SeaweedFS in docker compose (service `objectstore`, also
-reachable under the network alias `minio`), a real AWS S3 or Cloudflare R2
-endpoint in production, with the same code either way
+reachable under the network alias `minio`) both locally and on the cloud
+host; any S3-compatible endpoint works with the same code
 (`shared/storage.py`). `core.documents.storage_url` holds the object
 *key*, not a browsable URL: `GET /api/v1/research/documents/{id}/content`
 is the only way to retrieve the bytes (there is no directly linkable file

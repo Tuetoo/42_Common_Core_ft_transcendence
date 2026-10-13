@@ -72,7 +72,8 @@ tests:
 
   # p95 latency: every backtest request takes 2-5 s on ai-service (fires
   # with the interpolated p95 2 + 3 * 0.95 = 4.85 s); core-service's
-  # /internal scheduler route is just as slow but excluded.
+  # /internal scheduler route and the RAG answer stream are slower but
+  # excluded.
   - interval: 1m
     input_series:
       - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/backtests", method="POST", le="1"}'
@@ -89,6 +90,12 @@ tests:
         values: "0+6x30"
       - series: 'http_request_duration_seconds_bucket{service="core-service", handler="/internal/scheduler/market-close", method="POST", le="+Inf"}'
         values: "0+6x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/rag/ask/stream", method="POST", le="5"}'
+        values: "0x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/rag/ask/stream", method="POST", le="30"}'
+        values: "0+20x30"
+      - series: 'http_request_duration_seconds_bucket{service="ai-service", handler="/api/v1/rag/ask/stream", method="POST", le="+Inf"}'
+        values: "0+20x30"
     alert_rule_test:
       - eval_time: 25m
         alertname: HighLatencyP95

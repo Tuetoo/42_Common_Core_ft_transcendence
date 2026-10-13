@@ -255,33 +255,51 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
         <div className="section">
           <h2 className="section-title">Reflection</h2>
           <div className="row-list">
-            {analysis.reflections.map((r) => (
-              <div key={r.id} className="row-item">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <span className="row-title">Check {r.round_number}</span>
-                  <span className={r.verified ? "pill pill-up" : "pill pill-accent"}>
-                    {r.verified ? "verified" : "issues found"}
-                  </span>
-                </div>
-                {/* REVIEW_META lines are the backend's own bookkeeping, not issues. */}
-                {r.issues
-                  ?.filter((issue) => !issue.startsWith("REVIEW_META:"))
-                  .map((issue, i) => (
-                  <div key={i} className="row-meta break-words">
-                    • {issue}
+            {analysis.reflections.map((r) => {
+              const issues = (r.issues ?? []).filter((issue) => !issue.startsWith("REVIEW_META:"));
+              const retried = r.retry_agents ? Object.entries(r.retry_agents) : [];
+              const note = r.verified || issues.length > 0 || retried.length > 0 ? null : reviewNote(r.issues);
+              return (
+                <div key={r.id} className="row-item">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className="row-title">Check {r.round_number}</span>
+                    <span className={r.verified ? "pill pill-up" : "pill pill-accent"}>
+                      {r.verified ? "verified" : note ? "not verified" : "issues found"}
+                    </span>
                   </div>
-                ))}
-                {r.retry_agents &&
-                  Object.entries(r.retry_agents).map(([agent, reason]) => (
+                  {issues.map((issue, i) => (
+                    <div key={i} className="row-meta break-words">
+                      • {issue}
+                    </div>
+                  ))}
+                  {retried.map(([agent, reason]) => (
                     <div key={agent} className="row-meta break-words">
                       Re-ran <span className="mono">{agent}</span>: {reason}
                     </div>
                   ))}
-              </div>
-            ))}
+                  {note && <div className="row-meta break-words">{note}</div>}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
     </div>
   );
+}
+
+// A check with no issue to list is "not verified" because the review step
+// itself could not run (or no agent produced usable evidence); the backend
+// records why in its REVIEW_META line.
+function reviewNote(issues: string[] | null): string {
+  const meta = issues?.find((issue) => issue.startsWith("REVIEW_META:")) ?? "";
+  const usable = /usable_agents=0\//.test(meta);
+  const skipped = /llm_review_skipped_because=([^;]+)/.exec(meta)?.[1]?.trim();
+  if (usable) return "Not verified: no agent produced usable evidence.";
+  if (/llm_review_ran=false/.test(meta)) {
+    return skipped
+      ? `Not verified: the review step did not run (${skipped}).`
+      : "Not verified: the review step did not run.";
+  }
+  return "Not verified: no issue was recorded for this check.";
 }

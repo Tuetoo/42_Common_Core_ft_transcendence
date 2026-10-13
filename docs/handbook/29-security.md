@@ -365,9 +365,11 @@ matched is stored (`two_factor_secrets.last_used_step`) and any step not
 newer than it is refused, so a code cannot be replayed.
 
 Brute force: `_check_totp` first checks a lock (`two_factor_guard`); each
-wrong code is counted (`two_factor_failed`); after
+wrong code is counted (`two_factor_failed`) and each correct code clears
+the count (`two_factor_succeeded`); after
 `RATE_LIMIT_2FA_FAILURES` (5) failures within
-`RATE_LIMIT_2FA_WINDOW_SECONDS` (300) the user is locked for
+`RATE_LIMIT_2FA_WINDOW_SECONDS` (300) with no correct code in between,
+the user is locked for
 `RATE_LIMIT_2FA_LOCK_SECONDS` (900) and gets 429.
 
 Login with 2FA enabled and no code returns 401 with code
@@ -508,7 +510,8 @@ at connect time) and for API keys (the key owner's state, `apikeys.py`).
 Because a WebSocket is checked only when it connects, core-service also
 re-checks open sockets (Yjs editors and `/ws/{channel}` channels) when auth-service publishes a role,
 deactivation, deletion or organization-membership event: the socket is
-closed (4401 or 4403) or made read-only at once
+closed at once (4401 for a deactivated or deleted account, 4403 when the
+user loses read access, or for a note, write access)
 ([25-realtime-yjs.md](25-realtime-yjs.md)). The analysis queue also checks
 the owner again before it starts a queued analysis, and the internal
 order route refuses a trade for an owner who is deactivated or read-only.
@@ -638,7 +641,8 @@ allowed and a warning is logged (`rate_limit_unavailable` for auth-service
 and the public API, `rag_ask.rate_limit_unavailable` for the RAG
 assistant). An outage of the limiter must not lock users out. The 2FA
 lockout is built from two keys: a failure counter
-(`auth:rl:2fa:fail:<hash>`, the shared fixed window) and, after the fifth
+(`auth:rl:2fa:fail:<hash>`, the shared fixed window, deleted by every
+correct code) and, after the fifth
 failure, a lock key with the lock time as its expiry (the counter is then
 deleted). `two_factor_guard` refuses while the lock key has a positive
 TTL, with `Retry-After` = that TTL. The RAG

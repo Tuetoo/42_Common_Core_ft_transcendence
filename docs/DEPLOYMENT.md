@@ -51,8 +51,14 @@ These steps were done once; repeat them only for a new host.
    echo 'export COMPOSE_FILE=docker-compose.yaml' >> ~/.bashrc
    ```
 
-   `COMPOSE_FILE` makes every `docker compose` command and every script in
-   `scripts/` skip the development override.
+   `COMPOSE_FILE` makes `docker compose`, `make` and the scripts in
+   `scripts/` skip the development override. `~/.bashrc` applies only to
+   interactive shells, so it covers the commands typed after `ssh` logs
+   you in, but not a command passed to `ssh` directly
+   (`ssh <host> '<command>'`): export the variable in that same command,
+   for example `ssh -i <key> ubuntu@<host> 'cd ~/alphamind && export
+   COMPOSE_FILE=docker-compose.yaml && make health'`. `scripts/deploy.sh`
+   exports it itself.
 4. Create the read-only deploy key (`ssh-keygen -t ed25519 -f
    ~/.ssh/github_deploy`, an `~/.ssh/config` entry for github.com), add the
    public key under the repository's Settings -> Deploy keys without write
@@ -167,6 +173,7 @@ copy a backup and restore it (procedures in
 ```
 make backup                                  # local
 scp -i <key> -r backups/<YYYY-MM-DD_HHMM> ubuntu@<host>:/home/ubuntu/alphamind/backups/
+export COMPOSE_FILE=docker-compose.yaml            # on the host
 make restore BACKUP=<YYYY-MM-DD_HHMM>              # on the host: dry run
 make restore BACKUP=<YYYY-MM-DD_HHMM> CONFIRM=yes  # on the host
 docker compose --env-file .env.docker stop scheduler  # on the host

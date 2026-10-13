@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
 import clients.ai_client as ai_client
@@ -9,7 +10,9 @@ from domains.research.model import ResearchComment, ResearchNote
 
 logger = structlog.get_logger(__name__)
 
-_background_tasks: set[asyncio.Task[bool]] = set()
+RefreshFn = Callable[[UUID], Awaitable[bool]]
+_running: dict[tuple[RefreshFn, UUID], asyncio.Task[None]] = {}
+_rerun: set[tuple[RefreshFn, UUID]] = set()
 
 
 def note_sentiment_text(title: str, content: str | None) -> str:
@@ -90,7 +93,34 @@ async def refresh_comment_sentiment(comment_id: UUID) -> bool:
         return False
 
 
+async def _refresh_until_current(key: tuple[RefreshFn, UUID]) -> None:
+    refresh, item_id = key
+    try:
+        while True:
+            _rerun.discard(key)
+            await refresh(item_id)
+            if key not in _rerun:
+                return
+    finally:
+        _running.pop(key, None)
+
+
+def _schedule(refresh: RefreshFn, item_id: UUID) -> None:
+    key = (refresh, item_id)
+    if key in _running:
+        _rerun.add(key)
+        return
+    _running[key] = asyncio.create_task(_refresh_until_current(key))
+
+
 def schedule_note_sentiment(note_id: UUID) -> None:
-    task = asyncio.create_task(refresh_note_sentiment(note_id))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    _schedule(refresh_note_sentiment, note_id)
+
+
+def schedule_comment_sentiment(comment_id: UUID) -> None:
+    _schedule(refresh_comment_sentiment, comment_id)
+
+
+async def schedule_after_commit(
+        schedule: Callable[[UUID], None], item_id: UUID) -> None:
+    schedule(item_id)

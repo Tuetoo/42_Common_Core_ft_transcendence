@@ -17,8 +17,9 @@ from domains.research.schema import (DocumentRead, DocumentSort,
                                      ResearchCommentUpdate, ResearchNoteCreate,
                                      ResearchNoteFilters, ResearchNoteRead,
                                      ResearchNoteUpdate, SentimentSummary)
-from domains.research.sentiment import (refresh_comment_sentiment,
-                                        refresh_note_sentiment)
+from domains.research.sentiment import (schedule_after_commit,
+                                        schedule_comment_sentiment,
+                                        schedule_note_sentiment)
 from domains.research.service import (CommentChange, NoteChange,
                                       ResearchService)
 from shared.enums import DocumentCategory, DocumentStatus, NotificationType
@@ -54,7 +55,8 @@ async def create_note(
         background_tasks, [current_user.user_id],
         type=NotificationType.NOTE_CREATED, title="Note created",
         content=f"You created the note {quoted_title(result.title)}.")
-    background_tasks.add_task(refresh_note_sentiment, result.id)
+    background_tasks.add_task(
+        schedule_after_commit, schedule_note_sentiment, result.id)
     return APIResponse(data=result)
 
 
@@ -112,7 +114,8 @@ async def update_note(
             type=NotificationType.NOTE_UPDATED, title="Your note was edited",
             content=f"A member of your organization edited your note {title}.")
     if change.text_changed:
-        background_tasks.add_task(refresh_note_sentiment, note_id)
+        background_tasks.add_task(
+            schedule_after_commit, schedule_note_sentiment, note_id)
     return APIResponse(data=change.note)
 
 
@@ -154,7 +157,8 @@ async def add_comment(
             title="New comment on your note", content=(
                 f"{change.comment.author.username} commented on your note "
                 f"{title}."))
-    background_tasks.add_task(refresh_comment_sentiment, change.comment.id)
+    background_tasks.add_task(
+        schedule_after_commit, schedule_comment_sentiment, change.comment.id)
     return APIResponse(data=change.comment)
 
 
@@ -195,7 +199,8 @@ async def update_comment(
             f"You edited your comment on the note "
             f"{quoted_title(change.note_title)}."))
     if change.text_changed:
-        background_tasks.add_task(refresh_comment_sentiment, comment_id)
+        background_tasks.add_task(
+            schedule_after_commit, schedule_comment_sentiment, comment_id)
     return APIResponse(data=change.comment)
 
 

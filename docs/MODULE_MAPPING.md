@@ -83,7 +83,7 @@ REST (`services/*/clients/*.py`, service-to-service routes under
 
 | # | Module | Type | Pts | Evidence |
 |---|---|---|---|---|
-| B1 | Support for additional browsers | Minor | 1 | Besides Google Chrome, the latest stable Microsoft Edge and Safari are supported. Every page and feature was tested in each of them: registration and email verification, password, GitHub OAuth and 2FA logins, profile and avatar, friends and online status, organizations, notes with live editing between two browsers (Chrome and Edge), documents, search, the research assistant, analyses with their live status, analytics, notifications, admin and moderation pages, the legal pages and the narrow-window menu. The console stays clean in all three browsers, and the pages look and behave the same, because the layout uses only standard CSS (Tailwind CSS 4) and standard browser APIs (WebSocket, `fetch` with a streamed response body), with no browser-specific code. |
+| B1 | Support for additional browsers | Minor | 1 | Besides Google Chrome, the latest stable Microsoft Edge and Safari are supported. Every page and feature was tested in each of them: registration and email verification, password, GitHub OAuth and 2FA logins, profile and avatar, friends and online status, portfolios and their backtests, organizations, notes with live editing between two browsers (Chrome and Edge), documents, search, the research assistant, analyses with their live status, analytics, notifications, admin and moderation pages, the legal pages and the narrow-window menu. The console stays clean in all three browsers, and the pages look and behave the same, because the layout uses only standard CSS (Tailwind CSS 4) and standard browser APIs (WebSocket, `fetch` with a streamed response body), with no browser-specific code. |
 
 **Browser-specific limitations.** No feature differs between the three
 browsers. Two points to know when testing locally:
@@ -91,10 +91,12 @@ browsers. Two points to know when testing locally:
 - The local gateway uses a self-signed certificate, so each browser asks
   once to accept it for `https://localhost:8443` (Safari: "Show Details",
   then "visit this website"). The cloud host has a real certificate.
-- Edge's *Issues* panel (not the console) can list informational
-  navigation notices after the OAuth redirect chain; they come from the
-  browser's own checks of the redirects, not from the application, and
-  nothing fails.
+- The *Issues* panel of Chrome and Edge (not the console) can list
+  informational navigation notices after the redirects of a login or the
+  OAuth redirect chain, for example that a history entry created by an
+  automatic redirect is skipped on Back; they come from the browser's
+  own checks of the redirects, not from the application, and nothing
+  fails.
 
 ### 3.3 User Management (IV.3)
 

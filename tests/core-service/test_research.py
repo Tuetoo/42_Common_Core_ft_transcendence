@@ -368,6 +368,7 @@ class TestNotesAndDocumentUploads:
             self, monkeypatch, db_session, mock_cross_service,
             storage_recorder, published_events):
         from fastapi import BackgroundTasks
+        from shared.exceptions import ConflictError
         import domains.research.service as research_service
         from domains.research.service import ResearchService
 
@@ -402,6 +403,27 @@ class TestNotesAndDocumentUploads:
             len(storage_recorder.uploaded) == 1
             and storage_recorder.deleted == storage_recorder.uploaded)
         assert tasks.tasks == []
+
+        async def _allow_writer(user_id, organization_id):
+            return None
+
+        org_id = uuid4()
+        monkeypatch.setattr(
+            research_service.auth_client, "ensure_organization_writer",
+            _allow_writer)
+        mine = await service.documents.create(
+            owner_id=owner, organization_id=org_id, filename="org.txt",
+            document_type="txt", category="news", ticker=None,
+            storage_url="documents/org.txt")
+        mine.status = "failed"
+        await db_session.flush()
+        uploads_before = list(storage_recorder.uploaded)
+        with pytest.raises(ConflictError):
+            await service.upload(
+                owner_id=uuid4(), organization_id=org_id, filename="org.txt",
+                content=b"other", category="news", background_tasks=tasks)
+        assert mine.status == "failed"
+        assert storage_recorder.uploaded == uploads_before
 
         async def _boom(self, **kwargs):
             raise RuntimeError("db down")
@@ -1327,8 +1349,13 @@ class TestSentiment:
                 calls.append({"url": url, "json": json})
                 return next(responses)
 
-        monkeypatch.setattr(
-            client_module, "get_http_client", lambda timeout: _Client())
+        timeouts: list[float] = []
+
+        def _get_client(timeout):
+            timeouts.append(timeout)
+            return _Client()
+
+        monkeypatch.setattr(client_module, "get_http_client", _get_client)
         ok = await client_module.analyze_sentiment("Strong quarter", "note")
         assert ok == client_module.SentimentResult("positive", 0.8, "lite")
         assert calls[0]["url"].endswith("/internal/sentiment")
@@ -1338,6 +1365,8 @@ class TestSentiment:
         assert await client_module.analyze_sentiment("x", "comment") is None
         assert await client_module.analyze_sentiment("   ", "note") is None
         assert len(calls) == 4
+        assert set(timeouts) == {client_module._SENTIMENT_TIMEOUT}
+        assert client_module._SENTIMENT_TIMEOUT > 240.0
 
         import clients.auth_client as auth_client
         from domains.research.model import (NoteTag, ResearchComment,
@@ -1436,6 +1465,35 @@ class TestSentiment:
             assert (
                 await client.get(url, params=bad,
                                  headers=headers)).status_code == 422
+
+    async def test_refresh_is_single_flight_and_does_not_block(
+            self, monkeypatch):
+        import asyncio
+        from domains.research import sentiment
+
+        gate = asyncio.Event()
+        calls: list[UUID] = []
+
+        async def _refresh(item_id):
+            calls.append(item_id)
+            await gate.wait()
+            return True
+
+        monkeypatch.setattr(sentiment, "refresh_note_sentiment", _refresh)
+        monkeypatch.setattr(sentiment, "refresh_comment_sentiment", _refresh)
+        note_id, comment_id = uuid4(), uuid4()
+        sentiment.schedule_note_sentiment(note_id)
+        await sentiment.schedule_after_commit(
+            sentiment.schedule_comment_sentiment, comment_id)
+        await asyncio.sleep(0)
+        for _ in range(5):
+            sentiment.schedule_note_sentiment(note_id)
+        await asyncio.sleep(0)
+        assert calls == [note_id, comment_id]
+        gate.set()
+        await asyncio.gather(*sentiment._running.values())
+        assert (calls.count(note_id), calls.count(comment_id)) == (2, 1)
+        assert not sentiment._running and not sentiment._rerun
 
     async def test_refresh_skips_stale_result_and_failure(
             self, committed_sentiment_rows, monkeypatch):

@@ -536,9 +536,11 @@ Code: `AuthService.setup_two_factor`, `verify_two_factor`,
 - **No replay:** the accepted step is stored in `last_used_step`, and the
   update only succeeds when the new step is larger. The same code (or an
   older one) cannot be used twice.
-- **Lockout:** each failure calls `security.two_factor_failed`. After
-  `RATE_LIMIT_2FA_FAILURES` = 5 failures within
-  `RATE_LIMIT_2FA_WINDOW_SECONDS` = 300 s, the user's 2FA is locked for
+- **Lockout:** each failure calls `security.two_factor_failed`; each
+  correct code calls `security.two_factor_succeeded`, which clears the
+  failure counter. After `RATE_LIMIT_2FA_FAILURES` = 5 failures within
+  `RATE_LIMIT_2FA_WINDOW_SECONDS` = 300 s with no correct code in
+  between, the user's 2FA is locked for
   `RATE_LIMIT_2FA_LOCK_SECONDS` = 900 s; every check during the lock gets
   429 "Too many invalid codes" with `Retry-After`. The lock is per user,
   not per address.
@@ -1077,7 +1079,7 @@ error **fails open** (logged as `rate_limit_unavailable`).
 | `resend:email` | email | 3 | 3600 s | `POST /verify-email/resend` |
 | `invite:org` | organization id | 20 | 3600 s | invitations |
 | `friend:user` | requester user id | 30 | 3600 s | `POST /api/v1/connections` |
-| `2fa:fail` / `2fa:lock` | user id | 5 failures | 300 s window, 900 s lock | every TOTP check |
+| `2fa:fail` / `2fa:lock` | user id | 5 failures (a correct code resets the count) | 300 s window, 900 s lock | every TOTP check |
 
 Over the limit: 429 with body code `rate_limited`, the message "Too many
 attempts. Please try again later." (the 2FA lock says "Too many invalid
@@ -1397,7 +1399,7 @@ a body is not.
 | `/2fa/setup` or `/2fa/verify` 403 `recent_login_required` | the session's login (`auth_time`) is more than 10 minutes old, or the token predates the claim; a refresh does not help | log in again (password or OAuth), then retry |
 | an account the user registered a week ago is gone ("Email/password combination is incorrect.") | it was never verified, so the nightly `purge-unverified` job deleted it; log `unverified_accounts_purged` | register again with the same email |
 | 429 `rate_limited` with `Retry-After` | auth-service limit | `bash scripts/redis-cli.sh -n 1 --scan --pattern 'auth:rl:*'` shows active counters (hashed identities) |
-| 429 "Too many invalid codes" | 2FA lock (5 failures in 5 minutes, locked 15 minutes) | wait for `Retry-After` |
+| 429 "Too many invalid codes" | 2FA lock (5 failures in 5 minutes with no correct code between them, locked 15 minutes) | wait for `Retry-After` |
 | refresh 401 and the user is logged out in one browser | reuse detection fired: a rotated refresh token came back after the 30 s grace, usually a browser holding an old cookie (for example a second browser left idle for days) | log event `refresh_token_reuse_detected` (`bash scripts/logs.sh auth-service grep refresh_token_reuse_detected`); the sessions of that chain show `revoked_reason = 'reuse'`; other logins of the user stay valid |
 | a demoted admin still has admin rights | the mirror was not written | `bash scripts/redis-cli.sh -n 2 GET auth:user_state:<id>`; logs `user_state.mirror_failed`, `user_state.startup_sync_failed`; core/ai logs `user_state.redis_read_failed`, `user_state.auth_lookup_failed` |
 | verification or reset email never arrives | SMTP problem; the request still succeeded | log events `verification_email_failed`, `password_reset_email_failed`, `invitation_email_failed`, `email_send_failed`; MailHog UI |

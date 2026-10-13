@@ -5,6 +5,7 @@ import { Pager, pageParam } from "../../pager";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { AddHoldingForm } from "./add-holding-form";
 import { AddTransactionForm } from "./add-transaction-form";
+import { BacktestForm } from "./backtest-form";
 import { PortfolioSettingsForm } from "./portfolio-settings-form";
 
 type Portfolio = {
@@ -176,6 +177,13 @@ export default async function PortfolioDetailPage({
           <p className="empty-state">{readOnlyNote}</p>
         )}
       </div>
+
+      {can(me, "analysis:create") && (
+        <div className="section">
+          <h2 className="section-title">Backtest</h2>
+          <BacktestForm portfolioId={portfolio.id} />
+        </div>
+      )}
 
       {canEdit && (
         <div className="section">

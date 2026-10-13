@@ -288,6 +288,16 @@ async def two_factor_failed(user_id: str) -> None:
         logger.warning("rate_limit_unavailable", scope="2fa", error=str(exc))
 
 
+async def two_factor_succeeded(user_id: str) -> None:
+    if not settings.RATE_LIMIT_ENABLED:
+        return
+    try:
+        await get_rate_limit_client(settings).delete(
+            _rate_key("2fa:fail", user_id))
+    except Exception as exc:
+        logger.warning("rate_limit_unavailable", scope="2fa", error=str(exc))
+
+
 def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 

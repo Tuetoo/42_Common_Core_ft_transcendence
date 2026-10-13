@@ -386,8 +386,8 @@ AI-written `[agent:...]` note passage removed, as split by
 `recycled_content.note_and_source_passages`) plus `extra` (context the
 agent was given in code). A prior note is a lead, never evidence: a TSLA
 News answer (October 2026) invented a year-ago delivery count, 496,579,
-and later runs repeated it from the archived note, where the old check
-counted it as grounded and never looked at plain counts. Counts
+and later runs repeated it from the archived note; plain counts are
+therefore checked too. Counts
 (`ungrounded_counts`) match any number of the reference, written grouped
 or as plain digits of four or more, within 1%. Replayed on 1,041 stored
 answers of eight batches, the counts and the note exclusion flag exactly
@@ -525,8 +525,8 @@ the tolerance of one allowed value.
   quarter from SEC XBRL), `query_knowledge_graph`, `search_prior_analysis`
   (prior Fundamental notes, category `analyst_report`),
   `search_earnings_call_transcripts`, `web_search`. `MAX_ITERATIONS = 8`.
-  It has no price tool on purpose: raw price is Market's job, and an
-  earlier version stated an unsourced dollar price.
+  It has no price tool on purpose: raw price is Market's job, so it
+  cannot state an unsourced dollar price.
 - **Prefetch:** `get_fundamentals(ticker)`, `search_filings("latest
   quarter results revenue operating income net income net loss")` (so the
   newest 10-Q reaches the agent; without it an annual margin can be

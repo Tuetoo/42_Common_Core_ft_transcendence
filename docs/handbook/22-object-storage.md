@@ -384,7 +384,7 @@ the live stack.
 `restore.sh` reads only the current backup format 3 (`objectstore/<bucket>/`
 folders through the S3 API); `make restore` always starts `objectstore`
 first. Older formats (a tarball of the SeaweedFS data directory, or a MinIO
-tarball) are no longer read: a backup without `objectstore/` skips that
+tarball) are not read: a backup without `objectstore/` skips that
 part, and `--only objectstore` refuses it. See
 `../DISASTER_RECOVERY.md` sections 1, 4.3, 6 and 9.
 
