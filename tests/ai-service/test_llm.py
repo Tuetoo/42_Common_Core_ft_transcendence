@@ -424,7 +424,7 @@ class TestRouterBasics:
             reset=_reset_llm_state)
 
 
-def test_anthropic_system_messages_join_and_turns_stay_in_order():
+async def test_anthropic_message_order_and_caller_timeouts(monkeypatch):
     messages = [
         LLMMessage(role="system", content="You are a helpful analyst."),
         LLMMessage(role="system", content="Always cite sources."),
@@ -440,6 +440,37 @@ def test_anthropic_system_messages_join_and_turns_stay_in_order():
         "role": "assistant",
         "content": "Let me check."
     }]
+
+    import ai.llm.anthropic_provider as anthropic_module
+    import ai.llm.openai_provider as openai_module
+    from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
+    from openai import NOT_GIVEN as OPENAI_NOT_GIVEN
+
+    openai_create = _RecordingCreate(
+        SimpleNamespace(
+            model="gpt", usage=None, choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="ok"))
+            ]))
+    anthropic_create = _RecordingCreate(
+        SimpleNamespace(
+            model="claude", stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            content=[SimpleNamespace(type="text", text="ok")]))
+    monkeypatch.setattr(
+        openai_module, "_client",
+        SimpleNamespace(chat=SimpleNamespace(completions=openai_create)))
+    monkeypatch.setattr(
+        anthropic_module, "_client",
+        SimpleNamespace(messages=anthropic_create))
+    for adapter, create, not_given in (
+            (openai_module.OpenAIAdapter(), openai_create, OPENAI_NOT_GIVEN),
+            (anthropic_module.AnthropicAdapter(), anthropic_create,
+             ANTHROPIC_NOT_GIVEN)):
+        await adapter.complete(_msgs(), model="m")
+        await adapter.complete(_msgs(), model="m", timeout_seconds=300)
+        assert [k["timeout"] for k in create.kwargs] == [not_given, 300]
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -804,7 +835,7 @@ class TestGoogleAdapter:
             await google_module.GoogleAdapter().complete(_msgs(), model=_LITE)
         assert gen.calls == 0
 
-    async def test_quota_and_error_handling(self):
+    async def test_quota_errors_pacing_and_timeouts(self):
         self._day_quota_id_classified_as_day()
         await _run_steps(
             self._day_quota_hit_gets_the_long_cooldown,
@@ -812,6 +843,14 @@ class TestGoogleAdapter:
             self._gives_up_after_max_malformed_retries_with_a_big_pool,
             self._success_clears_the_models_overloaded_marker,
             self._server_error_wait_escalates_and_success_resets,
+            reset=_reset_llm_state)
+
+        await _run_steps(
+            self._wait_beyond_one_interval_fails_fast_without_sleeping,
+            self._zero_min_interval_pool_is_never_exhausted,
+            self._fallback_flag_uses_the_fallback_timeout,
+            self._timeouts_without_a_cooldown_leave_no_marker,
+            self._a_rate_limit_mark_during_the_pacing_wait_still_skips,
             reset=_reset_llm_state)
 
     async def _timeouts_without_a_cooldown_leave_no_marker(
@@ -842,15 +881,6 @@ class TestGoogleAdapter:
                 _msgs(), model="gemini-3.8-flash")
         assert not await google_module.google_model_recently_timed_out(
             "gemini-3.8-flash")
-
-    async def test_pacing_waits_and_timeouts(self):
-        await _run_steps(
-            self._wait_beyond_one_interval_fails_fast_without_sleeping,
-            self._zero_min_interval_pool_is_never_exhausted,
-            self._fallback_flag_uses_the_fallback_timeout,
-            self._timeouts_without_a_cooldown_leave_no_marker,
-            self._a_rate_limit_mark_during_the_pacing_wait_still_skips,
-            reset=_reset_llm_state)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -1219,12 +1249,21 @@ class TestRouterFallback:
         assert "skipped 'm2'" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, LLMServerOverloadedError)
 
-    async def test_skips_and_non_english_answers(self):
+    async def test_skips_non_english_and_fallback_calls(self):
         await _run_steps(
             self._exhausted_primary_goes_straight_to_the_fallback,
             self._overloaded_skip_is_reported_as_server_overloaded,
             self._non_english_fallback_response_raises,
             self._json_escaped_non_english_is_rejected,
+            reset=_reset_llm_state)
+
+        await _run_steps(
+            self._fallback_call_has_the_flag_and_no_schema,
+            self._thinking_budget_goes_to_both_google_calls,
+            self._a_failed_fallback_is_raised_without_more_calls,
+            self._day_exhausted_fallback_is_skipped,
+            self._timed_out_primary_goes_to_the_fallback,
+            self._caller_timeout_retries_once_without_fallback,
             reset=_reset_llm_state)
 
     async def _timed_out_primary_goes_to_the_fallback(self, monkeypatch):
@@ -1248,14 +1287,30 @@ class TestRouterFallback:
             LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
         assert adapter.models == ["m1", "m2"]
 
-    async def test_fallback_calls(self):
-        await _run_steps(
-            self._fallback_call_has_the_flag_and_no_schema,
-            self._thinking_budget_goes_to_both_google_calls,
-            self._a_failed_fallback_is_raised_without_more_calls,
-            self._day_exhausted_fallback_is_skipped,
-            self._timed_out_primary_goes_to_the_fallback,
-            reset=_reset_llm_state)
+    async def _caller_timeout_retries_once_without_fallback(
+            self, monkeypatch):
+        _chain(monkeypatch)
+        adapter = _PerModelAdapter({"m1": ["provider_timeout"], "m2": ["ok"]})
+        with pytest.raises(LLMProviderTimeoutError):
+            await LLMRouter(providers={
+                "google": adapter
+            }).complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
+                retries=4, timeout_seconds=300)
+        assert adapter.models == ["m1", "m1"]
+        assert all(
+            extra["timeout_seconds"] == 300 for _, extra in adapter.calls)
+
+
+class _RecordingCreate:
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.kwargs: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.kwargs.append(kwargs)
+        return self.response
 
 
 def test_router_retry_limit():
@@ -1500,6 +1555,14 @@ class TestPositionSizingLiteRetry:
         assert "3.5-flash timed out" in note
 
         router = _TierRouter({
+            LLMTier.HIGHEST_ACCURACY: LLMNonEnglishOutputError("non-English"),
+            LLMTier.CHEAP: _tiers_json([(100, 5)])
+        })
+        result, note = await _size(router)
+        assert router.tiers == [LLMTier.HIGHEST_ACCURACY, LLMTier.CHEAP]
+        assert result is not None and len(result.tiers) == 1
+
+        router = _TierRouter({
             LLMTier.HIGHEST_ACCURACY: LLMServerOverloadedError("503"),
             LLMTier.CHEAP: _tiers_json([(100, 500)])
         })
@@ -1666,7 +1729,7 @@ class TestGoogleEmbedBatch:
         assert embedding_module.embedding_model_name() == (
             "gemini-embedding-001")
 
-    def test_batches_respect_the_count_and_token_caps(self):
+    async def test_batches_requests_errors_and_timeouts(self):
         batches = embedding_module.google_batches(["short text"] * 45)
         assert [len(b) for b in batches] == [20, 20, 5]
         filing_chunk = " ".join(["word"] * 700)
@@ -1677,13 +1740,11 @@ class TestGoogleEmbedBatch:
             for b in batches)
         assert sum(len(b) for b in batches) == 30
 
-    async def test_requests_and_dispatch(self):
         await _run_steps(
             self._embedding_2_uses_prompt_prefixes_not_task_type,
             self._embed_texts_and_query_dispatch_to_google,
             reset=_reset_llm_state)
 
-    async def test_errors_waits_and_timeouts(self):
         await _run_steps(
             self._429_on_every_project_waits_then_gives_up,
             self._503_waits_and_retries, self._wrong_dimension_is_an_error,
@@ -2123,23 +2184,12 @@ async def committed_analysis(_schema_ready):
 
 class TestMetrics:
 
-    def test_reimport_does_not_register_twice(self) -> None:
+    async def test_metrics_register_once_and_queue_gauges_follow(self):
         before = observability.ANALYSES_TOTAL
         reloaded = importlib.reload(observability)
         assert reloaded.ANALYSES_TOTAL is before
         assert reloaded.LLM_ERRORS_TOTAL is observability.LLM_ERRORS_TOTAL
 
-    async def test_mark_analysis_failed_counts_only_the_real_transition(
-            self, committed_analysis) -> None:
-        from ai.workflows.analysis_workflow import mark_analysis_failed
-
-        analysis_id = await committed_analysis("running")
-        before = _failed_analyses("timeout")
-        assert await mark_analysis_failed(analysis_id, "timeout") is True
-        assert await mark_analysis_failed(analysis_id, "timeout") is False
-        assert _failed_analyses("timeout") == before + 1
-
-    async def test_queue_gauges_follow_the_queue(self) -> None:
         from domains.analysis.queue import (AnalysisJob, AnalysisQueue,
                                             analysis_queue)
 
@@ -2173,6 +2223,16 @@ class TestMetrics:
         finally:
             await queue.stop()
             observability.bind_analysis_queue(analysis_queue)
+
+    async def test_mark_analysis_failed_counts_only_the_real_transition(
+            self, committed_analysis) -> None:
+        from ai.workflows.analysis_workflow import mark_analysis_failed
+
+        analysis_id = await committed_analysis("running")
+        before = _failed_analyses("timeout")
+        assert await mark_analysis_failed(analysis_id, "timeout") is True
+        assert await mark_analysis_failed(analysis_id, "timeout") is False
+        assert _failed_analyses("timeout") == before + 1
 
 
 class TestServiceSetup:

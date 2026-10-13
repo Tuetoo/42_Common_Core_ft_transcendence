@@ -9,12 +9,13 @@ import structlog
 from ai.agents.evidence_grounding import non_english_reason
 from ai.llm.router import LLMRouter
 from ai.providers.base import ProviderError, WebSearchProvider, WebSearchResult
-from ai.providers.news_filters import (SNIPPET_CHARS, drop_prechecked,
-                                       relink_consent_items)
 from ai.providers.news_relevance import (NEWS_KINDS, NOT_NEWS, PRICE_PAGE,
-                                         REFERENCE_OR_SOCIAL, UNCLASSIFIED,
-                                         UNVERIFIED, kind_definitions_text,
+                                         REFERENCE_OR_SOCIAL, SNIPPET_CHARS,
+                                         UNCLASSIFIED, UNVERIFIED,
+                                         drop_prechecked,
+                                         kind_definitions_text,
                                          lookup_search_name,
+                                         relink_consent_items,
                                          verify_with_cheap_tier)
 from ai.providers.newsapi import catalog_flag, source_catalog, url_host
 from ai.providers.registry import get_web_search_provider

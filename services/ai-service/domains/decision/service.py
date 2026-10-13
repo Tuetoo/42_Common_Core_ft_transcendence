@@ -1,22 +1,20 @@
 import json
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 from uuid import UUID
 import structlog
-from ai.llm.base import LLMError, LLMMessage, LLMTier
-from ai.llm.json_fence import strip_json_code_fence
+from ai.llm.base import LLMError, LLMMessage, LLMTier, strip_json_code_fence
 from ai.llm.router import LLMRouter
 from ai_events import (TIER_CANCEL_REASON_DECLINED,
                        TIER_CANCEL_REASON_SUPERSEDED, TierEventInfo,
                        decision_event_payload, tier_cancelled_events)
 from deps import ensure_analysis_access, ensure_portfolio_owner
-from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.model import Analysis, Recommendation
 from domains.analysis.repository import (AnalysisRepository,
-                                         RecommendationTierRepository)
+                                         RecommendationTierRepository,
+                                         acceptance_lapsed)
 from domains.decision.model import DecisionOutcome, InvestmentDecision
 from domains.decision.repository import (DecisionOutcomeRepository,
                                          DecisionReviewRepository,
@@ -151,53 +149,40 @@ class DecisionService:
             analysis: Analysis) -> list[TierEventInfo]:
         if recommendation.window_expires_at is None:
             return []
-        if recommendation.window_expires_at < datetime.now(UTC):
+        statuses = {tier.status for tier in recommendation.tiers}
+        if TierStatus.PENDING_ACCEPTANCE.value not in statuses and statuses & {
+                TierStatus.ACCEPTED_AWAITING_TRIGGER.value,
+                TierStatus.TRIGGERED.value}:
+            return []
+        if recommendation.window_expires_at < datetime.now(UTC) or (
+                acceptance_lapsed(
+                    status=TierStatus.PENDING_ACCEPTANCE.value,
+                    user_id=analysis.user_id,
+                    issued_at=recommendation.created_at)):
             raise ValidationAppError(
                 "This recommendation's acceptance window has already "
                 "expired -- nothing left to accept.")
-        pending = (
-            await self.session.execute(
-                sql_text(
-                    "SELECT side, target_price FROM ai.recommendation_tiers "
-                    "WHERE recommendation_id = :rec_id AND status = :pending"),
-                {
-                    "rec_id": recommendation.id,
-                    "pending": TierStatus.PENDING_ACCEPTANCE.value
-                })).all()
-        if not pending:
+        tier_repo = RecommendationTierRepository(self.session)
+        accepted = await tier_repo.accept_pending(recommendation.id)
+        if not accepted:
             raise ValidationAppError(
                 "This recommendation has no tier still awaiting acceptance -- "
                 "its tiers were already accepted, declined, superseded by a "
                 "newer recommendation, or expired. Nothing left to accept.")
-        await self.session.execute(
-            sql_text(
-                "UPDATE ai.recommendations SET accepted_at = :now "
-                "WHERE id = :id"), {
-                    "now": datetime.now(UTC),
-                    "id": recommendation.id
-                })
-        await self.session.execute(
-            sql_text(
-                "UPDATE ai.recommendation_tiers SET status = :new_status "
-                "WHERE recommendation_id = :rec_id AND status = :old_status"),
-            {
-                "new_status": TierStatus.ACCEPTED_AWAITING_TRIGGER.value,
-                "rec_id": recommendation.id,
-                "old_status": TierStatus.PENDING_ACCEPTANCE.value
-            })
 
         superseded: list[TierEventInfo] = []
         if analysis.portfolio_id is not None:
-            accepted_side = str(pending[0][0])
-            closed = await RecommendationTierRepository(
-                self.session).invalidate_unfilled_tiers_for_new_recommendation(
+            accepted_side = accepted[0][0]
+            new_action = (
+                RecommendationAction.SELL if accepted_side
+                == TierSide.SELL.value else RecommendationAction.BUY)
+            closed = await (
+                tier_repo.invalidate_unfilled_tiers_for_new_recommendation(
                     portfolio_id=analysis.portfolio_id, ticker=analysis.ticker,
-                    new_action=(
-                        RecommendationAction.SELL if accepted_side
-                        == TierSide.SELL.value else RecommendationAction.BUY),
-                    new_prices=[Decimal(row[1]) for row in pending],
+                    new_action=new_action,
+                    new_prices=[price for _, price in accepted],
                     exclude_recommendation_id=recommendation.id,
-                    source="an accepted")
+                    source="an accepted"))
             for item in closed:
                 logger.info(
                     "decision.accept_superseded_tiers",
@@ -212,26 +197,15 @@ class DecisionService:
     async def _decline_recommendation_tiers(
             self, recommendation: Recommendation,
             analysis: Analysis) -> list[TierEventInfo]:
-        rows = (
-            await self.session.execute(
-                sql_text(
-                    "UPDATE ai.recommendation_tiers SET status = :new_status "
-                    "WHERE recommendation_id = :rec_id "
-                    "AND status IN (:pending, :accepted) "
-                    "RETURNING id, side, quantity, target_price"), {
-                        "new_status": TierStatus.DECLINED.value,
-                        "rec_id": recommendation.id,
-                        "pending": TierStatus.PENDING_ACCEPTANCE.value,
-                        "accepted": TierStatus.ACCEPTED_AWAITING_TRIGGER.value
-                    })).all()
+        rows = await RecommendationTierRepository(
+            self.session).decline_unfilled(recommendation.id)
         await self.session.flush()
         return [
             TierEventInfo(
-                tier_id=row[0], analysis_id=analysis.id,
+                tier_id=tier_id, analysis_id=analysis.id,
                 user_id=analysis.user_id, portfolio_id=analysis.portfolio_id,
-                ticker=analysis.ticker, side=str(row[1]),
-                quantity=Decimal(row[2]), price=Decimal(row[3]))
-            for row in rows
+                ticker=analysis.ticker, side=side, quantity=quantity,
+                price=price) for tier_id, side, quantity, price in rows
         ]
 
     async def list_my_decisions(
@@ -307,6 +281,12 @@ class DecisionService:
         review = await self.reviews.create(
             decision_id=decision_id, review_text=review_text,
             lessons_learned=lessons_learned)
+        self.pending_events.append((
+            EventName.DECISION_REVIEWED,
+            decision_event_payload(
+                decision_id=decision_id,
+                analysis_id=recommendation.analysis_id, user_id=user_id,
+                ticker=decision.ticker, decision=decision.action_taken)))
         return DecisionReviewRead.model_validate(review)
 
     async def get_review(

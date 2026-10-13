@@ -1,6 +1,6 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { formatNumber } from "@/app/lib/format";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Pager, pageParam } from "../../pager";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { AddHoldingForm } from "./add-holding-form";

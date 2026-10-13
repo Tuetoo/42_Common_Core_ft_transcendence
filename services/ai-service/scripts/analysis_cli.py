@@ -1,9 +1,11 @@
 import argparse
+import asyncio
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -30,7 +32,23 @@ def _request(
         return text
 
 
+async def _committed(portfolio_id: str) -> str:
+    from database import SessionLocal
+    from domains.analysis.repository import RecommendationTierRepository
+
+    async with SessionLocal() as session:
+        holders = await RecommendationTierRepository(
+            session).committed_buy_holders(
+                portfolio_id=UUID(portfolio_id), exclude_ticker="")
+    lines = [h.describe() for h in holders]
+    total = sum((h.amount for h in holders), Decimal(0))
+    lines.append(f"total committed BUY cash: {total:.2f}")
+    return "\n".join(lines)
+
+
 def _run(args: argparse.Namespace) -> str:
+    if args.command == "committed":
+        return asyncio.run(_committed(args.portfolio_id))
     if args.command == "create":
         body: dict[str, Any] = {"ticker": args.ticker}
         if args.portfolio:
@@ -65,6 +83,11 @@ def main(argv: list[str] | None = None) -> int:
         "--user", default=None, type=_uuid_arg, help=(
             "owning user_id (UUID); without it the analysis is a system "
             "analysis"))
+    committed = sub.add_parser(
+        "committed", help=(
+            "BUY cash held by the portfolio's open tiers, per analysis, as "
+            "the position-sizing budget counts it"))
+    committed.add_argument("portfolio_id", type=_uuid_arg)
     for name in ("status", "get"):
         cmd = sub.add_parser(name)
         cmd.add_argument("analysis_id")

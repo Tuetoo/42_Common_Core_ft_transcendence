@@ -2,7 +2,8 @@ from datetime import UTC, datetime
 from uuid import UUID
 import security
 from config import settings
-from events_out import PendingEvent, friend_event_payload
+from events_out import (PendingEvent, block_event_payload,
+                        friend_event_payload)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.auth.model import User, UserProfile
@@ -27,13 +28,17 @@ class SocialService:
         self.pending_events: list[PendingEvent] = []
 
     async def _friend_event(
-            self, name: EventName, actor_id: UUID, other_id: UUID) -> None:
+            self, name: EventName, actor_id: UUID, other_id: UUID, *,
+            action: str | None = None) -> None:
         actor = await self.users.get_by_id(actor_id)
+        other = await self.users.get_by_id(other_id)
         self.pending_events.append((
             name,
             friend_event_payload(
                 actor_id=actor_id, user_id=other_id,
-                actor_username=actor.username if actor is not None else "")))
+                actor_username=actor.username if actor is not None else "",
+                other_username=other.username if other is not None else "",
+                action=action)))
 
     async def send_request(
             self, requester_id: UUID,
@@ -99,11 +104,20 @@ class SocialService:
         if (connection.status == ConnectionStatus.BLOCKED
                 and connection.blocked_by not in (None, current_user_id)):
             raise PermissionDeniedError("This connection is blocked.")
+        was_blocked = connection.status == ConnectionStatus.BLOCKED
         connection.status = ConnectionStatus.BLOCKED
         connection.blocked_by = current_user_id
         connection.responded_at = datetime.now(UTC)
         await self._db.flush()
-        return await self._to_read(connection, viewer_id=current_user_id)
+        result = await self._to_read(connection, viewer_id=current_user_id)
+        if not was_blocked:
+            self.pending_events.append((
+                EventName.CONNECTION_BLOCKED,
+                block_event_payload(
+                    actor_id=current_user_id,
+                    blocked_user_id=result.other_user.id,
+                    blocked_username=result.other_user.username)))
+        return result
 
     async def remove(self, connection_id: UUID, current_user_id: UUID) -> None:
         connection = await self._require_connection(connection_id)
@@ -116,14 +130,20 @@ class SocialService:
                 and connection.blocked_by != current_user_id):
             raise PermissionDeniedError(
                 "Only the user who blocked this connection can remove it.")
-        was_friend = connection.status == ConnectionStatus.ACCEPTED
+        if connection.status == ConnectionStatus.ACCEPTED:
+            action = "removed"
+        elif connection.status == ConnectionStatus.BLOCKED:
+            action = "unblocked"
+        elif connection.requester_id == current_user_id:
+            action = "cancelled"
+        else:
+            action = "declined"
         other_id = (
             connection.addressee_id if connection.requester_id
             == current_user_id else connection.requester_id)
         await self.connections.delete(connection)
-        if was_friend:
-            await self._friend_event(
-                EventName.FRIEND_REMOVED, current_user_id, other_id)
+        await self._friend_event(
+            EventName.FRIEND_REMOVED, current_user_id, other_id, action=action)
 
     async def list_my_connections(
             self, user_id: UUID, status_filter: ConnectionStatus | None = None

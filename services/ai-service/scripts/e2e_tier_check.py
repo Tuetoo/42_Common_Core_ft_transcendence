@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, TextIO
 from uuid import UUID
 import httpx
-from scripts._text import flatten
+from scripts.smoke_check import flatten
 
 OK = "OK"
 FAIL = "FAIL"

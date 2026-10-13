@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { wsUrl } from "@/app/lib/ws-url";
-import { closeSocket } from "../close-socket";
+import { closeSocket, wsUrl } from "@/app/lib/ws-url";
 
 type WebSocketEnvelope = {
   event: string;

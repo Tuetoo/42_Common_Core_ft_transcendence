@@ -312,7 +312,8 @@ class TestBM25Index:
                 ChunkVisibility.system()) for i in range(count)
         ]
 
-    def test_search_matches_a_direct_bm25s_build(self):
+    async def test_search_matches_bm25s_and_rebuild_runs_off_the_loop(
+            self, memory_qdrant, monkeypatch):
         items = self._items(60)
         index = indexing_module.BM25Index()
         index.add_many(items[:40])
@@ -331,9 +332,6 @@ class TestBM25Index:
                 ticker="AAPL") == _bm25_reference_search(
                     kept, query, 10, mask)
 
-    @pytest.mark.asyncio
-    async def test_rebuild_runs_off_the_loop_and_old_index_serves_meanwhile(
-            self, memory_qdrant, monkeypatch):
         import threading
 
         threads: list[threading.Thread] = []
@@ -965,6 +963,17 @@ class TestMarketAndAnalyticsAuth:
         response = await client.get("/internal/market/instruments/ZZQQ/prices")
         assert response.status_code == 404
 
+        from ai.providers.base import ProviderRequestError
+
+        async def _down(ticker, **kwargs):
+            raise ProviderRequestError("provider down")
+
+        monkeypatch.setattr(market_api, "get_bars_cache_first", _down)
+        response = await client.get(
+            "/api/v1/market/instruments/MSFT/prices",
+            headers=_headers(uuid4()))
+        assert response.status_code == 502
+
 
 class TestBacktestScope:
 
@@ -1147,7 +1156,7 @@ def _sse(text: str) -> list[tuple[str, dict]]:
 class TestAsk:
 
     @pytest.mark.asyncio
-    async def test_answers_drafts_no_sources_and_english_only(
+    async def test_answers_drafts_no_sources_english_and_input_validation(
             self, client, ask_qdrant, fake_router):
         router = fake_router(
             FakeRouter(answers=["Revenue guidance rose [1][2]."]))
@@ -1215,8 +1224,6 @@ class TestAsk:
         assert rejected.status_code == 503
         assert _CYRILLIC.strip() not in rejected.text
 
-    @pytest.mark.asyncio
-    async def test_input_validation_422(self, client):
         bodies = [{
             "question": ""
         }, {

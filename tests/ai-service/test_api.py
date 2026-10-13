@@ -398,8 +398,7 @@ async def _tier_statuses_by_id(tier_ids):
 class TestAnalysisRepository:
 
     @pytest.mark.asyncio
-    async def test_missing_id_raises_and_listing_is_paginated(
-            self, db_session):
+    async def test_missing_id_pagination_and_debate_session(self, db_session):
         from domains.analysis.repository import AnalysisRepository
 
         repo = AnalysisRepository(db_session)
@@ -407,15 +406,46 @@ class TestAnalysisRepository:
             await repo.get_by_id(uuid4())
 
         user_id = uuid4()
-        for ticker in ["AAA", "BBB", "CCC"]:
+        same_instant = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)
+        created = [
             await repo.create(
                 user_id=user_id, portfolio_id=None, ticker=ticker)
+            for ticker in ["AAA", "BBB", "CCC"]
+        ]
+        for analysis in created:
+            analysis.created_at = same_instant
+        await db_session.flush()
 
         analyses, total = await repo.list_for_user(
             user_id, PaginationParams(page=1, page_size=2))
+        rest, _ = await repo.list_for_user(
+            user_id, PaginationParams(page=2, page_size=2))
         assert total == 3
         assert len(analyses) == 2
-        assert analyses[0].created_at >= analyses[1].created_at
+        assert [a.id for a in analyses + rest] == sorted(
+            (a.id for a in created), reverse=True)
+
+        from domains.analysis.repository import (AnalysisPersistenceRepository,
+                                                 AnalysisRepository)
+
+        analysis = await AnalysisRepository(db_session).create(
+            user_id=None, portfolio_id=None, ticker="GOOG")
+        session_row = await AnalysisPersistenceRepository(
+            db_session).save_debate_session(
+                analysis_id=analysis.id, arguments=[{
+                    "round_number": 1,
+                    "side": "bull",
+                    "content": "growth",
+                    "citations": ["src-1"]
+                }, {
+                    "round_number": 1,
+                    "side": "bear",
+                    "content": "valuation",
+                    "citations": []
+                }])
+        await db_session.flush()
+        await db_session.refresh(session_row, attribute_names=["arguments"])
+        assert len(session_row.arguments) == 2
 
     @pytest.mark.asyncio
     async def test_get_latest_recommendation_for_ticker(self, _schema_ready):
@@ -459,36 +489,11 @@ class TestAnalysisRepository:
             await session.delete(await current_repo.get_by_id(newer.id))
             await session.commit()
 
-    @pytest.mark.asyncio
-    async def test_save_debate_session_and_arguments(self, db_session):
-        from domains.analysis.repository import (AnalysisPersistenceRepository,
-                                                 AnalysisRepository)
-
-        analysis = await AnalysisRepository(db_session).create(
-            user_id=None, portfolio_id=None, ticker="GOOG")
-        session_row = await AnalysisPersistenceRepository(
-            db_session).save_debate_session(
-                analysis_id=analysis.id, arguments=[{
-                    "round_number": 1,
-                    "side": "bull",
-                    "content": "growth",
-                    "citations": ["src-1"]
-                }, {
-                    "round_number": 1,
-                    "side": "bear",
-                    "content": "valuation",
-                    "citations": []
-                }])
-        await db_session.flush()
-        await db_session.refresh(session_row, attribute_names=["arguments"])
-        assert len(session_row.arguments) == 2
-
 
 class TestAnalysisService:
 
     @pytest.mark.asyncio
-    async def test_create_returns_pending_and_missing_recommendation_raises(
-            self, db_session):
+    async def test_create_detail_and_missing_recommendation(self, db_session):
         from domains.analysis.repository import AnalysisRepository
         from domains.analysis.service import (AnalysisService,
                                               recommendation_read)
@@ -505,9 +510,6 @@ class TestAnalysisService:
         with pytest.raises(NotFoundError):
             recommendation_read(loaded)
 
-    @pytest.mark.asyncio
-    async def test_get_analysis_detail_assembles_agent_runs_and_recommendation(
-            self, db_session):
         from domains.analysis.repository import (AgentCatalogRepository,
                                                  AnalysisPersistenceRepository,
                                                  AnalysisRepository)
@@ -593,7 +595,7 @@ class TestRunAnalysisWorkflow:
         assert payloads_by_event["recommendation.ready"]["user_id"] is None
 
     @pytest.mark.asyncio
-    async def test_workflow_exception_records_workflow_error(
+    async def test_workflow_error_is_recorded_and_failed_row_not_rerun(
             self, committed_rows, mock_cross_service, monkeypatch):
         import ai.workflows.analysis_workflow as wf
 
@@ -610,11 +612,7 @@ class TestRunAnalysisWorkflow:
                 ] == ["analysis.started", "analysis.failed"]
         assert mock_cross_service[1][1]["failure_reason"] == "workflow_error"
 
-    @pytest.mark.asyncio
-    async def test_already_failed_row_is_not_rerun(
-            self, committed_rows, mock_cross_service, monkeypatch):
-        import ai.workflows.analysis_workflow as wf
-
+        mock_cross_service.clear()
         analysis_id = await committed_rows("failed", ticker="DEAD")
         called = False
 
@@ -633,29 +631,7 @@ class TestRunAnalysisWorkflow:
 class TestAnalysisQueue:
 
     @pytest.mark.asyncio
-    async def test_enqueue_restarts_a_dead_worker(self):
-        from domains.analysis.queue import AnalysisQueue
-
-        ran: list[UUID] = []
-
-        async def runner(job) -> None:
-            ran.append(job.analysis_id)
-
-        queue = AnalysisQueue(
-            runner=runner, mark_failed=_noop_mark_failed, timeout_seconds=5)
-        queue.start()
-        await queue.stop()
-        first, second = uuid4(), uuid4()
-        try:
-            queue.enqueue(_job(first))
-            queue.enqueue(_job(second))
-            await asyncio.wait_for(queue.join(), timeout=5)
-        finally:
-            await queue.stop()
-        assert ran == [first, second]
-
-    @pytest.mark.asyncio
-    async def test_timeout_cancels_marks_failed_publishes_and_continues(
+    async def test_timeout_and_stop_cancel_and_mark_failed(
             self, committed_rows, mock_cross_service):
         from domains.analysis.queue import AnalysisQueue, _default_mark_failed
 
@@ -697,8 +673,24 @@ class TestAnalysisQueue:
             "failure_reason": "timeout"
         }]
 
+        analysis_id = await committed_rows("running", ticker="STOP")
+        started = asyncio.Event()
+
+        async def runner(job) -> None:
+            started.set()
+            await asyncio.sleep(3600)
+
+        queue = AnalysisQueue(
+            runner=runner, mark_failed=_default_mark_failed,
+            timeout_seconds=60)
+        queue.enqueue(_job(analysis_id))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(queue.stop(), timeout=10)
+
+        assert await _load(analysis_id) == ("failed", "cancelled")
+
     @pytest.mark.asyncio
-    async def test_worker_survives_a_failing_job_and_a_failing_marker(
+    async def test_worker_survives_failures_and_restarts_when_dead(
             self, committed_rows, mock_cross_service):
         from domains.analysis.queue import AnalysisQueue, _default_mark_failed
 
@@ -747,26 +739,25 @@ class TestAnalysisQueue:
             await queue.stop()
         assert ran == [first, second]
 
-    @pytest.mark.asyncio
-    async def test_stop_cancels_in_flight_and_marks_it_cancelled(
-            self, committed_rows, mock_cross_service):
-        from domains.analysis.queue import AnalysisQueue, _default_mark_failed
+        from domains.analysis.queue import AnalysisQueue
 
-        analysis_id = await committed_rows("running", ticker="STOP")
-        started = asyncio.Event()
+        ran: list[UUID] = []
 
         async def runner(job) -> None:
-            started.set()
-            await asyncio.sleep(3600)
+            ran.append(job.analysis_id)
 
         queue = AnalysisQueue(
-            runner=runner, mark_failed=_default_mark_failed,
-            timeout_seconds=60)
-        queue.enqueue(_job(analysis_id))
-        await asyncio.wait_for(started.wait(), timeout=5)
-        await asyncio.wait_for(queue.stop(), timeout=10)
-
-        assert await _load(analysis_id) == ("failed", "cancelled")
+            runner=runner, mark_failed=_noop_mark_failed, timeout_seconds=5)
+        queue.start()
+        await queue.stop()
+        first, second = uuid4(), uuid4()
+        try:
+            queue.enqueue(_job(first))
+            queue.enqueue(_job(second))
+            await asyncio.wait_for(queue.join(), timeout=5)
+        finally:
+            await queue.stop()
+        assert ran == [first, second]
 
 
 class TestStartupReconciliation:
@@ -877,25 +868,6 @@ class TestStartupReconciliation:
 class TestCreateAnalysis:
 
     @pytest.mark.asyncio
-    async def test_requested_agents_need_a_research_agent(
-            self, client, enqueued):
-        cases = {
-            "empty-list": ([], 422),
-            "debate-only": (["bull", "bear"], 422),
-            "portfolio-only": (["portfolio"], 422),
-            "one-research-agent": (["bull", "macro"], 201)
-        }
-        for case_id, (agents, status) in cases.items():
-            enqueued.clear()
-            response = await client.post(
-                "/api/v1/analyses", headers=_headers(uuid4()), json={
-                    "ticker": "AMD",
-                    "requested_agents": agents
-                })
-            assert response.status_code == status, case_id
-            assert len(enqueued) == (1 if status == 201 else 0), case_id
-
-    @pytest.mark.asyncio
     async def test_portfolio_must_be_accessible(
             self, client, enqueued, owners, monkeypatch):
         import clients.auth_client as auth_client
@@ -955,7 +927,7 @@ class TestCreateAnalysis:
         assert denied.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_internal_create_enqueues_and_needs_no_token(
+    async def test_internal_create_and_requested_agents(
             self, client, enqueued):
         body_user = uuid4()
         created = await client.post(
@@ -991,6 +963,22 @@ class TestCreateAnalysis:
         assert len(enqueued) == 2
         assert str(enqueued[1].analysis_id) == body["id"]
         assert enqueued[1].analysis_type == AnalysisType.TECHNICAL
+
+        cases = {
+            "empty-list": ([], 422),
+            "debate-only": (["bull", "bear"], 422),
+            "portfolio-only": (["portfolio"], 422),
+            "one-research-agent": (["bull", "macro"], 201)
+        }
+        for case_id, (agents, status) in cases.items():
+            enqueued.clear()
+            response = await client.post(
+                "/api/v1/analyses", headers=_headers(uuid4()), json={
+                    "ticker": "AMD",
+                    "requested_agents": agents
+                })
+            assert response.status_code == status, case_id
+            assert len(enqueued) == (1 if status == 201 else 0), case_id
 
     @pytest.mark.asyncio
     async def test_global_queue_cap_returns_503_for_everyone(
@@ -1099,7 +1087,7 @@ class TestInternalCreateForUser:
 class TestReadAccess:
 
     @pytest.mark.asyncio
-    async def test_analyses_are_readable_by_owner_or_portfolio_access(
+    async def test_analysis_and_decision_routes_are_owner_only(
             self, client, db_session, owners):
         owner, stranger = uuid4(), uuid4()
         analysis = await _analysis(db_session, user_id=owner, with_rec=True)
@@ -1131,8 +1119,6 @@ class TestReadAccess:
             await client.get(orphan,
                              headers=_headers(owner))).status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_decision_routes_are_owner_only(self, client, db_session):
         from domains.analysis.repository import AnalysisRepository
         from domains.decision.repository import (DecisionReviewRepository,
                                                  InvestmentDecisionRepository)
@@ -1159,8 +1145,27 @@ class TestReadAccess:
         assert mine.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_guest_reads_are_allowed(self, client, monkeypatch):
+        import clients.core_client as core_client
+
+        async def _no_owner(portfolio_id):
+            return None
+
+        monkeypatch.setattr(core_client, "get_portfolio_owner", _no_owner)
+        guest = bearer_headers(uuid4(), role="guest")
+        assert (
+            await client.get("/api/v1/analyses",
+                             headers=guest)).status_code == 200
+        assert (
+            await client.get("/api/v1/decisions",
+                             headers=guest)).status_code == 200
+        overview = await client.get(
+            "/api/v1/analytics/overview", headers=guest)
+        assert overview.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_failed_review_keeps_the_old_one_and_new_one_replaces(
-            self, client, db_session, monkeypatch):
+            self, client, db_session, monkeypatch, ai_events_published):
         import domains.decision.service as decision_service
         from domains.decision.model import DecisionReview
         from domains.decision.repository import DecisionReviewRepository
@@ -1197,6 +1202,7 @@ class TestReadAccess:
             kept = await client.get(url, headers=headers)
             review_text = kept.json()["data"]["review_text"]
             assert review_text == "earlier review", case_id
+        assert ai_events_published == []
 
         decision = await _make_decision_with_outcome(db_session)
         url = f"/api/v1/decisions/{decision.id}/review"
@@ -1218,25 +1224,10 @@ class TestReadAccess:
                     DecisionReview.decision_id == decision.id)
             )).scalars().all()
         assert rows == ["second review"]
-
-    @pytest.mark.asyncio
-    async def test_guest_reads_are_allowed(self, client, monkeypatch):
-        import clients.core_client as core_client
-
-        async def _no_owner(portfolio_id):
-            return None
-
-        monkeypatch.setattr(core_client, "get_portfolio_owner", _no_owner)
-        guest = bearer_headers(uuid4(), role="guest")
-        assert (
-            await client.get("/api/v1/analyses",
-                             headers=guest)).status_code == 200
-        assert (
-            await client.get("/api/v1/decisions",
-                             headers=guest)).status_code == 200
-        overview = await client.get(
-            "/api/v1/analytics/overview", headers=guest)
-        assert overview.status_code == 200
+        assert [(name, p["decision_id"], p["user_id"])
+                for name, p in ai_events_published] == [
+                    ("decision.reviewed", str(decision.id),
+                     str(decision.user_id))] * 2
 
     @pytest.mark.asyncio
     async def test_member_cannot_decide_on_a_shared_system_analysis(
@@ -1299,7 +1290,7 @@ class TestBacktestRoutes:
 
     @pytest.mark.asyncio
     async def test_access_reads_and_deletes_are_owner_only(
-            self, client, owners, db_session, monkeypatch):
+            self, client, owners, db_session, monkeypatch, mock_cross_service):
         import domains.backtest.api as backtest_api
         from domains.backtest.model import Backtest, BacktestMetrics
         from domains.backtest.repository import BacktestRepository
@@ -1342,9 +1333,15 @@ class TestBacktestRoutes:
         for status in ("completed", "failed"):
             me = uuid4()
             backtest_id = await _stored_backtest(db_session, me, status)
+            mock_cross_service.clear()
             response = await client.delete(
                 f"/api/v1/backtests/{backtest_id}", headers=_headers(me))
             assert response.status_code == 204, response.text
+            assert mock_cross_service == [("backtest.deleted", {
+                "backtest_id": str(backtest_id),
+                "user_id": str(me),
+                "kind": "portfolio"
+            })]
             assert await db_session.get(Backtest, backtest_id) is None
             orphans = (
                 await db_session.execute(
@@ -1363,7 +1360,7 @@ class TestBacktestRoutes:
         assert response.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_fewer_than_two_snapshots_is_refused_up_front(
+    async def test_reserved_name_and_too_few_snapshots_refused(
             self, client, owners, monkeypatch):
         import domains.backtest.api as backtest_api
 
@@ -1408,6 +1405,18 @@ class TestBacktestRoutes:
         assert "positive total value" in response.json()["error"]["message"]
         assert started == []
 
+        reserved = ("ai_recommendation_replay", "portfolio_snapshot_backtest")
+        for name in reserved:
+            response = await client.post(
+                "/api/v1/backtests", headers=_headers(uuid4()), json={
+                    "strategy_name": name,
+                    "ticker": "AMD",
+                    "start_date": "2026-01-01",
+                    "end_date": "2026-02-01",
+                    "initial_capital": 1000
+                })
+            assert response.status_code == 422, name
+
     @pytest.mark.asyncio
     async def test_create_commits_before_starting_task(
             self, client, db_session, monkeypatch):
@@ -1445,20 +1454,6 @@ class TestBacktestRoutes:
             })
         assert response.status_code == 201
         assert order == ["commit", "start"]
-
-    @pytest.mark.asyncio
-    async def test_reserved_strategy_name_is_422(self, client):
-        reserved = ("ai_recommendation_replay", "portfolio_snapshot_backtest")
-        for name in reserved:
-            response = await client.post(
-                "/api/v1/backtests", headers=_headers(uuid4()), json={
-                    "strategy_name": name,
-                    "ticker": "AMD",
-                    "start_date": "2026-01-01",
-                    "end_date": "2026-02-01",
-                    "initial_capital": 1000
-                })
-            assert response.status_code == 422, name
 
     @pytest.mark.asyncio
     async def test_create_refused_above_active_cap(
@@ -1592,7 +1587,7 @@ class TestTriggeredTiers:
 class TestAnalyticsOverview:
 
     @pytest.mark.asyncio
-    async def test_filters_scope_all_and_core_outage(
+    async def test_filters_scope_core_outage_and_bad_input(
             self, client, db_session, analytics_owners):
         me, _, _ = await _seed_analytics(db_session, analytics_owners)
         by_ticker = await client.get(
@@ -1630,8 +1625,6 @@ class TestAnalyticsOverview:
             "/api/v1/analytics/overview", headers=_headers(me), params=RANGE)
         assert response.status_code == 503
 
-    @pytest.mark.asyncio
-    async def test_bad_input_is_422(self, client):
         bad = [{
             "from": "2026-03-10",
             "to": "2026-03-01"
@@ -1654,6 +1647,26 @@ class TestAnalyticsOverview:
                 "/api/v1/analytics/overview", headers=_headers(uuid4()),
                 params=params)
             assert response.status_code == 422, params
+
+    @pytest.mark.asyncio
+    async def test_analyses_list_shows_only_own_rows_unlike_mine_scope(
+            self, client, db_session, analytics_owners):
+        me, _, _ = await _seed_analytics(db_session, analytics_owners)
+        overview = await client.get(
+            "/api/v1/analytics/overview", headers=_headers(me), params=RANGE)
+        assert overview.json()["data"]["total_analyses"] == 5
+
+        for pid in list(analytics_owners.table):
+            analytics_owners.table[pid] = "down"
+        listed = await client.get(
+            "/api/v1/analyses", headers=_headers(me),
+            params={"page_size": 100})
+        assert listed.status_code == 200
+        body = listed.json()
+        assert body["total"] == 3
+        assert sorted(a["ticker"] for a in body["items"]) == [
+            "AMD", "AMD", "NVDA"]
+        assert all(a["user_id"] == str(me) for a in body["items"])
 
 
 class TestAnalyticsTimeseries:
@@ -1745,8 +1758,8 @@ class TestAnalyticsExport:
 class TestSentiment:
 
     @pytest.mark.asyncio
-    async def test_bad_input_is_422_and_llm_unavailable_is_503(
-            self, client, sentiment_router):
+    async def test_bad_input_unavailable_llm_retry_and_truncation(
+            self, client, sentiment_router, monkeypatch):
         bodies = [{
             "text": ""
         }, {
@@ -1769,9 +1782,6 @@ class TestSentiment:
                 "/internal/sentiment", json={"text": "hi"})
             assert response.status_code == 503, case_id
 
-    @pytest.mark.asyncio
-    async def test_retry_truncation_and_label_helpers(
-            self, client, sentiment_router, monkeypatch):
         from ai.user_sentiment import label_for_score, truncate_text
 
         router = sentiment_router("not json", '{"score": -0.5}')
@@ -1801,7 +1811,8 @@ class TestSentiment:
 class TestInternalRoutes:
 
     @pytest.mark.asyncio
-    async def test_stats_are_flat_integer_counts(self, client, db_session):
+    async def test_stats_are_flat_counts_and_routes_hidden(
+            self, client, db_session):
         from domains.analysis.model import Analysis, Recommendation
         from domains.backtest.repository import BacktestRepository
 
@@ -1838,6 +1849,11 @@ class TestInternalRoutes:
             "recommendations": 1,
             "backtests": 1
         }
+
+        import main
+
+        paths = main.app.openapi()["paths"]
+        assert not [p for p in paths if p.startswith("/internal")]
 
     @pytest.mark.asyncio
     async def test_closed_days_are_skipped_and_today_uses_new_york(
@@ -2023,12 +2039,6 @@ class TestInternalRoutes:
             })
         assert response.status_code == 200, response.text
         assert response.json() == {"rate": 0.79}
-
-    def test_internal_routes_not_in_openapi(self):
-        import main
-
-        paths = main.app.openapi()["paths"]
-        assert not [p for p in paths if p.startswith("/internal")]
 
 
 class TestHealth:
@@ -2342,8 +2352,8 @@ class TestEvents:
             await _delete_analyses_with_tiers([analysis_id, other_analysis])
 
     @pytest.mark.asyncio
-    async def test_malformed_event_payloads_are_ignored(
-            self, ai_events_published, monkeypatch):
+    async def test_malformed_payloads_ignored_and_publish_never_raises(
+            self, ai_events_published, monkeypatch, _schema_ready):
         import ai.workflows.rag_ingestion_workflow as wf
         import event_listener
 
@@ -2363,9 +2373,6 @@ class TestEvents:
         })
         assert called == []
 
-    @pytest.mark.asyncio
-    async def test_backtest_publish_helper_never_raises(
-            self, _schema_ready, ai_events_published):
         import ai.workflows.backtest_workflow as wf
 
         await wf.publish_backtest_finished(uuid4(), completed=True)
@@ -2379,8 +2386,7 @@ class TestDurableEvents:
         return f"test.event.{uuid4().hex[:8]}"
 
     @pytest.mark.asyncio
-    async def test_messages_published_before_a_subscriber_exists_are_kept(
-            self):
+    async def test_early_messages_kept_and_crashed_ones_stay_pending(self):
         event_name = self._unique_event_name()
         await publish_durable_event(settings, event_name, {"n": 1})
         await publish_durable_event(settings, event_name, {"n": 2})
@@ -2405,8 +2411,6 @@ class TestDurableEvents:
 
         assert received == [1, 2]
 
-    @pytest.mark.asyncio
-    async def test_handler_exception_leaves_message_pending_not_lost(self):
         event_name = self._unique_event_name()
         await publish_durable_event(settings, event_name, {"n": 1})
 

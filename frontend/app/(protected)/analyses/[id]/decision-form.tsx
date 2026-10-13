@@ -30,7 +30,7 @@ export function DecisionForm({
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="action_taken">What did you do?</label>
-        <select id="action_taken" name="action_taken" value={action} onChange={(e) => setAction(e.target.value)}>
+        <select id="action_taken" name="action_taken" autoComplete="off" value={action} onChange={(e) => setAction(e.target.value)}>
           {ACTIONS.map((a) => (
             <option key={a.value} value={a.value}>
               {a.label}
@@ -49,6 +49,7 @@ export function DecisionForm({
         <textarea
           id="notes"
           name="notes"
+          autoComplete="off"
           rows={3}
           maxLength={DECISION_NOTES_MAX_LENGTH}
           defaultValue={state.notes}

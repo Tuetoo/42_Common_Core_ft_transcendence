@@ -65,7 +65,7 @@
 | Test double / fake | A small object that stands in for a real dependency (an LLM router, a market data provider) and returns scripted answers. |
 | mypy `--strict` | Static type checking with all strict options on: every function must be typed, no implicit `Any`. |
 | flake8 | The classic Python style checker: PEP 8 style (pycodestyle), likely bugs such as unused imports and undefined names (pyflakes), and overly complex code (mccabe, off by default). |
-| Tool pragma | A comment addressed to a tool, not to a reader: `# type: ignore[...]` (mypy), `# noqa: <code>` (flake8), `# pragma: no cover` (coverage). |
+| Tool pragma | A comment addressed to a tool, not to a reader: `# type: ignore[...]` (mypy), `# noqa: <code>` (flake8), `# pragma: no cover` (coverage), `# pyright: ...` (the editor's import checker). |
 | CI | Continuous integration: GitHub Actions runs the checks on every pull request and push to `main`. |
 | promtool | Prometheus's command-line tool; `promtool test rules` checks that alert rules fire as expected on synthetic data. |
 
@@ -77,9 +77,14 @@
 
 The rules below apply to all Python code in the repository.
 
-- **No comments and no docstrings.** The only comments are tool pragmas
-  (`# type: ignore[...]`, `# noqa: <code>`, `# pragma: no cover`). The
-  handbook is the explanation of the code. Text the program needs at run
+- **Few comments and docstrings.** Most comments are tool pragmas
+  (`# type: ignore[...]`, `# noqa: <code>`, `# pragma: no cover`, and the
+  `# pyright: ...` header of the two shared test modules). Other comments
+  only name a section of a module that holds several topics (for example
+  `# Yjs decode/validate layer` in `yjs_relay.py`) or explain a choice the
+  code cannot show (a time budget, a concurrency rule); a few helpers in
+  `ai/agents/debate_common.py` have docstrings. The handbook is the
+  explanation of the code. Text the program needs at run
   time is an explicit string: error messages (for example `default_message` on each `AppError` subclass, see
   [30-shared-library.md](30-shared-library.md)), a script's `--help`
   (`argparse` `description=` and `help=`) and OpenAPI descriptions.
@@ -139,7 +144,7 @@ tests/
                          test_graph.py, test_knowledge.py, test_llm.py,
                          test_market_data.py, test_news.py, test_rag.py,
                          test_scripts.py, test_tools.py, test_workflows.py
-  integration/           test_rag_recall.py + conftest.py (needs the live stack)
+  integration/           test_rag_recall.py (needs the live stack)
   fixtures/              rag_golden_set.json
   alembic_contract.py    migration checks star-imported by one file per service
   auth_tokens.py         access_token(), auth_headers(), bearer_headers() for tests
@@ -154,8 +159,8 @@ what a service covers. Where things live:
 | Registration, login, tokens, sessions, 2FA, OAuth, profile, connections, emails | `tests/auth-service/test_accounts.py` |
 | Organizations, admin users, system roles, user state, auth events | `tests/auth-service/test_organizations.py` |
 | Internal token, HTTP surface, rate limits, migrations | `tests/auth-service/test_platform.py` |
-| Health, internal access, service clients, job health, user state, ownership rules, `e2e_check` helpers, migrations, gateway config (`X-Forwarded-For` replaced, never appended, in 4 places: http level, `/ws`, `/grafana/`, internal listener) | `tests/core-service/test_platform.py` |
-| Notes, documents, research content, document ingestion, API keys, sentiment | `tests/core-service/test_research.py` |
+| Health, internal access, service clients, job health, user state, ownership rules, API keys, `e2e_check` helpers, migrations, gateway config (`X-Forwarded-For` replaced, never appended, in 4 places: http level, `/ws`, `/grafana/`, internal listener) | `tests/core-service/test_platform.py` |
+| Notes, documents, research content, document ingestion, sentiment | `tests/core-service/test_research.py` |
 | Portfolio access, transactions, ledger adjustments, snapshots, scheduled jobs, exports | `tests/core-service/test_portfolio.py` |
 | Connection manager, WebSockets, notifications, event listener, cross-service events, Yjs collaboration | `tests/core-service/test_realtime.py` |
 | Judge, debate, reflection, position sizing, tier replacement, decision review | `tests/ai-service/test_debate_judge.py` |
@@ -163,14 +168,15 @@ what a service covers. Where things live:
 | Smoke and `e2e_tier_check` scripts, operator scripts | `tests/ai-service/test_scripts.py` |
 | Analysis repository, service and queue, create and read routes, backtest routes, analytics, internal routes, events, migrations | `tests/ai-service/test_api.py` |
 
-Size (collected tests, which count each parametrized case; 596 test
-functions in the 21 unit-test files):
+Size (collected tests, which count each parametrized case; 489 test
+functions in the 21 unit-test files, plus the 4 `alembic_contract.py`
+checks that every suite collects):
 
 | Suite | Test files | Collected tests | Statement coverage |
 |---|---|---|---|
-| `tests/auth-service` | 3 | 41 | 74% |
+| `tests/auth-service` | 3 | 42 | 75% |
 | `tests/core-service` | 4 | 84 | 66% |
-| `tests/ai-service` | 14 | 483 | 90% |
+| `tests/ai-service` | 14 | 375 | 90% |
 | `tests/integration` | 1 | 1 | not measured |
 
 The suite was reduced by removing tests that covered no code line or
@@ -323,8 +329,10 @@ migration.
 loads `tests/fixtures/rag_golden_set.json` and computes Recall@5 for BM25,
 vector and fused retrieval against the **running** Qdrant and its real
 corpus. Floors: `_MIN_RECALL_BM25 = 0.87`, `_MIN_RECALL_VECTOR = 0.72`,
-`_MIN_RECALL_FUSED = 0.86`. Its `conftest.py` starts no containers; a
-session fixture rebuilds the in-memory BM25 index from Qdrant first.
+`_MIN_RECALL_FUSED = 0.86`. The file has no `conftest.py` and starts no
+containers: its first lines put the repo root and `services/ai-service`
+on `sys.path`, and a session fixture (`_bm25_index_hydrated`, autouse)
+rebuilds the in-memory BM25 index from Qdrant first.
 
 ```bash
 make test-integration
@@ -383,10 +391,10 @@ address per hour, and each core run registers three users.
 `services/ai-service/scripts/smoke_check.py` (`make smoke`, or
 `bash scripts/smoke.sh --only db redis qdrant`) runs inside ai-service and
 checks what an analysis batch does not exercise: `db`, `redis`, `qdrant`,
-`bm25`, `retrieval`, `kg`, `market_data`, `fx`, `fred`, `core_service`,
+`bm25`, `retrieval`, `kg`, `filing_records`, `market_data`, `fx`, `fred`, `core_service`,
 `internal_api`, `backtest_metrics`, `backtest_replay`,
 `tier_monitoring_dry`, `review`, `queue`, and `llm` (only with
-`--with-llm`); 17 checks in `CHECKS`. Its report goes to stdout; service
+`--with-llm`); 18 checks in `CHECKS`. Its report goes to stdout; service
 logs are lowered to WARNING on stderr so they do not mix with it. Each check has its own
 timeout; one failure does not stop the rest. Side effects: `market_data`
 refreshes AAPL's cached price bars (last 10 days), and `backtest_replay`
@@ -503,7 +511,7 @@ lint:
 | `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` and the frontend's `/healthz` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404, `/login` = 200, `/healthz` = 200; `down -v` (always, also after a failure) |
 | `frontend-ci.yml` ("frontend CI") | pull request touching `frontend/**` or the workflow; push to `main` touching the same | in `frontend/`, Node 24: `npm ci`; `npm run lint` (ESLint); `npx next typegen && npx tsc --noEmit`; `npm run build` |
 
-| `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand | SSH to the cloud host with a key that may only run `scripts/deploy.sh` (fast-forward to `origin/main`, `docker compose up -d --build --wait`; the scheduler keeps its state: a stopped scheduler stays stopped); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
+| `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand; it then waits for every other workflow run of the same commit and deploys only if all succeeded or were skipped (the per-service checks run only for the services the commit touches; chapter [32](32-ci-cd.md) section 3.4) | SSH to the cloud host with a key that may only run `scripts/deploy.sh`, sending the checked commit sha (fast-forward to that commit, `docker compose up -d --build --wait`; the scheduler keeps its state: a stopped scheduler stays stopped); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 
 The stack smoke job does not run `tests/integration` (no seeded corpus or
 embedding key in CI) despite the file name.
@@ -520,6 +528,7 @@ embedding key in CI) despite the file name.
 | `[dependency-groups] dev` | pytest, pytest-asyncio, `testcontainers[postgres]`, flake8, mypy, `types-python-jose`, `types-passlib`, `boto3-stubs[s3]` | Test and quality tools. |
 | `[tool.uv] constraint-dependencies` | `grpcio>=1.82.1`, `charset-normalizer>=3.4.9` | Not used directly (they come in through qdrant-client and requests); pinned only to keep uv away from two yanked releases (grpcio 1.82.0 had a bad protobuf dependency, charset-normalizer 3.4.8 a decode regression). |
 | `[tool.mypy]` | `strict`, `explicit_package_bases`, ... | 3.10. |
+| `[tool.pyright]` | `typeCheckingMode = "off"`; one `executionEnvironments` entry per service and per test folder, with `extraPaths` (the service directory, `tests`, the repo root) | Editor import resolution only (Pylance in VS Code): the same paths each `conftest.py` puts on `sys.path`. mypy stays the type checker. `tests/alembic_contract.py` and `tests/auth_tokens.py` start with `# pyright: reportMissingImports=false`, because their `config` and `database` imports resolve to the suite that imports them. |
 | Test env (set by each `conftest.py`) | `USER_STATE_CHECK_ENABLED=false`, test `JWT_SECRET` and `INTERNAL_API_TOKEN`, container host/ports | Test-only overrides. |
 | `Makefile` | `test`, `test-auth`, `test-core`, `test-ai`, `test-integration`, `promtool-test`, `lint`, `mypy`, `mypy-*`, `clean`, `e2e`, `smoke` | Entry points. |
 
@@ -559,13 +568,14 @@ tested (`TestE2eCheckScript` in `tests/core-service/test_platform.py`,
 
 **mypy strict on everything.** The codebase passes data between three
 services and many async layers; types catch wrong shapes before runtime.
-The two `type: ignore[import-untyped]` lines are the only exceptions for
+The three `type: ignore[import-untyped]` lines are the only exceptions for
 imports, each limited to one error code.
 
-**flake8 with default settings, no comments in code.** The owner's rule:
+**flake8 with default settings, few comments in code.** The owner's rule:
 the style is the standard one (PEP 8, 79 characters) with nothing to
-configure, and the explanation of the code lives in one place, this
-handbook, instead of being split between comments and documents. Text the
+configure, and the explanation of the code lives in this handbook; the
+few comments in the code only name a section or explain a choice the
+code cannot show (section 3.0). Text the
 program shows at run time is an explicit string, so removing comments can
 never change behaviour.
 
@@ -681,9 +691,10 @@ replacement without any LLM or network.
   `mock_cross_service`. Tests then replace the whole LangGraph graph with
   `_StubGraph(result)` (in `helpers.py`; its `ainvoke` returns a fixed
   final state) and assert on the database rows and the events.
-- **Parametrized cases**: one test body, several named cases (for example
-  `buy-without-budget`, `sell-not-held` in
-  `TestPositionSizing.test_no_tiers_without_calling_the_llm`).
+- **Named cases**: one test body loops over a dict of named cases, and
+  each assert names its case (for example `buy-without-budget`,
+  `sell-not-held` in
+  `TestPositionSizing.test_bad_tiers_are_dropped_or_never_requested`).
 
 A minimal ai-service test in that style (the imports and the `_Router`,
 `_state`, `_ok` and `_args` names are the ones at the top of
@@ -737,8 +748,8 @@ Run on your machine (host), from the repository root, with `uv` installed
 
    It starts the Postgres and Redis containers (a few seconds), then runs
    the pure tests of the end-to-end script's helpers (MailHog parsing, link
-   extraction, PDF building): 3 test functions, some of them
-   parametrized. Point at the startup: "Even this class gets a real
+   extraction, PDF building): 3 test functions, each looping over
+   named cases. Point at the startup: "Even this class gets a real
    database, because the suite's `conftest.py` sets it up once per run."
    Expected last line: `N passed` with no failures.
 
@@ -874,7 +885,7 @@ anywhere with only Docker.
 | `tests/<service>/helpers.py` | Shared builders, fakes and functions of one service's tests. |
 | `tests/auth_tokens.py` | Test access tokens. |
 | `tests/alembic_contract.py` | Migration-versus-model checks, star-imported by `tests/{auth,core}-service/test_platform.py` and `tests/ai-service/test_api.py`. |
-| `tests/integration/test_rag_recall.py`, `conftest.py` | RAG recall floors against the live corpus. |
+| `tests/integration/test_rag_recall.py` | RAG recall floors against the live corpus; puts `services/ai-service` on `sys.path` and rebuilds BM25 itself. |
 | `tests/ai-service/test_debate_judge.py` | Reference for fake routers and `sizing_env`; `rows` and `workflow_env` are in `conftest.py`. |
 | `tests/core-service/test_platform.py` | Includes the unit tests of the e2e script's helpers (`TestE2eCheckScript`). |
 | `tests/ai-service/test_scripts.py` | Includes the unit tests of `e2e_tier_check` and the smoke runner. |

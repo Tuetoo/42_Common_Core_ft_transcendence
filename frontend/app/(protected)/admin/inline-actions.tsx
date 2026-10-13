@@ -108,6 +108,7 @@ export function SelectActionForm({
       <div className="flex flex-wrap items-center gap-2">
         <select
           name={name}
+          autoComplete="off"
           aria-label={label}
           value={value}
           onChange={(e) => setValue(e.target.value)}

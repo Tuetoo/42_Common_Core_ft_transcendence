@@ -32,6 +32,7 @@ export function AddHoldingForm({ portfolioId }: { portfolioId: string }) {
       <div className="field">
         <label htmlFor={`${uid}-quantity`}>Quantity</label>
         <input id={`${uid}-quantity`} name="quantity"
+          autoComplete="off"
           type="number"
           inputMode="decimal"
           step="any"
@@ -43,6 +44,7 @@ export function AddHoldingForm({ portfolioId }: { portfolioId: string }) {
       <div className="field">
         <label htmlFor={`${uid}-average_cost`}>Average cost</label>
         <input id={`${uid}-average_cost`} name="average_cost"
+          autoComplete="off"
           type="number"
           inputMode="decimal"
           step="any"

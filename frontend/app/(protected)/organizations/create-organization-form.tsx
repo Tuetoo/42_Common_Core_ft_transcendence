@@ -14,13 +14,14 @@ export function CreateOrganizationForm() {
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="name">Name</label>
-        <input id="name" name="name" type="text" required maxLength={128} defaultValue={state.values?.name ?? ""} />
+        <input id="name" name="name" autoComplete="off" type="text" required maxLength={128} defaultValue={state.values?.name ?? ""} />
       </div>
       <div className="field">
         <label htmlFor="description">Description (optional)</label>
         <textarea
           id="description"
           name="description"
+          autoComplete="off"
           rows={3}
           maxLength={1000}
           defaultValue={state.values?.description ?? ""}

@@ -25,7 +25,7 @@ type Me = {
 
 // What each system role means for this user, in plain words.
 const ROLE_SUMMARY: Record<string, string> = {
-  guest: "Read-only: you can view shared content but not create or change anything.",
+  guest: "Read-only: you can view shared content but not create or change it. You can still edit your own profile, avatar and two-factor settings.",
   user: "You can create portfolios, notes, comments, analyses, documents and organizations.",
   moderator: "Everything a user can do, plus moderating research content and deactivating accounts.",
   admin: "Full access, including managing users, roles and site statistics.",

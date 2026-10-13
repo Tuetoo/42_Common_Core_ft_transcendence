@@ -4,10 +4,11 @@ from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 import structlog
+from ai_events import backtest_deleted_payload, publish_event
 from clients.core_client import get_portfolio_snapshots
 from database import get_db
 from deps import ensure_portfolio_access, get_analysis_writer, get_current_user
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.repository import RecommendationTierRepository
 from domains.backtest.model import Backtest
@@ -20,6 +21,7 @@ from domains.backtest.schema import (PORTFOLIO_SNAPSHOT_STRATEGY,
                                      PortfolioBacktestCreate,
                                      RecommendationReplayCreate)
 from shared.enums import WorkflowStatus
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                RateLimitExceededError, ValidationAppError)
 from shared.schemas import APIResponse
@@ -250,7 +252,8 @@ async def get_backtest_metrics(
         "Another user's backtest is a 404; one still pending or running is a "
         "409."))
 async def delete_backtest(
-    backtest_id: UUID, user: CurrentUser = Depends(get_analysis_writer),
+    backtest_id: UUID, background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_analysis_writer),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> Response:
     backtest = await _get_own_backtest(db, backtest_id, user)
@@ -259,5 +262,10 @@ async def delete_backtest(
         raise ConflictError(
             f"Backtest {backtest_id} is still {backtest.status}; delete it "
             "after it has completed or failed.")
+    payload = backtest_deleted_payload(
+        backtest_id=backtest.id, user_id=backtest.user_id,
+        strategy_name=backtest.strategy_name)
     await BacktestRepository(db).delete(backtest)
+    background_tasks.add_task(
+        publish_event, EventName.BACKTEST_DELETED, payload)
     return Response(status_code=204)

@@ -3,8 +3,8 @@ from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 import structlog
-from api.apikeys_api import router as apikeys_router
 from api.internal import router as internal_router
+from api.public import apikeys_router
 from api.public import router as public_router
 from api.websocket import router as websocket_router
 from api.websocket import yjs_router as yjs_websocket_router
@@ -22,12 +22,12 @@ from websocket_manager import \
     run_cross_replica_listener as run_websocket_fanout_listener
 from yjs_relay import (relay, run_active_room_heartbeat,
                        run_cross_replica_listener)
+from yjs_relay import validator as yjs_update_validator
 from domains.notification.api import router as notification_router
 from domains.portfolio.api import router as portfolio_router
 from domains.portfolio.api import watchlist_router
 from domains.research.api import router as research_router
 from domains.research.api import moderation_router
-from domains.research.yjs_guard import validator as yjs_update_validator
 from shared.database import check_database_connection
 from shared.events import start_background_task
 from shared.exceptions import register_exception_handlers

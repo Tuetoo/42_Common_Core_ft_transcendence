@@ -76,8 +76,8 @@ and `bear` (the Supervisor, Judge and Reflection are graph nodes, not
 roles in that enum). The graph's generic
 node factory (`ai/graph/nodes.py::AGENT_REGISTRY`) maps eight of them
 to classes: Market, News, Sentiment, Filing, Technical, Fundamental, Risk,
-Macro. Portfolio is built separately by `portfolio_node` because it needs
-a `portfolio_id`. Bull, Bear, Judge and Reflection have hand-written
+Macro. Portfolio uses the same node factory (`make_agent_node`), which
+builds `PortfolioAgent` with the analysis's `portfolio_id` (`_build_agent`). Bull, Bear, Judge and Reflection have hand-written
 nodes. The supervisor node picks the others.
 
 `ai/graph/nodes.py::select_agents` is pure code, no
@@ -295,7 +295,7 @@ is_well_supported)`:
 
 | Situation | Score | Well supported |
 |---|---|---|
-| Hit the iteration cap, an unresolved issue, or "no evidence" | 0.35 (`_SCORE_UNRESOLVED`) | no |
+| Hit the iteration cap, an unresolved issue, or "no evidence" | 0.35 (`SCORE_UNRESOLVED`) | no |
 | Clean first pass | graded, 0.40-0.96 | yes |
 | Accepted on a Reflection retry (`feedback` present) | at most 0.65 (`_SCORE_FIXED_ON_RETRY`) | yes |
 | Thin evidence (1 or 2 live-search items, or News's unverified web fallback) | at most 0.6 (`_SCORE_THIN_EVIDENCE`) | yes |
@@ -1054,10 +1054,10 @@ the tolerance of one allowed value.
   says the funding is not shown. The TSLA Judge (October 2026) read a
   positive six-month free cash flow as "requiring" the debt raised, and
   the KO Judge called a $1.00B gap "funded by existing cash" when cash
-  fell $15M; the two middle clauses answer those. The earlier
-  wording "name how the gap was funded (debt issued, cash)" made the BA
+  fell $15M; the two middle clauses answer those. A bare
+  "name how the gap was funded (debt issued, cash)" made the BA
   Judge write "funded by cash reserves and debt" while the filing showed
-  debt repaid; the XBRL cash-flow line now also carries debt issued, debt
+  debt repaid; the XBRL cash-flow line also carries debt issued, debt
   repaid and the net change in cash when tagged, chapter 18);
   `LEGAL_AMOUNT_RULE` (an amount stated is claimed, sought, assessed or
   awarded, not a recorded loss; an accrued, paid or escrowed amount is
@@ -1256,7 +1256,7 @@ quotes, tool values), never from re-parsed model prose.
   (fewer than 2 well-formed items). To review a verdict's reasons, grep the
   analysis id with `judge.deciding_factor` and `judge.opposing_points`.
 - **Failure handling:** the answer is read with
-  `json_fence.parse_json_object`: code fence removed; if strict JSON fails,
+  `ai.llm.base.parse_json_object`: code fence removed; if strict JSON fails,
   a comma directly before a closing brace or bracket (outside strings) is
   dropped first (`json.trailing_comma_removed`; every 3.8 Judge re-ask in
   the batches of 2026-10-11 was this slip), then the first JSON object is decoded from the first "{", with line breaks

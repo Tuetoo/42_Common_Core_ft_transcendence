@@ -3,7 +3,7 @@
 import { LocalTime } from "@/app/(protected)/local-time";
 import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { deleteDocument } from "@/app/lib/actions/documents";
+import { deleteDocument } from "@/app/lib/actions/research";
 import { FINAL_DOCUMENT_STATUSES } from "../limits";
 import type { ResearchDocument } from "../types";
 

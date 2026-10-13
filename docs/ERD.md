@@ -16,6 +16,10 @@ migrations:
 The files are under `services/<service>/migrations/versions/`; details in
 `handbook/20-postgresql.md` section 3.5.
 
+Sections 2 to 4 describe every table in words. Section 7 draws the same
+tables and their foreign keys as diagrams, and section 8 shows how to
+look at the live schema and its relations in Adminer.
+
 ## 1. Cross-Service Reference Rule
 
 Each service owns one Postgres schema (`auth`, `core`, `ai`) in a single shared
@@ -35,7 +39,10 @@ delete: the row stays so other services' plain-UUID references keep
 resolving, `is_active` is false, `email`/`username` are replaced by
 `deleted-<id>@deleted.alphamind.local` / `deleted_<id>`, the password by a
 random one, and the user's profile fields, OAuth accounts, 2FA secret,
-connections, non-owner organization memberships and sessions are removed.
+connections, organization memberships and sessions are removed. An
+organization the user owned passes to its longest-standing admin, else its
+longest-standing other member; it keeps the deleted user's owner row only
+when it has no other member.
 A deleted account can never log in again. The live `system_role` /
 `is_active` of every user is mirrored in Redis (`auth:user_state:{id}`,
 `shared/user_state.py`) so every service applies changes at once.
@@ -49,10 +56,13 @@ A deleted account can never log in again. The live `system_role` /
 **user_sessions** — `id`, `user_id` (FK → users), `refresh_token_hash`
 (unique; the refresh token itself is never stored), `expires_at`,
 `ip_address`, `device_info`, `created_at`, `revoked_at`, `revoked_reason`
-(nullable: `rotated` / `logout` / `revoked_all` / `reuse`; a revoked row
-without a reason is treated as `rotated`). Only a `rotated` (or NULL)
-token presented again revokes every session of the user; a logged-out
-token just gets a 401. A new session deletes the user's sessions that
+(nullable: `rotated` / `logout` / `revoked_all` / `reuse`). A session
+created by a refresh has `created_at` equal to the `revoked_at` of the
+session it replaced, which links a rotation chain without a separate
+column. A `rotated` token presented again more than 30 seconds after its
+rotation revokes the sessions descending from it (reason `reuse`; the
+user's other sessions stay); within 30 seconds, and for any other reason
+or none, it just gets a 401. A new session deletes the user's sessions that
 expired more than 7 days ago.
 
 **oauth_accounts** — `id`, `user_id` (FK → users), `provider`,
@@ -75,8 +85,8 @@ organization roles.
 
 **organization_invitations** — `id`, `organization_id` (FK), `email`, `role`,
 `invited_by` (FK → users), `expires_at`, `accepted_at`. There is no
-status column. An invitation with `role = 'owner'` cannot be accepted
-(409).
+status column. An invitation can never carry the `owner` role (422 when
+it is created).
 
 **connections** — `id`, `requester_id` / `addressee_id` (FK → users),
 `pair_key` (deterministic, order-independent pair identifier — lets a unique
@@ -238,7 +248,10 @@ its tiers at once), `created_at`.
 indexed), `side` (`buy`/`sell`), `target_price` and `quantity` (NUMERIC),
 `status` (indexed; `pending_acceptance` → `accepted_awaiting_trigger` →
 `triggered`, or `expired` / `superseded` / `declined` /
-`execution_failed`), `triggered_at`, `triggered_price`, `created_at`. The
+`execution_failed`), `triggered_at`, `triggered_price`, `created_at`. A
+`pending_acceptance` tier of a system analysis (`analyses.user_id` NULL)
+that is not accepted within `SYSTEM_TIER_ACCEPTANCE_HOURS` (72) of its
+recommendation no longer reserves cash and becomes `expired`. The
 daily tier-monitoring job checks accepted tiers against the session's
 daily bar and sends a triggered tier to core-service as an order; there is
 no per-tier acceptance (see `recommendations.accepted_at`).
@@ -339,7 +352,7 @@ naming.
 
 **investment_decisions** — `id`, `user_id` (plain UUID), `portfolio_id`
 (plain UUID, nullable), `recommendation_id` (FK → recommendations),
-`ticker`, `action_taken` (`followed`/`ignored`/`partial`), `notes`
+`ticker`, `action_taken` (`followed`/`ignored`/`partial`/`declined`), `notes`
 (nullable), `created_at`; unique on `(user_id, recommendation_id)`.
 
 **decision_outcomes** (model `DecisionOutcome`) — `id`, `decision_id` (FK), `evaluation_days` (the
@@ -428,3 +441,646 @@ category/ticker, filtered per-query, not one collection per category; see
 `handbook/21-qdrant.md` section 5). `ai.document_chunks` is Postgres-side bookkeeping only, mapping
 a chunk's identity to its Qdrant point ID — the payload text/vector itself is
 never duplicated into Postgres.
+
+## 7. Relationship diagrams
+
+The diagrams below are generated from the SQLAlchemy models, so they show
+every table and column that the migrations create. `PK` is the primary
+key, `FK` a foreign key inside the same schema, `UK` a unique column.
+Each line is a foreign key: `||` means exactly one, `|o` zero or one,
+`o{` zero or more, and the label is the foreign-key column. GitHub and
+most Markdown viewers draw them; in a plain editor they read as text.
+
+### 7.1 Across the services
+
+Only the main links between the schemas. Solid lines are real foreign
+keys; dotted lines are plain UUID columns that point into another
+service's schema (section 1), which the application keeps consistent.
+
+```mermaid
+erDiagram
+    auth_users ||--o{ auth_organizations : "owner_id (FK)"
+    auth_organizations ||--o{ auth_organization_members : "organization_id (FK)"
+    auth_users ||--o{ auth_organization_members : "user_id (FK)"
+    auth_users ||..o{ core_portfolios : "owner_id (plain UUID)"
+    auth_organizations |o..o{ core_portfolios : "organization_id (plain UUID)"
+    auth_users ||..o{ core_research_notes : "author_id (plain UUID)"
+    auth_organizations |o..o{ core_research_notes : "organization_id (plain UUID)"
+    auth_users ||..o{ core_documents : "owner_id (plain UUID)"
+    auth_organizations |o..o{ core_documents : "organization_id (plain UUID)"
+    auth_users ||..o{ core_notifications : "user_id (plain UUID)"
+    auth_users ||..o{ core_api_keys : "owner_user_id (plain UUID)"
+    auth_users |o..o{ ai_analyses : "user_id (plain UUID, NULL for system analyses)"
+    core_portfolios |o..o{ ai_analyses : "portfolio_id (plain UUID)"
+    auth_users ||..o{ ai_investment_decisions : "user_id (plain UUID)"
+    core_portfolios |o..o{ ai_investment_decisions : "portfolio_id (plain UUID)"
+    core_documents ||..o{ ai_document_chunks : "document_id (plain UUID)"
+    ai_analyses ||--o{ ai_recommendations : "analysis_id (FK)"
+    ai_recommendations ||--o{ ai_recommendation_tiers : "recommendation_id (FK)"
+```
+
+### 7.2 `auth` schema
+
+```mermaid
+erDiagram
+    connections {
+        uuid id PK
+        uuid requester_id FK
+        uuid addressee_id FK
+        text pair_key UK
+        varchar status
+        timestamptz created_at
+        timestamptz responded_at
+        uuid blocked_by FK
+    }
+    oauth_accounts {
+        uuid id PK
+        uuid user_id FK
+        varchar provider
+        varchar provider_user_id
+    }
+    organization_invitations {
+        uuid id PK
+        uuid organization_id FK
+        varchar email
+        varchar role
+        uuid invited_by FK
+        timestamptz expires_at
+        timestamptz accepted_at
+    }
+    organization_members {
+        uuid id PK
+        uuid organization_id FK
+        uuid user_id FK
+        varchar role
+        timestamptz joined_at
+    }
+    organizations {
+        uuid id PK
+        varchar name
+        text description
+        uuid owner_id FK
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    two_factor_secrets {
+        uuid id PK
+        uuid user_id FK, UK
+        text secret
+        bool enabled
+        bigint last_used_step
+    }
+    user_profiles {
+        uuid id PK
+        uuid user_id FK, UK
+        varchar first_name
+        varchar last_name
+        text avatar_url
+        text bio
+        varchar timezone
+        varchar country
+    }
+    user_sessions {
+        uuid id PK
+        uuid user_id FK
+        text refresh_token_hash UK
+        timestamptz expires_at
+        varchar ip_address
+        text device_info
+        timestamptz created_at
+        timestamptz revoked_at
+        varchar revoked_reason
+    }
+    user_settings {
+        uuid id PK
+        uuid user_id FK, UK
+        varchar preferred_currency
+        varchar theme
+        varchar default_model
+        jsonb notification_preferences
+    }
+    users {
+        uuid id PK
+        varchar email UK
+        varchar username UK
+        text password_hash
+        varchar system_role
+        bool is_active
+        bool is_verified
+        timestamptz last_seen_at
+        timestamptz deleted_at
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    users ||--o{ connections : "requester_id"
+    users ||--o{ connections : "addressee_id"
+    users |o--o{ connections : "blocked_by"
+    users ||--o{ oauth_accounts : "user_id"
+    organizations ||--o{ organization_invitations : "organization_id"
+    users ||--o{ organization_invitations : "invited_by"
+    organizations ||--o{ organization_members : "organization_id"
+    users ||--o{ organization_members : "user_id"
+    users ||--o{ organizations : "owner_id"
+    users ||--o| two_factor_secrets : "user_id"
+    users ||--o| user_profiles : "user_id"
+    users ||--o{ user_sessions : "user_id"
+    users ||--o| user_settings : "user_id"
+```
+
+### 7.3 `core` schema
+
+Columns marked "plain UUID to ..." point into another schema (section 1).
+
+```mermaid
+erDiagram
+    api_keys {
+        uuid id PK
+        uuid owner_user_id "plain UUID to auth.users"
+        varchar name
+        varchar key_hash UK
+        int rate_limit_per_minute
+        timestamptz last_used_at
+        timestamptz revoked_at
+        timestamptz created_at
+    }
+    documents {
+        uuid id PK
+        uuid owner_id "plain UUID to auth.users"
+        uuid organization_id "plain UUID to auth.organizations"
+        varchar filename
+        varchar document_type
+        varchar category
+        varchar ticker
+        text storage_url
+        varchar status
+        timestamptz uploaded_at
+        timestamptz status_changed_at
+        timestamptz content_date
+        varchar title
+        text source_url
+    }
+    event_outbox {
+        uuid id PK
+        varchar event_name
+        jsonb payload
+        timestamptz created_at
+        timestamptz published_at
+        int attempts
+        text last_error
+    }
+    holdings {
+        uuid id PK
+        uuid portfolio_id FK
+        varchar ticker
+        numeric quantity
+        numeric average_cost
+    }
+    note_tags {
+        uuid note_id PK, FK
+        uuid tag_id PK, FK
+    }
+    notifications {
+        uuid id PK
+        uuid user_id "plain UUID to auth.users"
+        varchar type
+        varchar title
+        text content
+        timestamptz read_at
+        timestamptz created_at
+    }
+    portfolio_snapshots {
+        uuid id PK
+        uuid portfolio_id FK
+        date snapshot_date
+        numeric total_value
+        numeric cash_balance
+    }
+    portfolios {
+        uuid id PK
+        uuid owner_id "plain UUID to auth.users"
+        uuid organization_id "plain UUID to auth.organizations"
+        varchar name
+        varchar currency
+        varchar visibility
+        bool auto_analyze_at_open
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    research_comments {
+        uuid id PK
+        uuid note_id FK
+        uuid author_id "plain UUID to auth.users"
+        text content
+        timestamptz created_at
+        timestamptz updated_at
+        bool is_hidden
+        uuid hidden_by
+        timestamptz hidden_at
+        varchar sentiment_label
+        float sentiment_score
+        varchar sentiment_model
+        timestamptz sentiment_analyzed_at
+    }
+    research_notes {
+        uuid id PK
+        uuid author_id "plain UUID to auth.users"
+        uuid organization_id "plain UUID to auth.organizations"
+        varchar title
+        text content
+        tsvector search_vector
+        timestamptz created_at
+        timestamptz updated_at
+        bytea yjs_state
+        bool is_hidden
+        uuid hidden_by
+        timestamptz hidden_at
+        varchar sentiment_label
+        float sentiment_score
+        varchar sentiment_model
+        timestamptz sentiment_analyzed_at
+    }
+    research_tags {
+        uuid id PK
+        varchar name UK
+    }
+    transactions {
+        uuid id PK
+        uuid portfolio_id FK
+        varchar ticker
+        varchar transaction_type
+        numeric quantity
+        numeric price
+        numeric dividend_per_share
+        numeric split_ratio
+        timestamptz transaction_date
+        varchar idempotency_key UK
+    }
+    watchlist_items {
+        uuid id PK
+        uuid watchlist_id FK
+        varchar ticker
+    }
+    watchlists {
+        uuid id PK
+        uuid owner_id "plain UUID to auth.users"
+        varchar name
+    }
+    portfolios ||--o{ holdings : "portfolio_id"
+    research_notes ||--o{ note_tags : "note_id"
+    research_tags ||--o{ note_tags : "tag_id"
+    portfolios ||--o{ portfolio_snapshots : "portfolio_id"
+    research_notes ||--o{ research_comments : "note_id"
+    portfolios ||--o{ transactions : "portfolio_id"
+    watchlists ||--o{ watchlist_items : "watchlist_id"
+```
+
+### 7.4 `ai` schema
+
+```mermaid
+erDiagram
+    agent_memories {
+        uuid id PK
+        uuid agent_id FK
+        varchar ticker
+        uuid user_id "plain UUID to auth.users"
+        varchar memory_type
+        float score
+        jsonb content
+        timestamptz created_at
+    }
+    agent_metrics {
+        uuid id PK
+        uuid agent_id FK, UK
+        numeric avg_score
+        numeric success_rate
+    }
+    agent_reports {
+        uuid id PK
+        uuid analysis_id FK
+        varchar agent_role
+        varchar ticker
+        varchar category
+        text content
+        timestamptz created_at
+    }
+    agent_results {
+        uuid id PK
+        uuid agent_run_id FK, UK
+        numeric score
+        text summary
+        jsonb output
+    }
+    agent_runs {
+        uuid id PK
+        uuid analysis_id FK
+        uuid agent_id FK
+        varchar status
+        timestamptz started_at
+        timestamptz completed_at
+        int duration_ms
+    }
+    agents {
+        uuid id PK
+        varchar name UK
+        text description
+        varchar version
+        bool active
+    }
+    analyses {
+        uuid id PK
+        uuid user_id "plain UUID to auth.users"
+        uuid portfolio_id "plain UUID to core.portfolios"
+        varchar ticker
+        varchar status
+        text failure_reason
+        timestamptz created_at
+    }
+    backtest_metrics {
+        uuid id PK
+        uuid backtest_id FK, UK
+        numeric sharpe_ratio
+        numeric sortino_ratio
+        numeric drawdown
+        numeric win_rate
+    }
+    backtests {
+        uuid id PK
+        uuid user_id "plain UUID to auth.users"
+        varchar strategy_name
+        varchar benchmark_symbol
+        date start_date
+        date end_date
+        numeric initial_capital
+        numeric ending_capital
+        numeric strategy_return
+        numeric benchmark_return
+        varchar status
+        timestamptz created_at
+    }
+    benchmark_results {
+        uuid id PK
+        uuid backtest_id FK
+        uuid benchmark_id FK
+        numeric strategy_return
+        numeric benchmark_return
+        numeric alpha
+        numeric beta
+        numeric information_ratio
+        numeric tracking_error
+        bool outperformed
+        timestamptz created_at
+    }
+    benchmarks {
+        uuid id PK
+        varchar symbol UK
+        varchar name
+        varchar asset_type
+        varchar currency
+        text description
+        timestamptz created_at
+    }
+    debate_arguments {
+        uuid id PK
+        uuid debate_session_id FK
+        varchar side
+        text content
+        int round_number
+        jsonb citations
+    }
+    debate_sessions {
+        uuid id PK
+        uuid analysis_id FK
+        timestamptz created_at
+    }
+    decision_outcomes {
+        uuid id PK
+        uuid decision_id FK
+        int evaluation_days
+        numeric strategy_return
+        numeric benchmark_return
+        numeric alpha
+        bool outperformed
+        timestamptz evaluated_at
+    }
+    decision_reviews {
+        uuid id PK
+        uuid decision_id FK
+        text review_text
+        text lessons_learned
+        timestamptz created_at
+    }
+    document_chunks {
+        uuid id PK
+        uuid document_id "plain UUID to core.documents"
+        int chunk_index
+        int token_count
+        varchar qdrant_point_id UK
+    }
+    embedding_jobs {
+        uuid id PK
+        uuid document_id "plain UUID to core.documents"
+        varchar embedding_model
+        varchar status
+        timestamptz created_at
+    }
+    episodic_memories {
+        uuid id PK
+        uuid user_id "plain UUID to auth.users"
+        uuid analysis_id FK
+        varchar ticker
+        varchar recommendation
+        float confidence
+        varchar outcome
+        float outcome_return
+        text summary
+        timestamptz created_at
+    }
+    filing_records {
+        uuid id PK
+        varchar ticker
+        varchar filename UK
+        varchar form
+        date filing_date
+        date report_date
+        jsonb records
+        timestamptz created_at
+    }
+    instruments {
+        uuid id PK
+        varchar ticker UK
+        varchar name
+        varchar asset_type
+        varchar currency
+        varchar sector
+        varchar exchange
+    }
+    investment_decisions {
+        uuid id PK
+        uuid user_id "plain UUID to auth.users"
+        uuid portfolio_id "plain UUID to core.portfolios"
+        uuid recommendation_id FK
+        varchar ticker
+        varchar action_taken
+        text notes
+        timestamptz created_at
+    }
+    kg_entities {
+        uuid id PK
+        varchar name
+        varchar normalized_name
+        varchar entity_type
+        timestamptz created_at
+    }
+    kg_relations {
+        uuid id PK
+        uuid source_entity_id FK
+        uuid target_entity_id FK
+        varchar relation_type
+        uuid source_report_id FK
+        float confidence
+        varchar kind
+        date as_of
+        timestamptz created_at
+    }
+    price_bars {
+        uuid id PK
+        uuid instrument_id FK
+        varchar interval
+        timestamptz timestamp
+        numeric open
+        numeric high
+        numeric low
+        numeric close
+        numeric volume
+        timestamptz fetched_at
+    }
+    recommendation_metrics {
+        uuid id PK
+        uuid recommendation_id FK, UK
+        numeric accuracy_score
+    }
+    recommendation_tiers {
+        uuid id PK
+        uuid recommendation_id FK
+        varchar side
+        numeric target_price
+        numeric quantity
+        varchar status
+        timestamptz triggered_at
+        numeric triggered_price
+        timestamptz created_at
+    }
+    recommendations {
+        uuid id PK
+        uuid analysis_id FK
+        varchar recommendation
+        numeric confidence
+        varchar judge_leaning
+        numeric judge_confidence
+        text reasoning
+        text confidence_adjustment_note
+        text tier_generation_note
+        bool debate_converged
+        timestamptz window_expires_at
+        timestamptz accepted_at
+        timestamptz created_at
+    }
+    reflections {
+        uuid id PK
+        uuid analysis_id FK
+        int round_number
+        bool verified
+        jsonb issues
+        jsonb retry_agents
+    }
+    ticker_names {
+        uuid id PK
+        varchar ticker UK
+        varchar official_name
+        timestamptz created_at
+    }
+    agents ||--o{ agent_memories : "agent_id"
+    agents ||--o| agent_metrics : "agent_id"
+    analyses ||--o{ agent_reports : "analysis_id"
+    agent_runs ||--o| agent_results : "agent_run_id"
+    analyses ||--o{ agent_runs : "analysis_id"
+    agents ||--o{ agent_runs : "agent_id"
+    backtests ||--o| backtest_metrics : "backtest_id"
+    backtests ||--o{ benchmark_results : "backtest_id"
+    benchmarks ||--o{ benchmark_results : "benchmark_id"
+    debate_sessions ||--o{ debate_arguments : "debate_session_id"
+    analyses ||--o{ debate_sessions : "analysis_id"
+    investment_decisions ||--o{ decision_outcomes : "decision_id"
+    investment_decisions ||--o{ decision_reviews : "decision_id"
+    analyses ||--o{ episodic_memories : "analysis_id"
+    recommendations ||--o{ investment_decisions : "recommendation_id"
+    kg_entities ||--o{ kg_relations : "source_entity_id"
+    kg_entities ||--o{ kg_relations : "target_entity_id"
+    agent_reports ||--o{ kg_relations : "source_report_id"
+    instruments ||--o{ price_bars : "instrument_id"
+    recommendations ||--o| recommendation_metrics : "recommendation_id"
+    recommendations ||--o{ recommendation_tiers : "recommendation_id"
+    analyses ||--o{ recommendations : "analysis_id"
+    analyses ||--o{ reflections : "analysis_id"
+```
+
+## 8. Showing the schema in Adminer
+
+Adminer is a small database web UI that is part of the Compose file but
+does not start with the stack. It shows the real tables, columns, keys
+and foreign keys of the running database, and can draw them.
+
+1. Start it:
+   ```sh
+   make adminer
+   ```
+   The command prints the login link,
+   `http://127.0.0.1:8080/?pgsql=postgres&username=postgres&db=alphamind&ns=core`.
+   It only listens on `127.0.0.1`.
+2. Open the link and type the `POSTGRES_PASSWORD` from `.env.docker`.
+   The link already selects PostgreSQL, the server, the user, the database
+   and the schema (`ns=`). Change `ns=core` to `ns=auth` or `ns=ai` for
+   the other schemas; `public` is empty.
+3. **Diagram of a schema.** On the schema page (the list of its tables),
+   click **Database schema** in the row of links under the title, or open
+   the same address with `&schema=` at the end, for example
+   `http://127.0.0.1:8080/?pgsql=postgres&username=postgres&db=alphamind&ns=auth&schema=`.
+   Adminer draws every table of the schema as a box with its columns and
+   a line for each foreign key; the key columns (primary and foreign keys)
+   are in black.
+   The boxes start in one column; drag a box by its title to spread them
+   out. `alembic_version` is Alembic's own table (the schema's migration
+   revision) and has no relations. Plain UUID references between schemas
+   have no line, because they are not foreign keys (section 1); the
+   diagrams in section 7 show both kinds.
+4. **One table.** Click a table name, then **Show structure**: the
+   columns with their types, nullability and defaults, the indexes
+   (primary key, unique, full-text), and the foreign keys with their
+   target table and `ON DELETE` rule. **Select data** lists the rows; a
+   foreign-key value is a link to the row it points to.
+5. **Relations as data.** **SQL command** runs a query, for example the
+   members of every organization:
+   ```sql
+   SELECT o.name, u.username, m.role
+   FROM auth.organization_members m
+   JOIN auth.organizations o ON o.id = m.organization_id
+   JOIN auth.users u ON u.id = m.user_id
+   ORDER BY o.name, m.role;
+   ```
+   and a link across services through a plain UUID, the latest analyses
+   with their owner and portfolio:
+   ```sql
+   SELECT a.ticker, a.status, u.username, p.name AS portfolio
+   FROM ai.analyses a
+   LEFT JOIN auth.users u ON u.id = a.user_id
+   LEFT JOIN core.portfolios p ON p.id = a.portfolio_id
+   ORDER BY a.created_at DESC
+   LIMIT 10;
+   ```
+6. Stop it when done:
+   ```sh
+   make adminer-stop
+   ```
+
+Adminer logs in as the database owner, so it can change data. Use
+**Select data** and `SELECT` queries only, unless a change is intended.

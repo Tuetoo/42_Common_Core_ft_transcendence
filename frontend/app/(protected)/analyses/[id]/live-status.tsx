@@ -2,8 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { wsUrl } from "@/app/lib/ws-url";
-import { closeSocket } from "../../close-socket";
+import { closeSocket, wsUrl } from "@/app/lib/ws-url";
 
 type ConnectionStatus = "connecting" | "live" | "polling";
 
@@ -18,7 +17,15 @@ const REFRESH_EVENTS = new Set([
 
 const POLL_INTERVAL_MS = 15_000;
 
-export function LiveStatus({ analysisId, accessToken }: { analysisId: string; accessToken: string }) {
+export function LiveStatus({
+  analysisId,
+  accessToken,
+  shownStatus,
+}: {
+  analysisId: string;
+  accessToken: string;
+  shownStatus: string;
+}) {
   const router = useRouter();
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 
@@ -30,10 +37,10 @@ export function LiveStatus({ analysisId, accessToken }: { analysisId: string; ac
     ws.onmessage = (event) => {
       const { event: name, payload } = JSON.parse(event.data);
       // The first message is a snapshot of the current status: the analysis
-      // may have finished between the page loading and the socket opening.
-      const finishedBeforeSubscribe =
-        name === "analysis.status" && (payload?.status === "completed" || payload?.status === "failed");
-      if (REFRESH_EVENTS.has(name) || finishedBeforeSubscribe) {
+      // may have started or finished between the page loading and the
+      // socket opening, so its events were sent before this subscription.
+      const changedBeforeSubscribe = name === "analysis.status" && payload?.status !== shownStatus;
+      if (REFRESH_EVENTS.has(name) || changedBeforeSubscribe) {
         router.refresh();
       }
     };
@@ -50,7 +57,7 @@ export function LiveStatus({ analysisId, accessToken }: { analysisId: string; ac
       closeSocket(ws);
       if (pollTimer) clearInterval(pollTimer);
     };
-  }, [analysisId, accessToken, router]);
+  }, [analysisId, accessToken, shownStatus, router]);
 
   return (
     <div className="panel flex items-center gap-3" style={{ fontSize: 13 }}>

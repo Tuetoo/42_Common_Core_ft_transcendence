@@ -162,7 +162,8 @@ _REAL_PROSE = " ".join(f"word{i}" for i in range(150))
 @pytest.mark.usefixtures("edgar_listing")
 class TestListNewFilings:
 
-    async def test_nothing_is_listed_and_nothing_raised(self, monkeypatch):
+    async def test_nothing_listed_and_skipped_filings_never_fetched(
+            self, monkeypatch):
         cases = {
             "missing-user-agent": ("", None, "AMD"),
             "unknown-ticker": (
@@ -177,30 +178,6 @@ class TestListNewFilings:
                 ticker, already_ingested_filenames=set())
             assert result == [], case_id
 
-    async def test_new_filing_is_fetched_summarized_and_returned(
-            self, monkeypatch):
-        filing = _FakeFiling(date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>")
-        _patch_company(monkeypatch, {"10-K": [filing]})
-
-        result = await sec_edgar_filings.list_new_filings(
-            "AMD", already_ingested_filenames=set())
-
-        assert len(result) == 1
-        assert result[0].filename == "AMD_10-K_2026-02-04.txt"
-        assert result[0].form == "10-K"
-        assert result[0].filing_date == "2026-02-04"
-        assert result[0].text == (
-            f"[summary of {len(_REAL_PROSE.split())} words for AMD 10-K]")
-        assert result[0].report_date == "2026-01-01"
-        assert result[0].records == {
-            "legal_matters": [],
-            "transactions": [],
-            "guidance": [],
-            "one_off_items": []
-        }
-
-    async def test_skipped_filings_are_never_fetched_or_summarized(
-            self, monkeypatch):
         filing = _FakeFiling(
             date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>", raises_on_text=True)
         _patch_company(monkeypatch, {"10-K": [filing]})
@@ -227,6 +204,44 @@ class TestListNewFilings:
         assert (
             summarize_calls == []
         ), "too-short excerpt must never reach summarization"
+
+    async def test_new_filings_are_fetched_summarized_and_capped_per_form(
+            self, monkeypatch):
+        filing = _FakeFiling(date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>")
+        _patch_company(monkeypatch, {"10-K": [filing]})
+
+        result = await sec_edgar_filings.list_new_filings(
+            "AMD", already_ingested_filenames=set())
+
+        assert len(result) == 1
+        assert result[0].filename == "AMD_10-K_2026-02-04.txt"
+        assert result[0].form == "10-K"
+        assert result[0].filing_date == "2026-02-04"
+        assert result[0].text == (
+            f"[summary of {len(_REAL_PROSE.split())} words for AMD 10-K]")
+        assert result[0].report_date == "2026-01-01"
+        assert result[0].records == {
+            "legal_matters": [],
+            "transactions": [],
+            "guidance": [],
+            "one_off_items": []
+        }
+
+        filings = [
+            _FakeFiling(date(2026, 5, 6), f"<p>{_REAL_PROSE} q1</p>"),
+            _FakeFiling(date(2026, 2, 4), f"<p>{_REAL_PROSE} q4</p>"),
+            _FakeFiling(date(2025, 11, 5), f"<p>{_REAL_PROSE} q3</p>")
+        ]
+        _patch_company(monkeypatch, {"10-Q": filings})
+
+        result = await sec_edgar_filings.list_new_filings(
+            "AMD", already_ingested_filenames=set())
+
+        assert {r.filename
+                for r in result} == {
+                    "AMD_10-Q_2026-05-06.txt", "AMD_10-Q_2026-02-04.txt",
+                    "AMD_10-Q_2025-11-05.txt"
+                }
 
     async def test_only_an_amendment_for_the_same_period_is_merged_in(
             self, monkeypatch):
@@ -273,24 +288,6 @@ class TestListNewFilings:
         assert "+amendment" not in result[0].text, (
             "a real 10-K/A for a genuinely different real "
             "period_of_report must never be merged in")
-
-    async def test_per_form_cap_allows_several_10q_within_its_window(
-            self, monkeypatch):
-        filings = [
-            _FakeFiling(date(2026, 5, 6), f"<p>{_REAL_PROSE} q1</p>"),
-            _FakeFiling(date(2026, 2, 4), f"<p>{_REAL_PROSE} q4</p>"),
-            _FakeFiling(date(2025, 11, 5), f"<p>{_REAL_PROSE} q3</p>")
-        ]
-        _patch_company(monkeypatch, {"10-Q": filings})
-
-        result = await sec_edgar_filings.list_new_filings(
-            "AMD", already_ingested_filenames=set())
-
-        assert {r.filename
-                for r in result} == {
-                    "AMD_10-Q_2026-05-06.txt", "AMD_10-Q_2026-02-04.txt",
-                    "AMD_10-Q_2025-11-05.txt"
-                }
 
 
 class _TextFiling:
@@ -684,7 +681,7 @@ class TestQuarterResults:
         assert swung["net_income_yoy_pct"] is None
         assert "(swung to a loss)" in swung["text"]
 
-    def test_cost_lines_and_keys(self):
+    def test_cost_lines_keys_and_gross_margin(self):
         facts = _facts(
             Revenues=[_july30(_Q2, 10e9),
                       _july30(_Q2_PRIOR, 8e9)],
@@ -722,7 +719,6 @@ class TestQuarterResults:
         assert not any(
             k.startswith(("gross_margin", "rd_", "sga_")) for k in payload)
 
-    def test_gross_margin(self):
         cases = {
             "gross-profit-tag-wins": (
                 _facts(
@@ -749,7 +745,7 @@ class TestQuarterResults:
             got = (q.gross_margin_pct, q.gross_margin_pct_prior)
             assert got == margins, case_id
 
-    def test_payload_text_and_keys(self):
+    def test_payload_text_keys_and_marked_values(self):
         q = sec_edgar._quarter_results_from_facts(_AMZN, "AMZN")
         assert q is not None
         payload = sec_edgar.quarter_results_payload(q)
@@ -792,7 +788,6 @@ class TestQuarterResults:
         assert payload["year_to_date"]["below_operating"][0]["current"] == (
             69_378e6)
 
-    def test_computed_and_derived_values_are_marked(self):
         facts = _facts(
             Revenues=[_q(_Q2, 100e6), _q(_Q2_PRIOR, 90e6)],
             OperatingIncomeLoss=[_q(_Q2, 10e6),
@@ -834,7 +829,7 @@ class TestQuarterResults:
         assert "income tax expense (benefit) $2M* vs $1M*" in text
         assert text.endswith(sec_edgar._DERIVED_NOTE)
 
-    def test_cash_flow_of_a_10k_is_the_fiscal_year(self):
+    def test_cash_flow_period_debt_and_cash_change(self):
         year = ("2025-07-01", "2026-06-30")
         prior = ("2024-07-01", "2025-06-30")
         us_gaap = {
@@ -869,6 +864,41 @@ class TestQuarterResults:
         assert period is not None
         assert period.startswith("quarter 2026-01-01 to 2026-03-31")
 
+        cases = {
+            "general-debt-tags-and-cash-change": (
+                {
+                    "RepaymentsOfDebt": [8.376e9, 6.77e8],
+                    "ProceedsFromIssuanceOfDebt": [3.5e7, 9.8e7],
+                    "CashCashEquivalentsRestrictedCashAndRestricted"
+                    "CashEquivalentsPeriodIncreaseDecreaseIncluding"
+                    "ExchangeRateEffect": [-3.697e9, -6.026e9]
+                }, "debt issued $35M vs $98M; debt repaid $8.38B vs $677M; "
+                "net change in cash, cash equivalents and restricted cash "
+                "-$3.70B vs -$6.03B"),
+            "long-term-tag-first-older-cash-tag": (
+                {
+                    "RepaymentsOfLongTermDebt": [2e9, 1e9],
+                    "RepaymentsOfDebt": [3e9, 2e9],
+                    "CashAndCashEquivalentsPeriodIncreaseDecrease": [
+                        5e8, -2e8
+                    ]
+                },
+                "long-term debt repaid $2.00B vs $1.00B; net change in cash "
+                "and cash equivalents +$500M vs -$200M"),
+            "debt-net-of-issuance-costs": (
+                {
+                    "ProceedsFromDebtNetOfIssuanceCosts": [2.49e10, 1e9],
+                    "CashAndCashEquivalentsPeriodIncreaseDecrease": [
+                        1e9, -2e8
+                    ]
+                }, "debt issued (proceeds after issuance costs, before "
+                "repayments) $24.90B vs $1.00B; net change in cash and cash "
+                "equivalents +$1.00B vs -$200M"),
+            "untagged-adds-nothing": ({}, "")
+        }
+        for case_id, (extra, expected) in cases.items():
+            self._check_debt_and_cash(case_id, extra, expected)
+
     def test_free_cash_flow_after_returns(self):
         cases = {
             "period-missing-one-return-is-not-computed": (
@@ -900,6 +930,23 @@ class TestQuarterResults:
         }
         for case_id, (extra, expected, minus) in cases.items():
             self._check_after_returns(case_id, extra, expected, minus)
+
+        us_gaap = {
+            "NetCashProvidedByUsedInOperatingActivities": {
+                "units": {
+                    "USD": [_q(_YTD, 5e9)]
+                }
+            },
+            "PaymentsForRepurchaseOfCommonStock": {
+                "units": {
+                    "USD": [_q(_YTD, 1e9)]
+                }
+            }
+        }
+        lookup = sec_edgar._exact_lookup(
+            tuple(date.fromisoformat(d) for d in _YTD), None)
+        keys = [i.key for i in sec_edgar._cash_flow_items(us_gaap, lookup)]
+        assert keys == ["operating_cash_flow", "share_repurchases"]
 
     def _check_after_returns(self, case_id, extra, expected, label):
 
@@ -941,42 +988,6 @@ class TestQuarterResults:
             label + " " + sec_edgar._usd(after.current, signed=True) + " " +
             prior), case_id
 
-    def test_debt_and_cash_change_lines(self):
-        cases = {
-            "general-debt-tags-and-cash-change": (
-                {
-                    "RepaymentsOfDebt": [8.376e9, 6.77e8],
-                    "ProceedsFromIssuanceOfDebt": [3.5e7, 9.8e7],
-                    "CashCashEquivalentsRestrictedCashAndRestricted"
-                    "CashEquivalentsPeriodIncreaseDecreaseIncluding"
-                    "ExchangeRateEffect": [-3.697e9, -6.026e9]
-                }, "debt issued $35M vs $98M; debt repaid $8.38B vs $677M; "
-                "net change in cash, cash equivalents and restricted cash "
-                "-$3.70B vs -$6.03B"),
-            "long-term-tag-first-older-cash-tag": (
-                {
-                    "RepaymentsOfLongTermDebt": [2e9, 1e9],
-                    "RepaymentsOfDebt": [3e9, 2e9],
-                    "CashAndCashEquivalentsPeriodIncreaseDecrease": [
-                        5e8, -2e8
-                    ]
-                },
-                "long-term debt repaid $2.00B vs $1.00B; net change in cash "
-                "and cash equivalents +$500M vs -$200M"),
-            "debt-net-of-issuance-costs": (
-                {
-                    "ProceedsFromDebtNetOfIssuanceCosts": [2.49e10, 1e9],
-                    "CashAndCashEquivalentsPeriodIncreaseDecrease": [
-                        1e9, -2e8
-                    ]
-                }, "debt issued (proceeds after issuance costs, before "
-                "repayments) $24.90B vs $1.00B; net change in cash and cash "
-                "equivalents +$1.00B vs -$200M"),
-            "untagged-adds-nothing": ({}, "")
-        }
-        for case_id, (extra, expected) in cases.items():
-            self._check_debt_and_cash(case_id, extra, expected)
-
     def _check_debt_and_cash(self, case_id, extra, expected):
 
         def facts(current, prior):
@@ -1014,24 +1025,6 @@ class TestQuarterResults:
         cash = items[-1]
         assert cash.key == "net_change_in_cash" and cash.signed, case_id
         assert not cash.computed, case_id
-
-    def test_no_after_returns_line_without_free_cash_flow(self):
-        us_gaap = {
-            "NetCashProvidedByUsedInOperatingActivities": {
-                "units": {
-                    "USD": [_q(_YTD, 5e9)]
-                }
-            },
-            "PaymentsForRepurchaseOfCommonStock": {
-                "units": {
-                    "USD": [_q(_YTD, 1e9)]
-                }
-            }
-        }
-        lookup = sec_edgar._exact_lookup(
-            tuple(date.fromisoformat(d) for d in _YTD), None)
-        keys = [i.key for i in sec_edgar._cash_flow_items(us_gaap, lookup)]
-        assert keys == ["operating_cash_flow", "share_repurchases"]
 
     def test_concept_table_is_unique_and_bad_facts_fail_open(self):
         keys = [g[0] for g in sec_edgar._BELOW_OPERATING_GROUPS]
@@ -1449,7 +1442,7 @@ def _restructuring(amount: str) -> dict[str, Any]:
 
 class TestFilingRecords:
 
-    def test_split_summary_and_records(self):
+    def test_split_missing_categories_and_prompts(self):
         output = (
             f"Summary paragraph.\n\n{frec.RECORDS_MARKER}\n"
             f"{json.dumps({'guidance': []})}")
@@ -1463,6 +1456,71 @@ class TestFilingRecords:
         assert frec.split_summary_and_records(fenced)[1] == {"guidance": []}
         cut = f'Prose\n{frec.RECORDS_MARKER}\n{{"guidance": [{{"metric": '
         assert frec.split_summary_and_records(cut) == ("Prose", None)
+
+        assert frec.missing_categories(None) == []
+        assert (
+            frec.missing_categories({key: []
+                                     for key in frec.CATEGORIES}) == [])
+        data: dict[str, Any] = {
+            key: []
+            for key in frec.CATEGORIES if key != "guidance"
+        }
+        data["one_off_items"] = None
+        data["unusual_items"] = []
+        assert frec.missing_categories(data) == ["one_off_items", "guidance"]
+
+        prompt = frec.RECORDS_ONLY_PROMPT
+        assert list(frec.CATEGORIES) == [
+            "one_off_items", "guidance", "transactions", "legal_matters"
+        ]
+        assert "with these four keys" in prompt
+        assert (
+            prompt.index('"one_off_items"') < prompt.index('"guidance"') <
+            prompt.index('"transactions"') < prompt.index('"legal_matters"'))
+        for gone in ('"commitments"', '"results"', '"line"', '"part_of"',
+                     '"id"', '"next_event"', "prior_id", "PREVIOUS FILING",
+                     "RECORDS FROM THE PREVIOUS FILING",
+                     "every one the filing names",
+                     "fair-value changes that appear every period"):
+            assert gone not in prompt
+        for words in ("the most material first",
+                      "notes on other income (expense)",
+                      "IS an unusual item even when such a line appears every",
+                      "keeps a minus sign",
+                      "the amount claimed, sought, assessed or awarded",
+                      "the largest such amount",
+                      "accrued, paid, escrowed or reserved",
+                      "never a valuation",
+                      "never the period end of this report",
+                      "use a table row only when no sentence states it",
+                      "period header words"):
+            assert words in prompt
+        assert not hasattr(frec, "RECORDS_PROMPT")
+
+        for prompt in (filing_summary._10K_SYSTEM_PROMPT,
+                       filing_summary._10Q_SYSTEM_PROMPT):
+            assert filing_summary._CAPITAL_ALLOCATION_BULLET in prompt
+            assert frec.RECORDS_MARKER not in prompt
+        bullet = filing_summary._CAPITAL_ALLOCATION_BULLET
+        for words in ("capital expenditures",
+                      "share repurchases and dividends", "cash and debt",
+                      "new debt", "guarantees",
+                      "gap between operating income and net income"):
+            assert words in bullet
+        assert (
+            filing_summary._SUMMARY_MAX_TOKENS
+            < filing_summary._RETRY_MAX_TOKENS)
+        assert (
+            filing_summary._RECORDS_MAX_TOKENS
+            < filing_summary._RETRY_MAX_TOKENS)
+        assert "commitments" not in filing_module._SYSTEM_PROMPT
+        assert "reported-result" not in filing_module._SYSTEM_PROMPT
+        assert "next:" not in risk_module._SYSTEM_PROMPT
+        assert "below operating income" in debate_common.UNUSUAL_ITEMS_RULE
+        assert [key for key, _ in debate_common._FILING_PERIOD_TITLES] == [
+            debate_common.YEAR_TO_DATE_UNUSUAL_KEY,
+            debate_common.PRIOR_YEAR_UNUSUAL_KEY
+        ]
 
     @pytest.mark.usefixtures("fresh_sec_caches")
     def test_validate_records_keeps_only_structurally_valid_records(self):
@@ -1526,7 +1584,7 @@ class TestFilingRecords:
         assert frec.validate_records(None, _INTC_Q2_RAW) is None
 
     @pytest.mark.usefixtures("fresh_sec_caches")
-    def test_render_and_lookup_filing_records(self):
+    def test_render_lookup_and_unverified_quote(self):
         text = frec.render_filing_records(_KO_ROWS)  # type: ignore[arg-type]
         assert text.split("\n")[1:] == [
             "F1 = 10-Q filed 2026-07-29, period of report 2026-07-03 "
@@ -1552,7 +1610,26 @@ class TestFilingRecords:
                 is None)  # type: ignore[arg-type]
         assert frec.render_filing_records([]) == ""
 
-    def test_records_need_a_quote_found_in_the_filing(self, capsys):
+        row = SimpleNamespace(
+            filename="GOOGL_10-Q_2026-07-23.txt", form="10-Q",
+            filing_date=date(2026, 7, 23), report_date=date(2026, 6, 30),
+            records={
+                "legal_matters": [
+                    _matter("EC Android fine", "judgment", _EC_FINE_QUOTE)
+                ],
+                "one_off_items": [_charge("O1", "$12.5 billion", "q " * 150)]
+            })
+        text = frec.render_filing_records([row])  # type: ignore[list-item]
+        assert "can be wrong or incomplete" in text
+        assert (
+            "F1.L1 legal matter: EC Android fine -- status: judgment. "
+            "Filing text: \"the European Commission's decision became "
+            'final"') in text
+        assert "(3 months ended 2026-06-27)" in text
+        assert text.split("\n")[2].startswith("  F1.O1 unusual item")
+        assert text.split("\n")[2].endswith('..."')
+
+    def test_quotes_and_amounts_are_checked_against_the_filing(self, capsys):
         squashed = frec.squash(_CHARGES_RAW)
         assert frec.quote_in_filing(
             "in July 2026 we paid the fine of $5.2 billion", squashed)
@@ -1579,125 +1656,6 @@ class TestFilingRecords:
         out = capsys.readouterr().out
         assert "quote_not_in_filing" in out and "missing_quote" in out
 
-    def test_one_off_items_keep_only_the_filings_own_period(self):
-        quarter = (
-            "We recognized a loss of $ 12.5 billion related to the "
-            "change in fair value")
-        year_to_date = (
-            "For the six months ended June 27, 2026 we "
-            "recognized $ 14.1 billion")
-        kept = _charges_validated({
-            "one_off_items": [
-                _charge("O1", "$12.5 billion", quarter),
-                _charge("O2", "$14.1 billion", year_to_date, period_months=6),
-                _charge(
-                    "O3", "$12.5 billion", quarter, period_end="2025-06-28"),
-                _charge("O4", "$12.5 billion", quarter, period_months="three")
-            ]
-        })
-        assert [r["description"] for r in kept["one_off_items"]] == ["O1"]
-        annual = _charges_validated(
-            {"one_off_items": [_charge("O1", "$12.5 billion", quarter)]},
-            form="10-K")
-        assert annual["one_off_items"] == []
-
-    def test_transaction_completed_before_the_period_is_dropped(self, capsys):
-        quote = (
-            "the European Commission's decision became final, and in "
-            "July 2026")
-        deal = {
-            "name": "Old sale",
-            "type": "divestiture",
-            "status": "completed",
-            "quote": quote,
-            "detail": None
-        }
-        kept = _charges_validated({
-            "transactions": [{
-                **deal, "date": "2025-09-15"
-            }, {
-                **deal, "name": "This quarter",
-                "date": "2026-05"
-            }, {
-                **deal, "name": "Open deal",
-                "status": "pending",
-                "date": "2025-01-10"
-            }, {
-                **deal, "name": "Undated close",
-                "date": None
-            }, {
-                **deal, "name": "Note issue",
-                "type": "financing",
-                "status": "pending",
-                "date": None
-            }]
-        })
-        assert [r["name"] for r in kept["transactions"]
-                ] == ["This quarter", "Open deal", "Note issue"]
-        out = capsys.readouterr().out
-        assert "not_own_period" in out and "missing_date" in out
-        annual = _charges_validated(
-            {"transactions": [{
-                **deal, "date": "2025-09-15"
-            }]}, form="10-K", report_date="2025-12-31")
-        assert len(annual["transactions"]) == 1
-
-    def test_rendered_records_say_they_are_unverified_and_show_the_quote(self):
-        row = SimpleNamespace(
-            filename="GOOGL_10-Q_2026-07-23.txt", form="10-Q",
-            filing_date=date(2026, 7, 23), report_date=date(2026, 6, 30),
-            records={
-                "legal_matters": [
-                    _matter("EC Android fine", "judgment", _EC_FINE_QUOTE)
-                ],
-                "one_off_items": [_charge("O1", "$12.5 billion", "q " * 150)]
-            })
-        text = frec.render_filing_records([row])  # type: ignore[list-item]
-        assert "can be wrong or incomplete" in text
-        assert (
-            "F1.L1 legal matter: EC Android fine -- status: judgment. "
-            "Filing text: \"the European Commission's decision became "
-            'final"') in text
-        assert "(3 months ended 2026-06-27)" in text
-        assert text.split("\n")[2].startswith("  F1.O1 unusual item")
-        assert text.split("\n")[2].endswith('..."')
-
-    def test_status_date_on_the_period_end(self, capsys):
-        kept = _meta_validated({
-            "legal_matters": [
-                _youth_case(name="Period end", status_date="2026-06-30"),
-                _youth_case(name="Event date", status_date="2026-05-04"),
-                _youth_case(name="Partial", status_date="2026-06")
-            ]
-        })
-        dates = {r["name"]: r["status_date"] for r in kept["legal_matters"]}
-        assert dates == {
-            "Period end": None,
-            "Event date": "2026-05-04",
-            "Partial": "2026-06"
-        }
-        assert "status_date_is_period_end_cleared" in capsys.readouterr().out
-
-        kept = _meta_validated(
-            {"legal_matters": [_youth_case(status_date="2026-06-30")]},
-            report_date=None)
-        assert kept["legal_matters"][0]["status_date"] == "2026-06-30"
-
-        quote = (
-            "On March 31, 2026, the court entered judgment against the "
-            "Company in the Example Patent Litigation")
-        kept = _validated({
-            "legal_matters": [{
-                "name": "Example Patent Litigation",
-                "status": "appeal",
-                "status_date": "2026-03-31",
-                "quote": quote
-            }]
-        }, _PATENT_RAW, form="10-Q", filing_date="2026-04-30",
-                          report_date="2026-03-31")
-        assert kept["legal_matters"][0]["status_date"] == "2026-03-31"
-
-    def test_amounts_are_checked_against_the_quote(self, capsys):
         kept = _restructuring_validated({
             "one_off_items": [
                 _restructuring("$(8,888) million"),
@@ -1741,72 +1699,102 @@ class TestFilingRecords:
         assert "value_text" in frec.RECORDS_ONLY_PROMPT
         assert "per share" in frec.RECORDS_ONLY_PROMPT
 
-    def test_missing_categories(self):
-        assert frec.missing_categories(None) == []
-        assert (
-            frec.missing_categories({key: []
-                                     for key in frec.CATEGORIES}) == [])
-        data: dict[str, Any] = {
-            key: []
-            for key in frec.CATEGORIES if key != "guidance"
+    def test_one_off_items_and_transactions_keep_the_own_period(self, capsys):
+        quarter = (
+            "We recognized a loss of $ 12.5 billion related to the "
+            "change in fair value")
+        year_to_date = (
+            "For the six months ended June 27, 2026 we "
+            "recognized $ 14.1 billion")
+        kept = _charges_validated({
+            "one_off_items": [
+                _charge("O1", "$12.5 billion", quarter),
+                _charge("O2", "$14.1 billion", year_to_date, period_months=6),
+                _charge(
+                    "O3", "$12.5 billion", quarter, period_end="2025-06-28"),
+                _charge("O4", "$12.5 billion", quarter, period_months="three")
+            ]
+        })
+        assert [r["description"] for r in kept["one_off_items"]] == ["O1"]
+        annual = _charges_validated(
+            {"one_off_items": [_charge("O1", "$12.5 billion", quarter)]},
+            form="10-K")
+        assert annual["one_off_items"] == []
+
+        quote = (
+            "the European Commission's decision became final, and in "
+            "July 2026")
+        deal = {
+            "name": "Old sale",
+            "type": "divestiture",
+            "status": "completed",
+            "quote": quote,
+            "detail": None
         }
-        data["one_off_items"] = None
-        data["unusual_items"] = []
-        assert frec.missing_categories(data) == ["one_off_items", "guidance"]
+        kept = _charges_validated({
+            "transactions": [{
+                **deal, "date": "2025-09-15"
+            }, {
+                **deal, "name": "This quarter",
+                "date": "2026-05"
+            }, {
+                **deal, "name": "Open deal",
+                "status": "pending",
+                "date": "2025-01-10"
+            }, {
+                **deal, "name": "Undated close",
+                "date": None
+            }, {
+                **deal, "name": "Note issue",
+                "type": "financing",
+                "status": "pending",
+                "date": None
+            }]
+        })
+        assert [r["name"] for r in kept["transactions"]
+                ] == ["This quarter", "Open deal", "Note issue"]
+        out = capsys.readouterr().out
+        assert "not_own_period" in out and "missing_date" in out
+        annual = _charges_validated(
+            {"transactions": [{
+                **deal, "date": "2025-09-15"
+            }]}, form="10-K", report_date="2025-12-31")
+        assert len(annual["transactions"]) == 1
 
-    def test_records_summary_and_agent_prompts(self):
-        prompt = frec.RECORDS_ONLY_PROMPT
-        assert list(frec.CATEGORIES) == [
-            "one_off_items", "guidance", "transactions", "legal_matters"
-        ]
-        assert "with these four keys" in prompt
-        assert (
-            prompt.index('"one_off_items"') < prompt.index('"guidance"') <
-            prompt.index('"transactions"') < prompt.index('"legal_matters"'))
-        for gone in ('"commitments"', '"results"', '"line"', '"part_of"',
-                     '"id"', '"next_event"', "prior_id", "PREVIOUS FILING",
-                     "RECORDS FROM THE PREVIOUS FILING",
-                     "every one the filing names",
-                     "fair-value changes that appear every period"):
-            assert gone not in prompt
-        for words in ("the most material first",
-                      "notes on other income (expense)",
-                      "IS an unusual item even when such a line appears every",
-                      "keeps a minus sign",
-                      "the amount claimed, sought, assessed or awarded",
-                      "the largest such amount",
-                      "accrued, paid, escrowed or reserved",
-                      "never a valuation",
-                      "never the period end of this report",
-                      "use a table row only when no sentence states it",
-                      "period header words"):
-            assert words in prompt
-        assert not hasattr(frec, "RECORDS_PROMPT")
+    def test_status_date_on_the_period_end(self, capsys):
+        kept = _meta_validated({
+            "legal_matters": [
+                _youth_case(name="Period end", status_date="2026-06-30"),
+                _youth_case(name="Event date", status_date="2026-05-04"),
+                _youth_case(name="Partial", status_date="2026-06")
+            ]
+        })
+        dates = {r["name"]: r["status_date"] for r in kept["legal_matters"]}
+        assert dates == {
+            "Period end": None,
+            "Event date": "2026-05-04",
+            "Partial": "2026-06"
+        }
+        assert "status_date_is_period_end_cleared" in capsys.readouterr().out
 
-        for prompt in (filing_summary._10K_SYSTEM_PROMPT,
-                       filing_summary._10Q_SYSTEM_PROMPT):
-            assert filing_summary._CAPITAL_ALLOCATION_BULLET in prompt
-            assert frec.RECORDS_MARKER not in prompt
-        bullet = filing_summary._CAPITAL_ALLOCATION_BULLET
-        for words in ("capital expenditures",
-                      "share repurchases and dividends", "cash and debt",
-                      "new debt", "guarantees",
-                      "gap between operating income and net income"):
-            assert words in bullet
-        assert (
-            filing_summary._SUMMARY_MAX_TOKENS
-            < filing_summary._RETRY_MAX_TOKENS)
-        assert (
-            filing_summary._RECORDS_MAX_TOKENS
-            < filing_summary._RETRY_MAX_TOKENS)
-        assert "commitments" not in filing_module._SYSTEM_PROMPT
-        assert "reported-result" not in filing_module._SYSTEM_PROMPT
-        assert "next:" not in risk_module._SYSTEM_PROMPT
-        assert "below operating income" in debate_common.UNUSUAL_ITEMS_RULE
-        assert [key for key, _ in debate_common._FILING_PERIOD_TITLES] == [
-            debate_common.YEAR_TO_DATE_UNUSUAL_KEY,
-            debate_common.PRIOR_YEAR_UNUSUAL_KEY
-        ]
+        kept = _meta_validated(
+            {"legal_matters": [_youth_case(status_date="2026-06-30")]},
+            report_date=None)
+        assert kept["legal_matters"][0]["status_date"] == "2026-06-30"
+
+        quote = (
+            "On March 31, 2026, the court entered judgment against the "
+            "Company in the Example Patent Litigation")
+        kept = _validated({
+            "legal_matters": [{
+                "name": "Example Patent Litigation",
+                "status": "appeal",
+                "status_date": "2026-03-31",
+                "quote": quote
+            }]
+        }, _PATENT_RAW, form="10-Q", filing_date="2026-04-30",
+                          report_date="2026-03-31")
+        assert kept["legal_matters"][0]["status_date"] == "2026-03-31"
 
 
 class TestFilingSummaries:
@@ -1853,7 +1841,7 @@ class TestFilingSummaries:
                                              ])  # type: ignore[arg-type]
             ) is None)
 
-    async def test_summary_cut_at_the_limit_is_retried_with_a_larger_limit(
+    async def test_summary_and_records_calls_retry_with_a_larger_limit(
             self, capsys):
         router = _RecordingRouter([
             ("Summary cut mid", "FinishReason.MAX_TOKENS"),
@@ -1885,8 +1873,6 @@ class TestFilingSummaries:
         assert (out.text, out.truncated) == ("Cut again", True)
         assert "filing_summary.output_truncated" in capsys.readouterr().out
 
-    async def test_records_only_call_keeps_the_cap_and_names_the_model(
-            self, capsys):
         records_reply = _records_reply({
             **{
                 key: []
@@ -1968,7 +1954,7 @@ _KO_OLD_10Q = "This quarter, Coca-Cola reported revenue of $12.455B (+5% YoY)."
 class TestSearchFilingsTool:
 
     @pytest.mark.usefixtures("fresh_sec_caches")
-    async def test_header_once_periods_from_edgar_and_failing_open(self):
+    async def test_header_order_periods_and_failing_open(self):
         lookups: list[tuple[str, str, str]] = []
 
         async def _period(
@@ -2036,8 +2022,6 @@ class TestSearchFilingsTool:
         assert (await
                 tool.run(query="x")).startswith("No filing passages found")
 
-    async def test_passages_listed_newest_first_with_form_period_and_recency(
-            self):
         tool = SearchFilingsTool(
             ticker="KO",
             retriever=_ChunkRetriever(
@@ -2174,7 +2158,7 @@ _META = [
 
 class TestUnusualItemLines:
 
-    def test_year_to_date_and_prior_year_items(self):
+    def test_year_to_date_and_prior_year_items_and_window(self):
         duplicate = _Row(
             "META_10-Q_2026-05-01.txt", "10-Q", date(2026, 4, 29),
             date(2026, 3, 31), {
@@ -2212,7 +2196,6 @@ class TestUnusualItemLines:
         assert prior_year_unusual_item_lines(_META[:4]) == []
         assert prior_year_unusual_item_lines([]) == []
 
-    def test_year_to_date_window_from_record_periods(self):
         newest = _Row(
             "XOM_10-Q_2026-08-03.txt", "10-Q", date(2026, 8, 3),
             date(2026, 6, 30),
@@ -2273,7 +2256,8 @@ class _SessionOf:
 class TestBackfillScript:
 
     @pytest.mark.usefixtures("fresh_sec_caches")
-    async def test_dry_run_and_apply(self, monkeypatch, capsys):
+    async def test_dry_run_apply_and_wait_before_a_large_filing(
+            self, monkeypatch, capsys):
         from scripts import backfill_filing_records as backfill
 
         llm_calls: list[str] = []
@@ -2308,30 +2292,6 @@ class TestBackfillScript:
         assert counts == {"pending": 1, "stored": 1, "failed": 0}
         assert stored == ["KO_10-Q_2026-07-29.txt"]
 
-    @pytest.mark.usefixtures("fresh_sec_caches")
-    async def test_filings_that_have_records_are_skipped(
-            self, monkeypatch, db_session):
-        from scripts import backfill_filing_records as backfill
-
-        async def _filenames(ticker, category):
-            return [
-                "KO_10-Q_2026-07-29.txt", "KO_10-K_2026-02-20.txt", "note.txt"
-            ]
-
-        await FilingRecordRepository(db_session).upsert(
-            ticker="KO", filename="KO_10-K_2026-02-20.txt", form="10-K",
-            filing_date=date(2026, 2, 20), report_date=None, records={})
-        monkeypatch.setattr(
-            backfill, "get_existing_document_filenames", _filenames)
-        monkeypatch.setattr(backfill, "SessionLocal", _SessionOf(db_session))
-        assert await backfill._pending("KO") == [
-            ("KO_10-Q_2026-07-29.txt", "10-Q", "2026-07-29")
-        ]
-
-    @pytest.mark.usefixtures("fresh_sec_caches")
-    async def test_waits_before_a_large_filing(self, monkeypatch):
-        from scripts import backfill_filing_records as backfill
-
         sizes = {
             "JPM_10-Q_2026-08-06.txt": backfill.LARGE_FILING_CHARS + 1,
             "JPM_10-Q_2026-05-01.txt": 1000
@@ -2362,9 +2322,25 @@ class TestBackfillScript:
         assert counts["stored"] == 2
         assert slept == [backfill.IDLE_WAIT_SECONDS]
 
-    async def test_latest_does_not_slide_back_to_older_filings(
+    @pytest.mark.usefixtures("fresh_sec_caches")
+    async def test_pending_skips_recorded_filings_and_latest_does_not_slide(
             self, monkeypatch, db_session):
         from scripts import backfill_filing_records as backfill
+
+        async def _filenames(ticker, category):
+            return [
+                "KO_10-Q_2026-07-29.txt", "KO_10-K_2026-02-20.txt", "note.txt"
+            ]
+
+        await FilingRecordRepository(db_session).upsert(
+            ticker="KO", filename="KO_10-K_2026-02-20.txt", form="10-K",
+            filing_date=date(2026, 2, 20), report_date=None, records={})
+        monkeypatch.setattr(
+            backfill, "get_existing_document_filenames", _filenames)
+        monkeypatch.setattr(backfill, "SessionLocal", _SessionOf(db_session))
+        assert await backfill._pending("KO") == [
+            ("KO_10-Q_2026-07-29.txt", "10-Q", "2026-07-29")
+        ]
 
         names = [
             "KO_10-Q_2025-07-25.txt", "KO_10-Q_2025-10-23.txt",
@@ -2391,7 +2367,8 @@ class TestBackfillScript:
         redo = await backfill._pending("KO", redo=True, latest=2)
         assert [p[0] for p in redo] == names[2:]
 
-    async def test_filename_redoes_exact_filings(self, monkeypatch, capsys):
+    async def test_filename_redoes_exact_filings(
+            self, monkeypatch, capsys):
         from scripts import backfill_filing_records as backfill
 
         documents = [
@@ -2463,7 +2440,7 @@ class TestBackfillScript:
 
 class TestRegenerateSummariesScript:
 
-    async def test_saves_first_and_replaces_only_a_deleted_document(
+    async def test_saves_first_replaces_deleted_and_continues_after_failure(
             self, monkeypatch, tmp_path, capsys):
         from scripts import regenerate_filing_summaries as regen
 
@@ -2506,10 +2483,6 @@ class TestRegenerateSummariesScript:
         assert created == [name]
         assert not (tmp_path / f"{name}.records.json").exists()
         assert await regen.apply("KO_10-Q_2026-04-30.txt", tmp_path) is False
-
-    async def test_continues_after_a_failed_document(
-            self, monkeypatch, tmp_path, capsys):
-        from scripts import regenerate_filing_summaries as regen
 
         name = "KO_10-K_2026-02-20.txt"
         (tmp_path / f"{name}.summary.txt").write_text("New summary.")
@@ -2578,9 +2551,12 @@ def _load_golden_set_script():
 
 class TestRagGoldenSet:
 
-    async def test_generate_requested_uncovered_categories_or_raise(
-            self, monkeypatch):
+    async def test_delay_and_requested_uncovered_categories(self, monkeypatch):
         import ai.evaluation.rag_recall as gs
+
+        monkeypatch.setattr(gs, "mistral_key_count", lambda: 0)
+        assert gs._inter_chunk_delay_seconds() == (
+            gs._INTER_CHUNK_DELAY_SECONDS_PER_KEY)
 
         chunks = [
             _golden_chunk("n1", "news"),
@@ -2614,13 +2590,6 @@ class TestRagGoldenSet:
             await gs.generate_golden_set(
                 sample_size=1, llm_router=_QuestionRouter(),
                 categories=frozenset({"news"}))
-
-    def test_delay_survives_zero_mistral_keys(self, monkeypatch):
-        import ai.evaluation.rag_recall as gs
-
-        monkeypatch.setattr(gs, "mistral_key_count", lambda: 0)
-        assert gs._inter_chunk_delay_seconds() == (
-            gs._INTER_CHUNK_DELAY_SECONDS_PER_KEY)
 
     async def test_script_merges_new_chunks_and_rejects_unknown_category(self):
         from ai.evaluation.rag_recall import GoldenQAPair

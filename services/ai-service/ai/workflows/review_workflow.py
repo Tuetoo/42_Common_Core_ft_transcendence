@@ -3,8 +3,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 import structlog
-from ai.benchmark.metrics import total_return
 from ai.providers.registry import get_market_data_provider
+from ai.tools.indicators import total_return
 from ai_events import decision_outcome_event_payload, publish_event
 from config import settings
 from database import SessionLocal

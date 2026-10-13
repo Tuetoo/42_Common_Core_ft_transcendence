@@ -121,6 +121,16 @@ def backtest_event_payload(
     }
 
 
+def backtest_deleted_payload(
+        *, backtest_id: Any, user_id: Any,
+        strategy_name: str | None) -> dict[str, Any]:
+    return {
+        "backtest_id": str(backtest_id),
+        "user_id": _id_or_empty(user_id),
+        "kind": backtest_kind(strategy_name)
+    }
+
+
 async def publish_event(
         event_name: EventName, payload: dict[str, Any]) -> bool:
     try:

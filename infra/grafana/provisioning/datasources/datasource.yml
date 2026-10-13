@@ -1,8 +1,8 @@
 apiVersion: 1
 
-# Drop a same-named datasource left in an existing grafana_data volume
-# (created without the fixed uid below) so it is re-created with uid
-# "Prometheus".
+# Runs at every start: removes any datasource named Prometheus (a
+# grafana_data volume may hold one with another uid), so the one below is
+# always created with the fixed uid "Prometheus".
 deleteDatasources:
   - name: Prometheus
     orgId: 1

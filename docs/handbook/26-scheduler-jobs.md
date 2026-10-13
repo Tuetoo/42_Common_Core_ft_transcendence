@@ -12,6 +12,8 @@
 > job has not succeeded for too long (section 3.8). A run in which every
 > unit of work failed (every ticker, every tier, every analysis request) is
 > not a success: the service answers 500 and no heartbeat is sent.
+> The cloud host keeps the scheduler stopped, so it runs no scheduled
+> job and makes no automatic backup (section 3.11).
 
 ## 1. The big picture
 
@@ -273,8 +275,10 @@ queue checks the owner again before it starts and marks the job failed
    (pending acceptance or accepted awaiting trigger), re-read it under a row
    lock, check today's high/low against the target price and the tier's
    window, and then trigger (execute the trade into the portfolio through
-   core-service), expire, or leave it open. Each tier is committed on its
-   own and its event (`tier.executed`, `tier.execution_failed`) is
+   core-service), expire, or leave it open. A tier expires when its window
+   has passed, or when it is a pending tier of a system analysis that was
+   not accepted within `SYSTEM_TIER_ACCEPTANCE_HOURS` (72). Each tier is
+   committed on its own and its event (`tier.executed`, `tier.execution_failed`) is
    published after its commit. Log `tier_monitoring.run_complete` with
    counts: `checked, triggered, expired, no_fresh_data,
    price_lookup_failed, still_open, pending, execution_failed,
@@ -583,7 +587,9 @@ counts, every object by size and MD5, avatars). Through the Makefile:
 `make restore BACKUP=<name>` (dry run) or `make restore BACKUP=<name>
 CONFIRM=yes` (**DESTRUCTIVE**: stops auth-service, core-service,
 ai-service and scheduler, makes sure objectstore runs, restores, runs `--verify`, starts everything
-again). Both forms run the one-off `restore` compose service with
+again). That last step also starts the scheduler, so on the cloud host
+run `docker compose --env-file .env.docker stop scheduler` right after
+the restore. Both forms run the one-off `restore` compose service with
 `docker compose run --rm --build`. `--build` makes sure the restore image
 is rebuilt, because `make up` does not rebuild it, and an old image would
 run an old `restore.sh`.
@@ -761,6 +767,16 @@ with `FORCE=1`. The night jobs (02:00-04:20) are not guarded; inside
   backup. The HTTP jobs report a down service themselves, and the
   stale-job alerts fire.
 - Logging capped like every container (json-file, 5 x 20 MB).
+- On the cloud host the scheduler is kept stopped: its jobs spend the
+  LLM and news quotas that the cloud shares with the local stack, and
+  `scripts/deploy.sh` keeps a stopped scheduler stopped (chapter
+  [32](32-ci-cd.md) section 3.5). So the host runs no scheduled job and
+  makes no automatic backup. `make backup` does not work there either:
+  it runs `backup.sh` inside the running scheduler container. Backups
+  are made on the local stack (nightly, or by hand with `make backup`)
+  and copied to the host when its data should be replaced. Because no
+  job succeeds on the host, its stale-job alerts fire after 26 h / 100 h
+  (section 3.8).
 
 ## 4. Configuration
 
@@ -844,6 +860,7 @@ cannot also stop the nightly backup.
 | A portfolio got no market-open analyses | `market_open_owner_inactive_skipped` in core: the owner is deactivated or deleted | nothing; reactivate the owner if the skip is wrong |
 | A portfolio got no snapshot | `market_close_snapshot_skipped` in core; `MarketCloseSkippedPortfolios` alert | fill the day later: `bash scripts/snapshots.sh --portfolio=<id> --to <date>`, then again with `--confirm` |
 | Backup failed | `backup: ERROR: ...`, a `<stamp>-FAILED` folder, no heartbeat | read the error; `make backups`; `make backup-check` |
+| Stale-job alerts on the cloud host | `DailyJobStale` / `TradingDayJobStale` for the jobs, no backups in the host's `backups/` | expected: the host keeps the scheduler stopped (section 3.11); show jobs, backups and alerts on the local stack |
 | A new exchange closure not in the calendar | the jobs run as on a trading day, without a fresh price bar for that date (expect `no_fresh_data` tiers and skipped portfolios) | add the date to `EXTRA_CLOSED_DATES` |
 | Gauge shows nothing after a fresh install | no series until the first success | expected |
 | Your query for one job returns nothing | you filtered on `job="backup"` | filter on `scheduled_job="backup"` (section 3.8) |
@@ -855,7 +872,8 @@ market-close run with no skipped portfolio.
 
 ## 7. Demo walkthrough
 
-All steps except the marked ones are read-only.
+All steps except the marked ones are read-only. Run them on the local
+stack: the cloud host keeps the scheduler stopped.
 
 1. **Show the schedule and the running cron.**
    ```

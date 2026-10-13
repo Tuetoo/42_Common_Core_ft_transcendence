@@ -26,9 +26,9 @@
  |  apikeys.py          X-API-Key check + rate limit for /api/v1/public  |
  |  domains/portfolio   portfolios, ledger (ledger.py), holdings, cash,  |
  |                      snapshots, watchlists, market-open/close jobs    |
- |  domains/research    notes, comments, documents, moderation, Yjs guard|
+ |  domains/research    notes, comments, documents, moderation           |
  |  domains/notification  notification rows + delivery                   |
- |  apikeys.py + api/apikeys_api.py + api/public.py   public API         |
+ |  apikeys.py + api/public.py   public API and /api/v1/api-keys         |
  |  api/websocket.py + websocket_manager.py   JSON WebSocket channels    |
  |  api/websocket.py + yjs_relay.py           collaborative notes        |
  |  api/internal.py     /internal/* (scheduler, ai-service, system docs) |
@@ -504,7 +504,8 @@ least one request was made and every one failed, the route answers
 **500** with the same body (`shared/scheduled_jobs.py::job_response`), so
 the job script sends no heartbeat and the stale-job alert can fire. The
 analyses then wait in ai-service's serial queue (usually 1.5 to 4
-minutes each).
+minutes each, up to 10 minutes more for a ticker with a new SEC filing
+to summarise).
 
 ### 3.7 Market calendar
 
@@ -544,7 +545,7 @@ tickers is what ai-service's nightly ingestion keeps fresh
   `GET/PATCH/DELETE /notes/{id}`. Tags via `research_tags` and
   `note_tags`. A `PATCH` that changes the body updates `content` and
   applies the same change to the stored `yjs_state` as one Yjs edit
-  (`yjs_guard.replace_text`: the common start and end of the old and new
+  (`yjs_relay.replace_text`: the common start and end of the old and new
   text are kept, only the part in between is deleted and inserted). The
   CRDT history stays, so an editor that still holds the old Yjs document
   merges the server state without duplicating the text (chapter 25,
@@ -560,8 +561,9 @@ tickers is what ai-service's nightly ingestion keeps fresh
   `POST/GET /notes/{id}/comments`, `PATCH/DELETE
   /notes/{id}/comments/{cid}`. Commenting needs to be the note's author
   or an organization writer. A comment's author edits it; the comment's or
-  the note's author deletes it. The note author is notified of new
-  comments.
+  the note's author deletes it. A comment hidden by a moderator can only
+  be deleted by its own author (the note author gets 404 for it). The
+  note author is notified of new comments.
 - **Moderation** (`moderation_router` in `domains/research/api.py`, permission `content:moderate`):
   `POST /api/v1/moderation/notes/{id}/hide|unhide`,
   `DELETE /api/v1/moderation/notes/{id}`, the same for comments. Hidden
@@ -595,21 +597,24 @@ tickers is what ai-service's nightly ingestion keeps fresh
   saves `yjs_state` plus the plain text back to `content` after 20 updates
   or 30 seconds, whichever first. Updates larger than
   `YJS_MAX_UPDATE_BYTES` (1 MiB) or that fail to decode (checked in a
-  separate worker process, `yjs_guard.py`) close only that socket (1008).
+  separate worker process, `yjs_relay.py`) close only that socket (1008).
   While a room is open on any replica (Redis sorted set
   `yjs:active:<note_id>`), a REST edit of the body is refused with 409.
   A room whose edits are not saved yet also counts as open, even with
   nobody connected, so the 409 holds until the save succeeds. Rooms with
   unsaved edits are saved at shutdown. Open sockets follow access
-  changes: when an organization membership or role, an account role, or
-  an account state changes (events `organization.member.removed`,
-  `.member.left`, `.role.changed`, `organization.deleted`,
-  `user.role.changed`, `user.deactivated`, `user.deleted`), every replica
+  changes: when an organization membership or role, an account role, an
+  account state or a connection between two users changes (events
+  `organization.member.removed`, `.member.left`, `.role.changed`,
+  `organization.deleted`, `user.role.changed`, `user.deactivated`,
+  `user.deleted`, `friend.removed`, `connection.blocked`), every replica
   re-checks its local Yjs sockets of the affected users
   (`api/websocket.py::recheck_user_sessions`) with the same access
   rule as the connect path: a note no longer readable is closed with 4403
-  (4401 for a deactivated or deleted account), a reader who may no longer
-  write is downgraded to read-only (updates dropped, socket stays open).
+  (4401 for a deactivated or deleted account), a socket that may no
+  longer write is closed with 4403 "write access to this note was
+  revoked" (the editor shows its reload state; the reload opens it
+  read-only).
   If the new rights cannot be determined (auth-service down), the socket
   keeps its rights and `yjs_session_recheck_failed` is logged. The same
   re-check also covers the user's `/ws/{channel}` sockets (section 3.16).
@@ -873,9 +878,10 @@ rolled back.
 Typical notifications: portfolio created/updated/deleted, transaction
 recorded, holding adjusted, watchlist item added/removed, note and comment
 actions, document uploaded/ready/failed, API key created/updated/revoked,
-analysis started/completed/failed, recommendation ready, decision recorded
-or evaluated, tier executed/failed/cancelled, backtest completed/failed,
-organization and friend events, account changes (the full mapping is in
+analysis started/completed/failed, recommendation ready, decision recorded,
+reviewed or evaluated, tier executed/failed/cancelled, backtest
+completed/failed/deleted, organization, invitation, friend and block
+events, account changes (the full mapping is in
 `event_listener.py` and the route files).
 
 **Retention.** Read notifications do not stay forever. The nightly
@@ -1009,7 +1015,7 @@ create response. A plain SHA-256 is enough because the key is high-entropy
 random data (unlike a password), and it keeps lookup a single indexed
 query.
 
-Management (JWT, `api/apikeys_api.py`, prefix `/api/v1/api-keys`):
+Management (JWT, `apikeys_router` in `api/public.py`, prefix `/api/v1/api-keys`):
 `POST ""` (`{name, rate_limit_per_minute?}`), `GET ""`, `PATCH /{id}`,
 `DELETE /{id}` (revoke). Creating, changing and revoking need
 `api_key:manage` (guests get 403). At most
@@ -1101,19 +1107,23 @@ dispatcher as the retry path):
 | Events | Live push (WebSocket channel) | Notification |
 |---|---|---|
 | `analysis.started`, `analysis.completed`, `analysis.failed`, `recommendation.ready`, `decision.recorded` | `analysis:<analysis_id>` | the analysis user |
-| `decision.outcome.evaluated`, `backtest.completed`, `backtest.failed` | none | the user |
+| `decision.reviewed`, `decision.outcome.evaluated`, `backtest.completed`, `backtest.failed`, `backtest.deleted` | none | the user |
 | `tier.executed`, `tier.execution_failed`, `tier.cancelled` | `analysis:<analysis_id>` | the user, or the portfolio owner when `user_id` is empty (system analysis) |
 | `document.status_changed` | `document:<document_id>` | (by the durable handler) |
-| `organization.*` (created, updated, deleted, member joined/left/removed, role changed, invitation created) | none | members and the affected user (own wording) |
-| `friend.requested`, `friend.accepted`, `friend.removed` | none | the other side |
-| `user.updated`, `user.role.changed`, `user.deactivated`, `user.reactivated` | none | the user |
-| `user.deleted` | none | nobody (logged) |
+| `organization.*` (created, updated, deleted, member joined/left/removed, role changed) | none | members and the affected user (own wording) |
+| `organization.invitation.created`, `organization.invitation.revoked` | none | the actor, and the invitee when the invited email has an account |
+| `friend.requested`, `friend.accepted`, `friend.removed` | none | the actor; the other side for a request, an accept and an unfriend (`friend.removed` with `action` `removed`, or no `action`) |
+| `connection.blocked` | none | the actor only (never the blocked user) |
+| `user.updated`, `user.role.changed`, `user.deactivated`, `user.reactivated` | none | the user, and the admin or moderator who acted (when `actor_id` differs) |
+| `user.deleted` | none | the admin who deleted (the unverified-account purge, where the actor is the user: nobody, only logged) |
 | `user.presence.changed` | `presence:<user_id>` | none |
 
 Before the notification work, the handlers of
 `organization.member.removed`, `organization.member.left`,
 `organization.role.changed`, `organization.deleted` (all `member_ids`),
-`user.role.changed`, `user.deactivated` and `user.deleted` re-check the
+`user.role.changed`, `user.deactivated`, `user.deleted`, `friend.removed`
+(`actor_id` and `user_id`, for every `action`) and `connection.blocked`
+(`actor_id` and `blocked_user_id`) re-check the
 affected users' open Yjs sockets on every replica (no claim; a failure is
 logged and never stops the notification; see 3.9). auth-service drops the
 membership cache and writes the live state before it publishes, so the
@@ -1126,7 +1136,16 @@ empty id; tier events then notify the portfolio owner.
 auth-service publishes, including the user's own profile edits (`PATCH
 /me`, avatar upload, password reset, 2FA enable/disable), not only changes
 made by an administrator. It works as a security notice: an edit the user
-did not make is visible.
+did not make is visible. When an admin or moderator made the change, that
+person gets a notification too ("You updated the account of X (fields).").
+
+Recipient helpers: `_notify_payload_user` notifies `user_id`,
+`_notify_actor` notifies `actor_id`, and `_notify_pair` claims the event
+once and then notifies `user_id` and `actor_id` (when they differ), each
+with its own text. `friend.removed` with an `action` of `cancelled`,
+`declined`, `unblocked` (or an unknown value, with the text "Your
+connection with <name> changed.") notifies only the actor, so the other
+user never learns about an unblock or a declined request.
 
 **Replica de-duplication** (`_claim_event`). With several core replicas,
 each one receives every pub/sub event. Pushes must happen on every
@@ -1192,8 +1211,21 @@ the Yjs re-check (section 3.9), `recheck_user_sessions` runs the channel
 check again for every `/ws/{channel}` socket of the user. A deactivated or
 deleted account gets 4401 "account deactivated", a channel the user can
 no longer read gets 4403 "access to this channel was revoked" (log
-`websocket_session_closed_on_access_change`). If the check itself fails,
-the socket stays open (log `websocket_session_recheck_failed`).
+`websocket_session_closed_on_access_change`). After `friend.removed` or
+`connection.blocked`, an open `presence:<id>` socket is closed with 4403
+once the two users are no longer connected. If the check itself fails,
+the socket stays open (log `websocket_session_recheck_failed`). The
+presence check is an exception: `auth_client.are_users_connected`
+answers False on an auth-service HTTP error, so during an auth-service
+outage this re-check closes presence sockets instead of keeping them
+open.
+
+Accepted limitation: `analysis:<id>` and `document:<id>` sockets are not
+closed when the resource stops being shared (a portfolio PATCH to
+`visibility="private"`, a portfolio delete, a document delete), because
+no event triggers a re-check for them. An organization member's open
+socket keeps receiving status payloads until its token expires (15
+minutes or less); REST reads answer 404 at once.
 
 **Fan-out rules** (`websocket_manager.py`):
 
@@ -1698,11 +1730,10 @@ portfolio delete cascades to its transactions and holdings and publishes
 | `services/core-service/main.py` | app, lifespan (schema, bucket, job health, background listeners, outbox dispatcher, Yjs save at shutdown), routers, `/health` |
 | `services/core-service/config.py` | core settings (API keys, uploads, Yjs) |
 | `services/core-service/apikeys.py` | `ApiKey` model, hashing, create, revoke, cache key, the cache writes `mark_revoked_in_cache` and `forget_cached_key`; the public-API middleware: key check, owner state, rate limits, `last_used_at` throttle |
-| `services/core-service/api/apikeys_api.py` | `/api/v1/api-keys` routes |
-| `services/core-service/api/public.py` | `/api/v1/public` routes |
+| `services/core-service/api/public.py` | `/api/v1/public` routes and the `/api/v1/api-keys` routes (`apikeys_router`) |
 | `services/core-service/api/internal.py` | scheduler, portfolio, stats, tracked-tickers and system document internal routes |
 | `services/core-service/api/websocket.py` | JSON WebSocket endpoint and channel authorization, the Yjs endpoint, `recheck_user_sessions` |
-| `services/core-service/yjs_relay.py` | collaborative note editing (chapter 25) |
+| `services/core-service/yjs_relay.py` | collaborative note editing, and the Yjs decode/validate layer (`validator`, `UpdateValidator` worker processes, `replace_text`, `seed_state`) (chapter 25) |
 | `services/core-service/websocket_manager.py` | channel registry, fan-out, per-user cap, presence task, `ws:fanout`; token check, close codes, accept-then-close, expiry timer |
 | `services/core-service/event_listener.py` | pub/sub and durable handlers, replica claims |
 | `services/core-service/job_health.py` | job success gauges, the "tracked since" start value for jobs without a success, market-close skip count, and their Redis persistence |
@@ -1710,14 +1741,14 @@ portfolio delete cascades to its transactions and holdings and publishes
 | `services/core-service/domains/portfolio/ledger.py` | replay, phases, cash rules, adjustment planning, snapshot day |
 | `services/core-service/domains/portfolio/service.py` | portfolios, transactions, holdings, cash, snapshots, jobs, CSV exports |
 | `services/core-service/domains/portfolio/model.py`, `schema.py`, `repository.py`, `api.py` | tables, validation, data access, routes and their notification texts |
-| `services/core-service/domains/research/*` | notes, comments, documents, moderation, sentiment, Yjs guard |
+| `services/core-service/domains/research/*` | notes, comments, documents, moderation, sentiment |
 | `services/core-service/domains/notification/*` | notification rows, delivery, `notify_after_commit` |
 | `services/core-service/clients/ai_client.py`, `auth_client.py` | calls to the other services |
 | `services/core-service/scripts/recompute_snapshots.py` | snapshot check and repair |
 | `services/core-service/scripts/delete_documents.py` | operator delete of documents by id (preview, `--confirm`); per document: delete the row and enqueue `document.deleted` in the outbox in one transaction (`service.delete_document_row`, shared with the API), commit, publish with `outbox.publish_now`, then delete the stored file (a failure is reported as an orphan object) |
 | `services/core-service/scripts/backfill_sentiment.py` | fill missing note/comment sentiment (preview, `--apply`) |
 | `services/core-service/scripts/e2e_check.py` | real-environment end-to-end check (`make e2e`) |
-| `services/core-service/migrations/` | Alembic `env.py`, `versions/` (`f1160c000001` -> `f1170c000001` -> `f1200c000001` -> `f1250c000001`, head), `archive/` |
+| `services/core-service/migrations/` | Alembic `env.py`, `versions/` (`f1160c000001` -> `f1170c000001` -> `f1200c000001` -> `f1250c000001`, head), `script.py.mako` |
 | `services/core-service/deps.py` | `get_current_user`, the one `from <= to` check (422) for date-range query parameters (`check_date_range`), `day_start` |
 | `shared/market_calendar.py` | NYSE calendar, New York date |
 | `shared/events.py` | pub/sub and durable events, event names |

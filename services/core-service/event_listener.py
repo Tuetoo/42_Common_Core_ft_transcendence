@@ -38,19 +38,54 @@ async def _claim_event(event: str, payload: dict[str, Any]) -> bool:
     return bool(claimed)
 
 
-async def _notify_payload_user(
-        event: str, payload: dict[str, Any], *, type: NotificationType,
-        title: str, content: str) -> None:
-    user_id = payload.get("user_id")
-    if not user_id:
+async def _notify_field(
+        event: str, payload: dict[str, Any], key: str, *,
+        type: NotificationType, title: str, content: str) -> None:
+    recipient = payload.get(key)
+    if not recipient:
         logger.warning(
-            "event_missing_user_id", event_name=str(event),
+            f"event_missing_{key}", event_name=str(event),
             analysis_id=payload.get("analysis_id"))
         return
     if not await _claim_event(event, payload):
         return
     await notifications.notify_user(
-        user_id=user_id, type=type, title=title, content=content)
+        user_id=recipient, type=type, title=title, content=content)
+
+
+async def _notify_payload_user(
+        event: str, payload: dict[str, Any], *, type: NotificationType,
+        title: str, content: str) -> None:
+    await _notify_field(
+        event, payload, "user_id", type=type, title=title, content=content)
+
+
+async def _notify_actor(
+        event: str, payload: dict[str, Any], *, type: NotificationType,
+        title: str, content: str) -> None:
+    await _notify_field(
+        event, payload, "actor_id", type=type, title=title, content=content)
+
+
+async def _notify_pair(
+        event: str, payload: dict[str, Any], *, type: NotificationType,
+        user_title: str, user_content: str, actor_title: str,
+        actor_content: str) -> None:
+    user_id = payload.get("user_id") or None
+    actor_id = payload.get("actor_id") or None
+    if not user_id and not actor_id:
+        logger.warning("event_missing_recipient", event_name=str(event))
+        return
+    if not await _claim_event(event, payload):
+        return
+    if user_id:
+        await notifications.notify_user(
+            user_id=user_id, type=type, title=user_title,
+            content=user_content)
+    if actor_id and str(actor_id) != str(user_id):
+        await notifications.notify_user(
+            user_id=actor_id, type=type, title=actor_title,
+            content=actor_content)
 
 
 async def _handle_analysis_completed(payload: dict[str, Any]) -> None:
@@ -255,40 +290,105 @@ async def _handle_organization_role_changed(payload: dict[str, Any]) -> None:
 
 async def _handle_organization_invitation_created(
         payload: dict[str, Any]) -> None:
-    await _notify_payload_user(
+    org = _org_name(payload)
+    role = payload.get("role")
+    as_role = f" (role {role})" if role else ""
+    await _notify_pair(
         EventName.ORGANIZATION_INVITATION_CREATED, payload,
         type=NotificationType.ORGANIZATION_INVITE,
-        title="Organization invitation", content=(
-            f"You were invited to join the organization {_org_name(payload)}."
-        ))
+        user_title="Organization invitation",
+        user_content=f"You were invited to join the organization {org}.",
+        actor_title="Invitation sent",
+        actor_content=(
+            f"You invited a user to join the organization {org}{as_role}."))
+
+
+async def _handle_organization_invitation_revoked(
+        payload: dict[str, Any]) -> None:
+    org = _org_name(payload)
+    role = payload.get("role")
+    as_role = f" (role {role})" if role else ""
+    await _notify_pair(
+        EventName.ORGANIZATION_INVITATION_REVOKED, payload,
+        type=NotificationType.ORGANIZATION_INVITATION_REVOKED,
+        user_title="Invitation withdrawn",
+        user_content=f"Your invitation to the organization {org} was "
+        "withdrawn.", actor_title="Invitation revoked", actor_content=(
+            f"You revoked an invitation to the organization {org}{as_role}."))
 
 
 def _actor(payload: dict[str, Any]) -> str:
     return str(payload.get("actor_username") or "Someone")
 
 
+def _other(payload: dict[str, Any]) -> str:
+    return str(payload.get("other_username") or "a user")
+
+
 async def _handle_friend_requested(payload: dict[str, Any]) -> None:
-    await _notify_payload_user(
+    await _notify_pair(
         EventName.FRIEND_REQUESTED, payload,
-        type=NotificationType.FRIEND_REQUEST,
-        title="New friend request",
-        content=f"{_actor(payload)} sent you a friend request.")
+        type=NotificationType.FRIEND_REQUEST, user_title="New friend request",
+        user_content=f"{_actor(payload)} sent you a friend request.",
+        actor_title="Friend request sent",
+        actor_content=f"You sent a friend request to {_other(payload)}.")
 
 
 async def _handle_friend_accepted(payload: dict[str, Any]) -> None:
-    await _notify_payload_user(
+    await _notify_pair(
         EventName.FRIEND_ACCEPTED, payload,
         type=NotificationType.FRIEND_ACCEPTED,
-        title="Friend request accepted",
-        content=f"{_actor(payload)} accepted your friend request.")
+        user_title="Friend request accepted",
+        user_content=f"{_actor(payload)} accepted your friend request.",
+        actor_title="Friend request accepted",
+        actor_content=f"You are now friends with {_other(payload)}.")
+
+
+_CONNECTION_REMOVAL_TEXT = {
+    "cancelled": ("Friend request cancelled",
+                  "You cancelled your friend request to {name}."),
+    "declined": ("Friend request declined",
+                 "You declined the friend request from {name}."),
+    "unblocked": ("User unblocked", "You unblocked {name}.")
+}
 
 
 async def _handle_friend_removed(payload: dict[str, Any]) -> None:
-    await _notify_payload_user(
+    await _recheck_sessions(
+        [payload.get("actor_id"), payload.get("user_id")],
+        reason=EventName.FRIEND_REMOVED)
+    name = _other(payload)
+    action = str(payload.get("action") or "removed")
+    if action != "removed":
+        title, text = _CONNECTION_REMOVAL_TEXT.get(
+            action, ("Connection updated", "Your connection with {name} "
+                     "changed."))
+        await _notify_actor(
+            EventName.FRIEND_REMOVED, payload,
+            type=NotificationType.FRIEND_REMOVED, title=title,
+            content=text.format(name=name))
+        return
+    await _notify_pair(
         EventName.FRIEND_REMOVED, payload,
-        type=NotificationType.FRIEND_REMOVED,
-        title="Friend removed",
-        content=f"{_actor(payload)} removed you from their friends.")
+        type=NotificationType.FRIEND_REMOVED, user_title="Friend removed",
+        user_content=f"{_actor(payload)} removed you from their friends.",
+        actor_title="Friend removed",
+        actor_content=f"You removed {name} from your friends.")
+
+
+async def _handle_connection_blocked(payload: dict[str, Any]) -> None:
+    await _recheck_sessions(
+        [payload.get("actor_id"), payload.get("blocked_user_id")],
+        reason=EventName.CONNECTION_BLOCKED)
+    name = payload.get("blocked_username") or "a user"
+    await _notify_actor(
+        EventName.CONNECTION_BLOCKED, payload,
+        type=NotificationType.CONNECTION_BLOCKED, title="User blocked",
+        content=f"You blocked {name}. They are not notified.")
+
+
+def _target(payload: dict[str, Any]) -> str:
+    return str(payload.get("username") or "a user")
 
 
 async def _handle_user_updated(payload: dict[str, Any]) -> None:
@@ -296,38 +396,50 @@ async def _handle_user_updated(payload: dict[str, Any]) -> None:
     fields = (
         ", ".join(str(f)
                   for f in changed) if isinstance(changed, list) else "")
-    await _notify_payload_user(
+    suffix = f" ({fields})" if fields else ""
+    await _notify_pair(
         EventName.USER_UPDATED, payload, type=NotificationType.ACCOUNT_UPDATED,
-        title="Account updated", content=(
-            f"Your account was updated ({fields})."
-            if fields else "Your account was updated."))
+        user_title="Account updated",
+        user_content=f"Your account was updated{suffix}.",
+        actor_title="Account updated",
+        actor_content=f"You updated the account of {_target(payload)}"
+        f"{suffix}.")
 
 
 async def _handle_user_role_changed(payload: dict[str, Any]) -> None:
     await _recheck_sessions([payload.get("user_id")],
                             reason=EventName.USER_ROLE_CHANGED)
     role = payload.get("role") or "a new role"
-    await _notify_payload_user(
+    await _notify_pair(
         EventName.USER_ROLE_CHANGED, payload,
-        type=NotificationType.ACCOUNT_ROLE_CHANGED, title="Your role changed",
-        content=f"Your account role is now {role}.")
+        type=NotificationType.ACCOUNT_ROLE_CHANGED,
+        user_title="Your role changed",
+        user_content=f"Your account role is now {role}.",
+        actor_title="Account role changed",
+        actor_content=f"You changed the role of {_target(payload)} to {role}.")
 
 
 async def _handle_user_deactivated(payload: dict[str, Any]) -> None:
     await _recheck_sessions([payload.get("user_id")],
                             reason=EventName.USER_DEACTIVATED,
                             deactivated=True)
-    await _notify_payload_user(
+    await _notify_pair(
         EventName.USER_DEACTIVATED, payload,
-        type=NotificationType.ACCOUNT_UPDATED, title="Account deactivated",
-        content="Your account was deactivated by an administrator.")
+        type=NotificationType.ACCOUNT_UPDATED,
+        user_title="Account deactivated",
+        user_content="Your account was deactivated by an administrator.",
+        actor_title="Account deactivated",
+        actor_content=f"You deactivated the account of {_target(payload)}.")
 
 
 async def _handle_user_reactivated(payload: dict[str, Any]) -> None:
-    await _notify_payload_user(
+    await _notify_pair(
         EventName.USER_REACTIVATED, payload,
-        type=NotificationType.ACCOUNT_UPDATED, title="Account reactivated",
-        content="Your account was reactivated.")
+        type=NotificationType.ACCOUNT_UPDATED,
+        user_title="Account reactivated",
+        user_content="Your account was reactivated.",
+        actor_title="Account reactivated",
+        actor_content=f"You reactivated the account of {_target(payload)}.")
 
 
 async def _handle_user_deleted(payload: dict[str, Any]) -> None:
@@ -335,6 +447,12 @@ async def _handle_user_deleted(payload: dict[str, Any]) -> None:
                             reason=EventName.USER_DELETED,
                             deactivated=True)
     logger.info("user_deleted_received", user_id=payload.get("user_id"))
+    if str(payload.get("actor_id")) == str(payload.get("user_id")):
+        return
+    await _notify_actor(
+        EventName.USER_DELETED, payload, type=NotificationType.ACCOUNT_UPDATED,
+        title="Account deleted",
+        content=f"You deleted the account of {_target(payload)}.")
 
 
 async def _broadcast_analysis(event: str, payload: dict[str, Any]) -> None:
@@ -381,6 +499,14 @@ async def _handle_decision_recorded(payload: dict[str, Any]) -> None:
         type=NotificationType.DECISION_RECORDED,
         title="Decision recorded",
         content=f"Your decision on {ticker} was recorded ({decision}).")
+
+
+async def _handle_decision_reviewed(payload: dict[str, Any]) -> None:
+    ticker = payload.get("ticker") or "the ticker"
+    await _notify_payload_user(
+        EventName.DECISION_REVIEWED, payload,
+        type=NotificationType.DECISION_REVIEWED, title="Decision reviewed",
+        content=f"A new review of your decision on {ticker} is ready.")
 
 
 async def _handle_decision_outcome_evaluated(payload: dict[str, Any]) -> None:
@@ -501,6 +627,16 @@ async def _handle_backtest_failed(payload: dict[str, Any]) -> None:
             if error else f"Your {kind} backtest failed."))
 
 
+async def _handle_backtest_deleted(payload: dict[str, Any]) -> None:
+    kind = payload.get("kind") or "backtest"
+    await _notify_payload_user(
+        EventName.BACKTEST_DELETED, payload,
+        type=NotificationType.BACKTEST_DELETED,
+        title="Backtest deleted", content=(
+            f"Your {kind} backtest ({payload.get('backtest_id')}) was "
+            "deleted."))
+
+
 async def _handle_user_presence_changed(payload: dict[str, Any]) -> None:
     user_id = payload.get("user_id")
     if user_id is None:
@@ -520,12 +656,14 @@ _PUBSUB_HANDLERS: dict[EventName, Callable[[
     EventName.ANALYSIS_FAILED: _handle_analysis_failed,
     EventName.RECOMMENDATION_READY: _handle_recommendation_ready,
     EventName.DECISION_RECORDED: _handle_decision_recorded,
+    EventName.DECISION_REVIEWED: _handle_decision_reviewed,
     EventName.DECISION_OUTCOME_EVALUATED: _handle_decision_outcome_evaluated,
     EventName.TIER_EXECUTED: _handle_tier_executed,
     EventName.TIER_EXECUTION_FAILED: _handle_tier_execution_failed,
     EventName.TIER_CANCELLED: _handle_tier_cancelled,
     EventName.BACKTEST_COMPLETED: _handle_backtest_completed,
     EventName.BACKTEST_FAILED: _handle_backtest_failed,
+    EventName.BACKTEST_DELETED: _handle_backtest_deleted,
     EventName.DOCUMENT_STATUS_CHANGED: _broadcast_document_status_changed,
     EventName.ORGANIZATION_CREATED: _handle_organization_created,
     EventName.ORGANIZATION_UPDATED: _handle_organization_updated,
@@ -536,9 +674,12 @@ _PUBSUB_HANDLERS: dict[EventName, Callable[[
     EventName.ORGANIZATION_ROLE_CHANGED: _handle_organization_role_changed,
     EventName.ORGANIZATION_INVITATION_CREATED: (
         _handle_organization_invitation_created),
+    EventName.ORGANIZATION_INVITATION_REVOKED: (
+        _handle_organization_invitation_revoked),
     EventName.FRIEND_REQUESTED: _handle_friend_requested,
     EventName.FRIEND_ACCEPTED: _handle_friend_accepted,
     EventName.FRIEND_REMOVED: _handle_friend_removed,
+    EventName.CONNECTION_BLOCKED: _handle_connection_blocked,
     EventName.USER_UPDATED: _handle_user_updated,
     EventName.USER_ROLE_CHANGED: _handle_user_role_changed,
     EventName.USER_DEACTIVATED: _handle_user_deactivated,

@@ -64,14 +64,6 @@ def _unregister(registry: dict[str, set[_S]], session: _S) -> None:
         registry.pop(session.identity.user_id, None)
 
 
-def _register_session(session: _YjsSession) -> None:
-    _register(_sessions_by_user, session)
-
-
-def _unregister_session(session: _YjsSession) -> None:
-    _unregister(_sessions_by_user, session)
-
-
 async def _can_read_analysis(requester_id: str, analysis_id: UUID) -> bool:
     ref = await ai_client.get_analysis_ref(str(analysis_id))
     if ref.user_id is not None:
@@ -193,7 +185,7 @@ async def recheck_user_sessions(
             None if deactivated else await resolve_live_identity(
                 session.identity))
         if identity is None:
-            _unregister_session(session)
+            _unregister(_sessions_by_user, session)
             await _close_on_access_change(
                 session.websocket, CLOSE_UNAUTHORIZED, "account deactivated",
                 event="yjs_session_closed_on_access_change", user_id=user_id,
@@ -208,20 +200,18 @@ async def recheck_user_sessions(
                 user_id=user_id, reason=reason, exc_info=True)
             continue
         if not access.can_read:
-            _unregister_session(session)
-            await _close_on_access_change(
-                session.websocket, CLOSE_FORBIDDEN,
-                "access to this note was revoked",
-                event="yjs_session_closed_on_access_change", user_id=user_id,
-                note_id=str(session.note_id), reason=reason)
-            changed += 1
+            message = "access to this note was revoked"
+        elif session.access.can_write and not access.can_write:
+            message = "write access to this note was revoked"
+        else:
+            session.access = access
             continue
-        if session.access.can_write and not access.can_write:
-            logger.info(
-                "yjs_session_downgraded_to_read_only",
-                note_id=str(session.note_id), user_id=user_id, reason=reason)
-            changed += 1
-        session.access = access
+        _unregister(_sessions_by_user, session)
+        await _close_on_access_change(
+            session.websocket, CLOSE_FORBIDDEN, message,
+            event="yjs_session_closed_on_access_change", user_id=user_id,
+            note_id=str(session.note_id), reason=reason)
+        changed += 1
     return changed
 
 
@@ -320,7 +310,7 @@ async def yjs_websocket_endpoint(
     try:
         await websocket.accept()
         room = await yjs_relay.relay.connect(websocket, room_key)
-        _register_session(session)
+        _register(_sessions_by_user, session)
 
         async def _receive_loop() -> None:
             assert room is not None
@@ -364,7 +354,7 @@ async def yjs_websocket_endpoint(
         logger.exception("yjs_connection_failed", note_id=room_key)
         await close_quietly(websocket, CLOSE_INTERNAL_ERROR)
     finally:
-        _unregister_session(session)
+        _unregister(_sessions_by_user, session)
         try:
             if room is not None:
                 await yjs_relay.relay.disconnect(websocket, room)

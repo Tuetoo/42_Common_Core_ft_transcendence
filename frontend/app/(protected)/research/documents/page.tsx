@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Pager, pageParam } from "../../pager";
 import { UploadDocumentForm } from "./upload-document-form";
 import { DocumentTable } from "./document-table";
@@ -102,6 +102,7 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
             <input
               id="f-ticker"
               name="ticker"
+              autoComplete="off"
               type="text"
               maxLength={10}
               pattern={TICKER_HTML_PATTERN}
@@ -113,7 +114,7 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
           </div>
           <div className="field">
             <label htmlFor="f-category">Category</label>
-            <select id="f-category" name="category" defaultValue={filters.category}>
+            <select id="f-category" name="category" autoComplete="off" defaultValue={filters.category}>
               <option value="">All</option>
               {DOCUMENT_CATEGORIES.map((c) => (
                 <option key={c} value={c}>
@@ -124,7 +125,7 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
           </div>
           <div className="field">
             <label htmlFor="f-status">Status</label>
-            <select id="f-status" name="status" defaultValue={filters.status}>
+            <select id="f-status" name="status" autoComplete="off" defaultValue={filters.status}>
               <option value="">All</option>
               {DOCUMENT_STATUSES.map((s) => (
                 <option key={s} value={s}>
@@ -135,15 +136,15 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
           </div>
           <div className="field">
             <label htmlFor="f-from">Uploaded from</label>
-            <input id="f-from" name="created_from" type="date" defaultValue={filters.created_from} />
+            <input id="f-from" name="created_from" autoComplete="off" type="date" defaultValue={filters.created_from} />
           </div>
           <div className="field">
             <label htmlFor="f-to">Uploaded to</label>
-            <input id="f-to" name="created_to" type="date" defaultValue={filters.created_to} />
+            <input id="f-to" name="created_to" autoComplete="off" type="date" defaultValue={filters.created_to} />
           </div>
           <div className="field">
             <label htmlFor="f-sort">Sort by</label>
-            <select id="f-sort" name="sort" defaultValue={filters.sort}>
+            <select id="f-sort" name="sort" autoComplete="off" defaultValue={filters.sort}>
               {SORTS.map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
@@ -152,7 +153,7 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
             </select>
           </div>
           <label className="flex items-center gap-2 pb-2 text-[13px]">
-            <input type="checkbox" name="include_system" value="true" defaultChecked={!!filters.include_system} />
+            <input type="checkbox" name="include_system" autoComplete="off" value="true" defaultChecked={!!filters.include_system} />
             Include system documents
           </label>
           <div className="flex flex-wrap items-center gap-3 pb-1">

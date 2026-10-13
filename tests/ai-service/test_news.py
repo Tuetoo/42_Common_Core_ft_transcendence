@@ -14,7 +14,6 @@ import ai.ingestion.digests as macro_ingestion
 import ai.ingestion.digests as news_ingestion
 import ai.llm.google_provider as google_provider
 import ai.llm.router as router_module
-import ai.providers.news_filters as filters_module
 import ai.providers.news_relevance as relevance_module
 import ai.providers.newsapi as newsapi_module
 import ai.rag.indexing as indexing_module
@@ -43,10 +42,10 @@ from ai.providers.base import (MacroDataPoint, NewsArticle, PriceQuote,
                                ProviderError, ProviderRequestError,
                                WebSearchResult)
 from ai.providers.fred import _PERCENT_SERIES_IDS, _SERIES_ALIASES
-from ai.providers.news_filters import (company_aliases, consent_target_url,
-                                       precheck_reason)
 from ai.providers.news_relevance import (COMPANY_BUSINESS, ClassifiedArticle,
-                                         align_verdicts, read_verdicts)
+                                         align_verdicts, company_aliases,
+                                         consent_target_url, precheck_reason,
+                                         read_verdicts)
 from ai.providers.newsapi import NewsApiArticle, NewsApiProvider, SourceCatalog
 from ai.providers.tavily import TavilyProvider
 from ai.rag.chunking import Chunk
@@ -608,14 +607,13 @@ class TestSearchNewsTool:
         assert "[2026-10-01 Thu]" in prompt
         assert "2026-09-30" in prompt and "early October" in prompt
 
-    async def test_queries_recent_merge_and_topic_fallback(self):
+    async def test_queries_merge_fallback_and_classified_lines(self):
         self._news_lines_carry_the_weekday_and_the_prompt_resolves_it()
         await _run_steps(
             self._unscoped_search_is_unclassified,
             self._recent_news_is_merged_first_and_its_failure_is_ignored,
             self._zero_results_with_topic_falls_back_to_company_only)
 
-    async def test_classified_lines_links_and_catalog_marks(self):
         await _run_steps(
             self._every_usable_item_is_sent_to_the_classifier,
             self._consent_page_headlines_are_kept_without_links,
@@ -856,14 +854,13 @@ class TestNewsApiProvider:
         assert any(
             e["event"] == "newsapi.source_catalog_stale_served" for e in logs)
 
-    async def test_usage_rate_limit_and_search_fields(
+    async def test_usage_rate_limit_search_fields_and_catalog(
             self, clean_newsapi_usage):
         await _run_steps(
             self._only_counted_requests_are_recorded_and_redis_is_optional,
             self._default_search_fields_keep_the_previous_request,
             self._a_rate_limit_stops_requests_until_the_cooldown_ends)
 
-    async def test_source_catalog_cache_and_failures(self):
         await _run_steps(
             self._catalog_is_fetched_once_and_cached_for_a_week,
             self._catalog_failure_is_open_and_not_retried_at_once,
@@ -1193,13 +1190,12 @@ class TestNewsRelevance:
             e["event"] == "news_relevance.salvaged_without_retry"
             for e in logs)
 
-    async def test_misaligned_invalid_or_nameless_verdicts(self):
+    async def test_bad_verdicts_and_failed_classifier_calls(self):
         await _run_steps(
             self._misaligned_answer_keeps_articles_aligned_one_applies,
             self._stock_move_headline_is_kept_and_prompt_has_no_examples,
             self._invalid_verdicts_or_no_company_name_leave_unclassified)
 
-    async def test_unparseable_and_failed_classifier_calls(self):
         await self._unparseable_answer_is_retried_with_a_larger_budget()
         await self._classifier_call_errors()
         await self._invalid_but_complete_answer_is_not_retried()
@@ -1478,12 +1474,11 @@ class TestWebSearch:
         assert observation_yield(entries[0].observation) == 0
         assert len(router.calls) == 1 and len(router.calls[0]) == 3
 
-    async def test_tavily_requests_and_answer_budget(self):
+    async def test_tavily_requests_web_kinds_and_news_fallback(self):
         await _run_steps(
             self._tavily_news_mode_dates_and_score_order,
             self._web_answers_budget_and_unverified_items)
 
-    async def test_web_kinds_and_news_fallback(self):
         await _run_steps(
             self._web_kinds_drop_results_and_the_company_is_named,
             self._web_fallback_only_after_a_failed_news_search,
@@ -1523,7 +1518,7 @@ _WEEKDAY_REF = date(2026, 10, 3)
 
 class TestNewsAgent:
 
-    async def test_an_unverified_fallback_is_marked_as_thin(
+    async def test_unverified_fallback_finish_validator_and_weekdays(
             self, known_companies):
         monkeypatch = known_companies
         _patch_catalog(monkeypatch, {"reuters.com"})
@@ -1578,7 +1573,6 @@ class TestNewsAgent:
         assert any(
             e["event"] == "news.fallback_sources_unverified" for e in logs)
 
-    def test_finish_validator_and_weekday_checks(self):
         validator = _NewsFinishValidator()
         pad = [
             _prior_news_note("GOOGL", _GOOGL_PRIOR_NOTE),
@@ -1971,7 +1965,8 @@ def _macro_chunk(source: str | None) -> RetrievedChunk:
 
 class TestMacroResearch:
 
-    async def test_policy_rate_moves_and_daily_series(self):
+    async def test_policy_rates_series_guidance_and_recycled_notes(
+            self, monkeypatch):
         text = await GetMacroIndicatorsTool(_FakeMacro(_hike_series())
                                             ).run("fed_funds_rate")
         assert text.startswith(
@@ -2015,8 +2010,6 @@ class TestMacroResearch:
         assert _SERIES_ALIASES["fed_funds_rate"][0] == "DFF"
         assert "DFF" in _PERCENT_SERIES_IDS
         assert macro_module._LIVE_SERIES[0].series_id == "DFF"
-
-    async def test_agent_note_guidance_and_recycled_notes(self, monkeypatch):
 
         def tool(chunks):
             return SearchResearchArchiveTool(
@@ -2257,12 +2250,12 @@ class TestAnalysisPlumbing:
         assert retry["delay_seconds"] == 0.0
         assert retry["free_model"] == "gemini-3.6-flash"
 
-    async def test_review_retry_after_server_errors(self):
+    async def test_review_retry_upsert_retry_and_stream_gate(
+            self, monkeypatch):
         await _run_steps(
             self._review_is_retried_once_after_a_server_error,
             self._review_retry_skips_the_wait_when_a_chain_model_is_free)
 
-    async def test_upsert_retry_and_stream_gate_limit(self, monkeypatch):
         qdrant, bm25 = await _index_one_chunk(monkeypatch, failures=1)
         assert qdrant.calls == 2 and len(bm25.added) == 1
         with pytest.raises(ResponseHandlingException):
@@ -2316,15 +2309,15 @@ _REMOVED = [(settings, "NEWS_BLOCKED_DOMAINS"),
             (settings, "NEWS_DOWNWEIGHT_MAX_ITEMS"),
             (settings, "NEWS_HOMONYM_TICKER_MAX_LEN"),
             (nodes_module.settings, "DATA_AGENT_RATE_LIMIT_RETRY_SECONDS"),
-            (filters_module, "is_blocked_domain"),
-            (filters_module, "is_ticker_homonym"),
-            (filters_module, "non_news_reason"),
-            (filters_module, "cap_downweighted"),
-            (filters_module, "_GENERIC_NAME_WORDS"),
-            (filters_module, "_SHOPPING_TITLE"),
-            (filters_module, "_FORECAST_TITLE"),
-            (filters_module, "_BOILERPLATE_TEXT"),
-            (filters_module, "headline_mentions_company"),
+            (relevance_module, "is_blocked_domain"),
+            (relevance_module, "is_ticker_homonym"),
+            (relevance_module, "non_news_reason"),
+            (relevance_module, "cap_downweighted"),
+            (relevance_module, "_GENERIC_NAME_WORDS"),
+            (relevance_module, "_SHOPPING_TITLE"),
+            (relevance_module, "_FORECAST_TITLE"),
+            (relevance_module, "_BOILERPLATE_TEXT"),
+            (relevance_module, "headline_mentions_company"),
             (relevance_module, "_reasoning_contradicts_relevant"),
             (relevance_module, "_reasoning_affirms_company"),
             (relevance_module, "_keyword_prefilter"),
@@ -2348,8 +2341,6 @@ def test_removed_names_defaults_and_shared_objects():
         assert getattr(owner, name) == expected, case_id
     assert web_tool_module.LINK_UNAVAILABLE is (
         news_tool_module.LINK_UNAVAILABLE)
-    assert relevance_module.headline_names_company is (
-        filters_module.headline_names_company)
 
 
 def _japanese_article() -> NewsArticle:

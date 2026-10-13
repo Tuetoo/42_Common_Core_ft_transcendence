@@ -1,10 +1,16 @@
 # Continuous deployment to the cloud host (docs/DEPLOYMENT.md).
-# Runs after "stack smoke CI" succeeded for a push to main, so only a
-# main that builds and starts as a whole stack is deployed; it can also
-# be started by hand (Actions -> deploy -> Run workflow).
-# The job only opens an SSH connection: the host's authorized_keys entry
-# for this key forces `bash scripts/deploy.sh`, so the key can do nothing
-# else. Repository secrets: DEPLOY_HOST (host name), DEPLOY_SSH_KEY
+# Runs after "stack smoke CI" succeeded for a push to main (or by hand:
+# Actions -> deploy -> Run workflow). Before connecting, it waits for every
+# other workflow run of the same commit (per-service CI, frontend CI) and
+# deploys only when all of them succeeded or were skipped, so a commit with
+# a failing test, lint or type check is never deployed. A commit that is no
+# longer the head of main when the run starts is skipped: the newer
+# commit's run deploys it. A transient GitHub API error is retried.
+# The job only opens an SSH connection and sends the checked commit sha as
+# the command: the host's authorized_keys entry for this key forces
+# `bash scripts/deploy.sh`, which reads the sha from SSH_ORIGINAL_COMMAND
+# and deploys exactly that commit (not a newer main whose checks may still
+# run), so the key can do nothing else. Repository secrets: DEPLOY_HOST (host name), DEPLOY_SSH_KEY
 # (private key) and DEPLOY_KNOWN_HOSTS (`ssh-keyscan -t ed25519 <host>`).
 name: deploy
 
@@ -26,17 +32,62 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
     steps:
+      - name: Wait for every check of the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          api() {
+            local out
+            for _ in 1 2 3; do
+              if out=$(gh api "$@"); then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              echo "GitHub API call failed, retrying in 15 s" >&2
+              sleep 15
+            done
+            return 1
+          }
+          head=$(api "repos/$REPO/commits/main" --jq .sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "skip: $SHA is not the head of main ($head)"
+            echo "SKIP_DEPLOY=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for _ in $(seq 1 90); do
+            runs=$(api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+              --jq '.workflow_runs[] | select(.event == "push" and .name != "deploy")
+                    | "\(.name)|\(.status)|\(.conclusion)"')
+            echo "$runs"
+            if ! grep -qv '|completed|' <<< "$runs"; then
+              if grep -qvE '\|(success|skipped)$' <<< "$runs"; then
+                echo "error: a check of $SHA did not succeed" >&2
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "error: checks of $SHA did not finish in 30 minutes" >&2
+          exit 1
       - name: Deploy over SSH
+        if: env.SKIP_DEPLOY != '1'
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
-            -o ServerAliveInterval=30 "ubuntu@$DEPLOY_HOST"
+            -o ServerAliveInterval=30 "ubuntu@$DEPLOY_HOST" "$SHA"

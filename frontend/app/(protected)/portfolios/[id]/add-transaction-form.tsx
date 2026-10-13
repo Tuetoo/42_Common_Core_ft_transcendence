@@ -46,6 +46,7 @@ export function AddTransactionForm({ portfolioId }: { portfolioId: string }) {
         <select
           id={`${uid}-transaction_type`}
           name="transaction_type"
+          autoComplete="off"
           defaultValue={initialKind}
           onChange={(e) => setKind(e.target.value as TransactionKind)}
         >
@@ -74,6 +75,7 @@ export function AddTransactionForm({ portfolioId }: { portfolioId: string }) {
       <div className="field">
         <label htmlFor={`${uid}-quantity`}>{isCash ? "Amount" : "Quantity"}</label>
         <input id={`${uid}-quantity`} name="quantity"
+          autoComplete="off"
           type="number"
           inputMode="decimal"
           step="any"
@@ -86,6 +88,7 @@ export function AddTransactionForm({ portfolioId }: { portfolioId: string }) {
         <div className="field">
           <label htmlFor={`${uid}-price`}>Price</label>
           <input id={`${uid}-price`} name="price"
+            autoComplete="off"
             type="number"
             inputMode="decimal"
             step="any"
@@ -98,6 +101,7 @@ export function AddTransactionForm({ portfolioId }: { portfolioId: string }) {
       <div className="field">
         <label htmlFor={`${uid}-transaction_date`}>Date</label>
         <input id={`${uid}-transaction_date`} name="transaction_date"
+          autoComplete="off"
           type="datetime-local"
           required
           defaultValue={values.transaction_date}

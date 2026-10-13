@@ -46,11 +46,12 @@ def schedule_events(
 
 
 def user_event_payload(
-        *, user_id: UUID, actor_id: UUID, role: str, is_active: bool,
-        changed: Iterable[str]) -> dict[str, Any]:
+        *, user_id: UUID, actor_id: UUID, username: str, role: str,
+        is_active: bool, changed: Iterable[str]) -> dict[str, Any]:
     return {
         "user_id": str(user_id),
         "actor_id": str(actor_id),
+        "username": username,
         "role": role,
         "is_active": is_active,
         "changed": sorted(set(changed))
@@ -73,10 +74,24 @@ def organization_event_payload(
 
 
 def friend_event_payload(
-        *, actor_id: UUID, user_id: UUID,
-        actor_username: str) -> dict[str, Any]:
-    return {
+        *, actor_id: UUID, user_id: UUID, actor_username: str,
+        other_username: str, action: str | None = None) -> dict[str, Any]:
+    payload = {
         "actor_id": str(actor_id),
         "user_id": str(user_id),
-        "actor_username": actor_username
+        "actor_username": actor_username,
+        "other_username": other_username
+    }
+    if action is not None:
+        payload["action"] = action
+    return payload
+
+
+def block_event_payload(
+        *, actor_id: UUID, blocked_user_id: UUID,
+        blocked_username: str) -> dict[str, Any]:
+    return {
+        "actor_id": str(actor_id),
+        "blocked_user_id": str(blocked_user_id),
+        "blocked_username": blocked_username
     }

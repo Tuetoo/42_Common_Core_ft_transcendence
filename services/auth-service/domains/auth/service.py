@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from user_state_sync import mirror_user_safely
 from domains.auth.model import (SessionRevokeReason, TwoFactorSecret, User,
-                                UserProfile)
+                                UserProfile, UserSession)
 from domains.auth.repository import UserRepository
 from domains.auth.schema import (PROFILE_FIELDS, MeRead, MeUpdate,
                                  OAuthTwoFactorChallenge, TokenPair,
@@ -38,6 +38,8 @@ from shared.permissions import sorted_permissions
 from shared.redis import get_cache_client
 
 logger = structlog.get_logger(__name__)
+
+REFRESH_REUSE_GRACE = timedelta(seconds=30)
 
 _OAUTH_PROVIDERS: dict[OAuthProvider, dict[str, str]] = {
     OAuthProvider.GOOGLE: {
@@ -83,6 +85,12 @@ class EmailNotVerifiedError(InvalidCredentialsError):
         "Login succeeded on password but the account's email hasn't been "
         "verified yet.")
     code = "email_not_verified"
+
+
+class RefreshTokenSupersededError(InvalidCredentialsError):
+    default_message = (
+        "This refresh token was just replaced by a newer one.")
+    code = "refresh_token_superseded"
 
 
 class RecentLoginRequiredError(PermissionDeniedError):
@@ -316,7 +324,8 @@ class AuthService:
             self.pending_events.append((
                 EventName.USER_UPDATED,
                 user_event_payload(
-                    user_id=user.id, actor_id=user.id, role=user.system_role,
+                    user_id=user.id, actor_id=user.id,
+                    username=user.username, role=user.system_role,
                     is_active=user.is_active, changed=changed)))
 
     async def register(self, data: UserRegister) -> EmailDispatch:
@@ -432,14 +441,8 @@ class AuthService:
             known = await self.users.get_session_by_refresh_token(
                 refresh_token)
             if (known is not None and known.revoked_at is not None
-                    and known.revoked_reason
-                    in (None, SessionRevokeReason.ROTATED)):
-                revoked = await self.users.revoke_all_sessions(
-                    known.user_id, reason=SessionRevokeReason.REUSE)
-                await self._db.commit()
-                logger.warning(
-                    "refresh_token_reuse_detected", user_id=str(known.user_id),
-                    revoked=revoked)
+                    and known.revoked_reason == SessionRevokeReason.ROTATED):
+                await self._rotated_token_reused(known, known.revoked_at)
             raise InvalidCredentialsError(
                 "Refresh token is invalid or expired.")
 
@@ -450,7 +453,29 @@ class AuthService:
         return await self._issue_token_pair(
             user=user, ip_address=session_row.ip_address,
             device_info=session_row.device_info,
-            auth_time=security.refresh_token_auth_time(refresh_token))
+            auth_time=security.refresh_token_auth_time(refresh_token),
+            rotated_at=session_row.revoked_at)
+
+    async def _rotated_token_reused(
+            self, known: UserSession, rotated_at: datetime) -> None:
+        # Shortly after a rotation this is a benign race (two requests sent
+        # the same token), or a thief who refreshed first: answer with a
+        # distinct code so the client keeps its cookie and a later reuse
+        # still revokes the chain. After the grace it may be theft, or a
+        # browser that never stored the new cookie: revoke only the sessions
+        # descending from this token, never the user's other logins.
+        # rotated_at is known.revoked_at, passed separately as non-None.
+        if datetime.now(UTC) - rotated_at < REFRESH_REUSE_GRACE:
+            logger.warning(
+                "refresh_token_superseded", user_id=str(known.user_id),
+                session_id=str(known.id))
+            raise RefreshTokenSupersededError()
+        revoked = await self.users.revoke_rotation_successors(
+            known, reason=SessionRevokeReason.REUSE)
+        await self._db.commit()
+        logger.warning(
+            "refresh_token_reuse_detected", user_id=str(known.user_id),
+            revoked=revoked)
 
     async def logout(self, refresh_token: str) -> None:
         session_row = await self.users.get_session_by_refresh_token(
@@ -489,7 +514,8 @@ class AuthService:
 
     async def _issue_token_pair(
             self, *, user: User, ip_address: str | None,
-            device_info: str | None, auth_time: int | None) -> TokenPair:
+            device_info: str | None, auth_time: int | None,
+            rotated_at: datetime | None = None) -> TokenPair:
         claims: dict[str, Any] = {"role": user.system_role}
         if auth_time is not None:
             claims["auth_time"] = auth_time
@@ -501,7 +527,7 @@ class AuthService:
         await self.users.create_session(
             user_id=user.id, refresh_token=refresh_token,
             expires_at=expires_at, ip_address=ip_address,
-            device_info=device_info)
+            device_info=device_info, created_at=rotated_at)
         await self._mark_online(user)
         return TokenPair(
             access_token=access_token, refresh_token=refresh_token)

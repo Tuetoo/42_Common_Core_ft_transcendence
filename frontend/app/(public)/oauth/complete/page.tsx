@@ -7,7 +7,7 @@ import {
   completeOAuthLogin,
   completeOAuthTwoFactor,
   type OAuthTwoFactorState,
-} from "@/app/lib/actions/oauth";
+} from "@/app/lib/actions/auth";
 import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../../field-rules";
 
 type Outcome =

@@ -286,7 +286,7 @@ fixture `mock_email` in the same file replaces `shared.email.send_email`
 with a function that appends `{"to", "subject", "html_body"}` to a list.
 A test can then read the link out of the captured HTML. Another
 auth-service test
-(`tests/auth-service/test_accounts.py::TestRegistration::test_succeeds_when_smtp_is_down`)
+(`tests/auth-service/test_accounts.py::TestRegistration::test_password_rules_email_and_unknown_accounts`)
 replaces
 `send_email` with one that raises `EmailSendError("smtp down")`. It checks that
 registration still answers 201.

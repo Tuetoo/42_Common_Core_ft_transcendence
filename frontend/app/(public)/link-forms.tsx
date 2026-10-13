@@ -6,10 +6,11 @@ import {
   acceptInvitation,
   confirmPasswordReset,
   requestPasswordReset,
+  resendVerification,
   verifyEmail,
   type LinkActionState,
+  type ResendState,
 } from "@/app/lib/actions/email-links";
-import { resendVerification, type ResendState } from "@/app/lib/actions/verify-resend";
 import { EMAIL_MAX, PASSWORD_MAX_BYTES, PASSWORD_MIN, PASSWORD_TITLE, checkPasswordBytes } from "./field-rules";
 
 const initial: LinkActionState = {};
@@ -49,6 +50,9 @@ export function VerifyEmailForm({ token }: { token: string }) {
 
 export function ForgotPasswordForm() {
   const [state, formAction, pending] = useActionState(requestPasswordReset, initial);
+  // Controlled so the address survives a failed attempt (React resets
+  // uncontrolled fields after a form action).
+  const [email, setEmail] = useState("");
 
   if (state.success) {
     return (
@@ -61,7 +65,17 @@ export function ForgotPasswordForm() {
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="email">Email</label>
-        <input id="email" name="email" type="email" autoComplete="email" required maxLength={EMAIL_MAX} autoFocus />
+        <input
+          id="email"
+          name="email"
+          type="email"
+          autoComplete="email"
+          required
+          maxLength={EMAIL_MAX}
+          autoFocus
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
       </div>
       <ErrorLine error={state.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
@@ -73,6 +87,9 @@ export function ForgotPasswordForm() {
 
 export function ResetPasswordForm({ token }: { token: string }) {
   const [state, formAction, pending] = useActionState(confirmPasswordReset.bind(null, token), initial);
+  // Controlled so a backend refusal (e.g. a too common password) keeps both fields.
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
 
   if (state.success) {
     return (
@@ -97,7 +114,11 @@ export function ResetPasswordForm({ token }: { token: string }) {
           minLength={PASSWORD_MIN}
           maxLength={PASSWORD_MAX_BYTES}
           title={PASSWORD_TITLE}
-          onChange={(e) => checkPasswordBytes(e.target)}
+          value={password}
+          onChange={(e) => {
+            setPassword(e.target.value);
+            checkPasswordBytes(e.target);
+          }}
           autoFocus
         />
       </div>
@@ -112,6 +133,8 @@ export function ResetPasswordForm({ token }: { token: string }) {
           minLength={PASSWORD_MIN}
           maxLength={PASSWORD_MAX_BYTES}
           title={PASSWORD_TITLE}
+          value={confirm}
+          onChange={(e) => setConfirm(e.target.value)}
         />
       </div>
       <ErrorLine error={state.error} />

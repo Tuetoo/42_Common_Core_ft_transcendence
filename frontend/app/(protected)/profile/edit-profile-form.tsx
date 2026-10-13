@@ -19,6 +19,7 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
         <input
           id="username"
           name="username"
+          autoComplete="username"
           type="text"
           required
           minLength={3}
@@ -30,21 +31,22 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
       </div>
       <div className="field">
         <label htmlFor="first_name">First name</label>
-        <input id="first_name" name="first_name" type="text" maxLength={100} defaultValue={v.first_name} />
+        <input id="first_name" name="first_name" autoComplete="given-name" type="text" maxLength={100} defaultValue={v.first_name} />
       </div>
       <div className="field">
         <label htmlFor="last_name">Last name</label>
-        <input id="last_name" name="last_name" type="text" maxLength={100} defaultValue={v.last_name} />
+        <input id="last_name" name="last_name" autoComplete="family-name" type="text" maxLength={100} defaultValue={v.last_name} />
       </div>
       <div className="field">
         <label htmlFor="bio">Bio</label>
-        <textarea id="bio" name="bio" rows={3} maxLength={500} defaultValue={v.bio} />
+        <textarea id="bio" name="bio" autoComplete="off" rows={3} maxLength={500} defaultValue={v.bio} />
       </div>
       <div className="field">
         <label htmlFor="timezone">Timezone</label>
         <input
           id="timezone"
           name="timezone"
+          autoComplete="off"
           type="text"
           maxLength={64}
           pattern="[A-Za-z0-9_+\-\/]+"
@@ -55,7 +57,7 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
       </div>
       <div className="field">
         <label htmlFor="country">Country</label>
-        <input id="country" name="country" type="text" maxLength={100} defaultValue={v.country} />
+        <input id="country" name="country" autoComplete="country-name" type="text" maxLength={100} defaultValue={v.country} />
       </div>
       {state.error && (
         <p aria-live="polite" className="form-message error">

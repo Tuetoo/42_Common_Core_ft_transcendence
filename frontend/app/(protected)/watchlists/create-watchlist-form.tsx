@@ -13,7 +13,7 @@ export function CreateWatchlistForm() {
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="name">Name</label>
-        <input id="name" name="name" type="text" required maxLength={NAME_MAX_LENGTH} defaultValue={state.name} />
+        <input id="name" name="name" autoComplete="off" type="text" required maxLength={NAME_MAX_LENGTH} defaultValue={state.name} />
       </div>
       {state?.error && (
         <p aria-live="polite" className="form-message error">

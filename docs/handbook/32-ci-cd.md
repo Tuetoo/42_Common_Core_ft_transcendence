@@ -4,9 +4,10 @@
 > branch and opens a pull request; GitHub Actions lints, type-checks,
 > tests and builds the parts the change touches (continuous
 > integration). After the merge, the whole stack is built and started
-> once more on a fresh GitHub machine; only if that succeeds does a
-> second workflow log in to the cloud host over SSH and run
-> `scripts/deploy.sh`, which updates the code, rebuilds the images and
+> once more on a fresh GitHub machine; only if that succeeds, and every
+> other workflow run of the same commit succeeded, does a second workflow log in to
+> the cloud host over SSH and run `scripts/deploy.sh`, which updates the
+> code to exactly that commit, rebuilds the images and
 > waits until every service is healthy again (continuous deployment; a
 > stopped scheduler stays stopped).
 > The host is one AWS virtual machine running the same
@@ -43,10 +44,16 @@
                                      the frontend (/login, /healthz)
                                          | success (push to main)
                                          v
-                                   deploy workflow  ---- SSH (key that may only
-                                                         run the deploy script) ---->  EC2 host
+                                   deploy workflow
+                                     wait for every other check of the
+                                     commit (all succeeded or skipped)
+                                         |
+                                         v
+                                     SSH, command = the checked sha
+                                     (key that may only run the
+                                     deploy script)  ------------------------------------>  EC2 host
                                                                                         scripts/deploy.sh
-                                                                                          git merge --ff-only origin/main
+                                                                                          git merge --ff-only <checked sha>
                                                                                           docker compose up -d --build --wait
                                                                                           (17 containers; a stopped
                                                                                            scheduler stays stopped)
@@ -79,9 +86,9 @@ Three ideas explain almost everything:
 |---|---|---|
 | **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The five `*-ci.yml` workflows on pull requests and pushes to `main`. |
 | **Continuous delivery** | Every change that passed CI is ready to be released by one action. | `main` is always deployable; the deploy can also be started by hand. |
-| **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`. |
+| **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`, once every other workflow run of the same commit has succeeded or was skipped. Per-service checks run only for the services a commit touches (section 3.4). |
 | **Pipeline** | The ordered chain of automated steps from a change to a running release. | Section 1. |
-| **Gate** | A step that must succeed before the next may run. | Pull-request checks before the merge; stack smoke before the deploy. |
+| **Gate** | A step that must succeed before the next may run. | Pull-request checks before the merge; stack smoke and every other check of the commit before the deploy. |
 | **Artifact** | What a build produces and the next step uses. | The Docker images, built again on the host from the same commit. |
 | **Environment** | One place where the system runs, with its own configuration. | Local (development), CI (throwaway) and cloud (production). |
 | **Idempotent** | Running it twice gives the same result as once. | `deploy.sh` on an up-to-date host changes nothing and only re-checks health. |
@@ -232,7 +239,8 @@ This is the last gate. Unit tests prove each service alone; the smoke
 run proves that the containers start together from this exact commit:
 migrations apply on empty databases, health checks pass, the gateway
 routes. That is the same thing the deploy will do on the host, so its
-success is the condition for deploying.
+success is the condition for starting the deploy workflow, which then
+also waits for the other checks of the commit (section 3.4).
 
 ### 3.4 The deploy workflow (`.github/workflows/deploy.yml`)
 
@@ -272,15 +280,40 @@ Deploy only when a person asked for it, or when the smoke run succeeded
 and was started by a push to `main`. A failed smoke run leaves the job
 skipped (grey), and the host keeps the previous version.
 
-The single step writes the private key from `DEPLOY_SSH_KEY` to a file
-readable only by the runner's user, writes `DEPLOY_KNOWN_HOSTS` to
-`~/.ssh/known_hosts` and runs
+The commit is `SHA`: the smoke run's `head_sha`, or `github.sha` for a
+manual run. The job has two steps.
+
+1. **Wait for every check of the commit.** If `SHA` is no longer the
+   head of `main`, the job ends without deploying (a newer commit's run
+   deploys it). Otherwise it lists every workflow run of that commit
+   that was started by a push, except `deploy` itself (per-service CI,
+   frontend CI), every 20 seconds for up to 30 minutes. When all have
+   finished, it continues only if each one succeeded or was skipped; one
+   failure, or a check still running after 30 minutes, fails the job and
+   nothing is deployed. Each GitHub API call is tried up to 3 times, 15
+   seconds apart.
+
+   What the gate checks, exactly: every workflow run of the deployed
+   commit must succeed (or be skipped). It does not look at earlier
+   commits. The per-service workflows have path filters, so they run
+   only for the services a commit touches. Example: commit W changes
+   ai-service and its ai-service CI fails, so W is not deployed. The next
+   commit X changes only `docs/`; X has no ai-service CI run, its own runs
+   succeed, and X is deployed. The host fast-forwards to X, which
+   contains W's code. So a red check on `main` must be fixed (or the
+   commit reverted) before anything else is merged.
+2. **Deploy over SSH.** It writes the private key from `DEPLOY_SSH_KEY`
+   to a file readable only by the runner's user, writes
+   `DEPLOY_KNOWN_HOSTS` to `~/.ssh/known_hosts` and runs
 
 ```
-ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ServerAliveInterval=30 ubuntu@$DEPLOY_HOST
+ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ServerAliveInterval=30 "ubuntu@$DEPLOY_HOST" "$SHA"
 ```
 
-with no command at all: the host decides what runs (section 3.6).
+The only command sent is the commit sha. It is data, not a command: the
+host's forced command runs `scripts/deploy.sh` whatever the client asks,
+and the script reads the sha from `SSH_ORIGINAL_COMMAND` and validates it
+(sections 3.5 and 3.7).
 `BatchMode=yes` makes ssh fail at once instead of waiting for a
 password prompt nobody can answer; `ServerAliveInterval=30` keeps the
 connection alive during a long image build. The job's output is the
@@ -298,12 +331,14 @@ It runs on the host, from the deploy workflow or by hand
 | `cd "$(dirname "$0")/.."` | Run from the repository root wherever it is called from. |
 | `export COMPOSE_FILE=docker-compose.yaml` | Use only the production compose file, never the development override, even if the shell profile was not loaded (the forced SSH command starts a non-interactive shell). |
 | `[ -f .env.docker ]`, `[ -f infra/gateway/certs/server.crt ]` | Refuse to start without the host's configuration and certificate, with a clear message instead of a half-started stack. |
+| `target=origin/main`, then `SSH_ORIGINAL_COMMAND` | From the deploy workflow, sshd passes the sha the client sent in `SSH_ORIGINAL_COMMAND`. Only `^[0-9a-f]{40}$` is accepted, anything else exits 1; the sha becomes the target. By hand there is no SSH command, and the target stays `origin/main`. |
 | `git fetch --quiet origin main` | Download the latest `main` from GitHub with the read-only deploy key. |
-| `git merge --ff-only --quiet origin/main` | Move the checkout forward. `--ff-only` refuses if the host has local commits or edited tracked files, so a hand-made change on the host is never silently merged or overwritten (section 6). |
+| `git merge-base --is-ancestor <target> origin/main` | Refuse a commit that is not on `main` ("is not a commit on origin/main"). |
+| `git merge --ff-only --quiet <target>` | Move the checkout forward to exactly the checked commit, never to a newer `main` whose checks may still run. `--ff-only` refuses if the host has local commits or edited tracked files, so a hand-made change on the host is never silently merged or overwritten (section 6). |
 | `echo "deploying ..."` | Put the commit hash and title in the log. |
-| `ps -q --status running scheduler` | Remember whether the scheduler runs before the deploy. The host may keep it stopped on purpose (its cron jobs spend the shared API quotas), and a deploy must not change that. |
+| `ps -q --status running scheduler` | Remember whether the scheduler runs before the deploy. The cloud host keeps it stopped on purpose (its cron jobs spend the LLM and news quotas the cloud shares with the local stack), and a deploy must not change that. |
 | `docker compose --env-file .env.docker up -d --build --remove-orphans --wait --wait-timeout 300` | Rebuild images whose inputs changed, recreate only containers whose image or configuration changed, remove containers of services deleted from the compose file, then wait up to 5 minutes until every container is running and healthy. Any failure makes the script, and so the workflow, fail. When the scheduler was running, this runs for every service. |
-| `build scheduler`, then the same `up` with the service list from `config --services` without `scheduler` | When the scheduler was not running: its image is still rebuilt (a later `up -d scheduler` runs the new code), but only the other services are started, so no cron job can fire during the `--wait` window. |
+| `build scheduler`, then the same `up` with the service list from `config --services` without `scheduler` | When the scheduler was not running: its image is still rebuilt (a later `up -d scheduler` runs the new code), but only the other services are started, so no cron job can fire during the `--wait` window. The list is read with a `while read` loop, not `mapfile`, so the script also runs under the bash 3.2 that macOS ships (its test runs it there). |
 | `stop scheduler` and the message "scheduler was not running before the deploy: kept stopped" | A guard in case a future dependency starts it anyway; the message says how to start it. |
 | `docker image prune -f` | Delete image layers no container uses, so repeated builds do not fill the 40 GiB disk. |
 | `docker compose ... ps` | Show the final state in the log. |
@@ -339,13 +374,13 @@ check), 8443 (the gateway) and 443 (open, unused). Developer tools
 |---|---|---|---|---|
 | `alphamind-key.pem` (EC2 key pair) | the owner's Mac (`~/Downloads`) | the host's `authorized_keys` | the owner log in as `ubuntu` | - (full shell; keep it safe) |
 | `github_deploy` (read-only deploy key) | the host (`~/.ssh/github_deploy`) | GitHub repository -> Settings -> Deploy keys | the host `git fetch` the repository | push, read other repositories |
-| `gha_deploy` (deploy workflow key) | GitHub secret `DEPLOY_SSH_KEY` only (deleted from the host after setup) | the host's `authorized_keys`, behind `command="bash /home/ubuntu/alphamind/scripts/deploy.sh",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty` | GitHub run the deploy script | open a shell, run any other command, forward ports |
+| `gha_deploy` (deploy workflow key) | GitHub secret `DEPLOY_SSH_KEY` only (deleted from the host after setup) | the host's `authorized_keys`, behind `command="bash /home/ubuntu/alphamind/scripts/deploy.sh",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty` | GitHub run the deploy script; the sha it sends is only data that the script validates | open a shell, run any other command, forward ports |
 | host key (`/etc/ssh/ssh_host_ed25519_key`) | the host | GitHub secret `DEPLOY_KNOWN_HOSTS` | the runner verify it reached the real host | - |
 
 Other GitHub secrets: `DEPLOY_HOST` = `alphamind-research.duckdns.org`.
 
-If the deploy key leaks, the worst an attacker can do is deploy the
-current `main` again. To replace it: generate a new pair on the host,
+If the deploy key leaks, the worst an attacker can do is deploy a commit
+that is already on `main` again. To replace it: generate a new pair on the host,
 replace its `authorized_keys` line and the `DEPLOY_SSH_KEY` secret.
 
 ### 3.8 The certificate
@@ -377,11 +412,29 @@ replace its `authorized_keys` line and the `DEPLOY_SSH_KEY` secret.
 | Code change takes effect | `docker compose restart <service>` (or `scripts/rebuild.sh`) | merge to `main` |
 | `APP_ENV` | `development` (weak secrets allowed, with a warning) | `production` (a weak or missing secret stops the service) |
 | Address | `https://localhost:8443` (self-signed) | `https://alphamind-research.duckdns.org:8443` (Let's Encrypt) |
-| Data | your local volumes | the host's volumes; copied by backup and restore when wanted |
+| Data | your local volumes | the host's volumes; replaced by restoring a local backup when wanted |
+| Scheduler | running: the cron jobs and the nightly backup | stopped: no scheduled job, no automatic backup |
 
 The two never share data and can run at the same time. They do share the
 LLM and data-provider keys, so their quotas: do not run analysis batches
 on both at once.
+
+The cloud host keeps the scheduler stopped, so it makes no backups and
+runs no scheduled jobs; its stale-job alerts fire (chapter
+[26](26-scheduler-jobs.md) section 3.11). Backups are made on the local
+stack, nightly or by hand with `make backup` there. To show local data
+on the cloud, copy a local backup to the host's `backups/` and restore
+it there ([../DEPLOYMENT.md](../DEPLOYMENT.md) section 4).
+`make restore BACKUP=<name> CONFIRM=yes` ends with `docker compose up -d`,
+which also starts the scheduler, so stop it again right after the
+restore:
+
+```
+make restore BACKUP=<YYYY-MM-DD_HHMM> CONFIRM=yes
+docker compose --env-file .env.docker stop scheduler
+```
+
+Later deploys keep the scheduler in the state they find.
 
 ---
 
@@ -418,9 +471,15 @@ on both at once.
   a few minutes of host CPU, and the host's images are not
   byte-identical to the ones CI built (same commit and lock file, so the
   same code and versions).
-- **Deploy only after stack smoke succeeded on `main`.** The smoke run
-  does on a fresh machine exactly what the host will do. If it fails,
-  deploying would most likely break the cloud too.
+- **Deploy only after stack smoke succeeded on `main` and every other
+  workflow run of the same commit succeeded.** The smoke run does on a fresh
+  machine exactly what the host will do. If it fails, deploying would
+  most likely break the cloud too. The other checks (tests, lint, type
+  checks) run in parallel workflows, so the deploy waits for them, and
+  it deploys exactly the commit it checked. The gate does not look at
+  earlier commits, and per-service checks run only for the services a
+  commit touches, so a red check on `main` is fixed before the next
+  merge (section 3.4).
 - **Pull over SSH with a forced command, not push files.** The host
   pulls from GitHub with a read-only key, and GitHub may only trigger
   that pull. Neither side holds a key that can do more than its job.
@@ -451,6 +510,10 @@ on both at once.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | The deploy job is grey (skipped) after a merge | stack smoke failed, or was not a push to `main` | open the stack smoke run and fix its failure; or deploy by hand (Actions -> deploy -> Run workflow) if you are sure |
+| The deploy job is red at "Wait for every check of the commit" | another check of the commit failed, or did not finish in 30 minutes | fix the failing check; a re-run that turns green does not start a deploy by itself, so then use Actions -> deploy -> Run workflow |
+| The deploy job ends with "skip: ... is not the head of main" | a newer commit reached `main` first | nothing to do: the newer commit's run deploys it |
+| Code whose check failed on an earlier commit is live | a later commit that does not touch that service passed its own checks and was deployed; the gate checks only the deployed commit's runs | fix the failing check (or revert the commit) on `main`; the next deploy carries the fix |
+| `error: the SSH command must be a 40-hex commit sha` / `is not a commit on origin/main` | the client sent something other than a commit of `main` | check the workflow's `SHA`; by hand, run the script without a command |
 | `Host key verification failed` | `DEPLOY_KNOWN_HOSTS` does not match the host (new instance, or a typo) | on the host: `echo "alphamind-research.duckdns.org $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"`, update the secret |
 | `Permission denied (publickey)` | `DEPLOY_SSH_KEY` incomplete (missing the BEGIN/END lines) or its public key not in `authorized_keys` | recreate the key pair (section 3.7) |
 | `Connection timed out` on port 22 | security group allows SSH only from one address | set the SSH rule's source to `0.0.0.0/0` |
@@ -478,7 +541,9 @@ on both at once.
    build).
 4. **Merge and follow the pipeline.** In Actions, show "stack smoke CI"
    on `main` starting, then "deploy" starting after it; open the deploy
-   log and read the commit line and the container table.
+   log: the first step lists the other checks of the commit until all
+   have passed, the second shows the commit line and the container
+   table.
 5. **Show the result.** Open
    `https://alphamind-research.duckdns.org:8443/` (the frontend's login
    page), `/status` and a Swagger page (`/docs/core/`); show the valid
@@ -498,7 +563,8 @@ on both at once.
    deployment, and which one does AlphaMind use?
    *Delivery: every passing change is ready to release by one action.
    Deployment: it is released automatically. AlphaMind deploys
-   automatically after stack smoke, and keeps a manual button.*
+   automatically after stack smoke and every other workflow run of the
+   commit succeeded, and keeps a manual button.*
 2. Why does a pull request that changes only `docs/` show no service
    checks?
    *The service workflows have path filters; `docs/` is in none of
@@ -512,8 +578,9 @@ on both at once.
    *Someone changed tracked files or committed on the host. Failing
    keeps that change visible instead of silently losing it.*
 5. What can an attacker do with a leaked `DEPLOY_SSH_KEY`?
-   *Only run `scripts/deploy.sh`, which deploys the current `main`
-   again.*
+   *Only run `scripts/deploy.sh`, which deploys a commit that is
+   already on `main` (the commit the workflow checked, or `origin/main`
+   when no sha is sent).*
 6. Why are `.env.docker` and the certificate not in git?
    *They hold secrets and per-machine values; anything committed is
    copied to every clone forever.*
@@ -537,7 +604,7 @@ on both at once.
 | `.github/workflows/auth-service-ci.yml`, `core-service-ci.yml`, `ai-service-ci.yml` | Pull-request CI per service. |
 | `.github/workflows/frontend-ci.yml` | Lint, type check and build of `frontend/`. |
 | `.github/workflows/integration-ci.yml` | Config checks on PRs; config checks and the full stack smoke (with `/login` and `/healthz`) on `main`. |
-| `.github/workflows/deploy.yml` | Continuous deployment over SSH. |
+| `.github/workflows/deploy.yml` | Continuous deployment over SSH: the wait for every workflow run of the commit, then the sha sent to the host. |
 | `scripts/deploy.sh` | The deploy on the host. |
 | `docker-compose.yaml` | The stack, used everywhere. |
 | `docker-compose.override.yml` | Local development only. |

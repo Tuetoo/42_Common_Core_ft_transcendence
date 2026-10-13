@@ -2,8 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { wsUrl } from "@/app/lib/ws-url";
-import { CLOSE_UNAUTHORIZED, closeSocket } from "./close-socket";
+import { CLOSE_UNAUTHORIZED, closeSocket, wsUrl } from "@/app/lib/ws-url";
 
 // One WebSocket for as long as any signed-in page is open. It does two
 // jobs: the backend counts a user as online while they have an open socket

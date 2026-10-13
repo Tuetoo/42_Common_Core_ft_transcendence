@@ -3,6 +3,7 @@ from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.auth.model import User, UserProfile
 from domains.social.model import Connection
+from shared.enums import ConnectionStatus
 
 
 class ConnectionRepository:
@@ -51,7 +52,10 @@ class ConnectionRepository:
                        UserProfile, UserProfile.user_id == User.id).where(
                            or_(
                                Connection.requester_id == user_id,
-                               Connection.addressee_id == user_id)))
+                               Connection.addressee_id == user_id),
+                           ~((Connection.status == ConnectionStatus.BLOCKED)
+                             & Connection.blocked_by.is_not(None)
+                             & (Connection.blocked_by != user_id))))
         return [tuple(row) for row in result.all()]
 
     async def delete(self, connection: Connection) -> None:

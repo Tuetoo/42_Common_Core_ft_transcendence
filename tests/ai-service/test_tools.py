@@ -9,7 +9,6 @@ import runpy
 import shutil
 import sys
 from contextlib import redirect_stdout
-from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -30,13 +29,11 @@ import ai.tools.technical_tool as technical_tool_module
 import ai.tools.web_search_tool as web_search_tool_module
 import httpx
 import pytest
-from ai.benchmark.metrics import max_drawdown
 from ai.graph.state import AnalysisState, DebateState
 from ai.knowledge import filing_records as frec
-from ai.knowledge.extraction import _parse_response
+from ai.knowledge.archival import _parse_response
 from ai.knowledge.kg_context import format_kg_relations
-from ai.llm.base import LLMResponse, LLMUsage
-from ai.llm.json_fence import parse_json_list
+from ai.llm.base import parse_json_list
 from ai.providers import sec_edgar
 from ai.providers.base import (FundamentalsSnapshot, MacroDataPoint,
                                NewsArticle, PriceBar, PriceQuote,
@@ -57,7 +54,7 @@ from ai.tools.base import clamp_int, peer_ticker_label, peer_ticker_of
 from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.fundamentals_tool import GetFundamentalsTool
 from ai.tools.indicators import (annualized_volatility, atr, bollinger_bands,
-                                 ema_series, macd, rsi, sma)
+                                 ema_series, macd, max_drawdown, rsi, sma)
 from ai.tools.macro_tool import GetMacroIndicatorsTool
 from ai.tools.market_tool import (GetRecentPriceHistoryTool,
                                   describe_high_volume_sessions)
@@ -70,7 +67,7 @@ from ai.tools.risk_tool import GetVolatilityAndDrawdownTool
 from ai.tools.technical_tool import GetTechnicalIndicatorsTool
 from ai.tools.web_search_tool import WebSearchTool
 from helpers import (_BUY, _P, _cash, _FlakyMarket, _msft_amd_holdings,
-                     _StubGraph)
+                     _Router, _Row, _StubGraph)
 from domains.analysis.repository import AnalysisRepository
 from domains.knowledge.model import AgentReport, KgEntity, KgRelation
 from domains.knowledge.repository import KnowledgeGraphRepository
@@ -89,30 +86,6 @@ _RUSSIAN = (
 _CHINESE = (
     "\u82f9\u679c\u516c\u53f8\u53d1\u5e03\u4e86"
     "\u65b0\u4ea7\u54c1\u548c\u65b0\u670d\u52a1")
-
-
-@dataclass
-class _Row:
-    filename: str
-    form: str
-    filing_date: date
-    report_date: date | None
-    records: dict[str, Any] = field(default_factory=dict)
-
-
-class _Router:
-
-    def __init__(self, script: list[str]) -> None:
-        self._script = list(script)
-        self.calls: list[Any] = []
-
-    async def complete(self, tier, messages, **kwargs) -> LLMResponse:
-        self.calls.append(messages)
-        content = (
-            self._script.pop(0) if len(self._script) > 1 else self._script[0])
-        return LLMResponse(
-            content=content, provider="fake", model="fake-model",
-            usage=LLMUsage(prompt_tokens=1, completion_tokens=1))
 
 
 class _FakeFundamentalProvider:
@@ -589,7 +562,7 @@ def _core(stored: dict[str, list[str]], seen: list[httpx.Request]):
 class TestSearchFilingsTool:
 
     @pytest.mark.asyncio
-    async def test_search_tools_query_only_the_bound_ticker(self):
+    async def test_search_tools_are_bound_to_the_ticker_and_fail_open(self):
         retriever = _FakeRetriever([])
         tool = SearchFilingsTool(ticker="MSFT", retriever=retriever)
         await tool.run(query="margins", ticker="AAPL")
@@ -602,41 +575,11 @@ class TestSearchFilingsTool:
         assert retriever.calls == [("litigation exposure", "MSFT"),
                                    ("litigation exposure", "MSFT")]
 
-    @pytest.mark.asyncio
-    async def test_old_filing_gets_stale_flag(self):
-        chunks = [
-            RetrievedChunk(
-                chunk_id="c1", text="Guidance for next fiscal year outlook.",
-                score=0.9, category=DocumentCategory.FILING, ticker="AAPL",
-                source="10-K FY2022", content_date="2022-11-01")
-        ]
-        tool = SearchFilingsTool(
-            ticker="AAPL", retriever=_FakeRetriever(chunks))
-        result = await tool.run(query="guidance", ticker="AAPL")
-        assert "STALE FILING" in result
-
-    @pytest.mark.asyncio
-    async def test_non_english_passage_dropped_and_source_shown(self):
-        tool = SearchFilingsTool(
-            ticker="AMD", retriever=_FakeRetriever([
-                _chunk("1", "d1", f"{_RUSSIAN} {_RUSSIAN}"),
-                _chunk(
-                    "2", "d2", "Revenue rose 18% in the quarter", "2026-08-05",
-                    source="AMD_10-Q_2026-08-05")
-            ]))
-        obs = await tool.run("revenue", ticker="AMD")
-        assert "(1 passages)" in obs
-        assert "[AMD_10-Q_2026-08-05] (filed 2026-08-05)" in obs
-        assert "\u041d" not in obs
-
-    def test_search_tools_have_no_ticker_argument(self):
         assert set(SearchFilingsTool.parameters["properties"]) == {"query"}
         assert '"ticker"' not in SearchFilingsTool.description
         assert set(
             SearchResearchArchiveTool.parameters["properties"]) == {"query"}
 
-    @pytest.mark.asyncio
-    async def test_retriever_failure_becomes_observation_not_crash(self):
         cases = {
             "filings": (
                 lambda: SearchFilingsTool(
@@ -651,11 +594,37 @@ class TestSearchFilingsTool:
             result = await make_tool().run(query="anything", **kwargs)
             assert expected in result, case_id
 
+    @pytest.mark.asyncio
+    async def test_stale_flag_non_english_drop_and_source(self):
+        chunks = [
+            RetrievedChunk(
+                chunk_id="c1", text="Guidance for next fiscal year outlook.",
+                score=0.9, category=DocumentCategory.FILING, ticker="AAPL",
+                source="10-K FY2022", content_date="2022-11-01")
+        ]
+        tool = SearchFilingsTool(
+            ticker="AAPL", retriever=_FakeRetriever(chunks))
+        result = await tool.run(query="guidance", ticker="AAPL")
+        assert "STALE FILING" in result
+
+        tool = SearchFilingsTool(
+            ticker="AMD", retriever=_FakeRetriever([
+                _chunk("1", "d1", f"{_RUSSIAN} {_RUSSIAN}"),
+                _chunk(
+                    "2", "d2", "Revenue rose 18% in the quarter", "2026-08-05",
+                    source="AMD_10-Q_2026-08-05")
+            ]))
+        obs = await tool.run("revenue", ticker="AMD")
+        assert "(1 passages)" in obs
+        assert "[AMD_10-Q_2026-08-05] (filed 2026-08-05)" in obs
+        assert "\u041d" not in obs
+
 
 class TestSearchResearchArchiveTool:
 
     @pytest.mark.asyncio
-    async def test_archive_drops_non_english_passages(self):
+    async def test_archive_drops_non_english_and_transcripts_name_their_call(
+            self):
         retriever = _FakeRetriever([
             RetrievedChunk(
                 chunk_id="1", text="Margins held steady.", score=0.9,
@@ -671,8 +640,6 @@ class TestSearchResearchArchiveTool:
         assert "(1 passages)" in text and "Margins held steady." in text
         assert _RUSSIAN not in text
 
-    @pytest.mark.asyncio
-    async def test_transcript_passages_name_their_call(self):
         dated = RetrievedChunk(
             chunk_id="c1",
             text="We expect capital expenditures of $70 billion.", score=0.9,
@@ -704,7 +671,8 @@ class TestSearchResearchArchiveTool:
 class TestWebSearchTool:
 
     @pytest.mark.asyncio
-    async def test_empty_or_failed_search_is_a_readable_observation(self):
+    async def test_empty_failed_stale_and_non_english_results(
+            self, monkeypatch):
         cases = {
             "no-results": (
                 _FakeWebSearchProvider([]), "No web search results"),
@@ -718,8 +686,6 @@ class TestWebSearchTool:
             observation = await tool.run("anything")
             assert expected in observation, case_id
 
-    @pytest.mark.asyncio
-    async def test_stale_source_is_flagged_and_fake_url_dates_ignored(self):
         provider = _FakeWebSearchProvider([
             WebSearchResult(
                 title="TEXT-FOMC statement from Aug 9 meeting",
@@ -735,8 +701,6 @@ class TestWebSearchTool:
             web_search_tool_module._extract_date_from_url(
                 "https://example.com/2026/13/40/not-a-real-date.html") is None)
 
-    @pytest.mark.asyncio
-    async def test_web_search_drops_non_english(self, monkeypatch):
         seen: list[int] = []
 
         async def _relevance(query, results, *, llm_router=None):
@@ -941,7 +905,8 @@ class TestGetFundamentalsTool:
 class TestPortfolioTools:
 
     @pytest.mark.asyncio
-    async def test_no_portfolio_id_returns_clear_message(self):
+    async def test_missing_portfolio_or_core_failure_is_reported_never_hidden(
+            self, monkeypatch):
         cases = {
             "composition": (GetPortfolioCompositionTool, {}),
             "scenario": (
@@ -953,10 +918,6 @@ class TestPortfolioTools:
         for case_id, (tool_class, kwargs) in cases.items():
             result = await tool_class(portfolio_id=None).run(**kwargs)
             assert "No portfolio is attached" in result, case_id
-
-    @pytest.mark.asyncio
-    async def test_core_service_failures_are_reported_never_hidden(
-            self, monkeypatch):
 
         async def _broken_holdings(portfolio_id: str):
             raise UpstreamServiceError("core-service unreachable")
@@ -1074,7 +1035,7 @@ class TestPortfolioTools:
 
 class TestIndicators:
 
-    def test_insufficient_data_returns_none(self):
+    def test_short_series_flat_rsi_and_high_volume_sessions(self):
         cases = {
             "sma": lambda: sma([1, 2], 5),
             "rsi": lambda: rsi([1.0, 2.0], period=14),
@@ -1088,11 +1049,9 @@ class TestIndicators:
         for case_id, compute in cases.items():
             assert compute() is None, case_id
 
-    def test_short_ema_is_empty_and_flat_rsi_is_neutral(self):
         assert ema_series([1, 2], 5) == []
         assert rsi([100.0] * 20, period=14) == pytest.approx(50.0)
 
-    def test_high_volume_sessions_carry_their_direction(self):
         bars = [
             _bar(0, 500.0, 20e6),
             _bar(1, 497.75, 21e6),
@@ -1112,7 +1071,7 @@ class TestIndicators:
         assert describe_high_volume_sessions(no_volume, 2) == []
 
     @pytest.mark.asyncio
-    async def test_technical_tool_prints_latest_close_and_positions(
+    async def test_technical_and_volatility_tool_observations(
             self, monkeypatch):
         closes = [100.0 + i
                   for i in range(40)] + [139.0 - 2 * i for i in range(1, 21)]
@@ -1142,8 +1101,6 @@ class TestIndicators:
             f"Price vs SMA(50): below ({(99.0 - sma50) / sma50 * 100:+.1f}%)"
         ) in text
 
-    @pytest.mark.asyncio
-    async def test_volatility_tool_reports_too_few_bars(self, monkeypatch):
         bars = [
             PriceBar(
                 ticker="AAPL", interval="1d",
@@ -1165,7 +1122,7 @@ class TestIndicators:
 
 class TestPeerTickerResults:
 
-    def test_share_class_forms_are_one_ticker(self):
+    async def test_share_class_forms_and_peer_labels(self, monkeypatch):
         cases = {
             "BRK.B-BRK-B-None": ("BRK.B", "BRK-B", None),
             "brk/b-BRK.B-None": (" brk/b", "BRK.B", None),
@@ -1177,8 +1134,6 @@ class TestPeerTickerResults:
             got = peer_ticker_of({"ticker": requested}, analysed)
             assert got == peer, case_id
 
-    @pytest.mark.asyncio
-    async def test_other_ticker_result_is_labelled(self, monkeypatch):
         bars = [
             PriceBar(
                 ticker="AMD", interval="1d",
@@ -1244,7 +1199,7 @@ class TestMarketDataCache:
 class TestMacroData:
 
     @pytest.mark.asyncio
-    async def test_fred_retries_5xx_and_transport_errors(self, monkeypatch):
+    async def test_fred_retries_and_bad_bodies(self, monkeypatch):
         attempts: list[Any] = []
 
         def _handler(request: httpx.Request) -> httpx.Response:
@@ -1289,9 +1244,6 @@ class TestMacroData:
             await FredProvider().get_indicator("fed_funds_rate")
         assert calls["n"] == provider_base_module.DEFAULT_MAX_ATTEMPTS
 
-    @pytest.mark.asyncio
-    async def test_fred_bad_body_raises_provider_request_error(
-            self, monkeypatch):
         cases = {
             "non-json-body": httpx.Response(
                 200, text="<html>maintenance</html>"),
@@ -1419,7 +1371,7 @@ class TestRetrievalAndArchive:
     @pytest.mark.asyncio
     async def test_non_english_report_and_triples_are_never_stored(
             self, monkeypatch):
-        from ai.knowledge.extraction import KgTriple
+        from ai.knowledge.archival import KgTriple
 
         async def _fail(**kwargs):
             raise AssertionError("must not reach the duplicate check")
@@ -1513,7 +1465,7 @@ class TestRetrievalAndArchive:
 
 class TestKnowledgeGraph:
 
-    def test_agent_derived_relations_are_not_corroboration(self):
+    def test_relation_wording_and_extraction_kind(self):
         t = datetime(2026, 8, 1, tzinfo=UTC)
 
         def row(other: str, count: int, categories: str):
@@ -1532,7 +1484,6 @@ class TestKnowledgeGraph:
             "MSFT")
         assert "stated by 2 different agent roles, 3 extractions" in text
 
-    def test_extraction_reads_kind_and_as_of(self):
         triples = _parse_response(
             json.dumps([{
                 "source": "XOM",
@@ -1622,7 +1573,7 @@ class TestKnowledgeGraph:
 
 class TestFilingRecords:
 
-    def test_amount_without_a_scale_word(self):
+    def test_scale_word_rule_prompt_and_record_title(self):
         cases = {
             "bare-amount": ("$280", True),
             "bare-amount-with-comma": ("$1,423", True),
@@ -1638,7 +1589,6 @@ class TestFilingRecords:
         for case_id, (text, flagged) in cases.items():
             assert frec.amount_without_unit(text) is flagged, case_id
 
-    def test_records_prompt_wording(self):
         prompt = frec.RECORDS_ONLY_PROMPT
         assert 'never a bare "$1,423"' in prompt
         assert "is discarded" in prompt and "scale word" in prompt
@@ -1656,7 +1606,19 @@ class TestFilingRecords:
             prompt)
         assert "one-off" not in prompt.replace('"one_off_items"', "")
 
-    def test_exposure_is_amount_checked_and_next_event_is_ignored(
+        assert frec.record_title({
+            "category": "transactions",
+            "name": " A  deal "
+        }) == ("transaction: A deal")
+        assert (
+            frec.record_title({
+                "category": "one_off_items",
+                "description": "Impairment"
+            }) == "unusual item: Impairment")
+        assert frec.record_title({"category": "guidance", "metric": ""}) == ""
+        assert frec.record_title({}) == ""
+
+    def test_exposure_is_checked_rendered_and_next_events_dropped(
             self, capsys):
         kept = frec.validate_records({
             "legal_matters": [
@@ -1683,7 +1645,6 @@ class TestFilingRecords:
             assert reason in out
         assert "bad_next_event_date_cleared" not in out
 
-    def test_exposure_is_rendered_and_stored_next_events_are_not(self):
         row = _Row(
             "QCOM_10-Q_2026-07-29.txt", "10-Q", date(2026, 7, 29),
             date(2026, 6, 28), {
@@ -1717,20 +1678,7 @@ class TestFilingRecords:
             "  F1.T1 transaction: Alphawave (acquisition) -- status: "
             "pending.")
 
-    def test_record_title(self):
-        assert frec.record_title({
-            "category": "transactions",
-            "name": " A  deal "
-        }) == ("transaction: A deal")
-        assert (
-            frec.record_title({
-                "category": "one_off_items",
-                "description": "Impairment"
-            }) == "unusual item: Impairment")
-        assert frec.record_title({"category": "guidance", "metric": ""}) == ""
-        assert frec.record_title({}) == ""
-
-    def test_year_to_date_line_for_a_second_quarter(self):
+    def test_year_to_date_line_only_when_confirmed(self):
         q = sec_edgar._quarter_results_from_facts(_KO_FACTS, "KO")
         assert q is not None and q.year_to_date is not None
         payload = sec_edgar.quarter_results_payload(q)
@@ -1745,8 +1693,6 @@ class TestFilingRecords:
             "operating income $9.06B vs $7.60B (+19%); net income: not "
             "reported by the filer")
 
-    def test_no_year_to_date_for_a_first_quarter_10k_or_unconfirmed_start(
-            self):
         first = _facts(
             Revenues=[
                 _fact(
@@ -1783,7 +1729,8 @@ class TestFilingRecords:
 
 class TestPositionSizing:
 
-    def test_judge_line_names_the_position_limit(self):
+    async def test_judge_line_weight_lookup_and_position_limit(
+            self, msft_amd_sizing_env, monkeypatch):
         assert position_limit_line(_sizing_state()) == ""
         below = position_limit_line(_sizing_state(position_weight_pct=48.8))
         assert "48.8% of net value" in below and "limit: 50%" in below
@@ -1792,15 +1739,10 @@ class TestPositionSizing:
         assert "do not recommend BUY" in above
         assert "SELL remain allowed" in above
 
-    @pytest.mark.asyncio
-    async def test_weight_lookup(self, msft_amd_sizing_env):
         weight = await current_position_weight_pct("p", "MSFT")
         assert weight == pytest.approx(10000 / 20699 * 100)
         assert await current_position_weight_pct("p", "NVDA") == 0.0
 
-    @pytest.mark.asyncio
-    async def test_position_limit_rejects_or_skips_the_tiers(
-            self, msft_amd_sizing_env, monkeypatch):
         router = _Router([_tiers([(512.0, 2.5), (498.0, 3.5)])])
         result, note = await generate_position_sizing(
             ticker="MSFT", action=RecommendationAction.BUY, confidence=0.78,
@@ -1916,8 +1858,7 @@ class TestPositionSizing:
 
 class TestServiceScripts:
 
-    def test_script_starts_in_the_flattened_container_layout(
-            self, tmp_path: Path) -> None:
+    def test_script_layout_and_parent_walks(self, tmp_path):
         for name in ("probe_model_latency.py", "measure_rag_recall.py",
                      "verify_portfolio_backtest.py",
                      "generate_rag_golden_set.py"):
@@ -1931,7 +1872,6 @@ class TestServiceScripts:
                     runpy.run_path(str(flat / name), run_name="__main__")
             assert exit_info.value.code == 0, name
 
-    def test_script_walks_up_at_most_to_the_service_dir(self) -> None:
         names = sorted(
             p.name for p in _SCRIPTS.glob("*.py") if p.name != "__init__.py")
         for name in names:

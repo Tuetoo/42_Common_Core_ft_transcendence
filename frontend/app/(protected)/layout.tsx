@@ -1,7 +1,6 @@
 import { redirect } from "next/navigation";
-import { getAccessToken } from "@/app/lib/session";
+import { getAccessToken, getMe } from "@/app/lib/session";
 import { backendFetch } from "@/app/lib/backend";
-import { getMe } from "@/app/lib/me";
 import { logout } from "@/app/lib/actions/auth";
 import { SiteFooter } from "@/app/site-footer";
 import { Avatar } from "./avatar";

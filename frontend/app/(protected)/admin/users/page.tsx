@@ -3,7 +3,7 @@ import Form from "next/form";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { changeUserRole, deleteUser, setUserActive } from "@/app/lib/actions/admin";
 import { Pager, pageParam } from "../../pager";
 import { ActionButton, SelectActionForm } from "../inline-actions";
@@ -95,11 +95,11 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
           <Form action="/admin/users" className="filter-row">
             <div className="field">
               <label htmlFor="q">Username or email</label>
-              <input id="q" name="q" type="search" maxLength={254} defaultValue={q} placeholder="Search" />
+              <input id="q" name="q" autoComplete="off" type="search" maxLength={254} defaultValue={q} placeholder="Search" />
             </div>
             <div className="field">
               <label htmlFor="role">Role</label>
-              <select id="role" name="role" defaultValue={role}>
+              <select id="role" name="role" autoComplete="off" defaultValue={role}>
                 <option value="">All</option>
                 {ROLES.map((r) => (
                   <option key={r} value={r}>
@@ -110,14 +110,14 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
             </div>
             <div className="field">
               <label htmlFor="status">Status</label>
-              <select id="status" name="status" defaultValue={status}>
+              <select id="status" name="status" autoComplete="off" defaultValue={status}>
                 <option value="">All</option>
                 <option value="active">Active</option>
                 <option value="inactive">Inactive</option>
               </select>
             </div>
             <label className="flex items-center gap-2 text-[13px] text-[var(--text-secondary)] pb-2">
-              <input type="checkbox" name="deleted" value="1" defaultChecked={deleted === "1"} />
+              <input type="checkbox" name="deleted" autoComplete="off" value="1" defaultChecked={deleted === "1"} />
               Include deleted
             </label>
             <button type="submit" className="btn btn-primary">

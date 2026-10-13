@@ -13,7 +13,6 @@ from fastapi import BackgroundTasks
 from outbox import OutboxEntry, enqueue, publish_now
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
-from domains.research import yjs_guard
 from domains.research.model import Document, ResearchComment, ResearchNote
 from domains.research.repository import (FINAL_DOCUMENT_STATUSES,
                                          DocumentRepository,
@@ -26,11 +25,11 @@ from domains.research.schema import (DocumentRead, ResearchCommentCreate,
                                      ResearchNoteFilters, ResearchNoteRead,
                                      ResearchNoteUpdate, SentimentCounts,
                                      SentimentDay, SentimentSummary)
-from shared.concurrency import gather_bounded
 from shared.enums import DocumentCategory
 from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
+from shared.http_client import gather_bounded
 from shared.permissions import Permission, has_permission
 from shared.schemas import (PaginationParams, SYSTEM_DOCUMENT_OWNER_ID,
                             UserRef, normalize_ticker)
@@ -112,12 +111,12 @@ def _upload_ticker(ticker: str | None) -> str | None:
 def _body_state(note_id: UUID, state: bytes | None, text: str) -> bytes:
     if state:
         try:
-            return yjs_guard.replace_text(bytes(state), text)
-        except yjs_guard.YjsDecodeError as exc:
+            return yjs_relay.replace_text(bytes(state), text)
+        except yjs_relay.YjsDecodeError as exc:
             logger.warning(
                 "note_yjs_state_reseeded", note_id=str(note_id),
                 error=str(exc))
-    return yjs_guard.seed_state(text)
+    return yjs_relay.seed_state(text)
 
 
 def _looks_stuck(document: Document) -> bool:

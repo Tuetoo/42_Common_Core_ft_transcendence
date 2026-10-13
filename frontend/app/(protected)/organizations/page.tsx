@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { CreateOrganizationForm } from "./create-organization-form";
 
 type Organization = {

@@ -18,9 +18,10 @@ from ai.agents.risk import _CapturingRiskEventsValidator
 from ai.graph.state import (AgentOutput, AnalysisState, DebateArgument,
                             JudgeVerdict)
 from ai.knowledge import filing_records as frec
-from ai.llm.base import (LLMMessage, LLMProviderAdapter,
-                         LLMRequestTimeoutError, LLMResponse,
-                         LLMServerOverloadedError, LLMUsage, request_pacer)
+from ai.llm.base import (LLMConfigError, LLMMessage, LLMProviderAdapter,
+                         LLMProviderTimeoutError, LLMRequestTimeoutError,
+                         LLMResponse, LLMServerOverloadedError, LLMUsage,
+                         request_pacer)
 from ai.providers.base import PriceQuote, ProviderRequestError
 from google.genai import errors as genai_errors
 from domains.analysis.repository import (AnalysisPersistenceRepository,
@@ -63,9 +64,10 @@ async def _make_decision_with_outcome(
 
 
 def _finish(
-        answer: str, reported_metrics: dict[str, Any] | None = None) -> str:
+        answer: str, reported_metrics: Any = None,
+        thought: str = "done") -> str:
     return json.dumps({
-        "thought": "done",
+        "thought": thought,
         "action": None,
         "action_input": None,
         "finish_answer": answer,
@@ -73,13 +75,50 @@ def _finish(
     })
 
 
-def _action(action: str, action_input: dict[str, Any]) -> str:
+def _action(
+        action: str, action_input: dict[str, Any] | None,
+        thought: str = "checking") -> str:
     return json.dumps({
-        "thought": "checking",
+        "thought": thought,
         "action": action,
         "action_input": action_input,
         "finish_answer": None
     })
+
+
+class _Router:
+
+    def __init__(
+            self, script: list[str], finish_reason: str | None = None) -> None:
+        self._script = list(script)
+        self._finish_reason = finish_reason
+        self.calls: list[Any] = []
+
+    async def complete(self, tier, messages, **kwargs) -> LLMResponse:
+        self.calls.append(messages)
+        content = (
+            self._script.pop(0) if len(self._script) > 1 else self._script[0])
+        return LLMResponse(
+            content=content, provider="fake", model="fake-model",
+            usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
+            finish_reason=self._finish_reason)
+
+
+class _AlwaysFailsRouter:
+
+    async def complete(self, tier, messages, **kwargs):
+        raise LLMConfigError("no key configured")
+
+
+class _RaisingRouter:
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = 0
+
+    async def complete(self, tier, messages, **kwargs):
+        self.calls += 1
+        raise self.exc
 
 
 class _ScriptedAgentRouter:
@@ -303,6 +342,9 @@ class _PerModelAdapter(LLMProviderAdapter):
                     ("google", "timeout", model),
                     time.monotonic() + cooldown)
             raise LLMRequestTimeoutError(f"{model} timed out")
+        if outcome == "provider_timeout":
+            raise LLMProviderTimeoutError(
+                f"{model} timed out after {timeout_seconds:g}s")
         return LLMResponse(
             content=f"answer from {model}", provider="google", model=model,
             usage=LLMUsage(prompt_tokens=1,

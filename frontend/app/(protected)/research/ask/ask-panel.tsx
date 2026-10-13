@@ -149,6 +149,7 @@ export function AskPanel() {
           <label htmlFor="question">{mode === "ask" ? "Question" : "What should the paragraph cover?"}</label>
           <textarea
             id="question"
+            autoComplete="off"
             rows={3}
             maxLength={QUESTION_MAX}
             required
@@ -164,7 +165,7 @@ export function AskPanel() {
         <div className="filter-row">
           <div className="field">
             <label htmlFor="mode">Mode</label>
-            <select id="mode" value={mode} onChange={(e) => setMode(e.target.value as "ask" | "draft")}>
+            <select id="mode" autoComplete="off" value={mode} onChange={(e) => setMode(e.target.value as "ask" | "draft")}>
               <option value="ask">Ask — answer a question</option>
               <option value="draft">Draft — write a note paragraph</option>
             </select>
@@ -173,6 +174,7 @@ export function AskPanel() {
             <label htmlFor="ask-ticker">Ticker (optional)</label>
             <input
               id="ask-ticker"
+              autoComplete="off"
               type="text"
               maxLength={10}
               pattern={TICKER_HTML_PATTERN}
@@ -189,7 +191,7 @@ export function AskPanel() {
           </legend>
           {CATEGORIES.map((c) => (
             <label key={c} className="flex items-center gap-2" style={{ fontSize: 13 }}>
-              <input type="checkbox" checked={categories.includes(c)} onChange={() => toggleCategory(c)} />
+              <input autoComplete="off" type="checkbox" checked={categories.includes(c)} onChange={() => toggleCategory(c)} />
               {c.replaceAll("_", " ")}
             </label>
           ))}

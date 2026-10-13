@@ -9,16 +9,14 @@ from ai_events import (TierEventInfo, plain_decimal, publish_event,
                        tier_event_payload)
 from database import SessionLocal
 from domains.analysis.model import RecommendationTier
-from domains.analysis.repository import RecommendationTierRepository
+from domains.analysis.repository import (UNFILLED_TIER_STATUSES,
+                                         RecommendationTierRepository,
+                                         acceptance_lapsed)
 from shared.enums import TierSide, TierStatus
 from shared.events import EventName
 from shared.market_calendar import MARKET_TZ, market_today
 
 logger = structlog.get_logger(__name__)
-
-_OPEN_TIER_STATUSES = (
-    TierStatus.PENDING_ACCEPTANCE.value,
-    TierStatus.ACCEPTED_AWAITING_TRIGGER.value)
 
 
 def _session_open_utc(day: date) -> datetime:
@@ -40,6 +38,11 @@ async def _check_one_tier(tier: RecommendationTier, *, today: date) -> str:
         return "expired"
 
     if tier.status != TierStatus.ACCEPTED_AWAITING_TRIGGER.value:
+        if acceptance_lapsed(status=tier.status,
+                             user_id=recommendation.analysis.user_id,
+                             issued_at=recommendation.created_at):
+            tier.status = TierStatus.EXPIRED.value
+            return "expired"
         return "pending"
 
     ticker = recommendation.analysis.ticker
@@ -181,7 +184,7 @@ async def run_tier_monitoring_workflow() -> dict[str, Any]:
                 tier = loaded
                 await session.refresh(
                     tier, attribute_names=["status"], with_for_update=True)
-                if tier.status not in _OPEN_TIER_STATUSES:
+                if tier.status not in UNFILLED_TIER_STATUSES:
                     counts["closed_meanwhile"] += 1
                     await session.commit()
                     continue

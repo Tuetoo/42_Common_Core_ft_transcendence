@@ -1,10 +1,9 @@
 import math
 from typing import Any, ClassVar
-from ai.benchmark.metrics import max_drawdown
 from ai.providers.base import MarketDataProvider, ProviderError
 from ai.providers.registry import get_market_data_provider
 from ai.tools.base import Tool, clamp_int
-from ai.tools.indicators import annualized_volatility
+from ai.tools.indicators import annualized_volatility, max_drawdown
 from ai.tools.market_data_cache import (get_bars_cache_first,
                                         missing_session_note)
 

@@ -14,21 +14,27 @@ tests/
                     test_llm.py, test_market_data.py, test_news.py,
                     test_rag.py, test_scripts.py, test_tools.py,
                     test_workflows.py
-  integration/      test_rag_recall.py + conftest.py: RAG recall against the
-                    running stack and its real corpus
+  integration/      test_rag_recall.py: RAG recall against the running
+                    stack and its real corpus (sets sys.path and rehydrates
+                    BM25 itself)
   fixtures/         rag_golden_set.json
   alembic_contract.py   migration-versus-model checks (see below)
   auth_tokens.py        access_token(), auth_headers(), bearer_headers()
 ```
 
-The unit suites hold 41 (auth), 84 (core) and 483 (ai) collected tests
-from 596 test functions in 21 files: 3 (auth), 4 (core) and 14 (ai)
-(parametrized tests expand into several cases). Coverage of the service
-code is about 74% (auth), 66% (core) and 90% (ai). Tests are grouped by topic into `Test*` classes. Each
+The unit suites hold 42 (auth), 84 (core) and 375 (ai) collected tests,
+501 in total, from 489 test functions in 21 files: 3 (auth), 4 (core) and
+14 (ai), plus the 4 alembic_contract.py checks, which every suite
+collects. With the one integration test, the repository has 494 test
+functions. Coverage of the service code is about 75% (auth), 66% (core)
+and 90% (ai); coverage of `shared/` is 78%, 80% and 77% in the three
+runs. Tests
+are grouped by topic into `Test*` classes; one test covers one feature or
+flow, with several steps where they share setup. Each
 test file passes on its own, and so does each service's whole suite.
 
 `alembic_contract.py` holds the checks that a schema built by the real
-Alembic migrations equals the models, that downgrade and upgrade work, that
+Alembic migrations equals the models (compared by its `differences()`), that downgrade and upgrade work, that
 no model default is a quoted function call, and that a schema with tables
 but no Alembic revision is refused. It is star-imported
 by `auth-service/test_platform.py`, `core-service/test_platform.py` and
@@ -36,7 +42,11 @@ by `auth-service/test_platform.py`, `core-service/test_platform.py` and
 
 `auth_tokens.py` and `alembic_contract.py` are imported as
 `tests.<module>`: every suite's `conftest.py` puts the repo root on
-`sys.path`.
+`sys.path`. Both files start with `# pyright: reportMissingImports=false`:
+their `config` and `database` imports resolve to the service of whichever
+suite imports them, which the editor cannot know. The `[tool.pyright]`
+section of `pyproject.toml` gives the editor the same import paths as the
+conftests (import resolution only; mypy is the type checker).
 
 ## Running
 

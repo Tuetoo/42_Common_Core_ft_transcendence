@@ -413,7 +413,7 @@ note in place):
    `query_knowledge_graph` tool) is kept too; a concurrent insert of the
    same ticker is logged (`ticker_names.cache_write_failed`) and the
    name is still returned.
-2. `extract_entities_relations` (`ai/knowledge/extraction.py`) calls the
+2. `extract_entities_relations` (`ai/knowledge/archival.py`) calls the
    tier in `KG_EXTRACTION_LLM_TIER` (`cheap`) at temperature 0 with the
    report, prefixed by "This report is specifically about ticker AMD,
    official name ... Use "AMD" as the entity name ...". The model returns a
@@ -691,8 +691,14 @@ pasted into the prompts (`fresh_filing_context`, with the rule that this
 newer filing wins over older `search_filings` passages on the same topic);
 older new filings are only indexed
 (`fresh_filing_check.older_new_filings_not_pasted`): pasting all of them
-crowded the context and older text was read as current. Any failure
-returns `None` (`fresh_filing_check.sec_check_failed`).
+crowded the context and older text was read as current. The wait is
+capped at `FRESH_FILING_BUDGET_SECONDS` (600 s); on expiry the check logs
+`fresh_filing_check.timed_out` (`ticker`, `budget_seconds`) and returns
+`None`. The shielded ingest keeps running in the background and stays in
+`_ingests_in_flight`, so the next analysis of the same ticker joins it;
+source-failure reports of that background ingest are not attached to the
+timed-out analysis. Any failure returns `None`
+(`fresh_filing_check.sec_check_failed`).
 
 **Hallucination guard.** The prompt rule is the only guard on the summary
 text. There is no mechanical figure check after generation: tried on one
@@ -1217,9 +1223,9 @@ not ok.
 | code: `prune_beyond_retention(keep=3)` | 3 | `domains/memory/repository.py` | rows kept per role and ticker |
 | code: `_MIN_WORDS_TO_ARCHIVE` | 40 | `ai/knowledge/archival.py` | shortest archived note |
 | code: `_NEAR_DUPLICATE_DEDUP_LOOKBACK` | 3 | same | recent reports compared |
-| code: `_MAX_TRIPLES` | 15 | `ai/knowledge/extraction.py` | triples per report |
+| code: `_MAX_TRIPLES` | 15 | `ai/knowledge/archival.py` | triples per report |
 | code: `_HOLD_FLAT_BAND` | 0.02 | `ai/workflows/review_workflow.py` | HOLD counts as correct within +-2% |
-| code: `_EXTRACTION_MAX_TOKENS` | 2,048 | `ai/knowledge/extraction.py` | output budget of the triple extraction |
+| code: `_EXTRACTION_MAX_TOKENS` | 2,048 | `ai/knowledge/archival.py` | output budget of the triple extraction |
 | code: `_MAX_PER_FORM` | 10-K 1, 10-Q 4 | `ai/ingestion/sec_edgar_filings.py` | filings in the per-form ingestion window |
 | code: `_EDGAR_API_TIMEOUT_SECONDS` | 15 | same | how long the caller waits for each `edgartools` listing call (each HTTP request also has the library's `EDGAR_HTTP_TIMEOUT`, default 30 s) |
 | code: `_TRUNCATION_STAIRCASE` | 1.2M: 100%, 1.6M: 80%, 1.8M: 70%, 2.1M: 60%, 2.5M: 50%, above: skip | `ai/knowledge/filing_summary.py` | summary-call input cut |
@@ -1461,9 +1467,8 @@ All queries below are read-only.
 | `services/ai-service/ai/memory/agent_memory.py` | L2 read path; L4 gates, write, read (`combine_context` is in `ai/agents/loop.py`) |
 | `services/ai-service/domains/memory/model.py` | `EpisodicMemory`, `AgentMemory` |
 | `services/ai-service/domains/memory/repository.py` | scoped queries, retention pruning |
-| `services/ai-service/ai/knowledge/archival.py` | archival gates, visibility, near-duplicate supersede, KG extraction call |
+| `services/ai-service/ai/knowledge/archival.py` | archival gates, visibility, near-duplicate supersede, KG extraction call; triple extraction prompt and validation (`extract_entities_relations`) |
 | `services/ai-service/ai/knowledge/recycled_content.py` | recycled share, amounts found only in prior agent notes (chapter 15) |
-| `services/ai-service/ai/knowledge/extraction.py` | triple extraction prompt and validation |
 | `services/ai-service/ai/knowledge/kg_context.py` | fetch, format, tag, inject KG facts; official names, core-name matching |
 | `services/ai-service/ai/ingestion/sec_edgar_filings.py` | listing new filings, raw archive, `ingest_new_filings` |
 | `services/ai-service/ai/knowledge/filing_summary.py` | summary call (staircase, retry, fallback) and the records-only call |

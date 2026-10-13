@@ -1,14 +1,16 @@
+from datetime import UTC, datetime
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.model import (AgentRun, Analysis, DebateSession,
                                     Recommendation)
-from domains.analysis.repository import AnalysisRepository
+from domains.analysis.repository import (UNFILLED_TIER_STATUSES,
+                                         AnalysisRepository, acceptance_lapsed)
 from domains.analysis.schema import (AgentResultRead, AgentRunRead,
                                      AnalysisDetailRead, AnalysisRead,
                                      DebateArgumentRead, DebateRead,
                                      RecommendationRead,
                                      RecommendationTierRead, ReflectionRead)
-from shared.enums import WorkflowStatus
+from shared.enums import TierStatus, WorkflowStatus
 from shared.exceptions import NotFoundError
 from shared.schemas import PaginatedResponse, PaginationParams
 
@@ -22,13 +24,23 @@ def _agent_run_read(run: AgentRun) -> AgentRunRead:
             if run.result else None))
 
 
-def _tier_reads(rec: Recommendation) -> list[RecommendationTierRead]:
+def _tier_reads(
+        rec: Recommendation,
+        user_id: UUID | None) -> list[RecommendationTierRead]:
     tiers = sorted(
         rec.tiers, key=lambda t: (t.side, t.target_price, str(t.id)))
+    now = datetime.now(UTC)
+    window_passed = (
+        rec.window_expires_at is not None and rec.window_expires_at <= now)
     return [
         RecommendationTierRead(
             id=t.id, recommendation_id=t.recommendation_id, side=t.side,
-            target_price=t.target_price, quantity=t.quantity, status=t.status,
+            target_price=t.target_price, quantity=t.quantity, status=(
+                TierStatus.EXPIRED.value if (
+                    window_passed and t.status in UNFILLED_TIER_STATUSES)
+                or acceptance_lapsed(
+                    status=t.status, user_id=user_id,
+                    issued_at=rec.created_at, now=now) else t.status),
             window_expires_at=rec.window_expires_at,
             triggered_at=t.triggered_at, triggered_price=t.triggered_price,
             created_at=t.created_at) for t in tiers
@@ -36,16 +48,16 @@ def _tier_reads(rec: Recommendation) -> list[RecommendationTierRead]:
 
 
 def _recommendation_read(
-        rec: Recommendation, ticker: str) -> RecommendationRead:
+        rec: Recommendation, analysis: Analysis) -> RecommendationRead:
     return RecommendationRead(
-        id=rec.id, analysis_id=rec.analysis_id, ticker=ticker,
+        id=rec.id, analysis_id=rec.analysis_id, ticker=analysis.ticker,
         recommendation=rec.recommendation, confidence=rec.confidence,
         reasoning=rec.reasoning,
         confidence_adjustment_note=rec.confidence_adjustment_note,
         tier_generation_note=rec.tier_generation_note,
         debate_converged=rec.debate_converged, created_at=rec.created_at,
         window_expires_at=rec.window_expires_at, accepted_at=rec.accepted_at,
-        tiers=_tier_reads(rec))
+        tiers=_tier_reads(rec, analysis.user_id))
 
 
 def _debate_read(session_row: DebateSession) -> DebateRead:
@@ -66,8 +78,7 @@ def analysis_detail_read(analysis: Analysis) -> AnalysisDetailRead:
             _debate_read(analysis.debate_sessions[0])
             if analysis.debate_sessions else None),
         reflections=reflection_reads(analysis), recommendation=(
-            _recommendation_read(
-                analysis.recommendations[-1], analysis.ticker)
+            _recommendation_read(analysis.recommendations[-1], analysis)
             if analysis.recommendations else None))
 
 
@@ -76,13 +87,13 @@ def recommendation_read(analysis: Analysis) -> RecommendationRead:
         raise NotFoundError(
             f"No recommendation yet for analysis {analysis.id} "
             f"(status={analysis.status})")
-    return _recommendation_read(analysis.recommendations[-1], analysis.ticker)
+    return _recommendation_read(analysis.recommendations[-1], analysis)
 
 
 def tier_reads(analysis: Analysis) -> list[RecommendationTierRead]:
     if not analysis.recommendations:
         return []
-    return _tier_reads(analysis.recommendations[-1])
+    return _tier_reads(analysis.recommendations[-1], analysis.user_id)
 
 
 def debate_read(analysis: Analysis) -> DebateRead:

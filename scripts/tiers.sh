@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Recommendation tiers of a portfolio.
 #
-#   bash scripts/tiers.sh                    # open tiers (they reserve BUY cash)
+#   bash scripts/tiers.sh                    # BUY cash held by open tiers, per
+#                                            # analysis, exactly as the budget
+#                                            # counts it (see analysis_cli)
 #   bash scripts/tiers.sh all                # every tier of the portfolio, newest first
 #   bash scripts/tiers.sh decline <analysis-uuid> [...]
 #                                            # decline the analysis' recommendation
@@ -21,18 +23,7 @@ cmd="${1:-open}"
 
 case "$cmd" in
   open)
-    psql_stdin <<SQL
-SELECT a.ticker, t.side, t.target_price, t.quantity,
-       round(t.target_price * t.quantity, 2) AS amount, t.status,
-       r.window_expires_at, a.id AS analysis_id
-FROM ai.recommendation_tiers t
-JOIN ai.recommendations r ON t.recommendation_id = r.id
-JOIN ai.analyses a ON r.analysis_id = a.id
-WHERE a.portfolio_id = '$PORTFOLIO_ID'
-  AND t.status IN ('pending_acceptance', 'accepted_awaiting_trigger')
-  AND r.window_expires_at > now()
-ORDER BY a.ticker, t.side, t.target_price;
-SQL
+    "${COMPOSE[@]}" exec -T ai-service python -m scripts.analysis_cli committed "$PORTFOLIO_ID"
     ;;
   all)
     psql_stdin <<SQL

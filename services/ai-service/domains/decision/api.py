@@ -1,7 +1,8 @@
 from uuid import UUID
+from ai_events import publish_events
 from database import get_db
 from deps import get_analysis_writer, get_current_user
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.decision.schema import (DecisionOutcomeRead, DecisionReviewRead,
                                      InvestmentDecisionRead)
@@ -42,11 +43,13 @@ async def get_decision_outcome(
         "review and replaces the stored one. When the model call fails the "
         "answer is 503 with Retry-After and nothing is stored."))
 async def generate_decision_review(
-    decision_id: UUID, user: CurrentUser = Depends(get_analysis_writer),
+    decision_id: UUID, background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_analysis_writer),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[DecisionReviewRead]:
-    result = await DecisionService(db).generate_review(
-        decision_id, user_id=user.user_id)
+    service = DecisionService(db)
+    result = await service.generate_review(decision_id, user_id=user.user_id)
+    background_tasks.add_task(publish_events, list(service.pending_events))
     return APIResponse(data=result)
 
 

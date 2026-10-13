@@ -2,7 +2,7 @@ import { LocalTime } from "@/app/(protected)/local-time";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { changeUserRole, deleteUser, resetUserTwoFactor, setUserActive } from "@/app/lib/actions/admin";
 import { Avatar } from "../../../avatar";
 import { ActionButton, SelectActionForm } from "../../inline-actions";

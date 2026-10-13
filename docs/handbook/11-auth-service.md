@@ -111,7 +111,8 @@ Then the app is built:
   becomes `{"error": {"code", "message", "request_id"}}` (built by
   `error_response`). Codes and statuses: `not_found` 404, `conflict` 409,
   `validation_error` 422, `permission_denied` 403, `invalid_credentials`
-  401, `rate_limit_exceeded` 429, `upstream_service_error` 502. A
+  401, `rate_limit_exceeded` 429, `upstream_service_error` 502,
+  `service_unavailable` 503. A
   subclass keeps its own code and gets its nearest registered parent's
   status (`_status_for` walks the class hierarchy): auth's
   `TwoFactorRequiredError` (`two_factor_required`), `EmailNotVerifiedError`
@@ -379,8 +380,8 @@ refresh tokens.
 | `rotated` | `claim_session_for_rotation` (every refresh) | replaced by a refresh; the token was single-use |
 | `logout` | `revoke_session` (default reason), called by logout | the user logged out of this session |
 | `revoked_all` | `revoke_all_sessions` (default reason) | password reset confirmed, account deactivated by an admin or moderator, account deleted |
-| `reuse` | `revoke_all_sessions(..., reason=REUSE)` in `refresh` | revoked because a rotated token was presented again |
-| `NULL` | rows revoked before the column existed (migration `f1190b000001`) | treated like `rotated` |
+| `reuse` | `revoke_rotation_successors(..., reason=REUSE)` in `refresh` | revoked because a rotated token from its chain was presented again after the grace period |
+| `NULL` | rows revoked before the column existed (migration `f1190b000001`) | a refresh with such a token just gets 401 |
 
 ```
  client                     auth-service                                   Postgres
@@ -393,16 +394,21 @@ refresh tokens.
    |       row returned (R was valid and is now used up):                      |
    |                            | user active, not deleted? else 401           |
    |                            | new access + new refresh R' -> INSERT session|
-   |                            | (copies ip_address and device_info)          |
+   |                            | (copies ip_address and device_info,          |
+   |                            |  created_at = revoked_at of R's row)         |
    |<-- 200 {access_token, refresh_token: R'}  (commit)                        |
    |                                                                           |
    |       no row returned:                                                    |
    |                            | SELECT session by sha256(R)                  |
-   |                            | found AND revoked AND reason in (NULL, rotated)?
-   |                            |   yes -> "reuse": revoke ALL active sessions |
-   |                            |          of that user, reason 'reuse',       |
-   |                            |          COMMIT now, log                     |
-   |                            |          refresh_token_reuse_detected        |
+   |                            | found AND revoked AND reason = rotated?      |
+   |                            |   rotated less than 30 s ago:                |
+   |                            |     log refresh_token_superseded             |
+   |<-- 401 code refresh_token_superseded (nothing revoked)                    |
+   |                            |   rotated 30 s or more ago -> "reuse":       |
+   |                            |     revoke the sessions descending from R    |
+   |                            |     (its rotation chain), reason 'reuse',    |
+   |                            |     COMMIT now, log                          |
+   |                            |     refresh_token_reuse_detected revoked=<n> |
    |<-- 401 "Refresh token is invalid or expired."                             |
 ```
 
@@ -411,17 +417,37 @@ Why this design:
 - **Atomic claim.** One `UPDATE ... WHERE revoked_at IS NULL ...
   RETURNING` decides the winner. Two concurrent refreshes with the same
   token cannot both succeed; the second sees no row.
-- **The reuse rule.** If a token that was already *rotated* comes back,
-  either the client has a bug or an attacker copied the token. The
-  server cannot tell who is the real owner, so it logs the user out
-  everywhere (every still-active session gets `reuse`). The commit happens
-  inside the error path on purpose: the 401 that follows rolls back the
-  request transaction, which would otherwise undo the revocation.
-- **Only `rotated` (or `NULL`) triggers it.** A token revoked by a logout
-  or a "revoke all" just gets a 401. Without this distinction, a second
-  browser tab still holding a logged-out token would log the user out of
-  every device the next time it tried to refresh. The `revoked_reason`
-  column exists exactly to tell these cases apart.
+- **Grace period.** A rotated token that comes back within 30 seconds
+  (`REFRESH_REUSE_GRACE` in `domains/auth/service.py`) is usually a benign
+  race: two requests of the same browser sent the same token. It gets a
+  401 with the code `refresh_token_superseded` (`RefreshTokenSupersededError`),
+  nothing is revoked, and the event `refresh_token_superseded` is logged at
+  warning level with `user_id` and `session_id`. The distinct code tells
+  the frontend proxy to keep its cookies (chapter 29). This works like the
+  "reuse interval" of Auth0's refresh token rotation.
+- **The reuse rule.** If a rotated token comes back after the grace
+  period, either the client has a bug (for example a browser that never
+  stored the new cookie) or an attacker copied the token. The server
+  cannot tell who is the real owner, so it revokes every still-active
+  session that descends from that token (its rotation chain) with reason
+  `reuse` (`UserRepository.revoke_rotation_successors`). Other logins of
+  the same user (other browsers or devices) stay valid. The commit
+  happens inside the error path on purpose: the 401 that follows rolls
+  back the request transaction, which would otherwise undo the revocation.
+- **How the chain is found.** A session created by a refresh gets
+  `created_at` equal to the `revoked_at` of the session it replaced
+  (`_issue_token_pair(rotated_at=...)`). A recursive CTE follows these
+  links from the reused token's row, so no family column and no migration
+  are needed. The UPDATE repeats until the chain stops growing, so a
+  rotation committed at the same time as the revocation is revoked too
+  (this needs the default READ COMMITTED isolation). Rows rotated without
+  this exact link revoke nothing (`revoked=0`); the caller just gets 401.
+- **Only `rotated` triggers it.** A token revoked by a logout, a "revoke
+  all" or a reuse revocation, or a row with `revoked_reason` `NULL`, just
+  gets a 401. Without this distinction, a second browser tab still holding
+  a logged-out token would revoke sessions the next time it tried to
+  refresh. The `revoked_reason` column exists exactly to tell these cases
+  apart.
 - **Expired-session purge.** Every login and refresh adds a row. To stop
   unbounded growth, `create_session` first deletes that user's sessions
   whose `expires_at` is more than 7 days in the past
@@ -473,8 +499,8 @@ offline -> online change and announced again. No access token is needed: whoever
 refresh token may end its session. The access token issued with it stays
 valid until it expires (at most 15 minutes); access tokens are not
 tracked server-side. "Log out everywhere" exists only as a side effect of
-password reset, deactivation, deletion and reuse detection; there is no
-user-facing endpoint for it.
+password reset, deactivation and deletion; reuse detection revokes only
+one rotation chain. There is no user-facing endpoint for it.
 
 ### 3.8 Two-factor authentication (TOTP with `pyotp`)
 
@@ -877,7 +903,7 @@ Routes in `domains/organization/api.py` (prefix `/api/v1/organizations`):
 | `PATCH /{org_id}/members/{user_id}/role` | `organization:create` and owner or admin; only the owner changes admin roles or makes admins; never `owner` (422) | `organization.role.changed` |
 | `POST /{org_id}/invitations` | `organization:create` and owner/admin; only the owner invites admins | `organization.invitation.created` |
 | `GET /{org_id}/invitations` | owner or admin: the open invitations (not accepted, not expired), newest expiry first | |
-| `DELETE /{org_id}/invitations/{invitation_id}` | `organization:create` and owner or admin; only the owner revokes an admin invitation; 404 for an unknown, accepted or foreign invitation | |
+| `DELETE /{org_id}/invitations/{invitation_id}` | `organization:create` and owner or admin; only the owner revokes an admin invitation; 404 for an unknown, accepted or foreign invitation | `organization.invitation.revoked` |
 | `POST /invitations/accept` `{token}` | the invited email's account (guests too) | `organization.member.joined` |
 
 Every route that needs membership answers 404 "Organization not found."
@@ -938,7 +964,9 @@ have an account yet. No invitation can grant `owner` (422 when sent).
   get around the owner-only revocation rule below by re-inviting the
   address as a member).
 - **Revocation.** `DELETE /{org_id}/invitations/{id}` deletes an open
-  invitation; its link answers 404 from then on. No event is published.
+  invitation; its link answers 404 from then on. It publishes
+  `organization.invitation.revoked`: core-service notifies the user who
+  revoked and, when the invited email has an account, the invitee.
 - Accepted rows are kept (the accept route uses them to answer "already
   accepted").
 
@@ -968,17 +996,25 @@ need the permission `connection:write` (a guest gets 403); blocking and
   `RATE_LIMIT_FRIEND_REQUESTS_WINDOW_SECONDS` = 3600 s, counted before
   the username lookup, so the limit also covers "decline and re-send"
   loops and guessing usernames through the 404 answer.
-- `GET ""` (optional `?status=pending|accepted|blocked`).
+- `GET ""` (optional `?status=pending|accepted|blocked`). A block is
+  hidden from the user who was blocked: only the blocker sees the
+  `blocked` row (`ConnectionRepository.list_for_user_with_other_user`). A
+  legacy `blocked` row with `blocked_by` NULL stays visible to both.
 - `POST /{id}/accept`: only the addressee. Event `friend.accepted`.
   Accept, block and remove read the row's status and then write it, so
   they take a row lock first (`SELECT ... FOR UPDATE`); otherwise a
   concurrent accept and block both read "pending" and the later write
   could turn a block into a friendship.
 - `POST /{id}/block`: either side; the blocked side cannot take over a
-  block. Stores `blocked_by`.
+  block. Stores `blocked_by`. Publishes `connection.blocked`, which
+  notifies only the blocker; the other user is never told. A repeated
+  block of an already blocked connection publishes nothing.
 - `DELETE /{id}`: cancel, decline, unfriend, or unblock (unblock only by
-  the user who blocked). Only unfriending publishes `friend.removed`
-  (an unblock notice would reveal the block).
+  the user who blocked). Every `DELETE` publishes `friend.removed` with
+  an `action` field: `removed` (unfriend), `declined`, `cancelled` or
+  `unblocked`. Core-service always notifies the actor; only `removed`
+  also notifies the other side, so an unblock notice never reveals the
+  block.
 
 Connections matter for presence: core-service lets a user subscribe to
 another user's `presence:<id>` WebSocket channel only when
@@ -1064,20 +1100,24 @@ can de-duplicate across its replicas.
 
 | Event | Payload | Published when |
 |---|---|---|
-| `user.updated` | `user_id, actor_id, role, is_active, changed` (field names) | own profile/settings/password/2FA/avatar change (any changed field, including `bio` or `theme`; a PATCH that changes nothing and a repeated `/2fa/verify` publish nothing); admin edit |
+| `user.updated` | `user_id, actor_id, username, role, is_active, changed` (field names) | own profile/settings/password/2FA/avatar change (any changed field, including `bio` or `theme`; a PATCH that changes nothing and a repeated `/2fa/verify` publish nothing); admin edit |
 | `user.role.changed` | same | admin changes the role |
 | `user.deactivated` / `user.reactivated` | same | admin or moderator |
-| `user.deleted` | same | admin soft delete; the nightly unverified-account purge (`actor_id` is the user itself) |
+| `user.deleted` | same (`username` is the name before the soft delete set it to `deleted_<hex>`) | admin soft delete; the nightly unverified-account purge (`actor_id` is the user itself) |
 | `organization.created` / `.updated` / `.deleted` | `organization_id, organization_name, actor_id, user_id, role, member_ids` | |
 | `organization.member.joined` / `.left` / `.removed` | same | |
 | `organization.role.changed` | same | |
 | `organization.invitation.created` | same (`user_id` = invitee if registered) | |
-| `friend.requested` / `.accepted` / `.removed` | `actor_id, user_id, actor_username` | |
+| `organization.invitation.revoked` | same (`user_id` = invitee if registered, `role` = the invitation role) | an owner or admin revokes an open invitation |
+| `friend.requested` / `.accepted` / `.removed` | `actor_id, user_id, actor_username, other_username`, plus `action` on `.removed` | |
+| `connection.blocked` | `actor_id, blocked_user_id, blocked_username` (no `user_id` on purpose) | a connection becomes blocked (not on a repeated block) |
 | `user.presence.changed` | `user_id, is_online` | queued by login/refresh/presence/logout and published after the commit, like the other events |
 
 Who listens: core-service turns them into notifications and live
 WebSocket pushes (every `user.updated`, including a user's own profile
-edit, becomes an "Account updated" notification for that user) (chapter 12, section 3.15; chapter 24). Note that a
+edit, becomes an "Account updated" notification for that user, and for
+the admin or moderator who acted when that is someone else) (chapter 12,
+section 3.15; chapter 24). Note that a
 deactivated user's tokens stop working through the live state check, not
 through these events; the events are for notifications only.
 
@@ -1123,10 +1163,12 @@ becomes unverified and gets a new verification email. Soft delete sets
 `deleted-<hex>@deleted.alphamind.local` / `deleted_<hex>`, sets a random
 password, clears the profile, deletes OAuth links, 2FA secret and
 connections, removes organization memberships except owner rows, revokes
-all sessions, and deletes the avatar file after the commit. The steps
-after the permission checks are one method, `AdminService._delete(user,
-actor_id)`, shared with the nightly purge of unverified accounts
-(`purge_unverified_accounts`, section 3.4): it lists the candidates
+all sessions, and the route deletes the avatar file after the commit.
+The steps after the permission checks are one method,
+`AdminService._delete(user, actor_id)`, shared with the nightly purge of
+unverified accounts (`purge_unverified_accounts`, section 3.4; a purge
+candidate has never signed in, so it has never held a token and cannot
+have uploaded an avatar, and the purge deletes no files): it lists the candidates
 (`AdminRepository.unverified_account_ids`), then for each one locks the
 row again with the same conditions (`lock_unverified_account`, `SELECT
 ... FOR UPDATE`, so an account verified or signed in meanwhile is
@@ -1269,6 +1311,21 @@ logged-out token would log the user out on every device the next time it
 tried to refresh. The `revoked_reason` column (migration `f1190b000001`)
 lets the service tell a theft signal apart from an ordinary stale tab.
 
+**A 30-second grace period, then only the token's rotation chain is
+revoked.**
+*Alternative:* revoke every session of the user as soon as any rotated
+token comes back.
+*Reason:* two requests of one browser often send the same refresh token
+at almost the same moment; the loser of that race is not a thief. Like
+the "reuse interval" of Auth0's refresh token rotation, a reuse within
+30 seconds only gets `refresh_token_superseded`. After the grace, the
+sessions descending from the reused token are revoked, which logs out
+the browser (or attacker) holding that chain. The user's other browsers
+and devices have their own chains and stay logged in, so one browser
+with an old cookie does not log the user out everywhere. The chain is
+found from `created_at` = predecessor `revoked_at`, so no family column
+or migration is needed.
+
 **Emails sent after the commit, in background tasks.**
 *Alternative:* send inside the request.
 *Reason:* sending inside the request turns SMTP failures into 500s for
@@ -1341,7 +1398,7 @@ a body is not.
 | an account the user registered a week ago is gone ("Email/password combination is incorrect.") | it was never verified, so the nightly `purge-unverified` job deleted it; log `unverified_accounts_purged` | register again with the same email |
 | 429 `rate_limited` with `Retry-After` | auth-service limit | `bash scripts/redis-cli.sh -n 1 --scan --pattern 'auth:rl:*'` shows active counters (hashed identities) |
 | 429 "Too many invalid codes" | 2FA lock (5 failures in 5 minutes, locked 15 minutes) | wait for `Retry-After` |
-| refresh 401 and the user is logged out on every device | reuse detection fired | log event `refresh_token_reuse_detected` (`bash scripts/logs.sh auth-service grep refresh_token_reuse_detected`); sessions show `revoked_reason = 'reuse'` |
+| refresh 401 and the user is logged out in one browser | reuse detection fired: a rotated refresh token came back after the 30 s grace, usually a browser holding an old cookie (for example a second browser left idle for days) | log event `refresh_token_reuse_detected` (`bash scripts/logs.sh auth-service grep refresh_token_reuse_detected`); the sessions of that chain show `revoked_reason = 'reuse'`; other logins of the user stay valid |
 | a demoted admin still has admin rights | the mirror was not written | `bash scripts/redis-cli.sh -n 2 GET auth:user_state:<id>`; logs `user_state.mirror_failed`, `user_state.startup_sync_failed`; core/ai logs `user_state.redis_read_failed`, `user_state.auth_lookup_failed` |
 | verification or reset email never arrives | SMTP problem; the request still succeeded | log events `verification_email_failed`, `password_reset_email_failed`, `invitation_email_failed`, `email_send_failed`; MailHog UI |
 | OAuth ends at `/oauth/complete#error=oauth_failed&message=...` | any sign-in error; the `message` says which one (rows below) | log `oauth_callback_failed` (`bash scripts/logs.sh auth-service grep oauth_callback_failed`) shows the error code |
@@ -1349,7 +1406,7 @@ a body is not.
 | OAuth message "This sign-in was not started in this browser. Start the sign-in again." (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
 | OAuth `oauth_callback_failed` code `oauth_link_refused` | a local account with that email exists but one side is unverified | log in with the password first |
 | OAuth `oauth_callback_failed` code `oauth_provider_error` | provider unreachable or odd answer | log events `oauth_provider_http_error`, `oauth_github_emails_unavailable` |
-| auth-service does not start, log says the schema was refused | tables without `alembic_version`, or a revision Alembic does not know (a backup from before round 116) | restore a backup made by the current code |
+| auth-service does not start, log says the schema was refused | tables without `alembic_version`, or a revision Alembic does not know (a backup whose revision is not in the current migration chains) | restore a backup made by the current code |
 | auth-service refuses to start: "JWT_SECRET must be set..." | weak secret with `APP_ENV` not development/test | set a random secret of 32+ characters |
 | 2FA login answers 409 "Your 2FA settings cannot be read..." | the stored secret cannot be decrypted with `TOTP_ENCRYPTION_KEY` or the `JWT_SECRET`-derived key (both changed, or a damaged row); log `totp_secret_unreadable` with `user_id` | an admin resets the user's 2FA: `DELETE /api/v1/admin/users/{id}/2fa`; the user then sets it up again |
 | auth-service refuses to start: "TOTP_ENCRYPTION_KEY must be set..." or "...is not a valid Fernet key" | key missing with `APP_ENV` not development/test, or malformed | generate one: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
@@ -1399,7 +1456,8 @@ Expected: 401 with `"code": "email_not_verified"`.
 **Step 2: read the verification email in MailHog.** Open
 `http://127.0.0.1:8025` in a browser. The newest message is "Verify your
 AlphaMind account" to the demo address. The link is
-`http://localhost:3000/verify-email?token=...` (the frontend URL). Copy the
+`https://localhost:8443/verify-email?token=...` (the frontend URL,
+`FRONTEND_BASE_URL` from `.env.example`). Copy the
 `token` value. Or extract it with the helper the end-to-end script uses
 (it decodes the email body):
 
@@ -1469,8 +1527,9 @@ Expected: logout `204`, then `401`. Say: "R1 was used up by the refresh.
 R2 was logged out. Presenting R2 again is just refused; it does not log
 the user out elsewhere."
 
-**Step 7: reuse detection.** This revokes every active session of the
-demo user.
+**Step 7: the grace period and reuse detection.** This revokes the
+rotation chain that starts at R3; a second login of the demo user stays
+valid. The step takes about 35 seconds.
 
 ```
 R3=$(curl -k -sS -X POST $BASE/api/v1/auth/login -H 'Content-Type: application/json' \
@@ -1479,12 +1538,22 @@ R4=$(curl -k -sS -X POST $BASE/api/v1/auth/refresh -H 'Content-Type: application
   -d "{\"refresh_token\": \"$R3\"}" | json refresh_token)
 curl -k -sS -X POST $BASE/api/v1/auth/refresh -H 'Content-Type: application/json' \
   -d "{\"refresh_token\": \"$R3\"}"
+OTHER=$(curl -k -sS -X POST $BASE/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d "{\"email\": \"$EMAIL\", \"password\": \"correct-horse-42\"}" | json refresh_token)
+sleep 31
+curl -k -sS -X POST $BASE/api/v1/auth/refresh -H 'Content-Type: application/json' \
+  -d "{\"refresh_token\": \"$R3\"}"
 curl -k -sS -o /dev/null -w 'R4 after reuse: %{http_code}\n' -X POST $BASE/api/v1/auth/refresh \
   -H 'Content-Type: application/json' -d "{\"refresh_token\": \"$R4\"}"
+curl -k -sS -o /dev/null -w 'second login after reuse: %{http_code}\n' -X POST $BASE/api/v1/auth/refresh \
+  -H 'Content-Type: application/json' -d "{\"refresh_token\": \"$OTHER\"}"
 ```
 
-Expected: the reused R3 gets 401 "Refresh token is invalid or expired.",
-and the perfectly valid R4 is now refused too (401). Show the log line:
+Expected: the first reuse of R3, right after the rotation, is inside the
+30-second grace: it gets 401 with the code `refresh_token_superseded`
+and nothing is revoked. After the pause, R3 gets 401 "Refresh token is
+invalid or expired.", the perfectly valid R4 is now refused too (401),
+and the second login still refreshes (200). Show the log line:
 
 ```
 docker compose --env-file .env.docker logs --since 2m auth-service | grep refresh_token_reuse_detected
@@ -1497,7 +1566,8 @@ bash scripts/psql.sh -c "SELECT s.created_at, s.revoked_at IS NOT NULL AS revoke
 ```
 
 Expected, in order: `rotated` (R1), `logout` (R2), `rotated` (R3),
-`reuse` (R4). Point out that only a SHA-256 prefix of the token is stored
+`reuse` (R4), then `rotated` (the second login) and one active row with
+no reason (the pair from its refresh). Point out that only the SHA-256 of the token is stored (the query shows its first 12 characters)
 and that `ip_address` is the real client address forwarded by the gateway.
 
 **Step 9: an admin token with `scripts/token.sh`.**
@@ -1572,9 +1642,11 @@ in the database and in Redis.)
    role/active state is read from Redis.
 2. `sha256(refresh_token)` in hex. A database leak then does not give
    usable refresh tokens; lookup is still one indexed equality query.
-3. R's session has `revoked_reason = 'rotated'`, so it counts as reuse:
-   every still-active session of the user is revoked with reason `reuse`,
-   and the caller gets 401. The 401 rolls back the request transaction, so
+3. R's session has `revoked_reason = 'rotated'`. Within 30 seconds of
+   the rotation the caller gets 401 `refresh_token_superseded` and nothing
+   is revoked. Later it counts as reuse: every still-active session that
+   descends from R (R' and its successors) is revoked with reason `reuse`,
+   the user's other logins stay valid, and the caller gets 401. The 401 rolls back the request transaction, so
    the revocation is committed explicitly before raising.
 4. Only a 401. The session's reason is `logout`, which is not a theft
    signal, so nothing else is revoked.
@@ -1614,8 +1686,8 @@ in the database and in Redis.)
 | `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai, and the scheduler's `purge-unverified` |
 | `services/auth-service/domains/auth/model.py` | users, profiles, settings, sessions (`SessionRevokeReason`), OAuth accounts, 2FA secrets |
 | `services/auth-service/domains/auth/schema.py` | request/response models, password and username rules |
-| `services/auth-service/domains/auth/repository.py` | data access, atomic rotation claim, session purge, TOTP step consume |
-| `services/auth-service/domains/auth/service.py` | registration, verification, login, refresh, logout, 2FA, OAuth, reset, presence, `/me`; avatar files (magic-byte type check, safe file delete) |
+| `services/auth-service/domains/auth/repository.py` | data access, atomic rotation claim, rotation-chain revocation (`revoke_rotation_successors`), session purge, TOTP step consume |
+| `services/auth-service/domains/auth/service.py` | registration, verification, login, refresh (with the reuse grace `REFRESH_REUSE_GRACE`), logout, 2FA, OAuth, reset, presence, `/me`; avatar files (magic-byte type check, safe file delete) |
 | `services/auth-service/domains/auth/api.py` | `/api/v1/auth/*` routes, avatar upload |
 | `services/auth-service/domains/organization/*` | organizations, members, invitations, owner successor |
 | `services/auth-service/domains/social/*` | connections (friends), block |

@@ -12,9 +12,8 @@ from ai.agents.debate_common import (FREE_CASH_FLOW_RULE, LEGAL_AMOUNT_RULE,
 from ai.agents.evidence_grounding import non_english_reason
 from ai.graph.state import (LOW_PARTICIPATION_RATIO_THRESHOLD, AgentOutput,
                             AnalysisState, DebateArgument, JudgeVerdict)
-from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMMessage, LLMResponse,
-                         LLMTier)
-from ai.llm.json_fence import JsonObjectParse, parse_json_object
+from ai.llm.base import (AGENT_LLM_CALL_RETRIES, JsonObjectParse, LLMMessage,
+                         LLMResponse, LLMTier, parse_json_object)
 from ai.llm.router import LLMRouter
 from ai.recommendation.engine import position_limit_line
 from ai.tools.base import is_evidence_record

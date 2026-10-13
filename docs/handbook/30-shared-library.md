@@ -53,7 +53,7 @@ almost everything else depends on.
  exceptions.py <- redis.py (error_response), user_state.py
  enums.py <- permissions.py, schemas.py
  (no shared imports at all): exceptions.py, enums.py, market_calendar.py,
-                             concurrency.py, scheduled_jobs.py
+                             scheduled_jobs.py
 ```
 
 Read `A <- B` as "B imports A".
@@ -503,7 +503,8 @@ section 3.8.
 `{organization_id: role}` from
 `GET /internal/users/{id}/organizations`, cached under
 `auth_client:org_roles:<user_id>` in the cache database for
-`MEMBERSHIP_CACHE_TTL_SECONDS` (60). A Redis error counts as a miss; an
+`MEMBERSHIP_CACHE_TTL_SECONDS` (60). A Redis error counts as a miss, and so does a corrupt entry (logged
+`org_membership_cache.corrupt_entry`, then fetched from auth-service); an
 auth-service error raises `UpstreamServiceError`, so callers fail closed.
 A membership with no role is treated as `viewer`
 (`FALLBACK_ORGANIZATION_ROLE`: fail closed, read access and no writes;
@@ -518,7 +519,7 @@ instead of after the TTL. Used by core-service and ai-service `clients/auth_clie
 (read) and auth-service `organization/service.py` and `events_out.py`
 (invalidate).
 
-#### `concurrency.py` -- bounded `gather`
+#### `http_client.py`: `gather_bounded` -- bounded `gather`
 
 `gather_bounded(coros, limit=10)`: like `asyncio.gather`, with at most
 `limit` coroutines running at once (a semaphore). Results keep the input
@@ -550,10 +551,10 @@ every service start (from each service's `database.py`): it creates the schema
 if needed, refuses a schema that has tables but no Alembic revision, and otherwise runs
 `alembic upgrade head` in a worker thread. `build_alembic_config` builds
 the Alembic config in memory so Alembic does not reset the service's
-logging. `schema_differences` compares the database with the models,
-skipping the `alembic_version` table with `exclude_alembic_version`;
-each service's migration `env.py` can pass the same predicate as its
-`include_object`.
+logging. `exclude_alembic_version` keeps the `alembic_version` table out
+of schema comparisons: each service's migration `env.py` passes it as its
+`include_object`, and the test-only comparison
+`tests/alembic_contract.py::differences` uses it too.
 
 Each service keeps its own `alembic_version` table inside its own schema,
 so the three services can bootstrap at the same time. Alembic's `env.py`
@@ -644,7 +645,9 @@ What the values mean, where the code does not say it by name:
   explicit, immediate "no" (different from leaving a tier to expire);
   `execution_failed` means core refused the trade for a business reason
   and is terminal, so the tier is not retried every day. There is no
-  `cancelled` status: cancelled tiers become `expired` with a note.
+  `cancelled` status: cancelled tiers become `expired` with a note. A
+  pending tier of a system analysis also becomes `expired` when nobody
+  accepts it within `SYSTEM_TIER_ACCEPTANCE_HOURS` (72, chapter 16).
 - `NotificationType` is stored as a plain string
   (`core.notifications.type`), so a new value needs no migration. But the
   read schema validates against the enum, so a stored row whose type is
@@ -832,7 +835,7 @@ All read-only.
 
 6. **Type-check the shared package** (on the host, needs `uv sync`):
    `make mypy-shared`. Expected: `Success: no issues found in <N> source
-   files` (26 modules today; the number changes when modules are added
+   files` (16 modules today; the number changes when modules are added
    or removed).
 
 ---
@@ -896,11 +899,11 @@ service-specific (settings come in as parameters).
 | File | What it holds |
 |---|---|
 | `shared/config.py` | `BaseServiceSettings`, `get_settings`, secret checks |
-| `shared/database.py` | `Base`, `UUIDPKMixin`, `TimestampColumnsMixin`, engine and session factories, `make_get_db`, `count_query`; schema bootstrap (`bootstrap_schema`, `schema_differences`) |
+| `shared/database.py` | `Base`, `UUIDPKMixin`, `TimestampColumnsMixin`, engine and session factories, `make_get_db`, `count_query`; schema bootstrap (`bootstrap_schema`, `exclude_alembic_version`) |
 | `shared/logging.py` | `configure_logging`; `RequestIdMiddleware`, `current_request_id`: request id in logs, error and success bodies and `X-Request-ID` header; `get_or_create` for Prometheus collectors |
 | `shared/redis.py` | Four Redis clients and pools; fixed-window counter, 429 response; end-to-end run lock |
 | `shared/events.py` | `EventName`, `EVENT_OWNERS`; pub/sub and Redis Streams publishers and subscribers |
-| `shared/http_client.py` | Pooled httpx clients, internal-token hook |
+| `shared/http_client.py` | Pooled httpx clients, internal-token hook, `gather_bounded` |
 | `shared/exceptions.py` | `AppError` hierarchy, error handlers |
 | `shared/security.py` | Current user, permission dependencies, internal token |
 | `shared/permissions.py` | Role -> permission map |
@@ -908,7 +911,6 @@ service-specific (settings come in as parameters).
 | `shared/email.py` | SMTP sender and templates |
 | `shared/market_calendar.py` | `MARKET_TZ`, `market_today`, NYSE holidays |
 | `shared/user_state.py` | Live role/active state; organization roles cache and invalidation |
-| `shared/concurrency.py` | `gather_bounded` |
 | `shared/scheduled_jobs.py` | `job_response`, `all_units_failed` |
 | `shared/enums.py` | Shared `StrEnum` vocabularies |
 | `shared/schemas.py` | Response envelopes, cross-service refs; `TICKER_RE`, `normalize_ticker` |

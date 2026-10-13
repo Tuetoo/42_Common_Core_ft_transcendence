@@ -5,7 +5,6 @@ from uuid import UUID, uuid4
 import ai.graph.nodes as nodes_module
 import ai.ingestion.sec_edgar_filings as sec_edgar_filings
 import ai.knowledge.archival as archival_module
-import ai.knowledge.extraction as extraction_module
 import ai.workflows.auto_ingestion_workflow as auto_workflow
 import config
 import pytest
@@ -16,9 +15,10 @@ from ai.knowledge.recycled_content import (note_and_source_passages,
                                            prior_note_similarity,
                                            recycled_share,
                                            split_agent_note_passages)
-from ai.llm.base import LLMConfigError, LLMError, LLMResponse, LLMUsage
+from ai.llm.base import LLMError, LLMResponse, LLMUsage
 from ai.rag.visibility import ChunkVisibility
 from database import SessionLocal
+from helpers import _AlwaysFailsRouter
 from sqlalchemy import select
 from domains.analysis.repository import AnalysisRepository
 from domains.knowledge.model import AgentReport, KgEntity, KgRelation
@@ -46,12 +46,6 @@ class _ScriptedRouter:
         return LLMResponse(
             content=self._response_text, provider="fake", model="fake-model",
             usage=LLMUsage(prompt_tokens=1, completion_tokens=1))
-
-
-class _FailingRouter:
-
-    async def complete(self, tier, messages, **kwargs):
-        raise LLMConfigError("no key configured")
 
 
 _LONG_REPORT = (
@@ -97,10 +91,10 @@ class TestExtractEntitiesRelations:
         cases = {
             "unparseable-response": _ScriptedRouter("not json at all"),
             "unknown-entity-type-dropped": _ScriptedRouter(unknown_type),
-            "llm-failure-fails-open": _FailingRouter()
+            "llm-failure-fails-open": _AlwaysFailsRouter()
         }
         for case_id, router in cases.items():
-            triples = await extraction_module.extract_entities_relations(
+            triples = await archival_module.extract_entities_relations(
                 _LONG_REPORT, llm_router=router)
             assert triples == [], case_id
 
@@ -112,7 +106,7 @@ class TestExtractEntitiesRelations:
                 "target": "Apple",
                 "confidence": 0.95
             }]))
-        triples = await extraction_module.extract_entities_relations(
+        triples = await archival_module.extract_entities_relations(
             _LONG_REPORT, llm_router=router)
         assert len(triples) == 1
         assert triples[0].target_type == "concept"
@@ -206,7 +200,7 @@ class TestArchiveAgentReport:
         monkeypatch.setattr(archival_module, "embed_texts", _fake_embed_texts)
         monkeypatch.setattr(
             archival_module, "index_chunks", _fake_index_chunks)
-        monkeypatch.setattr(extraction_module, "LLMRouter", lambda: router)
+        monkeypatch.setattr(archival_module, "LLMRouter", lambda: router)
 
         await archival_module.archive_agent_report(
             analysis_id=analysis_id, role=AgentRole.MACRO, ticker="AMD",
@@ -863,7 +857,7 @@ class TestRecycledShare:
             "is_tool_result": False
         }]
 
-    def test_share_of_words_copied_from_prior_notes(self):
+    def test_recycled_share_and_tool_header_is_not_a_note(self):
         cases = {
             "copied-note": (
                 "[Live] Federal Reserve policy keeps borrowing costs elevated "
@@ -889,7 +883,6 @@ class TestRecycledShare:
         assert recycled_share("Federal Reserve policy is tight.", pad) == 0.0
         assert recycled_share("anything", None) == 0.0
 
-    def test_tool_header_and_guidance_are_not_a_prior_note(self):
         header = (
             "Prior macro note search results for 'Federal Reserve policy "
             "keeps borrowing costs elevated' (1 passages):\nNote: passages "

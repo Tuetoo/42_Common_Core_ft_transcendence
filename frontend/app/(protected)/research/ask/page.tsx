@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { AskPanel } from "./ask-panel";
 
 export default async function AskPage() {

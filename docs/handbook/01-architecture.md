@@ -33,7 +33,8 @@ Think of AlphaMind as a small company building:
   vectors for search, uploaded files, and a fake mailbox for development.
 - The **scheduler** is the alarm clock. At fixed New York times it calls
   internal routes (market open, tier monitoring, market close, nightly
-  review, RAG ingestion) and makes the nightly backup.
+  review, RAG ingestion, purge of unverified accounts, notification
+  retention) and makes the nightly backup.
 - **Prometheus, Alertmanager, Grafana, the exporters and vector** are the
   security cameras and log books.
 
@@ -309,7 +310,7 @@ The pieces:
 | core-service | `clients/ai_client.py` | `/internal/recommendations/latest`, `/internal/analyses/{id}`, `/internal/market/instruments/{ticker}/prices`, `/internal/fx-rate`, `/internal/analyses` (create), `/internal/sentiment` |
 | ai-service | `clients/core_client.py` | `/internal/portfolios/{id}/holdings`, `/owner`, `/cash-balance`, `/snapshots`, `/cash-flows`, `POST /internal/portfolios/{id}/transactions` (tier execution), `/internal/tracked-tickers`, `/internal/documents/filenames`, `/internal/documents` |
 | auth-service | `domains/admin/service.py::_fetch_service_stats` | `/internal/stats` of core and ai (admin statistics page; auth's own numbers are read from its database, it has no `/internal/stats` route) |
-| scheduler | `infra/scheduler/*.sh` (curl) | core `/internal/scheduler/market-open`, `/market-close`, `/heartbeat/{job}`; ai `/internal/scheduler/tier-monitoring`, `/internal/scheduler/rag-ingest`, `/internal/review/run` |
+| scheduler | `infra/scheduler/*.sh` (curl) | core `/internal/scheduler/market-open`, `/market-close`, `/notification-retention`, `/heartbeat/{job}`; ai `/internal/scheduler/tier-monitoring`, `/internal/scheduler/rag-ingest`, `/internal/review/run`; auth `/internal/scheduler/purge-unverified` |
 
 Because the gateway never forwards `/internal/`, operator tools that need
 an internal route run **inside** a container. For example
@@ -328,7 +329,7 @@ for, or even know, the listeners. Two transports exist
 
 | Transport | Function | Redis | Guarantee | Used for |
 |---|---|---|---|---|
-| Pub/sub | `publish_cross_service` / `CrossServiceSubscriber` | channel `events:<name>` | at most once: lost if no listener is connected | notifications and live updates: `analysis.*`, `recommendation.ready`, `tier.*`, `decision.*`, `backtest.*`, organization, friend and user events, presence |
+| Pub/sub | `publish_cross_service` / `CrossServiceSubscriber` | channel `events:<name>` | at most once: lost if no listener is connected | notifications and live updates: `analysis.*`, `recommendation.ready`, `tier.*`, `decision.*`, `backtest.*`, organization, friend, block and user events, presence |
 | Durable stream | `publish_durable_event` / `DurableEventSubscriber` | stream `stream:<name>` in DB 3, consumer group `workers` | at least once: kept until acknowledged, retried, capped at about 10,000 entries | `document.uploaded`, `document.deleted`, `portfolio.deleted` (core -> ai, written first to the outbox table `core.event_outbox` in the same transaction as the change, then published), and the database update of `document.status_changed` (ai -> core) |
 
 Who listens:
@@ -482,6 +483,7 @@ page number is a `422`, not a `500`.
    | `InvalidCredentialsError` | `invalid_credentials` | 401 |
    | `RateLimitExceededError` | `rate_limit_exceeded` | 429 |
    | `UpstreamServiceError` | `upstream_service_error` | 502 |
+   | `ServiceUnavailableError` | `service_unavailable` | 503 |
 
    A subclass keeps its own `code` and inherits the status of its nearest
    registered parent (`_status_for` walks the class hierarchy). For
@@ -552,8 +554,9 @@ Three architecture points to remember:
   (`domains/analysis/queue.py`). Analyses running in parallel compete for
   the same small LLM quotas, and then whole batches fail together.
   Serial running removes that competition. One analysis usually takes
-  about 1.5 to 4 minutes (longer when a new SEC filing must be summarised
-  first), so a 15-ticker batch takes roughly 30 to 40 minutes.
+  about 1.5 to 4 minutes (up to 10 minutes more when a new SEC filing
+  must be summarised first), so a 15-ticker batch takes roughly 30 to 40
+  minutes.
 - **A restart of ai-service ends running analyses.** On shutdown the
   worker marks the in-flight analysis `failed` / `cancelled`. On startup,
   `fail_stale_analyses_on_startup` marks every analysis still `pending`
@@ -617,7 +620,7 @@ before it can answer `/health`:
 |---|---|
 | auth-service | configure logging; `ensure_schema` (Alembic upgrade); write every user's live state to Redis (`mirror_all_users_safely`, failure only logged); create the avatar folder. At shutdown: dispose the database engine, close Redis and the HTTP clients |
 | core-service | logging; `ensure_schema`; `ensure_bucket` for `S3_BUCKET_DOCUMENTS`; reload scheduled-job health from Redis (`load_job_health`); start six background tasks: pub/sub subscriber, durable subscriber, Yjs cross-replica listener, active-room heartbeat, WebSocket fan-out listener, outbox dispatcher. At shutdown it cancels the six tasks and waits for them (they use the engine and clients that close next), saves Yjs rooms with unsaved edits (`relay.persist_all_dirty`, they live only in memory), stops the Yjs validator workers, then closes the engine, Redis, HTTP and S3 clients |
-| ai-service | logging; `ensure_schema`; `check_embedding_configuration` (provider and vector size must match, or startup fails); `ensure_collection` in Qdrant; rebuild the BM25 keyword index from Qdrant (log `bm25_index_rebuilt` with `chunk_count`); start the durable subscriber; fail stale analyses, then stale backtests; start the analysis queue worker. At shutdown it first stops the queue worker (the running analysis becomes `failed` / `cancelled`, which needs the database, so this comes before the engine closes), cancels the background backtests and the durable subscriber and waits for them, then closes the engine, Redis, HTTP, Qdrant, LLM-provider and S3 clients |
+| ai-service | logging; `ensure_schema`; `check_embedding_configuration` (provider and vector size must match, or startup fails); `ensure_collection` in Qdrant; rebuild the BM25 keyword index from Qdrant (log `bm25_index_rebuilt` with `chunk_count`); start the durable subscriber; fail stale analyses, then stale backtests; start the analysis queue worker. At shutdown it first stops the queue worker (the running analysis becomes `failed` / `cancelled`, which needs the database, so this comes before the engine closes), cancels the background backtests and the durable subscriber and waits for them, then closes the engine, Redis, HTTP, Qdrant and S3 clients |
 
 Every service also exposes `/metrics` through
 `prometheus_fastapi_instrumentator`, with extra latency buckets
@@ -1003,7 +1006,7 @@ Run from the repository root with the stack already up (see
 | `shared/config.py` | `BaseServiceSettings`: shared settings, service URLs, Redis DB numbers, startup checks. |
 | `shared/database.py` | Engine with per-service `search_path`, `make_get_db`, startup schema bootstrap with Alembic (`bootstrap_schema`). |
 | `shared/redis.py` | Redis clients per logical database. |
-| `shared/http_client.py` | Pooled `httpx` clients that add the internal token. |
+| `shared/http_client.py` | Pooled `httpx` clients that add the internal token; `gather_bounded` (a `gather` with a concurrency limit). |
 | `shared/security.py` | JWT decoding, live user state check, `require_internal_token`. |
 | `shared/events.py` | Pub/sub and durable stream transports; event names and owners. |
 | `infra/gateway/nginx.conf` | Routing, TLS, headers, rate limit, resolver. |
@@ -1011,7 +1014,7 @@ Run from the repository root with the stack already up (see
 | `infra/scheduler/` | Scheduler image, crontab, job scripts, backup and restore. |
 | `infra/objectstore/` | SeaweedFS entrypoint (writes the S3 identity) and health check. |
 | `infra/prometheus/`, `infra/alertmanager/`, `infra/grafana/`, `infra/vector/` | Monitoring and logging configuration. |
-| `pyproject.toml`, `uv.lock` | One locked dependency set for all services, Python 3.11. |
+| `pyproject.toml`, `uv.lock` | One locked dependency set for all services, Python 3.11; tool settings (isort, mypy, pytest, and `[tool.pyright]` for editor import resolution only, with type checking off). |
 
 ## 10. Related chapters
 

@@ -225,7 +225,7 @@ Variables: `S` = service(s), `T` = tickers, `A` = analysis id(s), `ARGS`
 | `make logs` | `docker compose ... logs -f` | follow every container's log |
 | `make backup` | `docker compose ... exec scheduler /scripts/backup.sh` | backup now (writes `./backups/<stamp>/`) |
 | `make restore BACKUP=<stamp>` | restore dry run in the `restore` container | checks only |
-| `make restore BACKUP=<stamp> CONFIRM=yes` | **DESTRUCTIVE**: stops auth, core, ai, scheduler, objectstore; restores; `up -d` | replaces current data |
+| `make restore BACKUP=<stamp> CONFIRM=yes` | **DESTRUCTIVE**: stops auth, core, ai and scheduler, keeps objectstore running; restores; `up -d` | replaces current data |
 | `make test` / `test-auth` / `test-core` / `test-ai` | `uv run pytest tests/<service> -v` | unit tests on the host (real Postgres/Redis via testcontainers) |
 | `make test-integration` | `QDRANT_URL=http://127.0.0.1:6333 uv run --env-file .env.docker pytest tests/integration -v -m integration` | integration tests against the running stack |
 | `make promtool-test` | `promtool check rules` and `promtool test rules` in the Prometheus image | validate alert rules and their unit tests |
@@ -236,7 +236,7 @@ Variables: `S` = service(s), `T` = tickers, `A` = analysis id(s), `ARGS`
 | `make token [WHO=admin\|owner\|<uuid>]` | `bash scripts/token.sh` (default `admin`) | print a 2-hour access token |
 | `make e2e [PART=core\|tier] [ARGS=...]` | `bash scripts/e2e.sh` (default `all`) | real-environment end-to-end checks |
 | `make analyze T="AAPL MSFT"` | `bash scripts/run_analysis.sh` | real analyses with an output folder |
-| `make tiers [ARGS=all]` | `bash scripts/tiers.sh` (default `open`) | tiers of the test portfolio |
+| `make tiers [ARGS=all]` | `bash scripts/tiers.sh` (default `open`) | BUY cash held by the test portfolio's open tiers, per analysis (`all`: every tier) |
 | `make tiers-decline A="<uuid> ..."` | `bash scripts/tiers.sh decline` | decline recommendations (writes data) |
 | `make health` | `bash scripts/health.sh` | one-screen health view |
 | `make psql [ARGS=...]` | `bash scripts/psql.sh` | psql in the postgres container |
@@ -273,7 +273,7 @@ the Python scripts inside the services are in section 3.5b):
 | `logs.sh` | follow or grep logs | no | no |
 | `rebuild.sh` | rebuild or restart services, wait for health | restarts | yes |
 | `run_analysis.sh` | real analyses with an output folder | yes (analyses, tiers, memory) | no |
-| `tiers.sh` | open tiers; `decline` | only `decline` | no |
+| `tiers.sh` | BUY cash held by open tiers, per analysis, as the budget counts it; every tier; `decline` | only `decline` | no |
 | `snapshots.sh` | recompute NAV snapshots | only with `--confirm` | yes |
 | `backups.sh` | list, make, dry-run-check and drill backups | only `now` (`drill` writes only to its throwaway project) | no |
 | `probe.sh` | Gemini latency probe, key and model health | no (uses LLM quota) | no |
@@ -457,14 +457,22 @@ See section 3.9.
 #### `scripts/tiers.sh` - recommendation tiers of a portfolio
 
 ```sh
-bash scripts/tiers.sh                       # open tiers (they reserve BUY cash)
+bash scripts/tiers.sh                       # BUY cash held by open tiers, per analysis
 bash scripts/tiers.sh all                   # every tier, newest first (up to 100)
 bash scripts/tiers.sh decline <analysis-uuid> [...]   # WRITES DATA: declines the recommendation
 PORTFOLIO_ID=<uuid> bash scripts/tiers.sh
 ```
 
-"Open" means status `pending_acceptance` or `accepted_awaiting_trigger`
-with a window that has not expired. `decline` makes a 1-hour token for
+The default `open` runs `python -m scripts.analysis_cli committed
+<PORTFOLIO_ID>` in the ai-service container. It prints one line per
+analysis that holds BUY cash ("TICKER amount (analysis <id>, status)")
+and then "total committed BUY cash: X", exactly as the position-sizing
+budget counts it. A tier counts when its status is `pending_acceptance`
+or `accepted_awaiting_trigger`, its window has not expired, and it is
+accepted, or its analysis has a user, or its recommendation is younger
+than `SYSTEM_TIER_ACCEPTANCE_HOURS` (72; a pending tier of a system
+analysis stops counting after that). SELL tiers are not listed; use
+`all` for them and for the history. `decline` makes a 1-hour token for
 `OWNER_USER_ID` (a decision must come from the portfolio owner) and calls
 the public `POST /api/v1/analyses/{id}/decisions` with
 `{"action_taken": "declined", "portfolio_id": ...}` through the gateway.
@@ -561,19 +569,19 @@ bash scripts/smoke.sh --with-llm               # plus one cheap completion and o
 
 Runs `python -m scripts.smoke_check` in ai-service. Checks (from
 `CHECKS` in `services/ai-service/scripts/smoke_check.py`): `db`, `redis`,
-`qdrant`, `bm25`, `retrieval`, `kg`, `market_data`, `fx`, `fred`,
+`qdrant`, `bm25`, `retrieval`, `kg`, `filing_records`, `market_data`, `fx`, `fred`,
 `core_service`, `internal_api`, `backtest_metrics`, `backtest_replay`,
 `tier_monitoring_dry`, `review`, `queue`, and `llm` (only with
 `--with-llm`: one CHEAP completion and one embedding). One line per check
 (`OK`, `FAIL`, `SKIP`) with its detail or reason, then a summary; exit
 code 1 if any check failed. Each check runs on its own with its own time
-limit (`bm25`, `retrieval` and `llm` 120 s, `market_data` 90 s,
+limit (`bm25`, `retrieval`, `filing_records` and `llm` 120 s, `market_data` 90 s,
 `backtest_replay` 180 s, every other check 60 s), so one failure
 never stops the others. `fred` reads the Macro agent's FRED data through
 an alias (`fed_funds_rate`, 90 days) and a raw series id (`DGS10`, 30
 days); it is SKIP when `FRED_API_KEY` is empty and FAIL when a series has
-no observation in its window. `tier_monitoring_dry` is always SKIP for
-now: there is no side-effect-free trigger evaluation it could call (the
+no observation in its window. `tier_monitoring_dry` is always SKIP:
+there is no side-effect-free trigger evaluation it could call (the
 tier check executes trades), so it only counts the open tiers.
 
 Side effects by design: `market_data` refreshes AAPL's cached price bars (the same rows any analysis writes), `core_service` may
@@ -611,7 +619,7 @@ checks the clock.
 | `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
 | `recompute_snapshots` (through `scripts/snapshots.sh`) | core | with `--confirm` | Rebuilds NAV snapshots from the ledger and official closes; see section 3.5. | 12 |
 | `e2e_check` (through `scripts/e2e.sh`) | core | test data only, cleaned up | Whole-stack end-to-end check; see section 3.11. | 31 |
-| `analysis_cli create\|status\|get` | ai | `create` | Internal analysis client used by `run_analysis.sh`; see section 3.9. | 13 |
+| `analysis_cli create\|status\|get\|committed` | ai | `create` | Internal analysis client used by `run_analysis.sh` (see section 3.9); `committed <portfolio-uuid>` prints the BUY cash held by open tiers, used by `tiers.sh`. | 13 |
 | `upload_seed_documents --as-system [--dry-run] [--categories ...] [--seed-root DIR]` | ai | yes | Uploads the repository's `rag_seed_documents/` as system documents; see section 3.2 step 8. Without `--as-system` it uploads as a user (`--email`, `--password`) through the public API from the host. | 17 |
 | `measure_rag_recall [--limit N] [--top-k 10] < golden_set.json` | ai | no | Recall@1/5/10 and MRR@10 of the live index (BM25-only, vector-only, fused, and the production default) against the golden set read from stdin; questions whose chunk no longer exists are skipped and counted. One batched embedding pass, no chat model call. | 17 |
 | `measure_rag_recall --sweep [--apply]` | ai | only with `--apply` | Tunes the per-category BM25/vector weights in `ai/rag/category_weights.json` (categories with at least 10 questions; a win of 2 hits or fewer is flagged as noise). The file is inside the image: copy it out with `docker compose cp`, commit it, rebuild. | 17 |
@@ -625,8 +633,8 @@ checks the clock.
 | `probe_model_latency` (through `scripts/probe.sh`) | ai | no (uses LLM quota) | See section 3.5. | 14 |
 | `verify_portfolio_backtest --list` / `--portfolio U [--start D] [--end D] [--benchmark SPY] [--run [--keep]]` | ai | only with `--run` (row deleted unless `--keep`) | Recomputes a portfolio backtest independently in three layers: each snapshot against the ledger, the TWR metrics with its own code, and with `--run` the production backtest. | 19 |
 
-`services/ai-service/scripts/_text.py` is a helper module for the
-scripts' output, not a command.
+The output helpers of these scripts (`flatten`, `one_line`) live at the
+top of `services/ai-service/scripts/smoke_check.py`.
 
 ### 3.6 Deploying a change: restart, rebuild or recreate
 
@@ -735,8 +743,9 @@ How a job runs:
   not made PID 1 because dcron calls `setpgid()` at start, which fails
   for PID 1 (a session leader); crond then exits and the container
   restarts in a loop.
-- The five HTTP jobs (market-open, market-close, tier-monitoring,
-  review-run, rag-ingest) all run through one script,
+- The seven HTTP jobs (market-open, market-close, tier-monitoring,
+  review-run, rag-ingest, purge-unverified, notification-retention) all
+  run through one script,
   `call-job.sh <job>`: it sources `env.sh`, looks up the job's route and
   time limit, calls the route with `--max-time <limit>` and the
   `X-Internal-Token` header, prints the answer, and on success calls
@@ -745,7 +754,8 @@ How a job runs:
   alert eventually fires. It uses `curl -sS --fail-with-body`, so a
   failed run prints the answer body with its counts.
 - A job counts as failed when its endpoint answers an HTTP error. The
-  rag-ingest, tier-monitoring, review-run and market-open endpoints answer `500`
+  rag-ingest, tier-monitoring, review-run, market-open, purge-unverified
+  and notification-retention endpoints answer `500`
   with their counts (plus `"all_units_failed": [<step names>]`) when a
   step tried at least one item and every item failed
   (`shared/scheduled_jobs.py::job_response`, log
@@ -922,11 +932,14 @@ Consequences to know:
 - It writes real data: an analysis row, agent outputs, a recommendation,
   memory and knowledge-graph entries. For a BUY or SELL verdict, the
   position sizing writes tiers with status `pending_acceptance` on the
-  portfolio. They do not trade unless accepted. Decline unwanted ones
-  with `bash scripts/tiers.sh decline <analysis-id>`.
+  portfolio. They do not trade unless accepted. The script makes system
+  analyses (no `--user`), so their pending tiers expire after
+  `SYSTEM_TIER_ACCEPTANCE_HOURS` (72 hours). Decline unwanted ones
+  earlier with `bash scripts/tiers.sh decline <analysis-id>`.
 - It spends LLM quota.
 - Analyses run one at a time in ai-service, so a batch of N tickers takes
-  roughly N times one analysis (usually 1.5 to 4 minutes each; a
+  roughly N times one analysis (usually 1.5 to 4 minutes each, up to 10
+  minutes more for a ticker with a new SEC filing to summarise; a
   15-ticker batch about 30 to 40 minutes).
 - A batch also uses NewsAPI requests (about 35 for 15 tickers, of 100
   per day); `make health` shows how many are left.
@@ -944,11 +957,14 @@ docker compose --env-file .env.docker exec -T ai-service python -m scripts.analy
 docker compose --env-file .env.docker exec -T ai-service python -m scripts.analysis_cli status <analysis-id>
 docker compose --env-file .env.docker exec -T ai-service python -m scripts.analysis_cli get <analysis-id>
 docker compose --env-file .env.docker exec -T ai-service python -m scripts.analysis_cli create AMD --user <user-uuid>
+docker compose --env-file .env.docker exec -T ai-service python -m scripts.analysis_cli committed d72855ea-2776-41c3-bc77-ce1a4c1435d5
 ```
 
 `create` prints `{"data": {"id": ...}}`, `status` prints `{"data":
 {"status": ...}}`, `get` prints the same body as the public `GET
-/api/v1/analyses/{id}`. With `--user` the analysis belongs to that user
+/api/v1/analyses/{id}`. `committed` reads the database directly and
+prints the BUY cash held by the portfolio's open tiers, one line per
+analysis, plus the total (what `bash scripts/tiers.sh` shows). With `--user` the analysis belongs to that user
 (it appears in their history and notifications); with `--portfolio` as
 well, ai-service checks that the user may use that portfolio. Without
 `--user` it is a system analysis. On an HTTP error the body is printed
@@ -1038,6 +1054,9 @@ on demand with `make backup` (or `bash scripts/backups.sh now`, or
 `BACKUP_RETENTION_DAYS` (default 7) are deleted **only after** a new
 backup succeeded, and the newest 3 complete backups are always kept,
 whatever their age (so a week with the Mac asleep never leaves just one).
+The nightly backup runs only where the scheduler runs. The cloud host
+keeps its scheduler stopped, so it makes no automatic backups; backups
+are made on the local stack (nightly, or with `make backup` by hand).
 
 **Safety rules in the script:**
 
@@ -1103,8 +1122,10 @@ The real restore stops `auth-service core-service ai-service scheduler`,
 makes sure `objectstore` is running (`up -d --wait`), runs
 `restore.sh --yes` in the `restore` container (with `run --rm --build`),
 then `restore.sh --verify`, which compares the running data with the
-backup and stops the target on any difference, and finally `up -d`. What
-`restore.sh` does per part:
+backup and stops the target on any difference, and finally `up -d`.
+`up -d` also starts the scheduler, so on the cloud host stop it again
+right after the restore (`docker compose --env-file .env.docker stop
+scheduler`). What `restore.sh` does per part:
 
 - `postgres`: converts the dump to SQL first (a broken dump stops here),
   then in **one transaction** drops the `auth`, `core` and `ai` schemas
@@ -1299,7 +1320,7 @@ a gateway failure). Every command in this chapter stands alone.
 | `required variable ... set GRAFANA_ADMIN_PASSWORD in .env.docker` (or `S3_ACCESS_KEY`) | Compose ran without `--env-file .env.docker`, or the value is empty. | Always use `docker compose --env-file .env.docker ...` or the make targets. Fill the value. |
 | The browser says the connection is not private | Self-signed certificate. | Accept it for localhost; use `curl -k`. Regenerate with `sh infra/gateway/gen-certs.sh --force` if expired (825 days). |
 | `https://localhost:8443` refuses the connection | The gateway is not running, usually because a service is not healthy. | `docker compose --env-file .env.docker ps`; `bash scripts/logs.sh <unhealthy service>`. |
-| A service restarts in a loop with `SchemaBootstrapError` | The schema has tables but no Alembic revision, or a revision Alembic does not know ("Can't locate revision", for example a backup from before round 116). | Restore a backup made by the current code. See [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 8. |
+| A service restarts in a loop with `SchemaBootstrapError` | The schema has tables but no Alembic revision, or a revision Alembic does not know ("Can't locate revision", for example a backup whose revision is not in the current migration chains). | Restore a backup made by the current code. See [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 8. |
 | ai-service fails at startup about the embedding provider or vector size | `EMBEDDING_PROVIDER`, `QDRANT_VECTOR_SIZE` and `QDRANT_COLLECTION_RESEARCH` do not match (`check_embedding_configuration`, `ensure_collection`). | Set the three together (see `.env.example`). |
 | A code change has no effect | No auto-reload. | `RESTART_ONLY=1 bash scripts/rebuild.sh <svc>`; then confirm a log line from the new code. |
 | A `.env.docker` change has no effect | `restart` keeps the old environment. | `docker compose --env-file .env.docker up -d --force-recreate <services>`, then read the value back inside the container. |
@@ -1467,9 +1488,12 @@ command on its own line, from the repository root.
     ```sh
     make smoke
     ```
-    They see one `OK`/`SKIP` line per check and a summary. (It refreshes
+    They see one `OK`, `SKIP` or `FAIL` line per check and a summary.
+    Run it once before the evaluation: `filing_records` fails while a
+    stored filing has no `ai.filing_records` row (fix it with
+    `backfill_filing_records`, section 3.5b). The check itself refreshes
     AAPL's cached prices and creates and deletes one scratch backtest;
-    nothing else is written.)
+    nothing else is written.
 
 Optional, if time allows and you want to show alerting live (it stops
 one exporter for about two minutes; no data is touched):
@@ -1538,11 +1562,11 @@ one exporter for about two minutes; no data is touched):
 | `scripts/logs.sh` | Follow or grep logs. |
 | `scripts/rebuild.sh` | Rebuild or restart, wait for health. |
 | `scripts/run_analysis.sh` | Real analyses with an output folder. |
-| `scripts/tiers.sh` | Open tiers; decline. |
+| `scripts/tiers.sh` | BUY cash held by open tiers (per analysis); every tier; decline. |
 | `scripts/snapshots.sh` | NAV snapshot recompute (preview / `--confirm`). |
 | `scripts/backups.sh` | List, make, dry-run-check and drill backups. |
 | `scripts/probe.sh`, `scripts/smoke.sh`, `scripts/e2e.sh` | Latency probe, smoke check, end-to-end checks. |
-| `services/ai-service/scripts/analysis_cli.py` | Internal analysis client (create/status/get). |
+| `services/ai-service/scripts/analysis_cli.py` | Internal analysis client (create/status/get) and `committed` (BUY cash held by a portfolio's open tiers). |
 | `services/ai-service/scripts/smoke_check.py` | Smoke checks. |
 | `services/ai-service/scripts/e2e_tier_check.py` | Tier chain end-to-end check. |
 | `services/ai-service/scripts/probe_model_latency.py` | Gemini latency probe. |

@@ -6,12 +6,12 @@ from typing import Any, ClassVar
 import structlog
 from ai.knowledge.recycled_content import scratchpad_field
 from ai.providers.base import NewsArticle, NewsProvider, ProviderError
-from ai.providers.news_filters import build_ticker_news_query
 from ai.providers.news_relevance import (COMPANY_BUSINESS, CONSUMER_PRODUCT,
                                          EVIDENCE_KINDS, OPINION_LISTICLE,
                                          STOCK_MARKET, UNCLASSIFIED,
-                                         UNVERIFIED, cap_consumer_items,
-                                         clean_articles, lookup_search_name)
+                                         UNVERIFIED, build_ticker_news_query,
+                                         cap_consumer_items, clean_articles,
+                                         lookup_search_name)
 from ai.providers.newsapi import (NewsApiArticle, NewsApiProvider,
                                   SourceCatalog, catalog_flag, source_catalog)
 from ai.providers.registry import get_news_provider

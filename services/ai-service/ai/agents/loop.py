@@ -12,8 +12,8 @@ import structlog
 from ai.agents.evidence_grounding import wrap_verification_warning
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMMessage,
-                         LLMNonEnglishOutputError, LLMResponse, LLMTier)
-from ai.llm.json_fence import parse_json_dict
+                         LLMNonEnglishOutputError, LLMResponse, LLMTier,
+                         parse_json_dict)
 from ai.llm.router import LLMRouter
 from ai.tools.base import NON_EVIDENTIAL_TOOLS, Tool, is_evidence_record
 from config import settings

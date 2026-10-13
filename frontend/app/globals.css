@@ -505,8 +505,10 @@ a.row-item:hover { background: var(--bg-hover); }
   * { animation: none !important; }
 }
 
-/* wide content never breaks the page layout sideways */
+/* wide content never breaks the page layout sideways; position: relative
+   keeps absolutely positioned children (.sr-only) inside the scroll box */
 .table-scroll {
+  position: relative;
   max-width: 100%;
   overflow-x: auto;
 }

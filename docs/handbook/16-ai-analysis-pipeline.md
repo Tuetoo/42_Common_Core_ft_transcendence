@@ -174,7 +174,7 @@ effort (a failure means "no context", never a failed analysis):
 
 The "prior open recommendation" is the newest recommendation for the same
 portfolio and ticker whose window has not passed and that still has an
-unfilled tier (`domains/analysis/repository.py::get_open_recommendation_for`).
+unfilled tier (3.14; `domains/analysis/repository.py::get_open_recommendation_for`).
 The Judge sees only its action, confidence and date, never its reasoning
 (`PriorRecommendation.judge_context_line`). Shown the full earlier
 reasoning, the Judge restates it as if newly confirmed, run after run;
@@ -213,6 +213,7 @@ The Supervisor node also computes context once and shares it, so agents
 stay pure functions of the state. Every item below is an optional
 enrichment: a failure is logged (`supervisor_node.procedural_hints_failed`,
 `fresh_filing_check.sec_check_failed`,
+`fresh_filing_check.timed_out`,
 `supervisor_node.kg_context_failed`,
 `supervisor_node.portfolio_kg_context_failed`) and gives "no context" for
 that item, never a failed analysis.
@@ -233,8 +234,15 @@ that item, never a failed analysis.
   up to one 10-K and four 10-Qs, 3 s apart). Only the newest new filing's
   summary is pasted into the Filing, Fundamental and Risk prompts; pasting
   all of them (about 40k tokens for a new ticker) crowded the context and
-  older text was read as current. Any failure gives no context, never a
-  failed analysis.
+  older text was read as current. The wait is capped at
+  `FRESH_FILING_BUDGET_SECONDS` (600 s): one filing call at its worst
+  case (2 attempts x 300 s) and the slowest normal first ingest (5
+  filings, about 465 s) fit, and 2100 s of the 2700 s
+  `ANALYSIS_TIMEOUT_SECONDS` stay for agents, debate and Judge. When the
+  cap is reached, `fresh_filing_check.timed_out` is logged and this run
+  gets no fresh-filing context; the shielded ingest keeps running in the
+  background, and the next analysis of the same ticker joins it. Any
+  failure gives no context, never a failed analysis.
 - **Knowledge-graph context** (`ai/knowledge/kg_context.py::get_kg_context_for_ticker`)
   for Fundamental, Risk and Filing, limited to relations from system
   analyses and this user's own analyses. The log event
@@ -252,7 +260,7 @@ selected, Sentiment is held back. News's node has a conditional edge,
 Sentiment always builds on News's real summary. The same rule holds for
 Reflection retries (3.10): when News is retried, Sentiment is never sent
 directly, whether or not Sentiment is retried too; it runs after the new
-News output exists (`edges._sentiment_waits_for_news`).
+News output exists (`ai/graph/builder.py::_sentiment_waits_for_news`).
 
 Each agent node goes through `_run_agent_safely` (`ai/graph/nodes.py`):
 
@@ -791,9 +799,17 @@ weight if every tier fills (SELL: shares sold of those held).
    portfolio's *other* still-open BUY tiers (pending acceptance or accepted
    and waiting, window not passed), excluding this ticker, because a new
    BUY replaces this ticker's earlier BUY tiers
-   (`RecommendationTierRepository.committed_buy_cash`). Without this
+   (`RecommendationTierRepository.committed_buy_cash`). A pending tier of
+   a system analysis (`user_id` null) older than
+   `SYSTEM_TIER_ACCEPTANCE_HOURS` does not count. Without this
    rule, two open recommendations could each plan to spend about 98% of
-   the cash.
+   the cash. When the note is a `BudgetBlockedNote`, the workflow adds
+   "The committed cash is held by open BUY tiers on: <TICKER> (issued
+   <YYYY-MM-DD>), ..." (from `committed_buy_holders`; the date is the New
+   York market date of the holder's recommendation). It names tickers and
+   dates only, never analysis ids or amounts, because a system analysis
+   on an organization-shared portfolio is readable by every member. The
+   admin CLI `analysis_cli committed` prints the ids and amounts.
 4. **Minimum tier size** = `max(TIER_MIN_NOTIONAL_USD,
    TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION x net value)`, so `max(100, 1% of
    net value)` by default (`min_tier_notional`). A budget above 0 but below
@@ -840,7 +856,8 @@ and the fallback model:
   months.
 
 **Lite fallback.** If the strong call fails with an `LLMRequestError`
-(timeout, overload, rate limit), the same prompt goes once to the Lite
+(timeout, overload, rate limit) or its answer is rejected as non-English
+(`LLMNonEnglishOutputError`), the same prompt goes once to the Lite
 tier. Its tiers pass the same checks, and the note says "Entry/exit tiers
 were computed by the fallback model (...)". (Without it, one strong-model
 timeout would cost every tier.)
@@ -851,9 +868,12 @@ no tiers with one of these notes, the workflow *keeps* the ticker's earlier
 unfilled BUY tiers instead of closing them, and adds "Kept N earlier
 unfilled BUY tier(s) ...". N comes from
 `RecommendationTierRepository.unfilled_buy_tier_count`, which counts only
-tiers whose recommendation's `window_expires_at` is still in the future.
-A tier whose window has passed can never fill, so it is not counted as
-kept, even if the daily job has not marked it `expired` yet. (Without
+tiers whose recommendation's `window_expires_at` is still in the future
+and, for a pending tier of a system analysis, whose recommendation is
+younger than `SYSTEM_TIER_ACCEPTANCE_HOURS`.
+A tier whose window or acceptance deadline has passed can never fill, so
+it is not counted as kept, even if the daily job has not marked it
+`expired` yet. (Without
 this rule, a proposal slightly over budget would get no tiers and still
 close good earlier tiers, leaving a BUY with no entry plan.) Any other no-tier note (price lookup failed, model failed,
 position limit) does not keep them.
@@ -867,9 +887,15 @@ Unless the keep rule applies, every saved recommendation that has a
 portfolio (HOLD included) runs `RecommendationTierRepository.invalidate_unfilled_tiers_for_new_recommendation`
 for its portfolio and ticker. "Unfilled" means `pending_acceptance` or
 `accepted_awaiting_trigger`, and only tiers whose recommendation's
-`window_expires_at` is still in the future. A tier past its window that
-the daily tier-monitoring job has not swept yet is left alone here; that
-job marks it `expired`, not `superseded` (chapter 19, section 3.3). A
+`window_expires_at` is still in the future; a pending tier of a system
+analysis must also be younger than `SYSTEM_TIER_ACCEPTANCE_HOURS`. This
+rule lives in one place,
+`domains/analysis/repository.py::unfilled_tier_condition()`, and is
+shared by the budget, the keep rule, this function and
+`AnalysisRepository.get_open_recommendation_for`. A tier past its window
+or its acceptance deadline that the daily tier-monitoring job has not
+swept yet is left alone here; that job marks it `expired`, not
+`superseded` (chapter 19, section 3.3). A
 "set" is one older recommendation's tiers of one side. Two sets *cross* when any BUY price is at or above any SELL price
 (`bands_cross`).
 
@@ -904,8 +930,11 @@ back and nothing is saved (`analysis_workflow.completion_discarded_not_active`).
                   |
          pending_acceptance --------------------+------------+
            |      |      \                      |            |
- "followed"|  "declined"  window passed      newer rec.   portfolio
-           v      |       (daily job)        (rules 3.14)  deleted
+ "followed"|  "declined"  window passed, or   newer rec.   portfolio
+           |      |       system analysis    (rules 3.14)  deleted
+           |      |       not accepted in
+           |      |       SYSTEM_TIER_ACCEPTANCE_HOURS
+           v      |       (daily job)
  accepted_awaiting_trigger    |                 |            |
    |    |    |     \          v                 v            v
    |    |    |      +----> declined          superseded    expired
@@ -919,13 +948,17 @@ back and nothing is saved (`analysis_workflow.completion_discarded_not_active`).
 | `pending_acceptance` | created, waiting for the user | no |
 | `accepted_awaiting_trigger` | user followed it; the daily job may execute it | no |
 | `triggered` | the daily bar crossed the target; the trade was recorded in core-service | yes |
-| `expired` | window passed (or the portfolio was deleted) | yes |
+| `expired` | window passed, system tier not accepted in time, or portfolio deleted | yes |
 | `superseded` | a newer or accepted recommendation closed it | yes |
 | `declined` | the user declined (or changed a decision to ignored) | yes |
 | `execution_failed` | core-service refused the trade for a business reason | yes |
 
 Only the two non-terminal statuses reserve cash and are checked by the
-daily tier-monitoring job (chapter 19).
+daily tier-monitoring job (chapter 19). A pending or accepted tier whose
+window (`window_expires_at`) has passed, and a pending tier of a system
+analysis past its acceptance deadline, reserve no cash, and API reads
+already show them as `expired` before the daily job sweeps them
+(`domains/analysis/service.py::_tier_reads`).
 
 ### 3.16 Decisions: followed, ignored, partial, declined
 
@@ -943,7 +976,7 @@ organization member who can only read the portfolio gets 403.
 
 | Action | Effect on tiers |
 |---|---|
-| `followed` | all `pending_acceptance` tiers become `accepted_awaiting_trigger`; `accepted_at` is set; other recommendations' unfilled tiers are closed by the rules of 3.14. Refused (422) if the window already passed or no tier is still pending. |
+| `followed` | all `pending_acceptance` tiers become `accepted_awaiting_trigger` in one `UPDATE ... RETURNING`; `accepted_at` is set; other recommendations' unfilled tiers are closed by the rules of 3.14. Refused (422, "acceptance window has already expired") if the window already passed, or if it is a system analysis whose tiers passed `SYSTEM_TIER_ACCEPTANCE_HOURS`. If no tier is still `pending_acceptance` but at least one is `accepted_awaiting_trigger` or `triggered` (for example followed, then partial, then followed again), nothing changes on the tiers and the decision is stored as `followed`; this check runs before the window check. Otherwise refused (422, "no tier still awaiting acceptance") if the `UPDATE` changes no row; nothing is stored then (race with the expiry job or another supersede). |
 | `ignored` (first time) | nothing; tiers stay pending and expire with the window |
 | `partial` | nothing |
 | `declined` | every pending or accepted-but-not-triggered tier becomes `declined` |
@@ -954,9 +987,11 @@ old outcome rows (they are scored again) and its old LLM reviews (they
 described the old action), logs `decision.updated`
 (with `outcomes_removed` and `reviews_removed`), and publishes
 `decision.recorded`.
-Tier changes use explicit SQL `UPDATE` statements, not the ORM
-relationship: through the ORM, the relationship's `delete-orphan`
-cascade can delete every tier of a recommendation during a decline.
+Tier changes use explicit SQL `UPDATE` statements
+(`RecommendationTierRepository.accept_pending` and `.decline_unfilled`,
+ORM `update()`), not the ORM relationship: through the relationship, its
+`delete-orphan` cascade can delete every tier of a recommendation during
+a decline. The decision service holds no SQL.
 
 Decisions are later scored by the review job (chapter 19), and
 `GET /api/v1/decisions`, `/{id}/outcome` and `/{id}/review` serve only the
@@ -1003,6 +1038,7 @@ All settings are in `services/ai-service/config.py` (class
 | `TIER_MIN_NOTIONAL_USD` | 100.0 | smallest BUY tier in USD |
 | `TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION` | 0.01 | smallest BUY tier as a share of net value |
 | `TIER_WINDOW_DAYS_MAX` | 30 | longest tier validity window; a larger `window_days` answer is capped |
+| `SYSTEM_TIER_ACCEPTANCE_HOURS` | 72 | how long a `pending_acceptance` tier of a system analysis (`user_id` null) may wait for acceptance; after that it reserves no cash, is shown as `expired`, cannot be accepted, and the daily job marks it `expired`. User-owned analyses keep their own window. Counted in calendar hours (an owner decision); 72 h lets a system analysis issued on a Friday evening still be accepted at Monday's open |
 | code: `MAX_DEBATE_ROUNDS` (`ai/graph/state.py`) | 3 | mutual debate rounds |
 | code: `MAX_REFLECTION_RETRIES` (`ai/graph/state.py`) | 2 | Reflection retry rounds |
 | code: `DEBATE_MAX_REGENERATIONS` (`debate_common.py`) | 1 | rewrites of one argument (only for ungrounded figures) |
@@ -1010,6 +1046,7 @@ All settings are in `services/ai-service/config.py` (class
 | code: `CONFIDENCE_CHANGE_TO_EXPLAIN` (`judge.py`) | 0.05 | confidence move against the Judge's own earlier verdict that needs a stated change |
 | code: `_ONE_OFF_MATERIAL_PE_RATIO` (`judge.py`) | 1.10 | forward / trailing P/E needed for the valuation note |
 | code: `_DEBATE_SIDE_STAGGER_SECONDS` (`nodes.py`) | 0.5 | Bear starts this much later than Bull |
+| code: `FRESH_FILING_BUDGET_SECONDS` (`nodes.py`) | 600.0 | longest wait for the inline fresh-filing ingest in `supervisor_node` (3.2) |
 | code: `_GRAPH_RECURSION_LIMIT` (`analysis_workflow.py`) | 100 | LangGraph recursion limit |
 | code: penalties/caps (`engine.py`) | 0.15 / 0.15 / 0.3 / 0.15 / 0.3 | see 3.12 |
 | code: participation thresholds (`state.py`) | 0.5 / 0.8 | low / partial participation |
@@ -1092,6 +1129,7 @@ Reason: the `delete-orphan` cascade can delete real tiers (3.16).
 | low confidence, odd note | caps applied | read `confidence_adjustment_note` in the result |
 | BUY without tiers | sizing refused | read `tier_generation_note`; logs `position_sizing.*` (e.g. `position_sizing.buy_over_budget`, `position_sizing.buy_confidence_below_minimum`) |
 | tiers disappeared | superseded or declined | `bash scripts/tiers.sh all`; log `analysis_workflow.earlier_tiers_superseded` |
+| a system analysis's tier shows `expired` while its window is still open | not accepted within `SYSTEM_TIER_ACCEPTANCE_HOURS`; it reserves no cash and cannot be accepted | compare the recommendation's `created_at` with the setting (3.15) |
 | want the Judge's deciding factor, change basis or opposing points | not stored, only logged | `bash scripts/logs.sh ai-service grep judge.deciding_factor` and `judge.opposing_points`, filtered by the analysis id |
 | Judge rationale changed after a figure check | a rationale figure had no match in the evidence; one rewrite | `judge.ungrounded_figures`, `judge.ungrounded_figures_after_rewrite`, `judge.ungrounded_rewrite_failed` |
 | need every log line of one analysis | each line of the run (agents, LLM calls, tools, archival) carries `analysis_id` and, once known, `ticker` (structlog context variables bound in `run_analysis_workflow`) | `bash scripts/logs.sh ai-service grep '"analysis_id": "<analysis-uuid>"'` |
@@ -1122,7 +1160,8 @@ decision: which node fired, with which round counters and retry lists.
 
 ## 7. Demo walkthrough
 
-A full analysis takes about 10 minutes and makes real LLM calls. For a
+One analysis usually takes about 1.5 to 4 minutes (up to 10 minutes more
+when a new SEC filing must be summarised first) and makes real LLM calls. For a
 live demo, run one beforehand and show its run folder; optionally start a
 new one at the beginning of the session.
 
@@ -1165,17 +1204,23 @@ new one at the beginning of the session.
    `tier_generation_note` (budget, trimming, superseded tiers); the
    `REVIEW_META:` line at the end of each reflection's issues.
 
-3. **List the open tiers of the test portfolio.**
+3. **Show the BUY cash held by the open tiers of the test portfolio.**
 
    ```
    make tiers
    ```
 
-   (or `bash scripts/tiers.sh`). Say: "Only `pending_acceptance` and
-   `accepted_awaiting_trigger` tiers with a live window are open. Their
-   BUY notional is the cash the next sizing step treats as committed."
-   `bash scripts/tiers.sh all` shows the history, including `superseded`
-   and `declined` tiers.
+   (or `bash scripts/tiers.sh`). It runs `python -m scripts.analysis_cli
+   committed <PORTFOLIO_ID>` in the ai-service container and prints one
+   line per analysis holding BUY cash ("TICKER amount (analysis <id>,
+   status)") and then "total committed BUY cash: X", exactly as the
+   position-sizing budget counts it. Say: "Only `pending_acceptance` and
+   `accepted_awaiting_trigger` tiers with a live window are open; a
+   pending tier of a system analysis also stops counting after
+   `SYSTEM_TIER_ACCEPTANCE_HOURS`. Their BUY notional is the cash the next
+   sizing step treats as committed." SELL tiers are not listed:
+   `bash scripts/tiers.sh all` shows every tier, including SELL,
+   `superseded` and `declined` tiers.
 
 4. **Show the replacement rule in the database.**
 
@@ -1184,8 +1229,8 @@ new one at the beginning of the session.
    ```
 
 5. **Decline the recommendation (writes data: its tiers become
-   `declined`; not reversible).** Use the `analysis_id` column from
-   `make tiers`.
+   `declined`; not reversible).** Use an analysis id from `make tiers`
+   (or the `analysis_id` column of `bash scripts/tiers.sh all`).
 
    ```
    make tiers-decline A="<analysis-uuid>"
@@ -1195,7 +1240,7 @@ new one at the beginning of the session.
    a token for the portfolio owner, because only the owner may decide.
    The response is the saved decision inside a `data` object, with
    `"action_taken": "declined"`.
-   Run `make tiers` again: the tiers are gone from the open list.
+   Run `make tiers` again: the analysis is gone from the list.
 
 6. **Optional: show the delayed retries in the log of the day.**
 
@@ -1276,11 +1321,12 @@ tier can only become a trade after the owner accepts it."
 | `services/ai-service/ai/recommendation/engine.py` | single-position limit helpers, `no_verdict_reason`, `build_final_recommendation` |
 | `services/ai-service/ai/recommendation/position_sizing.py` | budget, minimum size, sizing call, validation, note types |
 | `services/ai-service/ai/workflows/analysis_workflow.py` | context, graph run, persistence, tiers, events, learning writes |
-| `services/ai-service/domains/analysis/repository.py` | tier queries, `committed_buy_cash`, `invalidate_unfilled_tiers_for_new_recommendation` |
+| `services/ai-service/domains/analysis/repository.py` | tier queries, `UNFILLED_TIER_STATUSES`, `unfilled_tier_condition`, `acceptance_lapsed`, `committed_buy_cash`, `committed_buy_holders`, `accept_pending`, `decline_unfilled`, `invalidate_unfilled_tiers_for_new_recommendation` |
 | `services/ai-service/domains/analysis/queue.py` | serial queue and timeout |
 | `services/ai-service/domains/decision/service.py` | record decision, accept/decline tiers, decision review |
 | `shared/enums.py` | `RecommendationAction`, `TierSide`, `TierStatus`, `AnalysisFailureReason` |
 | `scripts/run_analysis.sh`, `scripts/tiers.sh` | demo scripts |
+| `services/ai-service/scripts/analysis_cli.py` | `committed <portfolio-uuid>`: BUY cash held by open tiers, per analysis (used by `tiers.sh`) |
 
 ---
 

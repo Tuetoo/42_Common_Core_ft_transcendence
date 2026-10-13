@@ -1,5 +1,5 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { getMe } from "@/app/lib/me";
+import { getMe } from "@/app/lib/session";
 import { markAllNotificationsRead } from "@/app/lib/actions/notifications";
 import { Pager, pageParam } from "../pager";
 import { LocalTime } from "@/app/(protected)/local-time";

@@ -160,7 +160,8 @@ after (to drop an entry another service cached from the old data during
 the commit). The TTL remains as a backstop if Redis is unreachable. An
 auth-service failure during a lookup raises `UpstreamServiceError`, so
 callers fail closed. A membership without a role is treated as `viewer`
-(read only).
+(read only). An entry that cannot be parsed is logged
+(`org_membership_cache.corrupt_entry`) and treated as a miss.
 
 **Market data is not cached in Redis.** Prices and instruments are cached
 in PostgreSQL (`ai.instruments`, `ai.price_bars`), see
@@ -269,7 +270,7 @@ check fails). Both e2e scripts take `e2e:run_lock` first and refuse to
 start while another run holds it. The TTL frees the lock if a run is
 killed; `--break-lock` removes it at once.
 
-**About `shared/concurrency.py`.** Despite its name it does not use
+**About `gather_bounded` (`shared/http_client.py`).** It does not use
 Redis. `gather_bounded(coros, limit=10)` runs coroutines concurrently with
 an `asyncio.Semaphore`, so at most `limit` run at once inside one
 process. Database locks (row and advisory locks) are described in
@@ -636,7 +637,7 @@ counted from `ai.analyses` in PostgreSQL.
 | `services/core-service/apikeys.py` | public API counters, key validation cache |
 | `services/ai-service/domains/rag/qa.py` | research assistant counters |
 | `shared/events.py` | pub/sub publish/subscribe, streams, consumer group |
-| `shared/concurrency.py` | `gather_bounded` (in-process semaphore, not Redis) |
+| `shared/http_client.py` | `gather_bounded` (in-process semaphore, not Redis) |
 | `services/core-service/event_listener.py` | event claims |
 | `services/core-service/yjs_relay.py`, `websocket_manager.py` | Yjs and WebSocket channels, active-room markers |
 | `services/core-service/job_health.py` | job heartbeat hash |

@@ -121,20 +121,24 @@ class NotificationType(StrEnum):
     ORGANIZATION_MEMBER_LEFT = "organization_member_left"
     ORGANIZATION_MEMBER_REMOVED = "organization_member_removed"
     ORGANIZATION_ROLE_CHANGED = "organization_role_changed"
+    ORGANIZATION_INVITATION_REVOKED = "organization_invitation_revoked"
     FRIEND_REQUEST = "friend_request"
     FRIEND_ACCEPTED = "friend_accepted"
     FRIEND_REMOVED = "friend_removed"
+    CONNECTION_BLOCKED = "connection_blocked"
     ACCOUNT_UPDATED = "account_updated"
     ACCOUNT_ROLE_CHANGED = "account_role_changed"
 
     ANALYSIS_FAILED = "analysis_failed"
     DECISION_RECORDED = "decision_recorded"
+    DECISION_REVIEWED = "decision_reviewed"
     DECISION_EVALUATED = "decision_evaluated"
     TIER_EXECUTED = "tier_executed"
     TIER_EXECUTION_FAILED = "tier_execution_failed"
     TIER_CANCELLED = "tier_cancelled"
     BACKTEST_COMPLETED = "backtest_completed"
     BACKTEST_FAILED = "backtest_failed"
+    BACKTEST_DELETED = "backtest_deleted"
 
     @classmethod
     def __get_pydantic_json_schema__(
