@@ -74,23 +74,23 @@ promtool-test:
 
 # --- Lint ---------------------------------------------------------------
 
+# Each mypy invocation needs BOTH `--explicit-package-bases` AND
+# `MYPYPATH` pointed at the repo root: no directory has an
+# `__init__.py`, so mypy's default module-name inference reports
+# same-named files (e.g. `ai/tools/base.py` vs `ai/llm/base.py`)
+# as a spurious "Duplicate module" error.
+# `shared` runs from the repo root; each service must run from
+# inside its own directory.
+# `shared` must NOT be `cd`-ed into (the same file would then be
+# seen as both "database" and "shared.database").
+# The four invocations below are not interchangeable.
 lint:
 	uv run flake8 --extend-exclude mistral_provider.py \
 	    services shared tests infra
-	# Each mypy invocation needs BOTH `--explicit-package-bases` AND
-	# `MYPYPATH` pointed at the repo root: no directory has an
-	# `__init__.py`, so mypy's default module-name inference reports
-	# same-named files (e.g. `ai/tools/base.py` vs `ai/llm/base.py`)
-	# as a spurious "Duplicate module" error.
-	# `shared` runs from the repo root; each service must run from
-	# inside its own directory.
-	# `shared` must NOT be `cd`-ed into (the same file would then be
-	# seen as both "database" and "shared.database").
-	# The four invocations below are not interchangeable.
 	$(MAKE) mypy
 
 # One target per mypy invocation so CI can run the relevant ones per
-# service (see the notes under `lint`).
+# service (see the notes above `lint`).
 mypy: mypy-shared mypy-auth mypy-core mypy-ai
 
 mypy-shared:

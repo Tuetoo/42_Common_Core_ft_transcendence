@@ -131,6 +131,13 @@ class TestRateLimits:
         assert locked.status_code == 429 and "Retry-After" in locked.headers
 
         await reset_rate_limits()
+        codes = [(await login_response(
+            client, "lockout@example.com", totp_code=code)).status_code
+                 for code in ("000000", "000000", next_code(secret),
+                              "000000", "000000")]
+        assert codes == [401, 401, 200, 401, 401]
+
+        await reset_rate_limits()
         for i in range(2):
             r = await client.post(
                 "/api/v1/auth/register", json={

@@ -357,7 +357,8 @@ process cannot import two of them.
     │                        or not; legal.ts (their last-updated date)
     └── (protected)/         pages that need a login (layout.tsx checks the
                              session; sidebar and mobile navigation):
-                             portfolios, watchlists, analyses, analytics,
+                             portfolios, backtests, watchlists, analyses,
+                             analytics,
                              research (notes, collaborative editor, ask,
                              documents), notifications, friends,
                              organizations, profile, admin (users,

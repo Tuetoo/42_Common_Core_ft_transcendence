@@ -67,7 +67,9 @@ aliases above. Any other path goes to the frontend, which shows its own
 
 Errors raised by the services use the body
 `{"error": {"code", "message", "request_id"}}`; codes are snake_case
-(a missing resource is `not_found`). Every HTTP
+(a missing resource is `not_found`). Authentication and permission errors
+(401/403 from `shared/security.py`) and request-validation errors (422)
+keep FastAPI's `{"detail": ...}` body. Every HTTP
 response (not WebSockets) carries an `X-Request-ID` header. A client may
 send its own `X-Request-ID` (kept when it matches `[A-Za-z0-9._-]{1,64}`,
 otherwise replaced by a new `uuid4` hex). The same id is the error body's
@@ -147,8 +149,9 @@ POST   /api/v1/auth/2fa/disable
 Rules: emails are case-insensitive (stored lowercase; usernames are
 unique ignoring case). Login, 2FA codes, password-reset requests, register,
 resend-verification and invitations are rate limited (429 with
-`Retry-After`; limits in auth-service `config.py`); 5 wrong 2FA codes lock
-2FA for 15 minutes. `/2fa/setup` returns 409 while 2FA is enabled.
+`Retry-After`; limits in auth-service `config.py`); 5 wrong 2FA codes
+within 5 minutes, with no correct code between them, lock 2FA for 15
+minutes. `/2fa/setup` returns 409 while 2FA is enabled.
 `/2fa/setup` and `/2fa/verify` (the step that enables 2FA) need a **recent
 login**: the access token's `auth_time` claim (the Unix time of the
 password or OAuth login that started the session; a refresh keeps it, it
@@ -406,7 +409,6 @@ GET    /internal/users/{user_id}/state          {"role", "is_active"}
 GET    /internal/users/{user_id}/organizations
 GET    /internal/users/{user_id}/notification-settings
 GET    /internal/connections/check
-GET    /internal/stats
 POST   /internal/users/{user_id}/presence      body {"online": bool} (called by core-service WebSockets)
 POST   /internal/scheduler/purge-unverified     (scheduler, daily 04:10 New York)
 ```
@@ -429,8 +431,8 @@ Internal routes are excluded from the public OpenAPI document.
 `/users/{id}/state` returns the live role and active flag from
 the database (a deleted user is `is_active: false`; 404 only for an id that
 never existed) -- the fallback `shared/user_state.py` uses on a Redis miss.
-`/stats` returns auth's flat counts (`users_total`, `users_active`,
-`users_deleted`, `users_by_role`). Each item of `/users/{id}/organizations`
+auth-service has no `/internal/stats`; `GET /api/v1/admin/stats` reads
+auth's counts from its own database. Each item of `/users/{id}/organizations`
 also carries the member's organization `role` (`owner`/`admin`/
 `member`/`viewer`); core-service uses it to make VIEWER read-only.
 
@@ -599,7 +601,8 @@ file delete leaves at most an orphan object, never a row without its file.
 
 Re-uploading a duplicate document returns the existing row (201)
 without uploading or publishing anything (a `failed` duplicate is re-ingested
-in place); download sends an RFC 5987 `filename*` so non-ASCII names work;
+in place when the caller owns it; another organization member gets 409
+`conflict`); download sends an RFC 5987 `filename*` so non-ASCII names work;
 `sort` on the notes list is validated (422 on unknown values); another
 user's document or notification returns 404. Comments can be listed by
 anyone who can read the note and deleted by the comment or note author; a
@@ -648,10 +651,14 @@ buried under the shared corpus); `is_system` is true on those rows.
   summary for everyone except their author (who sees `is_hidden: true`)
   and moderators; a hidden comment is 404 for other readers.
 - Sentiment (A3): after a note or comment is created or its text changes
-  (REST or the Yjs write-back), a background task asks ai-service `POST
-  /internal/sentiment` and stores the result, only if the text is still
-  the same. A failure leaves the fields null; `scripts/backfill_sentiment.py`
-  (preview, `--apply`) fills rows that have none.
+  (REST or the Yjs write-back), a separate asyncio task asks ai-service
+  `POST /internal/sentiment` and stores the result, only if the text is
+  still the same; the response does not wait for it. At most one call
+  per note or comment runs at a time; saves made meanwhile queue one
+  follow-up that reads the latest text. A failed refresh keeps the
+  previous label until the next successful refresh (a new row stays
+  null); `scripts/backfill_sentiment.py` (preview, `--apply`) fills only
+  rows that have no label.
 - `GET /sentiment/summary`: the analysed notes and comments the caller may
   read, optionally about `ticker` (tagged with it or mentioning it, plus
   their comments) and created within `from`..`to` (UTC days, 422 when
@@ -1319,8 +1326,11 @@ note or comment is saved, and `scripts/backfill_sentiment.py`): body
 `{"text": str, "kind": "note" | "comment"}` -> 200 `{"label": "positive" |
 "neutral" | "negative", "score": float in [-1, 1], "model": str}`; 422 for
 empty text; 503 (`Retry-After: 60`) when the LLM is unavailable or gives no
-usable answer (the caller leaves the sentiment empty and retries on the
-next save or via the backfill). One Lite-tier call with strict JSON; only
+usable answer, or after `SENTIMENT_TIMEOUT_SECONDS` (240) in total (the
+caller keeps the stored sentiment, empty for a new row, and tries again on
+the next save; the backfill fills rows that have no label). core-service
+waits up to 270 s for the answer. One cheap (Lite) tier call with strict
+JSON, asked again once when the answer is not the requested JSON; only
 the score is taken from the model (clamped), and the label is derived from
 it (>= 0.15 positive, <= -0.15 negative, else neutral). Texts are cut to
 `SENTIMENT_MAX_INPUT_CHARS` (6000) at a word boundary; the text is treated

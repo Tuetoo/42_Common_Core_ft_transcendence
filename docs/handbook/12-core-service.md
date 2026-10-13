@@ -574,16 +574,24 @@ tickers is what ai-service's nightly ingestion keeps fresh
   with 4403 (edits are saved after a hide, discarded after a delete;
   chapter 25).
 - **Sentiment** (`sentiment.py`): after a note or comment is created or
-  its text changes (REST, or the Yjs write-back), a background task calls
-  ai-service `POST /internal/sentiment` (`clients/ai_client.py`)
+  its text changes (REST, or the Yjs write-back), core starts an asyncio
+  task (`schedule_note_sentiment` / `schedule_comment_sentiment`) that
+  calls ai-service `POST /internal/sentiment` (`clients/ai_client.py`)
   and stores the label and score, only if the text has not changed
   meanwhile, so a slow answer for an older version never overwrites the
-  newer one's. The task opens its own session (the request has
-  committed) and never raises; storing a result does not move
-  `updated_at` (it is not an edit). A failed call leaves the row without
-  sentiment (NULL); the next edit or `python -m scripts.backfill_sentiment
+  newer one's. The REST routes start it from a `BackgroundTasks` entry
+  (`schedule_after_commit`), so it starts after the commit, but the
+  response (and its latency metric) does not wait for the LLM. Refreshes
+  are single-flight per note or comment: at most one call runs, and
+  further saves meanwhile queue one follow-up that re-reads the latest
+  text. The task opens its own session and never raises; storing a
+  result does not move `updated_at` (it is not an edit). A failed call
+  stores nothing. A new note or comment then stays without sentiment
+  (NULL) until the next edit or `python -m scripts.backfill_sentiment
   --apply` (preview without `--apply`, `--rate` calls per minute, default
-  30) fills it. `GET /api/v1/research/sentiment/summary` aggregates it
+  30) fills it. After an edit, a failed refresh keeps the previous label
+  until the next successful refresh; the backfill only fills rows that
+  have no label. `GET /api/v1/research/sentiment/summary` aggregates it
   (counts per label, average score, a per-day series by UTC creation
   day; `ticker` selects notes tagged with it or mentioning it, and their
   comments). It counts the caller's own notes and the notes of the
@@ -704,9 +712,12 @@ the document list always shows the current status.
 **Duplicates and retries.** A second upload with the same (tenant,
 ticker, category, filename):
 
-- status `failed` -> retried in place: the object is overwritten, status
-  reset to `uploaded`, `document.uploaded` published again, notification
-  "Document re-uploaded" (auto-ingestion relies on this);
+- status `failed` -> retried in place when the uploader owns the
+  document: the object is overwritten, status reset to `uploaded`,
+  `document.uploaded` published again, notification "Document
+  re-uploaded" (auto-ingestion relies on this); another member of the
+  organization gets 409 ("A document with this name already exists in
+  the organization.");
 - status not final and unchanged for too long, measured from the last
   status change (`status_changed_at`, set on create, on every applied
   `document.status_changed` and on a failed-upload retry): `uploaded` for
@@ -1267,8 +1278,9 @@ All use the shared pooled client (`shared/http_client.py`), which adds
 `auth_client` and `ai_client` calls, except `get_daily_closes` and
 `request_analysis` with 15 s (a close may trigger a provider refresh in
 ai-service, and a create can involve more work than a cached read);
-`ai_client.analyze_sentiment` waits up to 30 s (`_SENTIMENT_TIMEOUT`), because the sentiment call is an
-LLM call that runs in a background task. The sentiment contract: body
+`ai_client.analyze_sentiment` waits up to 270 s (`_SENTIMENT_TIMEOUT`), because the sentiment call is an
+LLM call that runs in a fire-and-forget asyncio task (the HTTP response does not wait for it); the wait is longer than ai-service's own
+limit (`SENTIMENT_TIMEOUT_SECONDS`, 240 s), so a slow answer or its 503 arrives. The sentiment contract: body
 `{"text", "kind": "note" | "comment"}` -> `{"label", "score" in [-1, 1],
 "model"}`; 422 for empty text, 503 when the LLM is unavailable; any
 failure or an answer outside the contract returns `None`.
@@ -1322,8 +1334,8 @@ Head: `f1250c000001`. Bootstrap runs at start
 | `PRESENCE_HEARTBEAT_SECONDS` | `60` (`websocket_manager.py`) | |
 | `_EVENT_CLAIM_TTL_SECONDS` | `300` (`event_listener.py`) | replica de-duplication window |
 | `OUTBOX_DISPATCH_INTERVAL_SECONDS` / `OUTBOX_GRACE_SECONDS` / `OUTBOX_BATCH_SIZE` / `OUTBOX_RETENTION_DAYS` | `5` s / `10` s / `100` / `7` days (`outbox.py`) | dispatcher period; age before the dispatcher takes over a row; rows per pass, oldest first; how long published rows are kept (purged once an hour) |
-| `_CLOSES_TIMEOUT` / `_TIMEOUT` | `15.0` / `3.0` s (`clients/ai_client.py`) | price fetch and analysis create / other ai calls |
-| `_SENTIMENT_TIMEOUT` | `30.0` s (`clients/ai_client.py`) | sentiment (LLM) call |
+| `_CLOSES_TIMEOUT` / `_TIMEOUT` | `15.0` / `3.0` s (`clients/ai_client.py`) | price fetch (analysis create uses a literal `15.0`) / other ai calls |
+| `_SENTIMENT_TIMEOUT` | `270.0` s (`clients/ai_client.py`) | sentiment (LLM) call |
 | `_CACHE_TTL_SECONDS` | `60` s (`clients/auth_client.py`), `10` s (`clients/ai_client.py`) | user-ref cache / latest-recommendation cache |
 | `DEFAULT_THRESHOLD` / `CASH_TOLERANCE` | `1.00` / `0.01` (`scripts/recompute_snapshots.py`) | recompute flags |
 | cron times | market-open `30 9 * * 1-5`, market-close `30 17 * * 1-5`, notification-retention `20 4 * * *` (New York) | `infra/scheduler/crontab` |

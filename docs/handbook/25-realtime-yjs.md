@@ -500,7 +500,10 @@ either:
    full-text search follows automatically; `updated_at` moves (onupdate).
    If the text did not change, `updated_at` is kept as it is.
 4. Commit. If the text changed, `schedule_note_sentiment(note_id)` asks
-   ai-service to refresh the note's sentiment.
+   ai-service to refresh the note's sentiment; while a refresh for the
+   note is running, further saves only queue one follow-up (single-flight
+   per note), so live typing makes at most one call in flight plus one
+   queued.
 5. Return `False` if the note no longer exists (deleted meanwhile). A real
    database error is not turned into `False`; it raises.
 

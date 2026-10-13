@@ -788,6 +788,29 @@ class TestBacktestWorkflow:
 
         await _delete_backtest(backtest_id)
 
+        backtest_id = await _create_single_ticker_backtest(
+            start_date=start, end_date=end, initial_capital=initial_capital)
+        published: list[str | None] = []
+
+        async def _publish(backtest_uuid, *, completed, error=None):
+            published.append(error)
+
+        monkeypatch.setattr(
+            backtest_workflow, "get_market_data_provider",
+            lambda: _FakeMarketProvider({"SPY": spy_closes}))
+        monkeypatch.setattr(
+            backtest_workflow, "publish_backtest_finished", _publish)
+        await backtest_workflow.run_backtest_workflow(
+            str(backtest_id), ticker=ticker,
+            portfolio_id=str(target_portfolio))
+
+        async with SessionLocal() as session:
+            backtest = await BacktestRepository(session).get_by_id(backtest_id)
+            assert backtest.status == "failed"
+        assert len(published) == 1
+        assert f"no price history for {ticker}" in (published[0] or "")
+        await _delete_backtest(backtest_id)
+
         await backtest_workflow.run_backtest_workflow(
             str(uuid4()), ticker="AMD")
         await backtest_workflow.mark_backtest_failed(uuid4())

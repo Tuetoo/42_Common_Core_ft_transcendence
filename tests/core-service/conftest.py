@@ -201,10 +201,14 @@ def published_events(monkeypatch):
 
 
 @pytest.fixture
-def no_sentiment_analysis(monkeypatch):
+async def no_sentiment_analysis(monkeypatch):
+    import asyncio
     import clients.ai_client as ai_client
+    from domains.research import sentiment
 
     async def _none(text, kind):
         return None
 
     monkeypatch.setattr(ai_client, "analyze_sentiment", _none)
+    yield
+    await asyncio.gather(*sentiment._running.values())

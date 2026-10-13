@@ -222,10 +222,10 @@ hashed so raw addresses never sit in Redis. Scopes and limits
 | `resend:email` | 3 | 1 h |
 | `invite:org` | 20 | 1 h |
 | `friend:user` | 30 friend requests per requester | 1 h |
-| `2fa:fail` -> `2fa:lock` | 5 failures in 5 min | lock for 15 min |
+| `2fa:fail` -> `2fa:lock` | 5 failures in 5 min (a correct code resets) | lock for 15 min |
 
 The 2FA lock uses its own keys: failures count in
-`auth:rl:2fa:fail:<hash>`; at the limit `auth:rl:2fa:lock:<hash>` is set
+`auth:rl:2fa:fail:<hash>` (a correct code deletes it); at the limit `auth:rl:2fa:lock:<hash>` is set
 with a 15-minute TTL, and every attempt first checks that TTL.
 `RATE_LIMIT_ENABLED` turns all of it off (tests).
 

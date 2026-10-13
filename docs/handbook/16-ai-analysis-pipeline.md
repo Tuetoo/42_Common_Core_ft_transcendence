@@ -820,7 +820,12 @@ weight if every tier fills (SELL: shares sold of those held).
    room is smaller than the budget, the budget is cut to the room.
    There is no per-recommendation BUY cap (an owner decision): a BUY may use
    the whole remaining BUY budget; the single-position limit, the minimum
-   tier size and `MIN_BUY_TIER_CONFIDENCE` still apply. Consequence to
+   tier size and `MIN_BUY_TIER_CONFIDENCE` still apply. The room needs the
+   net value: when a holding has no live price, or the cash or holdings
+   lookup failed, the room is not computed and the limit is not applied
+   in that run (nor the engine's BUY-to-HOLD switch or the Judge's limit
+   line, which need the weight); the tier note then says that the share
+   of the portfolio's net value is unavailable. Consequence to
    explain to an evaluator: in a batch, the first BUYs can reserve almost
    all cash (two BUYs can reserve about 99%), so later BUYs get a
    `BudgetBlockedNote` and no tiers; tier size depends on run order. This

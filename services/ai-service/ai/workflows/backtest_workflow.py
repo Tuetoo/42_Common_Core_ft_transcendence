@@ -313,6 +313,10 @@ async def _replay_backtest(
                 ticker, start=start_date, end=end_date)
             closes_by_ticker[ticker] = closes_by_date(
                 bars, ticker=ticker, event=dropped_event)
+            if not closes_by_ticker[ticker]:
+                raise ValueError(
+                    f"no price history for {ticker} between {start_date} "
+                    f"and {end_date}")
         benchmark_bars = await provider.get_price_history_range(
             benchmark_symbol, start=start_date, end=end_date)
         benchmark_closes_by_date = closes_by_date(

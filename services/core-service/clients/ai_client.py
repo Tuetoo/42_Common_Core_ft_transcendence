@@ -18,7 +18,9 @@ logger = structlog.get_logger(__name__)
 _CACHE_TTL_SECONDS = 10
 _TIMEOUT = 3.0
 _CLOSES_TIMEOUT = 15.0
-_SENTIMENT_TIMEOUT = 30.0
+# Longer than ai-service SENTIMENT_TIMEOUT_SECONDS (240 s), so its answer
+# or its 503 arrives instead of a client-side timeout.
+_SENTIMENT_TIMEOUT = 270.0
 _LABELS = frozenset({"positive", "neutral", "negative"})
 
 
@@ -173,7 +175,8 @@ async def analyze_sentiment(
         model = str(data.get("model") or "")
     except Exception as exc:
         logger.warning(
-            "sentiment_request_failed", kind=kind, error=str(exc)[:200])
+            "sentiment_request_failed", kind=kind,
+            error=str(exc)[:200] or type(exc).__name__)
         return None
     if (label not in _LABELS or not math.isfinite(score)
             or not -1.0 <= score <= 1.0):

@@ -72,15 +72,20 @@ groups:
 
       # Per-handler histogram (buckets up to 30s, see the services'
       # main.py). Excluded: /internal/* (scheduler jobs such as the daily
-      # review run are long by design) and the /metrics and /health
-      # probes. Creating an analysis or a backtest only stores the row and
-      # starts the work in the background, so both stay included.
+      # review run are long by design), the RAG ask handlers (an LLM call,
+      # and the streamed answer is timed until its last token) and the
+      # /metrics and /health probes. Creating an analysis or a backtest
+      # only stores the row and starts the work in a separate task, so
+      # both stay included. The measured duration includes the FastAPI
+      # background tasks of a request (core's notifications and emails);
+      # the note and comment sentiment call runs in its own asyncio task
+      # and is not counted.
       - alert: HighLatencyP95
         expr: |
           histogram_quantile(
             0.95,
             sum by (service, le) (
-              rate(http_request_duration_seconds_bucket{handler!~"/internal/.*|/metrics|/health"}[10m])
+              rate(http_request_duration_seconds_bucket{handler!~"/internal/.*|/metrics|/health|/api/v1/rag/ask.*"}[10m])
             )
           ) > 2
         for: 10m

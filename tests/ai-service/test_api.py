@@ -1803,6 +1803,17 @@ class TestSentiment:
         assert len(body) <= 100
         assert not body.endswith(" wor")
 
+        class _SlowRouter:
+
+            async def complete(self, tier, messages, **kwargs):
+                await asyncio.sleep(5)
+
+        monkeypatch.setattr(settings, "SENTIMENT_TIMEOUT_SECONDS", 0.05)
+        import ai.user_sentiment as us
+        monkeypatch.setattr(us, "LLMRouter", _SlowRouter)
+        slow = await client.post("/internal/sentiment", json={"text": "hmm"})
+        assert slow.status_code == 503
+
         assert truncate_text("  short  ", 100) == "short"
         assert truncate_text("abcdefghij", 5) == "abcde"
         assert label_for_score(0.149) == "neutral"
