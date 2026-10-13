@@ -248,8 +248,6 @@ class TestPortfolioAccess:
         assert str(shared.id) in ids
         assert str(private.id) not in ids
 
-        import clients.auth_client as auth_client
-
         mine = uuid4()
         watched = uuid4()
 
@@ -860,7 +858,6 @@ class TestSnapshots:
         assert snap is not None and snap.total_value == Decimal("10000")
 
         import api.internal as internal
-        import clients.ai_client as ai_client
 
         _, headers = _make_token()
         pid = await _portfolio_with_positions(client, headers, "AAPL")
@@ -1102,7 +1099,6 @@ class TestScheduledJobs:
         await client.get(f"/api/v1/portfolios/{pid}/holdings", headers=headers)
         assert rec_calls == [("NVDA", UUID(pid))]
 
-        import clients.ai_client as ai_client
         import domains.portfolio.service as service_module
 
         owner, headers = _make_token()
@@ -1122,9 +1118,6 @@ class TestScheduledJobs:
         monkeypatch.setattr(service_module, "get_user_state", _state)
         await service_module.PortfolioService(db_session).run_market_open_job()
         assert not any(user_id == UUID(owner) for _, _, user_id in calls)
-
-        import clients.ai_client as ai_client
-        import domains.portfolio.service as service_module
 
         owner, headers = _make_token()
         await _enable_auto_analysis(client, headers, "amd", "msft")
@@ -1495,10 +1488,6 @@ class TestInternalQueries:
         assert mine == sorted([(owner1, "QCOM"), (owner2, "QCOM"),
                                (owner2, "INTC")])
 
-        from domains.portfolio.repository import (HoldingRepository,
-                                                  PortfolioRepository,
-                                                  WatchlistRepository)
-
         portfolio = await PortfolioRepository(db_session).create(
             owner_id=uuid4(), name="P", currency="USD", organization_id=None,
             visibility="private")
@@ -1561,9 +1550,6 @@ class TestInternalQueries:
 
         assert len(flows) == 2
         assert {f.transaction_type for f in flows} == {"deposit", "withdrawal"}
-
-        from domains.portfolio.repository import (PortfolioRepository,
-                                                  TransactionRepository)
 
         portfolio = await PortfolioRepository(db_session).create(
             owner_id=uuid4(), name="Cash Flow Endpoint Test", currency="USD",

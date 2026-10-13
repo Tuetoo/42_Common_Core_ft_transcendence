@@ -19,11 +19,11 @@ export function EditOrganizationForm({
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="org-name">Name</label>
-        <input id="org-name" name="name" type="text" required maxLength={128} defaultValue={v.name} />
+        <input id="org-name" name="name" autoComplete="off" type="text" required maxLength={128} defaultValue={v.name} />
       </div>
       <div className="field">
         <label htmlFor="org-description">Description</label>
-        <textarea id="org-description" name="description" rows={3} maxLength={1000} defaultValue={v.description} />
+        <textarea id="org-description" name="description" autoComplete="off" rows={3} maxLength={1000} defaultValue={v.description} />
       </div>
       {state.error && (
         <p aria-live="polite" className="form-message error">

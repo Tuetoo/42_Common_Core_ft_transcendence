@@ -34,10 +34,9 @@ bucket was listed is in the next night's backup. The backup keeps keys and
 contents, not S3 metadata: on restore each object's `Content-Type` is set
 from its key's file extension (the services never read it back).
 
-`manifest.json` has `"format": 3`. The older formats (a tarball of the
-object storage's data directory, before 2026-10-05) are no longer
-restored: they aged out of the 7-day retention, and their object storage
-part cannot be put back.
+`manifest.json` has `"format": 3`. A backup without an `objectstore/`
+folder has no object storage part: a restore skips that part with a
+warning (or stops, with `--only objectstore`).
 
 The layout of one backup:
 
@@ -59,8 +58,12 @@ backups/2026-10-05_0230/
   gitignored.
 - **Schedule:** every day at **02:30 America/New_York** (scheduler
   crontab), between the review job (02:00) and RAG ingestion (03:00).
+  Backups run only while the scheduler runs. The cloud host keeps it
+  stopped, so the cloud makes no backups; backups are made on the local
+  stack (`docs/DEPLOYMENT.md` section 6).
 - **By hand:** `make backup`, which runs
-  `docker compose --env-file .env.docker exec scheduler /scripts/backup.sh`.
+  `docker compose --env-file .env.docker exec scheduler /scripts/backup.sh`
+  (so the scheduler must be running).
   Add `--dry-run` to see what it would do without doing anything.
 - **Retention:** backups older than `BACKUP_RETENTION_DAYS` days (default
   **7**, set in `.env.docker`) are deleted -- but only after the new
@@ -183,8 +186,9 @@ schema without CASCADE, so a database holding a table newer than the
 backup -- exactly the "after a bad migration" case -- could not be
 restored. On their next start the services run `alembic upgrade head`
 (see section 8), so a backup from an older code version is migrated
-forward automatically -- except a backup from before the current
-baselines (before round 116), which cannot be restored (section 8).
+forward automatically -- except a backup whose Alembic revision is not
+in the current chains (the baselines `f1160*`), which cannot be
+restored (section 8).
 
 ### 4.2 Only Qdrant
 
@@ -346,7 +350,7 @@ environment. Alembic alone manages the schema:
   every table;
 - a schema at a known revision: `alembic upgrade head`;
 - a schema at a revision Alembic does not know (for example from a backup
-  taken before round 116, when an older migration chain was used): Alembic
+  made with an older migration chain, before the baselines above): Alembic
   stops with "Can't locate revision" and the service does not start. Such
   backups cannot be restored with this version;
 - a schema with tables but no Alembic revision: refused (its state is

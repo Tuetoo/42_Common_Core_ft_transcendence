@@ -11,7 +11,8 @@ export function AddCommentForm({ noteId }: { noteId: string }) {
   const [state, formAction, pending] = useActionState(addCommentForNote, initialState);
   const formRef = useRef<HTMLFormElement>(null);
 
-  // Clear the box after each successful post.
+  // Clear the box after each successful post. After an error the action
+  // returns the comment, and the reset form shows it again.
   useEffect(() => {
     if (state.posted) formRef.current?.reset();
   }, [state.posted]);
@@ -23,9 +24,11 @@ export function AddCommentForm({ noteId }: { noteId: string }) {
         <textarea
           id="comment-content"
           name="content"
+          autoComplete="off"
           rows={3}
           required
           maxLength={COMMENT_MAX}
+          defaultValue={state.values?.content ?? ""}
           aria-describedby="comment-help"
         />
         <span id="comment-help" className="text-xs text-[var(--text-faint)]">

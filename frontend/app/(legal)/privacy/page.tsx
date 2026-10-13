@@ -94,9 +94,11 @@ export default function PrivacyPolicyPage() {
         </li>
         <li>For security: rate limiting, detecting abuse and recording errors.</li>
         <li>
-          To send email: verifying your email address, resetting your password and organization invitations. If you
-          turn on email notifications in your account settings (they are off by default), your notifications are
-          also sent to your email address.
+          To send email: verifying your email address, resetting your password and organization invitations.
+          Email notifications are off by default. The website has no switch for them yet; they can be turned on
+          only through the account API (the <code>notification_preferences</code> field of{" "}
+          <code>PATCH /api/v1/auth/me</code>). When they are on, your notifications are also sent to your email
+          address.
         </li>
       </ul>
       <p>There is no advertising, and your information is not sold.</p>
@@ -157,8 +159,11 @@ export default function PrivacyPolicyPage() {
         </li>
         <li>Read notifications are deleted after 90 days. Unread ones are kept.</li>
         <li>
-          Sign-in session records (IP address and browser information) are removed when you next sign in, once the
-          session has been expired for more than 7 days. Records of an account that does not sign in again are kept.
+          A sign-in session record (the IP address and browser information from your sign-in) is written when you
+          sign in and again each time your sign-in is renewed automatically, which happens about every 15 minutes
+          while you use the site. Each record expires 30 days after it is written. Expired records are deleted the
+          next time you sign in or your sign-in is renewed, once they have been expired for more than 7 days (so a
+          record is kept for about 37 days). Records of an account that does not sign in again are kept.
         </li>
         <li>
           Server log files are kept for about 14 days. Each container&apos;s own Docker log is limited by size (up to

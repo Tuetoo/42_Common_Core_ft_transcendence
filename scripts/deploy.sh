@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Deploy the latest main on the cloud host. Runs on that host: by the
-# deploy workflow over SSH (.github/workflows/deploy.yml), or by hand:
+# Deploy main on the cloud host. Runs on that host: by the deploy workflow
+# over SSH (.github/workflows/deploy.yml), or by hand:
 #
 #   bash scripts/deploy.sh
 #
-# Fast-forwards the checkout to origin/main, rebuilds the images, restarts
+# The workflow sends the commit it checked as the SSH command. The host's
+# authorized_keys entry forces this script, so sshd passes that text in
+# SSH_ORIGINAL_COMMAND: it must be a 40-hex commit on origin/main, and the
+# checkout is fast-forwarded to exactly that commit (never to a newer one
+# whose checks may still be running). Without it (by hand), the checkout is
+# fast-forwarded to origin/main. Then the script rebuilds the images, restarts
 # the services whose image or configuration changed and waits until every
 # service is healthy (exit 1 otherwise). Uses docker-compose.yaml only:
 # the development override is never loaded on the host. .env.docker and
@@ -24,15 +29,30 @@ compose=(docker compose --env-file .env.docker)
 [ -f infra/gateway/certs/server.crt ] \
   || { echo "error: infra/gateway/certs/server.crt is missing" >&2; exit 1; }
 
+target=origin/main
+sha=${SSH_ORIGINAL_COMMAND:-}
+if [ -n "$sha" ]; then
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] \
+    || { echo "error: the SSH command must be a 40-hex commit sha" >&2; exit 1; }
+  target=$sha
+fi
+
 git fetch --quiet origin main
-git merge --ff-only --quiet origin/main
+git merge-base --is-ancestor "$target" origin/main 2>/dev/null \
+  || { echo "error: $target is not a commit on origin/main" >&2; exit 1; }
+git merge --ff-only --quiet "$target"
 echo "deploying $(git log -1 --format='%h %s')"
 
 up=(up -d --build --remove-orphans --wait --wait-timeout 300)
 if [ -n "$("${compose[@]}" ps -q --status running scheduler)" ]; then
   "${compose[@]}" "${up[@]}"
 else
-  mapfile -t services < <("${compose[@]}" config --services | grep -vx scheduler)
+  # A read loop, not mapfile: the script also runs (in tests) under the
+  # bash 3.2 that macOS ships.
+  services=()
+  while IFS= read -r service; do
+    [ -n "$service" ] && services+=("$service")
+  done < <("${compose[@]}" config --services | grep -vx scheduler || true)
   [ "${#services[@]}" -gt 0 ] \
     || { echo "error: could not list the compose services" >&2; exit 1; }
   "${compose[@]}" build scheduler

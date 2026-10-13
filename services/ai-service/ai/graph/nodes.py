@@ -229,9 +229,24 @@ async def _procedural_hints(
     return hints
 
 
+# Inline ingest runs before any agent starts. 600 s fits one filing call at
+# its worst case (2 attempts x 300 s) and the slowest normal first ingest
+# seen (5 filings, ~465 s), and leaves 2100 s of the 2700 s analysis timeout
+# for the agents, debate and judge. On expiry the shielded ingest keeps
+# running in the background and the next analysis of the ticker joins it.
+FRESH_FILING_BUDGET_SECONDS = 600.0
+
+
 async def load_fresh_filing_context(ticker: str) -> str | None:
     try:
-        new_filings = (await ingest_new_filings(ticker)).new_filings
+        new_filings = (await asyncio.wait_for(
+            ingest_new_filings(ticker),
+            timeout=FRESH_FILING_BUDGET_SECONDS)).new_filings
+    except TimeoutError:
+        logger.warning(
+            "fresh_filing_check.timed_out", ticker=ticker,
+            budget_seconds=FRESH_FILING_BUDGET_SECONDS)
+        return None
     except Exception as exc:
         logger.warning(
             "fresh_filing_check.sec_check_failed", ticker=ticker,

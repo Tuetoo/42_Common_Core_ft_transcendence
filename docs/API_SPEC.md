@@ -47,6 +47,8 @@ auth-service's own limits.
 /docs/{auth,core,ai}/    -> each service's Swagger UI
 /grafana/*               -> Grafana (login required)
 /status                  -> static status page (infra/gateway/status.html)
+/static/avatars/*        -> auth-service (uploaded avatar images)
+/*                       -> frontend (every other path is a page)
 ```
 
 `/api/v1/rag` is proxied with `proxy_buffering off`,
@@ -60,7 +62,8 @@ reachable only on the Docker-internal network, for service-to-service calls
 (`clients/*.py`) and the scheduler; the gateway answers `404` for it.
 `/metrics` is likewise internal-only (Prometheus scrapes it directly), and
 each service's `/health` is exposed only through the `/health/<service>`
-aliases above. Any other path is a `404` at the gateway.
+aliases above. Any other path goes to the frontend, which shows its own
+404 page for an unknown page.
 
 Errors raised by the services use the body
 `{"error": {"code", "message", "request_id"}}`; codes are snake_case
@@ -153,8 +156,7 @@ does not renew it) must be at most `TWO_FACTOR_RECENT_LOGIN_MINUTES`
 (default 10) minutes old, for password and OAuth users alike. Otherwise
 they answer **403** `recent_login_required` ("This action needs a recent
 login. Log in again (password or OAuth) and retry within the next few
-minutes."); a token issued before this rule existed has no `auth_time` and
-gets the same 403. The frontend should send the user through login again
+minutes."); a token without an `auth_time` claim gets the same 403. The frontend should send the user through login again
 and then retry. `/2fa/disable` is not affected (it needs a valid code). The OAuth
 callback applies the same checks as password login: a deactivated account
 is refused, and when 2FA is enabled it gives a `challenge_token` instead of
@@ -163,9 +165,15 @@ exchanges `{challenge_token, code}` for the token pair (single use, 5 min).
 OAuth links to an existing account only when the provider verified the email
 and the local account is verified (else 409 `oauth_link_refused`). Password
 reset links are single-use and revoke every session. Refresh tokens are
-stored hashed; reusing a refresh token revoked by rotation (reason
-`rotated`, or none) revokes all of the user's sessions, while one revoked by
-logout or revoke-all only gets 401. `/verify-email/resend` always returns 200.
+stored hashed. A refresh token revoked by rotation (reason `rotated`) that
+comes back within 30 seconds of the rotation (`REFRESH_REUSE_GRACE`) gets
+**401** `refresh_token_superseded` and nothing else is revoked (two
+requests raced with the same token; the client keeps its cookie and
+tries later). After 30 seconds it is treated as reuse: 401
+`invalid_credentials`, and the sessions descending from that token (its
+rotation chain) are revoked with reason `reuse`; the user's other logins
+stay valid. A token revoked by logout, revoke-all or for any other reason
+only gets 401. `/verify-email/resend` always returns 200.
 An account that never verifies its email (and never signs in, and has no
 OAuth link) is deleted by a nightly job 7 days after registration
 (`UNVERIFIED_ACCOUNT_RETENTION_DAYS`), which frees the email for a new
@@ -264,7 +272,8 @@ Invitations: `POST .../invitations/accept` takes the token in the body
 invitation list (`GET`) shows the open invitations (not accepted, not
 expired) to the owner and admins; `DELETE` revokes one (owner/admin;
 an invitation with the admin role only by the owner; 404 for an unknown,
-accepted or foreign invitation). A new invitation replaces the
+accepted or foreign invitation) and publishes
+`organization.invitation.revoked`. A new invitation replaces the
 organization's open invitations for the same email and removes its
 expired open invitations; accepted rows are kept. Replacing an open admin
 invitation is owner-only, like revoking it (an admin gets 403).
@@ -288,15 +297,24 @@ DELETE /api/v1/connections/{connection_id}
 ```
 
 A block records who blocked; only the blocker can remove it, and
-the blocked user can neither delete it nor send a new request. Online status
+the blocked user can neither delete it nor send a new request. `GET` hides
+a block from the user who was blocked: only the blocker sees the `blocked`
+row (a row without `blocked_by` stays visible to both). Online status
 is shown only for accepted connections. Sending and accepting need
 `connection:write` (a guest gets 403); blocking and `DELETE` (remove,
 decline, cancel, unblock) stay open to guests.
 
-Sending a request, accepting one, and removing an accepted
-friend publish `friend.requested` / `friend.accepted` / `friend.removed`
-(the other side is notified). Declining or cancelling a request and
-unblocking are silent (an unblock notice would reveal the block).
+Sending a request and accepting one publish `friend.requested` /
+`friend.accepted`; the actor and the other side are notified ("You sent a
+friend request to X.", "You are now friends with X."). Every `DELETE`
+publishes `friend.removed` with an `action`: `removed` (an accepted friend),
+`declined`, `cancelled` or `unblocked`. The actor is always notified ("You
+removed X from your friends.", "You declined the friend request from X.",
+"You cancelled your friend request to X.", "You unblocked X."); only
+`removed` also notifies the other side. Blocking publishes
+`connection.blocked` (only when the connection was not already blocked),
+which notifies only the user who blocked. The blocked user is never told
+about a block or an unblock.
 
 ### Administration
 ```
@@ -348,19 +366,24 @@ Rules (`domains/admin/service.py`):
   secret cannot be decrypted. 204 also when no 2FA was set up;
   403 on the admin's own account (use `POST /auth/2fa/disable` with a
   code); 404 for an unknown id, 409 for a deleted user. Sessions are kept;
-  `user.updated` with `changed: ["two_factor_enabled"]` notifies the user.
+  `user.updated` with `changed: ["two_factor_enabled"]` notifies the user
+  and the admin.
 - **Soft delete** (`DELETE`): the row stays so references from core and ai
   still resolve. `deleted_at` is set, `is_active` becomes false, the email
   becomes `deleted-<id>@deleted.alphamind.local`, the username
   `deleted_<id>`, the password is replaced by a random one, profile fields
   and the avatar file are removed, OAuth links, the 2FA secret and friend
-  connections are deleted, organization memberships are removed (an owned
-  organization keeps its owner row), and every session is revoked.
+  connections are deleted, organization memberships are removed, and every
+  session is revoked. An organization the user owned passes to its
+  longest-standing admin, else its longest-standing other member
+  (`organization.role.changed` for the new owner); it keeps the deleted
+  user's owner row only when it has no other member.
 - Every role/active/delete change is written to the live-state mirror in
   Redis before the commit (a mirror failure rolls the change back), so it
   applies to existing tokens at once. The route then publishes
   `user.role.changed`, `user.deactivated`, `user.reactivated`,
-  `user.deleted` and/or `user.updated` (§6).
+  `user.deleted` and/or `user.updated` (§6). The user and the admin or
+  moderator who acted are both notified (for a delete, only the admin).
 
 `GET /stats` returns `{"auth": {...}, "core": {...} | null, "ai": {...} |
 null}`: auth's counts (`users_total`, `users_active`, `users_deleted`,
@@ -394,8 +417,8 @@ ago, never verified its email, never signed in (`last_seen_at` is null) and
 has no OAuth link. Each account goes through the same path as
 `DELETE /api/v1/admin/users/{id}` (soft delete: anonymized email and
 username, sessions revoked, `user.deleted` published after the commit,
-with the user as `actor_id`), one account per transaction, so the email can
-register again. Answer `{"retention_days", "candidates", "deleted",
+with the user as `actor_id`, so nobody is notified), one account per
+transaction, so the email can register again. Answer `{"retention_days", "candidates", "deleted",
 "skipped", "failed"}`; 500 with `"all_units_failed": ["accounts"]` when
 accounts were attempted and every one failed (`shared/scheduled_jobs.py`).
 `skipped` counts an account that changed meanwhile (verified, signed in)
@@ -579,7 +602,9 @@ without uploading or publishing anything (a `failed` duplicate is re-ingested
 in place); download sends an RFC 5987 `filename*` so non-ASCII names work;
 `sort` on the notes list is validated (422 on unknown values); another
 user's document or notification returns 404. Comments can be listed by
-anyone who can read the note and deleted by the comment or note author.
+anyone who can read the note and deleted by the comment or note author; a
+comment hidden by a moderator can be deleted only by its own author (the
+note author gets 404 for it).
 
 **System documents.** Documents owned by the system (filing
 summaries and news digests from ai-service's ingestion, `upload_seed_documents
@@ -741,15 +766,18 @@ If auth-service cannot be reached, the defaults apply (nothing is lost).
 | documents | `document_ready`, `document_failed` | ingestion finished (`document.status_changed`; not for system documents) |
 | organizations | `organization_created`, `organization_updated`, `organization_deleted` | the members (for delete: the members before the delete) |
 | organizations | `organization_member_joined`, `organization_member_left`, `organization_member_removed`, `organization_role_changed` | the affected member (own wording) and the `member_ids` in the event |
-| organizations | `organization_invite` | an invitation for an email that already has an account |
-| friends | `friend_request`, `friend_accepted`, `friend_removed` | the other side of the connection |
-| account | `account_updated` | own profile/settings/password/2FA/avatar change, admin edit, deactivation, reactivation |
-| account | `account_role_changed` | an admin changed the system role |
+| organizations | `organization_invite` | an invitation was sent: the inviter (also when the invitee has no account) and the invitee when the email already has an account |
+| organizations | `organization_invitation_revoked` | an invitation was revoked: the user who revoked, and the invitee when the email has an account ("Your invitation to the organization X was withdrawn.") |
+| friends | `friend_request`, `friend_accepted`, `friend_removed` | the actor, and the other side (not for decline, cancel or unblock) |
+| friends | `connection_blocked` | the user who blocked (never the blocked user) |
+| account | `account_updated` | own profile/settings/password/2FA/avatar change; admin edit, 2FA reset, deactivation, reactivation (the user and the admin or moderator who acted); admin delete (the admin) |
+| account | `account_role_changed` | an admin changed the system role (the user and the admin) |
 | analyses | `analysis_started`, `analysis_completed`, `analysis_failed`, `recommendation_ready` | the analysis owner (system analyses: nobody) |
 | decisions | `decision_recorded` | a decision was posted or changed |
+| decisions | `decision_reviewed` | a new or replacing review was generated (`POST /decisions/{id}/review`; a failed generation sends nothing) |
 | decisions | `decision_evaluated` | the review scored the decision after 7, 30 or 90 days (outperformed the benchmark or not, by how much) |
 | tiers | `tier_executed`, `tier_execution_failed`, `tier_cancelled` | the tier's user, or the portfolio owner for a system analysis |
-| backtests | `backtest_completed`, `backtest_failed` | the backtest owner |
+| backtests | `backtest_completed`, `backtest_failed`, `backtest_deleted` | the backtest owner |
 
 ### Public API (§5 — API-key authenticated, not unauthenticated)
 ```
@@ -811,10 +839,16 @@ user online in auth-service; closing their last socket marks them offline.
 
 A deactivated or deleted account is refused
 with 4401 (live account state, same rule as HTTP). Open sockets follow
-access changes: on a role, deactivation, deletion or organization-membership
-event, a socket of a deactivated or deleted account is closed with 4401 and
-a socket whose channel the user can no longer read with 4403 (a failed
-check leaves it open). Every push reaches each
+access changes: on a role, deactivation, deletion, organization-membership,
+`friend.removed` or `connection.blocked` event, a socket of a deactivated
+or deleted account is closed with 4401 and a socket whose channel the user
+can no longer read with 4403 (a failed check leaves it open; for a
+`presence:` socket the connection check answers "not connected" when
+auth-service cannot be reached, so the socket is closed). An
+`analysis:` or `document:` socket is not closed when its resource stops
+being shared (portfolio made private or deleted, document deleted): it
+keeps receiving status payloads until the token expires (at most 15
+minutes), while REST reads answer 404 at once. Every push reaches each
 socket at most once; a user's notifications arrive on every one of their
 `user:` sockets on any replica. Messages are `{"event": <event name>,
 "payload": <event payload>}`; the `analysis:{analysis_id}` channel
@@ -844,12 +878,15 @@ should treat `analysis.completed` / `analysis.failed` as final.
 - Access uses the REST rule (`can_edit` in the note response): a reader
   who may not edit (organization VIEWER, guest) joins and receives the
   sync and every live update, but their updates are dropped -- open the
-  editor read-only. No read access: 4403. Bad token or note id, or a
-  deactivated account: 4401. Text frames: 1003.
+  editor read-only. No read access: 4403. An open writable socket whose
+  user loses write access (made organization VIEWER or guest) is closed
+  with 4403 "write access to this note was revoked"; reconnecting opens
+  it read-only. Bad token or note id, or a deactivated account: 4401.
+  Text frames: 1003.
 - An update larger than `YJS_MAX_UPDATE_BYTES` (1 MiB) or one that does not
   decode closes only that socket with **1008**; the room and every other
   connection continue. Updates are first decoded in separate worker
-  processes (`domains/research/yjs_guard.py`), because malformed bytes can
+  processes (`yjs_relay.py`), because malformed bytes can
   abort the y_py process.
 - While any replica has the room open, REST body edits of the note get 409
   (see Research above).
@@ -988,10 +1025,11 @@ actual agent graph run happens in the single serial, in-process analysis
 queue (`domains/analysis/queue.py`, one run at a time in arrival order,
 running `ai/workflows/analysis_workflow.py`). There is no synchronous "wait for the
 result" mode. It requires a logged-in user; the owner comes from
-the JWT only, and a `portfolio_id` must belong to the caller (owner, or a
-member of the portfolio's organization when the portfolio is not private --
-checked through core-service `GET /internal/portfolios/{id}/owner`), else
-404. System callers (core-service's market-open job, the owner's run scripts)
+the JWT only, and a `portfolio_id` must be owned by the caller (checked
+through core-service `GET /internal/portfolios/{id}/owner`): 404 when the
+caller cannot see the portfolio, 403 when the caller can see it (a member
+of the organization it is shared with) but is not the owner. System
+callers (core-service's market-open job, the owner's run scripts)
 use `POST /internal/analyses` on the docker network instead. Optional `portfolio_id` in
 the request body: when set and the Judge's verdict is BUY/SELL (not HOLD), a
 real position-sizing step runs and writes real, pending recommendation tiers
@@ -1000,6 +1038,10 @@ analysis is review-only and produces no tiers regardless of the verdict.
 Optional `requested_agents`: when given, it must name at least one
 research agent (any role except portfolio, bull and bear), else 422.
 
+`GET /api/v1/analyses` lists only the caller's own analyses (paginated,
+newest first); system analyses on the caller's portfolios appear in
+analytics `scope=mine` (CSV `analysis_id`) and can be opened by id, but
+are not listed here.
 `GET /api/v1/analyses/{id}` returns full detail: every agent run, the debate
 transcript, reflection history, and the final recommendation, in one
 response. In the debate transcript a side that failed for provider
@@ -1048,7 +1090,8 @@ generates a new one on every call rather than returning a cached result;
 a new review replaces the decision's earlier ones. `GET .../review`
 retrieves the stored one. When the LLM call fails or its answer is not
 usable, `POST .../review` answers **503** with `Retry-After: 60` and stores
-nothing (an earlier review stays).
+nothing (an earlier review stays). A stored review publishes
+`decision.reviewed` (notification `decision_reviewed`, §6).
 
 `POST .../review` needs `analysis:create` (an LLM call and a
 write; a guest gets 403).
@@ -1065,7 +1108,8 @@ DELETE /api/v1/backtests/{backtest_id}
 
 `DELETE /api/v1/backtests/{backtest_id}` (needs `analysis:create`)
 removes the caller's own finished backtest (`completed` or `failed`) with all
-its results -> 204; another user's backtest is 404, one still `pending` or
+its results -> 204 and publishes `backtest.deleted` (notification to the
+owner); another user's backtest is 404, one still `pending` or
 `running` is 409. `POST /api/v1/backtests/portfolio` needs at least two
 daily snapshots in the requested window, counted from the first snapshot
 with a positive total value (422 with the count otherwise; a new
@@ -1133,8 +1177,10 @@ GET    /api/v1/market/instruments/{ticker}/prices?interval=1d
 
 The prices route requires login; core-service uses the internal
 copy `GET /internal/market/instruments/{ticker}/prices`. A ticker the
-provider has no data for returns 404 and creates no instrument row. The
-prices route is the only public market route.
+provider has no data for returns 404 and creates no instrument row. When
+the provider fails and nothing is cached, the route returns 502
+(`upstream_service_error`). The prices route is the only public market
+route.
 
 ### RAG assistant
 ```
@@ -1211,7 +1257,9 @@ parameters: `from`/`to` (UTC days, `to` inclusive; defaults: `to` = today,
 (`WorkflowStatus`), `scope` = `mine` (default: the caller's analyses plus
 system analyses on portfolios the caller may use, resolved once per
 request; 503 when core or auth cannot answer the access check) or `all`
-(every analysis; needs `site:stats`, else 403).
+(every analysis; needs `site:stats`, else 403). `mine` is broader than
+`GET /api/v1/analyses`, which lists only the caller's own analyses
+(deliberate), so the analytics total can be larger than the list total.
 - `overview` -> `range {from, to}, scope, total_analyses, status_counts,
   recommendations, action_distribution, average_confidence, accuracy
   {evaluated, rate}, by_agent[{agent, runs, completed, failed,
@@ -1435,20 +1483,24 @@ of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pu
 | `analysis.failed` | ai-service | pub/sub | core-service | `analysis:{id}` broadcast + `analysis_failed` notification (with the reason) |
 | `recommendation.ready` | ai-service | pub/sub | core-service | WebSocket + `recommendation_ready` notification |
 | `decision.recorded` | ai-service | pub/sub | core-service | `analysis:{id}` broadcast + `decision_recorded` notification |
+| `decision.reviewed` | ai-service | pub/sub | core-service | `decision_reviewed` notification to the user |
 | `tier.executed` | ai-service | pub/sub | core-service | `analysis:{id}` broadcast + `tier_executed` notification |
 | `tier.execution_failed` | ai-service | pub/sub | core-service | `analysis:{id}` broadcast + `tier_execution_failed` notification |
 | `tier.cancelled` | ai-service | pub/sub | core-service | `analysis:{id}` broadcast + `tier_cancelled` notification |
 | `backtest.completed` / `backtest.failed` | ai-service | pub/sub | core-service | `backtest_completed` / `backtest_failed` notification |
+| `backtest.deleted` | ai-service | pub/sub | core-service | `backtest_deleted` notification to the owner |
 | `decision.outcome.evaluated` | ai-service | pub/sub | core-service | `decision_evaluated` notification to the deciding user |
 | `organization.created` / `.updated` / `.deleted` | auth-service | pub/sub | core-service | `organization_created` / `_updated` / `_deleted` for every id in `member_ids` |
 | `organization.member.joined` | auth-service | pub/sub | core-service | welcome notification to the new member and `organization_member_joined` to the other members; published after the commit |
 | `organization.member.left` / `.member.removed` / `.role.changed` | auth-service | pub/sub | core-service | the affected member (own wording) and the other members, `organization_member_left` / `_member_removed` / `organization_role_changed` |
-| `organization.invitation.created` | auth-service | pub/sub | core-service | `organization_invite` to the invitee when the email already has an account |
-| `friend.requested` / `.accepted` / `.removed` | auth-service | pub/sub | core-service | `friend_request` / `friend_accepted` / `friend_removed` to the other side |
-| `user.updated` | auth-service | pub/sub | core-service | `account_updated` (lists the changed field names) |
-| `user.role.changed` | auth-service | pub/sub | core-service | `account_role_changed` |
-| `user.deactivated` / `user.reactivated` | auth-service | pub/sub | core-service | `account_updated` ("deactivated" / "reactivated") |
-| `user.deleted` | auth-service | pub/sub | core-service | logged only (nobody to notify); access is already blocked by the live user state |
+| `organization.invitation.created` | auth-service | pub/sub | core-service | `organization_invite` to the actor, and to the invitee when the email already has an account |
+| `organization.invitation.revoked` | auth-service | pub/sub | core-service | `organization_invitation_revoked` to the actor, and to the invitee when the email has an account |
+| `friend.requested` / `.accepted` / `.removed` | auth-service | pub/sub | core-service | `friend_request` / `friend_accepted` / `friend_removed` to the actor, and to the other side for a request, an accept and `action` `removed`; `.removed` also re-checks both users' open sockets |
+| `connection.blocked` | auth-service | pub/sub | core-service | `connection_blocked` to the actor only (never the blocked user); re-checks both users' open sockets |
+| `user.updated` | auth-service | pub/sub | core-service | `account_updated` (lists the changed field names) to the user, and to the actor when another user acted |
+| `user.role.changed` | auth-service | pub/sub | core-service | `account_role_changed` to the user, and to the actor |
+| `user.deactivated` / `user.reactivated` | auth-service | pub/sub | core-service | `account_updated` ("deactivated" / "reactivated") to the user, and to the actor |
+| `user.deleted` | auth-service | pub/sub | core-service | `account_updated` to the admin who deleted; the unverified-account purge (actor = user) is only logged; access is already blocked by the live user state |
 | `user.presence.changed` | auth-service | pub/sub | core-service | WebSocket relay to `presence:{user_id}` |
 
 Payloads (built by `services/auth-service/events_out.py`,
@@ -1461,8 +1513,8 @@ Payloads (built by `services/auth-service/events_out.py`,
   `.failed` adds `"failure_reason"`. (`recommendation.ready` keeps its own
   shape: `{"id", "analysis_id", "ticker", "action", "confidence",
   "user_id" | null}`.)
-- `decision.recorded`: `{"decision_id", "analysis_id", "user_id",
-  "ticker", "decision"}`.
+- `decision.recorded` and `decision.reviewed`: `{"decision_id",
+  "analysis_id", "user_id", "ticker", "decision"}`.
 - `decision.outcome.evaluated`: `{"decision_id", "analysis_id",
   "user_id", "ticker", "evaluation_days", "alpha" (the decision's return
   minus the benchmark's, a fraction) | null, "outperformed" | null}`
@@ -1474,11 +1526,19 @@ Payloads (built by `services/auth-service/events_out.py`,
   for cancelled: `declined`, `superseded` or `portfolio_deleted`)}`.
 - `backtest.completed` / `.failed`: `{"backtest_id", "user_id", "kind",
   "status": "completed" | "failed", "error" | null}`.
+- `backtest.deleted`: `{"backtest_id", "user_id", "kind"}`.
 - every `organization.*` event (including `member.joined`):
   `{"organization_id", "organization_name", "actor_id", "user_id" (the
-  affected member, or null), "role" | null, "member_ids": [...]}`.
-- `friend.*`: `{"actor_id", "user_id" (the other side), "actor_username"}`.
-- `user.*` (except presence): `{"user_id", "actor_id", "role",
+  affected member, or null), "role" | null, "member_ids": [...]}`. For
+  `invitation.created` / `.revoked`, `user_id` is the invitee when the
+  email has an account (else null) and `role` is the invitation's role.
+- `friend.*`: `{"actor_id", "user_id" (the other side), "actor_username",
+  "other_username"}`, plus `"action"` (`removed` | `declined` |
+  `cancelled` | `unblocked`) on `friend.removed`.
+- `connection.blocked`: `{"actor_id", "blocked_user_id",
+  "blocked_username"}` (no `user_id`, on purpose).
+- `user.*` (except presence): `{"user_id", "actor_id", "username" (for
+  `user.deleted`: the username before the soft delete renamed it), "role",
   "is_active", "changed": [field names, never values]}`.
 
 Every event has a consumer.

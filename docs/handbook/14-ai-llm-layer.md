@@ -524,7 +524,7 @@ budget):
 | ReAct turn of a data agent | 4096 | `ai/agents/loop.py::_REACT_LOOP_MAX_TOKENS` |
 | Judge | 3072 | `ai/agents/judge.py::_JUDGE_MAX_TOKENS` |
 | Reflection's review | 2048 | `ai/agents/reflection.py::_REVIEW_MAX_TOKENS` |
-| Knowledge-graph extraction | 2048 | `ai/knowledge/extraction.py::_EXTRACTION_MAX_TOKENS` |
+| Knowledge-graph extraction | 2048 | `ai/knowledge/archival.py::_EXTRACTION_MAX_TOKENS` |
 | News relevance classifier | 4096, one retry at 8192 | `ai/providers/news_relevance.py::_VERIFY_MAX_TOKENS`, `_RETRY_MAX_TOKENS` |
 | Web-search relevance classifier | 4096, one retry at 8192 | same helpers, `verify_with_cheap_tier` and `parsed_with_retry` |
 | Filing summary | 12288, one retry at 16384 | `ai/knowledge/filing_summary.py::_SUMMARY_MAX_TOKENS`, `_RETRY_MAX_TOKENS` |
@@ -619,7 +619,7 @@ calls answered in 1.9-10.3 s.
 
 ### 3.12 JSON answers and code fences
 
-`ai/llm/json_fence.py` has the shared helpers. `strip_json_code_fence(raw)`
+`ai/llm/base.py` has the shared helpers (section "Parsing JSON out of LLM replies"). `strip_json_code_fence(raw)`
 returns the content of the first ```` ```json ```` (or bare ```` ``` ````)
 fence, case-insensitive, or the trimmed text. Every LLM-JSON parser calls
 it first, because Gemini sometimes wraps even a JSON-mode answer such as
@@ -802,7 +802,7 @@ Constants in code (not settings):
 | `_REACT_LOOP_MAX_TOKENS` | 4096 | `ai/agents/loop.py` |
 | `_JUDGE_MAX_TOKENS` | 3072 | `ai/agents/judge.py` |
 | `_REVIEW_MAX_TOKENS` | 2048 | `ai/agents/reflection.py` |
-| `_EXTRACTION_MAX_TOKENS` | 2048 | `ai/knowledge/extraction.py` |
+| `_EXTRACTION_MAX_TOKENS` | 2048 | `ai/knowledge/archival.py` |
 | `_VERIFY_MAX_TOKENS` / `_RETRY_MAX_TOKENS` | 4096 / 8192 | `ai/providers/news_relevance.py` |
 | `_SUMMARY_MAX_TOKENS` / `_RECORDS_MAX_TOKENS` / `_RETRY_MAX_TOKENS` | 12288 / 10240 / 16384 | `ai/knowledge/filing_summary.py` |
 | `_FILING_SUMMARY_TIMEOUT_SECONDS` | 300.0 | `ai/knowledge/filing_summary.py` |
@@ -867,7 +867,7 @@ after a 3.6 503 succeeded 35 of 49 times (71%); one of 3.8 after a 3.8
 503 succeeded 2 of 18 times (11%). So the extra tries go to 3.6, inside
 one adapter call, with no delay. A 60 s limit on 3.8 never saved a call
 (all 9 answers came in under 30 s), so 3.8 keeps 30 s. One router call
-now takes at most about 155 s, and a 3.8 timeout followed by a 3.6
+takes at most about 155 s, and a 3.8 timeout followed by a 3.6
 answer about 35 s. Longer outages are left to the slower step retries
 in chapter 16.
 
@@ -1048,12 +1048,11 @@ real requests and spends daily quota.
 
 | File | What it holds |
 |---|---|
-| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. |
+| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. JSON reply helpers: `strip_json_code_fence`, `parse_json_dict`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
 | `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets); the capacity checks `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
 | `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config (and the caller's `thinking_budget` on Lite models), timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`); the `fallback` flag (60 s timeout, 3 keys on a 503). |
 | `services/ai-service/ai/llm/mistral_provider.py` | `MistralAdapter` and its key pool. |
 | `services/ai-service/ai/llm/openai_provider.py`, `anthropic_provider.py` | Dormant adapters. |
-| `services/ai-service/ai/llm/json_fence.py` | `strip_json_code_fence`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
 | `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
 | `services/ai-service/ai/providers/news_relevance.py` | `verify_with_cheap_tier` (the relevance classifiers' CHEAP call, fail-open and echo check) and `parsed_with_retry` (their JSON retry at 8192 tokens). |
 | `services/ai-service/ai/rag/embedding.py` | Gemini and Mistral embeddings, batching, key rotation. |

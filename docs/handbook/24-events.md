@@ -89,14 +89,14 @@ message to the browsers that are connected (see
 `EventName` is a `StrEnum` with every event name. `EVENT_OWNERS` maps each
 name to the one service that publishes it. The map documents ownership;
 nothing enforces it at runtime. Its only reader is the contract test
-`tests/core-service/test_realtime.py::test_every_auth_and_ai_event_has_a_handler`,
+`tests/core-service/test_realtime.py::TestNotificationEvents::test_event_handlers_exist_and_claims_dedupe_replicas`,
 which checks that core-service handles every auth and ai event. The payload shapes are
 listed in the table below (this table is their only description), and
 payload builder functions in the producers
 (`services/auth-service/events_out.py`, `services/ai-service/ai_events.py`)
 make sure each shape is built in one place only.
 
-Table of all 32 events (producer, transport, consumer and what the
+Table of all 36 events (producer, transport, consumer and what the
 consumer does). "pub/sub" means `publish_cross_service`; "durable" means
 `publish_durable_event`. Every pub/sub payload also gets an `event_id`
 field on the wire (section 3.4).
@@ -112,12 +112,14 @@ field on the wire (section 3.4).
 | `analysis.failed` | ai (`mark_analysis_failed`, `domains/analysis/queue.py` at startup) | pub/sub | core `_handle_analysis_failed` | same + `failure_reason` | push, notification with the reason |
 | `recommendation.ready` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_recommendation_ready` | `id, analysis_id, ticker, action, confidence, user_id (None = system)` | push, notification |
 | `decision.recorded` | ai (`domains/decision/service.py`, published by the route) | pub/sub | core `_handle_decision_recorded` | `decision_id, analysis_id, user_id, ticker, decision` | push, notification |
+| `decision.reviewed` | ai (`domains/decision/service.py`, a new or replacing review, published by the route) | pub/sub | core `_handle_decision_reviewed` | same as `decision.recorded` | notification to the user |
 | `decision.outcome.evaluated` | ai (`review_workflow.py`) | pub/sub | core `_handle_decision_outcome_evaluated` | `decision_id, analysis_id, user_id, ticker, evaluation_days, alpha, outperformed` | notification |
 | `tier.executed` | ai (`tier_monitoring_workflow.py`) | pub/sub | core `_handle_tier_executed` | `tier_id, analysis_id, user_id, portfolio_id, ticker, action, quantity, price, reason` | push, notification |
 | `tier.execution_failed` | ai (`tier_monitoring_workflow.py`) | pub/sub | core `_handle_tier_execution_failed` | same | push, notification |
 | `tier.cancelled` | ai (decision route: `declined` / `superseded`; analysis workflow: `superseded`; portfolio delete: `portfolio_deleted`) | pub/sub | core `_handle_tier_cancelled` | same, `reason` set | push, notification |
 | `backtest.completed` | ai (`backtest_workflow.py::publish_backtest_finished`) | pub/sub | core `_handle_backtest_completed` | `backtest_id, user_id, kind, status, error` | notification |
 | `backtest.failed` | ai (same) | pub/sub | core `_handle_backtest_failed` | same | notification |
+| `backtest.deleted` | ai (`domains/backtest/api.py::delete_backtest`, after the commit as a background task) | pub/sub | core `_handle_backtest_deleted` | `backtest_id, user_id, kind` | notification to the owner |
 | `organization.created` | auth (`domains/organization/service.py`) | pub/sub | core `_handle_organization_created` | `organization_id, organization_name, actor_id, user_id` (the affected member, or `None`), `role` (or `None`), `member_ids` (members to notify, sorted, unique) | notification to members |
 | `organization.updated` | auth | pub/sub | core | same | notification to members |
 | `organization.deleted` | auth | pub/sub | core | same | open sockets (Yjs and channels) of every former member are re-checked (section 3.8); notification to former members |
@@ -125,15 +127,17 @@ field on the wire (section 3.4).
 | `organization.member.left` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.member.removed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.role.changed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
-| `organization.invitation.created` | auth | pub/sub | core | same | notification to the invited user (when the invitation names one) |
-| `friend.requested` | auth (`domains/social/service.py`) | pub/sub | core `_handle_friend_requested` | `actor_id, user_id, actor_username` | notification to `user_id` |
-| `friend.accepted` | auth | pub/sub | core | same | notification |
-| `friend.removed` | auth | pub/sub | core | same | notification |
-| `user.updated` | auth (`domains/auth/service.py`, `domains/admin/service.py`) | pub/sub | core `_handle_user_updated` | `user_id, actor_id, role, is_active, changed` (sorted field names only, never values) | notification |
-| `user.role.changed` | auth (admin) | pub/sub | core | same | open sockets of the user re-checked; notification |
-| `user.deactivated` | auth (admin) | pub/sub | core | same | every open socket of the user closed (4401); notification |
-| `user.reactivated` | auth (admin) | pub/sub | core | same | notification |
-| `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same | every open socket of the user closed (4401); logged `user_deleted_received` (nobody to notify) |
+| `organization.invitation.created` | auth | pub/sub | core | same (`user_id` = the invitee when the email has an account, else `None`) | notification to the actor and to the invited user (when the email has an account) |
+| `organization.invitation.revoked` | auth | pub/sub | core | same (`user_id` as above, `role` = the invitation role) | notification to the actor and to the invited user (when the email has an account) |
+| `friend.requested` | auth (`domains/social/service.py`) | pub/sub | core `_handle_friend_requested` | `actor_id, user_id, actor_username, other_username` | notification to `user_id` and to the actor |
+| `friend.accepted` | auth | pub/sub | core | same | notification to both users |
+| `friend.removed` | auth (every `DELETE /connections/{id}`) | pub/sub | core | same + `action` (`removed`, `declined`, `cancelled`, `unblocked`) | open sockets of both users re-checked; notification to the actor, and to the other user only for `removed` |
+| `connection.blocked` | auth (`domains/social/service.py`, only when the connection was not already blocked) | pub/sub | core `_handle_connection_blocked` | `actor_id, blocked_user_id, blocked_username` (no `user_id`) | open sockets of both users re-checked; notification to the actor only (the blocked user is never told) |
+| `user.updated` | auth (`domains/auth/service.py`, `domains/admin/service.py`) | pub/sub | core `_handle_user_updated` | `user_id, actor_id, username, role, is_active, changed` (sorted field names only, never values) | notification to the user and to the actor (when different) |
+| `user.role.changed` | auth (admin) | pub/sub | core | same | open sockets of the user re-checked; notification to the user and the actor |
+| `user.deactivated` | auth (admin) | pub/sub | core | same | every open socket of the user closed (4401); notification to the user and the actor |
+| `user.reactivated` | auth (admin) | pub/sub | core | same | notification to the user and the actor |
+| `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same (`username` is the name before the soft delete renamed it) | every open socket of the user closed (4401); logged `user_deleted_received`; notification to the admin who deleted (the purge, where actor = user, notifies nobody) |
 | `user.presence.changed` | auth (`domains/auth/service.py::presence_event`, published after the commit) | pub/sub | core `_handle_user_presence_changed` | `user_id, is_online` | push to `presence:<user_id>` |
 
 Notes on the table:
@@ -230,7 +234,7 @@ Subscribing (`CrossServiceSubscriber`):
 
 core-service builds its subscriber in
 `services/core-service/event_listener.py::build_subscriber()` from the
-dictionary `_PUBSUB_HANDLERS` (29 events: 12 from ai-service, 17 from
+dictionary `_PUBSUB_HANDLERS` (33 events: 14 from ai-service, 19 from
 auth-service) and starts it in `main.py`'s lifespan with
 `start_background_task(build_subscriber().run(), "event_subscriber")`.
 
@@ -680,12 +684,18 @@ core-service's handlers in `event_listener.py` do up to three things:
    `cross_replica=True` (relayed to other replicas through the Redis
    channel `ws:fanout`) and sends an email if the user enabled it.
 3. **Access re-check of open sockets** (`_recheck_sessions`, which
-   calls `api/websocket.py::recheck_user_sessions`). Seven events
+   calls `api/websocket.py::recheck_user_sessions`). Nine events
    change what a user may do with a note or a channel: `organization.member.removed`,
    `organization.member.left`, `organization.role.changed`,
    `organization.deleted` (for every id in `member_ids`),
    `user.role.changed`, `user.deactivated` and `user.deleted` (the last
-   two close every socket of the user). The re-check runs on every replica
+   two close every socket of the user), `friend.removed` (every action;
+   `actor_id` and `user_id`) and `connection.blocked` (`actor_id` and
+   `blocked_user_id`). The last two close an open `presence:<id>` socket
+   with 4403 once the two users are no longer connected.
+   `auth_client.are_users_connected` answers False on an auth-service
+   HTTP error, so during an auth outage this re-check closes presence
+   sockets instead of keeping them open. The re-check runs on every replica
    (each replica only knows its own sockets), before the event claim, and
    never raises: a failure is logged (`yjs_session_recheck_failed`) and the
    notification still goes out. auth-service drops the membership cache
@@ -698,12 +708,16 @@ core-service's handlers in `event_listener.py` do up to three things:
    Details in [25-realtime-yjs.md](25-realtime-yjs.md).
 
 Handlers that need a recipient and find none log a warning and stop:
-the notify handlers (friend, user, analysis, recommendation, decision,
-backtest and invitation events) log one event, `event_missing_user_id`
-(fields `event_name`, `analysis_id`; for example a system analysis);
+the notify handlers for one recipient (analysis, recommendation,
+decision and backtest events) log `event_missing_user_id` (fields
+`event_name`, `analysis_id`; for example a system analysis), the
+actor-only ones (`connection.blocked`, `friend.removed` other than
+`removed`, `user.deleted`) log `event_missing_actor_id`, and the handlers
+that notify the user and the actor (`_notify_pair`: friend, user and
+invitation events) log `event_missing_recipient` when both are missing;
 `organization_member_joined_missing_user_id`,
 `user_presence_changed_missing_user_id` and `tier_event_without_recipient`
-stay as they are.
+are logged by their own handlers (`event_listener.py:239, :560, :643`).
 
 The WebSocket side (channels, authorization, message shapes) is in
 [25-realtime-yjs.md](25-realtime-yjs.md).
@@ -856,7 +870,7 @@ root. Everything in steps 1-5 is read-only.
    bash scripts/redis-cli.sh PUBSUB CHANNELS
    bash scripts/redis-cli.sh PUBSUB NUMPAT
    ```
-   The audience sees the 29 `events:*` channels core-service subscribes
+   The audience sees the 33 `events:*` channels core-service subscribes
    to, plus `ws:fanout`. `NUMPAT` is at least 1 (the Yjs pattern
    `yjs:note:*`). Say: "These are core-service's ears. ai-service has none,
    it only reads streams."

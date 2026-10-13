@@ -18,8 +18,7 @@ from ai.graph.state import (AVAILABILITY_FAILURE_KINDS, FAILURE_KIND_TEXT,
                             lacks_successful_tool_evidence)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
                          LLMRateLimitError, LLMRequestTimeoutError,
-                         LLMServerOverloadedError, LLMTier)
-from ai.llm.json_fence import parse_json_dict
+                         LLMServerOverloadedError, LLMTier, parse_json_dict)
 from ai.llm.router import LLMRouter, capacity_aware_delay
 from config import settings
 from shared.enums import AgentRole, AgentStatus

@@ -1,7 +1,7 @@
 import { LocalTime } from "@/app/(protected)/local-time";
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Pager, pageParam } from "../pager";
 import { CreateNoteForm } from "./create-note-form";
 import { SentimentPill } from "./sentiment-pill";
@@ -96,6 +96,7 @@ export default async function ResearchPage({ searchParams }: { searchParams: Pro
             <input
               id="q"
               name="q"
+              autoComplete="off"
               type="search"
               maxLength={SEARCH_TEXT_MAX}
               defaultValue={filters.q}
@@ -107,6 +108,7 @@ export default async function ResearchPage({ searchParams }: { searchParams: Pro
             <input
               id="tag"
               name="tag"
+              autoComplete="off"
               type="text"
               maxLength={TAG_MAX_CHARS}
               defaultValue={filters.tag}
@@ -116,7 +118,7 @@ export default async function ResearchPage({ searchParams }: { searchParams: Pro
           </div>
           <div className="field">
             <label htmlFor="organization_id">Organization</label>
-            <select id="organization_id" name="organization_id" defaultValue={filters.organization_id}>
+            <select id="organization_id" name="organization_id" autoComplete="off" defaultValue={filters.organization_id}>
               <option value="">All I can see</option>
               {organizations.map((o) => (
                 <option key={o.id} value={o.id}>
@@ -127,7 +129,7 @@ export default async function ResearchPage({ searchParams }: { searchParams: Pro
           </div>
           <div className="field">
             <label htmlFor="sort">Sort by</label>
-            <select id="sort" name="sort" defaultValue={filters.sort}>
+            <select id="sort" name="sort" autoComplete="off" defaultValue={filters.sort}>
               {SORTS.map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
@@ -136,7 +138,7 @@ export default async function ResearchPage({ searchParams }: { searchParams: Pro
             </select>
           </div>
           <label className="flex items-center gap-2 pb-2 text-[13px]">
-            <input type="checkbox" name="author_id" value={me.id} defaultChecked={filters.author_id === me.id} />
+            <input type="checkbox" name="author_id" autoComplete="off" value={me.id} defaultChecked={filters.author_id === me.id} />
             Only my notes
           </label>
           <div className="flex flex-wrap items-center gap-3 pb-1">

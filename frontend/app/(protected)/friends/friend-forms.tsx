@@ -22,6 +22,7 @@ export function AddFriendForm() {
           <input
             id="username"
             name="username"
+            autoComplete="off"
             type="text"
             required
             minLength={3}

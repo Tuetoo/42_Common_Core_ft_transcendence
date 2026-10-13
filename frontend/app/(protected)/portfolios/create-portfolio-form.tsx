@@ -17,6 +17,7 @@ export function CreatePortfolioForm({ organizations }: { organizations: { id: st
         <input
           id="name"
           name="name"
+          autoComplete="off"
           type="text"
           required
           maxLength={NAME_MAX_LENGTH}
@@ -25,7 +26,7 @@ export function CreatePortfolioForm({ organizations }: { organizations: { id: st
       </div>
       <div className="field">
         <label htmlFor="currency">Currency</label>
-        <select id="currency" name="currency" defaultValue={values.currency ?? "USD"}>
+        <select id="currency" name="currency" autoComplete="off" defaultValue={values.currency ?? "USD"}>
           {CURRENCIES.map((c) => (
             <option key={c} value={c}>
               {c}
@@ -35,7 +36,7 @@ export function CreatePortfolioForm({ organizations }: { organizations: { id: st
       </div>
       <div className="field">
         <label htmlFor="sharing">Who can see it</label>
-        <select id="sharing" name="sharing" defaultValue={values.sharing ?? "private"}>
+        <select id="sharing" name="sharing" autoComplete="off" defaultValue={values.sharing ?? "private"}>
           <option value="private">Only me</option>
           {organizations.map((org) => (
             <option key={org.id} value={org.id}>

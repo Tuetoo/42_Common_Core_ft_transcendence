@@ -153,11 +153,13 @@ def route_after_reflection(state: AnalysisState) -> list[Send] | str:
 
 def build_analysis_graph() -> CompiledStateGraph[AnalysisState, Any, Any, Any]:
     graph = StateGraph(AnalysisState)
+    agent_roles = [*AGENT_REGISTRY, AgentRole.PORTFOLIO]
+    agent_nodes = [node_name(role) for role in agent_roles]
 
     graph.add_node("episodic_memory_node", episodic_memory_node)
     graph.add_node("supervisor_node", supervisor_node)
 
-    for role in [*AGENT_REGISTRY, AgentRole.PORTFOLIO]:
+    for role in agent_roles:
         graph.add_node(node_name(role), make_agent_node(role))
 
     graph.add_node("agent_join_node", agent_join_node)
@@ -172,11 +174,9 @@ def build_analysis_graph() -> CompiledStateGraph[AnalysisState, Any, Any, Any]:
     graph.add_edge("episodic_memory_node", "supervisor_node")
 
     graph.add_conditional_edges(
-        "supervisor_node", fan_out_to_selected_agents,
-        [node_name(role)
-         for role in AGENT_REGISTRY] + [node_name(AgentRole.PORTFOLIO)])
+        "supervisor_node", fan_out_to_selected_agents, agent_nodes)
 
-    for role in [*list(AGENT_REGISTRY), AgentRole.PORTFOLIO]:
+    for role in agent_roles:
         if role == AgentRole.NEWS:
             continue
         graph.add_edge(node_name(role), "agent_join_node")
@@ -200,10 +200,7 @@ def build_analysis_graph() -> CompiledStateGraph[AnalysisState, Any, Any, Any]:
 
     graph.add_conditional_edges(
         "reflection_node", route_after_reflection,
-        [node_name(role) for role in AGENT_REGISTRY] + [
-            node_name(AgentRole.PORTFOLIO), "bull_node", "bear_node",
-            "recommendation_node"
-        ])
+        [*agent_nodes, "bull_node", "bear_node", "recommendation_node"])
 
     graph.add_edge("recommendation_node", END)
 

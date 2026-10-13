@@ -98,10 +98,14 @@ async def organization_roles(
             "org_membership_cache.get_failed", key=key, error=str(exc))
         cached = None
     if cached:
-        return {
-            UUID(org_id): role
-            for org_id, role in json.loads(cached).items()
-        }
+        try:
+            return {
+                UUID(org_id): role
+                for org_id, role in json.loads(cached).items()
+            }
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "org_membership_cache.corrupt_entry", key=key, error=str(exc))
     url = f"{auth_service_url}/internal/users/{user_id}/organizations"
     try:
         response = await client.get(url)

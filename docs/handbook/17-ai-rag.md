@@ -548,7 +548,7 @@ else.
 There are no site lists, title patterns or word lists. Every item is
 classified by the LLM into fixed enums, and code decides only from those
 enums, so the rules hold for any US stock. The only checks without the
-LLM are structural (`ai/providers/news_filters.py`):
+LLM are structural (`ai/providers/news_relevance.py`):
 
 - a placeholder title or a news headline of fewer than three words (it
   cannot be classified or matched by its echo); web results need one
@@ -637,7 +637,7 @@ ticker and at least one English item.
   stored document is read by later analyses as a fact source, so it must
   not contain items nobody checked.
 
-**The NewsAPI query** (`news_filters.build_ticker_news_query`) is the
+**The NewsAPI query** (`news_relevance.build_ticker_news_query`) is the
 same for the News tool and the digest: `(TICKER OR "Company Name")`,
 AND-ed with at most 4 topic words left from the model's query. The
 ticker, the company's name words, 4-digit years, words under three
@@ -821,7 +821,10 @@ out.
 
 The same filing check also runs during an analysis
 (`ai/graph/nodes.py::load_fresh_filing_context`, chapter 16): a brand-new filing is
-ingested and also handed directly to that analysis's agents.
+ingested and also handed directly to that analysis's agents. The analysis
+waits at most `FRESH_FILING_BUDGET_SECONDS` (600 s) for this ingest; after
+that it runs without the fresh-filing context, and the ingest finishes in
+the background.
 
 ### 3.14 Seed documents
 
@@ -834,7 +837,7 @@ comes back with `make restore`. Layout:
 | Folder | Content |
 |---|---|
 | `rag_seed_documents/analyst_report/` | 4 files |
-| `rag_seed_documents/earnings_call/` | 16 files |
+| `rag_seed_documents/earnings_call/` | earnings-call transcripts, prepared remarks and earnings presentations (PDF and text files, named `<TICKER>_...`) |
 | `rag_seed_documents/macro_research/` | 3 files |
 | `rag_seed_documents/filing/` | 5 files |
 | `rag_seed_documents/news/` | 18 files |
@@ -1233,7 +1236,7 @@ bash scripts/psql.sh -c "SELECT count(*) AS chunk_rows, count(DISTINCT document_
 | `services/ai-service/ai/workflows/rag_ingestion_workflow.py` | ingestion pipeline and status events |
 | `services/ai-service/ai/workflows/auto_ingestion_workflow.py` | daily filing/news and monthly macro ingestion |
 | `services/ai-service/ai/ingestion/` | SEC EDGAR, NewsAPI digest, FRED macro report |
-| `services/ai-service/ai/providers/news_relevance.py`, `news_filters.py` | news relevance classifier, `verify_with_cheap_tier`, `parsed_with_retry`, `clean_articles`, `stored_evidence_articles`; structural pre-checks and the NewsAPI query builder |
+| `services/ai-service/ai/providers/news_relevance.py` | news relevance classifier, `verify_with_cheap_tier`, `parsed_with_retry`, `clean_articles`, `stored_evidence_articles`; structural pre-checks and the NewsAPI query builder |
 | `services/ai-service/ai/tools/news_tool.py`, `web_search_tool.py` | result lines, kind tags, catalog field, result header; the web-search relevance classifier (`classify_results`, in `web_search_tool.py`) |
 | `services/ai-service/ai/providers/newsapi.py` | NewsAPI client and source catalog |
 | `services/ai-service/ai/tools/filing_tool.py`, `research_archive_tool.py` | agent search tools |

@@ -23,11 +23,13 @@ class EventName(StrEnum):
     RECOMMENDATION_READY = "recommendation.ready"
     DECISION_OUTCOME_EVALUATED = "decision.outcome.evaluated"
     DECISION_RECORDED = "decision.recorded"
+    DECISION_REVIEWED = "decision.reviewed"
     TIER_EXECUTED = "tier.executed"
     TIER_EXECUTION_FAILED = "tier.execution_failed"
     TIER_CANCELLED = "tier.cancelled"
     BACKTEST_COMPLETED = "backtest.completed"
     BACKTEST_FAILED = "backtest.failed"
+    BACKTEST_DELETED = "backtest.deleted"
 
     ORGANIZATION_MEMBER_JOINED = "organization.member.joined"
     USER_PRESENCE_CHANGED = "user.presence.changed"
@@ -38,9 +40,11 @@ class EventName(StrEnum):
     ORGANIZATION_MEMBER_REMOVED = "organization.member.removed"
     ORGANIZATION_ROLE_CHANGED = "organization.role.changed"
     ORGANIZATION_INVITATION_CREATED = "organization.invitation.created"
+    ORGANIZATION_INVITATION_REVOKED = "organization.invitation.revoked"
     FRIEND_REQUESTED = "friend.requested"
     FRIEND_ACCEPTED = "friend.accepted"
     FRIEND_REMOVED = "friend.removed"
+    CONNECTION_BLOCKED = "connection.blocked"
     USER_UPDATED = "user.updated"
     USER_ROLE_CHANGED = "user.role.changed"
     USER_DEACTIVATED = "user.deactivated"
@@ -59,11 +63,13 @@ EVENT_OWNERS: dict[EventName, str] = {
     EventName.RECOMMENDATION_READY: "ai-service",
     EventName.DECISION_OUTCOME_EVALUATED: "ai-service",
     EventName.DECISION_RECORDED: "ai-service",
+    EventName.DECISION_REVIEWED: "ai-service",
     EventName.TIER_EXECUTED: "ai-service",
     EventName.TIER_EXECUTION_FAILED: "ai-service",
     EventName.TIER_CANCELLED: "ai-service",
     EventName.BACKTEST_COMPLETED: "ai-service",
     EventName.BACKTEST_FAILED: "ai-service",
+    EventName.BACKTEST_DELETED: "ai-service",
     EventName.ORGANIZATION_MEMBER_JOINED: "auth-service",
     EventName.USER_PRESENCE_CHANGED: "auth-service",
     EventName.ORGANIZATION_CREATED: "auth-service",
@@ -73,9 +79,11 @@ EVENT_OWNERS: dict[EventName, str] = {
     EventName.ORGANIZATION_MEMBER_REMOVED: "auth-service",
     EventName.ORGANIZATION_ROLE_CHANGED: "auth-service",
     EventName.ORGANIZATION_INVITATION_CREATED: "auth-service",
+    EventName.ORGANIZATION_INVITATION_REVOKED: "auth-service",
     EventName.FRIEND_REQUESTED: "auth-service",
     EventName.FRIEND_ACCEPTED: "auth-service",
     EventName.FRIEND_REMOVED: "auth-service",
+    EventName.CONNECTION_BLOCKED: "auth-service",
     EventName.USER_UPDATED: "auth-service",
     EventName.USER_ROLE_CHANGED: "auth-service",
     EventName.USER_DEACTIVATED: "auth-service",

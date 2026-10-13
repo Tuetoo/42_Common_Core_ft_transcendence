@@ -73,6 +73,8 @@ class AdminRepository:
     @staticmethod
     def _unverified_before(created_before: datetime) -> list[Any]:
         linked = select(OAuthAccount.id).where(OAuthAccount.user_id == User.id)
+        # last_seen_at IS NULL means the account never held a token, so it
+        # cannot have uploaded an avatar.
         return [
             User.is_verified.is_(False),
             User.deleted_at.is_(None),

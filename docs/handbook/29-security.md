@@ -69,7 +69,7 @@ private Docker network.
 | Access token | A JWT with `type: "access"`, valid 15 minutes, sent as `Authorization: Bearer <token>`. |
 | Refresh token | A JWT with `type: "refresh"`, valid 30 days, used once to get a new token pair. |
 | Rotation | Every refresh revokes the used refresh token and issues a new one. |
-| Reuse detection | If a refresh token that was already rotated is presented again, someone may have stolen it; all of that user's sessions are revoked. |
+| Reuse detection | If a refresh token that was already rotated is presented again more than 30 seconds after the rotation, someone may have stolen it; the sessions descending from that token (its rotation chain) are revoked. The user's other logins stay valid. |
 | bcrypt | A deliberately slow password hashing function with a salt. A stolen hash is expensive to crack. |
 | TOTP / 2FA | Time-based one-time password (the 6-digit code in an authenticator app); a second factor after the password. |
 | OAuth `state` | A random value sent to Google/GitHub and checked when the user comes back. It proves the server started this sign-in; on its own it does not prove that the same browser did. |
@@ -264,17 +264,33 @@ POST /api/v1/auth/refresh {"refresh_token": R}
      return it. Only one of two concurrent refreshes can win.
   row returned?  -> new access + refresh pair (new session row)
   no row:
-    known session, revoked as 'rotated' (or no reason)?
-        -> REUSE: revoke ALL sessions of that user (reason 'reuse'),
-           commit, log refresh_token_reuse_detected, answer 401
-    revoked by logout / "revoke all", expired, unknown?
+    known session, revoked as 'rotated'?
+        rotated less than 30 s ago (REFRESH_REUSE_GRACE)?
+            -> 401 refresh_token_superseded, nothing revoked,
+               log refresh_token_superseded (warning, session_id)
+        rotated earlier?
+            -> REUSE: revoke the sessions descending from R (its
+               rotation chain, reason 'reuse'), commit,
+               log refresh_token_reuse_detected revoked=<n>, answer 401
+    revoked by logout / "revoke all", no reason, expired, unknown?
         -> just 401
 ```
 
+The grace window covers a benign race: two requests of one browser send
+the same token, and the slower one arrives just after the rotation. It
+can also be a thief who refreshed first; the distinct code lets the
+victim's client keep its cookie, so a later reuse of that token still
+revokes the thief's chain. The
+chain needs no extra column: a session created by a refresh has
+`created_at` equal to the `revoked_at` of the session it replaced
+(`_issue_token_pair(rotated_at=...)`), and
+`UserRepository.revoke_rotation_successors` follows that link with a
+recursive CTE. It repeats the revocation until the chain stops growing,
+so a rotation committed at the same moment is revoked too.
+
 Logout (`POST /api/v1/auth/logout`) revokes only that session. A token
-revoked by a logout does not trigger the "revoke everything" path, so a
-second browser tab that still holds it cannot log the user out
-everywhere.
+revoked by a logout does not trigger the reuse path, so a second browser
+tab that still holds it cannot revoke any other session.
 
 Access tokens are not revocable one by one; they simply expire within 15
 minutes. Deactivation and role changes still apply immediately through
@@ -285,7 +301,13 @@ set by the frontend's server (`frontend/app/lib/session-cookies.ts`):
 `httpOnly`, `SameSite=Lax`, `path=/`, and `Secure` when
 `NODE_ENV=production` (the Docker image). Page JavaScript cannot read
 these cookies. `frontend/proxy.ts` swaps an access token that expires
-within 60 seconds for a new pair before the page runs. Known trade-off:
+within 60 seconds for a new pair before the page runs. Concurrent
+refreshes of one token are merged. A request that still carries the old
+refresh cookie gets the same new pair again (only from the same client
+IP, `x-real-ip`; other addresses go to the backend) until a request
+arrives with the new refresh token, then for 30 seconds more, and for at
+most 15 minutes. A 401 with `refresh_token_superseded` keeps both
+cookies (like a 5xx or 429: try later). Known trade-off:
 the browser's WebSocket needs the token in `?token=`, so the server
 passes the access token to the client components that open sockets
 (live notifications, unread count, analysis status, analytics refresh,
@@ -627,7 +649,7 @@ gateway limit lives in nginx memory and needs no store.
 
 ### 3.12 API keys (the public API)
 
-`services/core-service/apikeys.py` and `api/apikeys_api.py`:
+`services/core-service/apikeys.py` and `api/public.py` (`apikeys_router`):
 
 - Created with `POST /api/v1/api-keys` (needs `api_key:manage`, so guests
   cannot). The raw key is `amk_` + `secrets.token_urlsafe(32)`, shown
@@ -854,7 +876,8 @@ per-address limit could be bypassed by sending a fake header.
 (SHA-256) and passwords (bcrypt) are stored as hashes, so a database leak
 does not hand out working credentials. Rotation is one atomic
 `UPDATE ... RETURNING`, so two concurrent refreshes cannot both win, and
-reuse of a rotated token revokes everything.
+reuse of a rotated token after the 30-second grace revokes its rotation
+chain.
 
 **One internal secret, checked in constant time.** Alternative: mutual
 TLS between services. A shared header is simple to run in Docker Compose,
@@ -886,7 +909,7 @@ pinning `bcrypt<4.1` keeps it working instead of rewriting hashing code.
 | 401 `Missing or invalid internal token` between services | Services started with different `INTERNAL_API_TOKEN` values. | Recreate all services and the scheduler from the same `.env.docker`. |
 | Many 429 for everyone behind one address | Per-address limits; behind Docker Desktop all host traffic can share one address. | Wait for `Retry-After`; check keys with `bash scripts/redis-cli.sh -n 1 --scan --pattern 'auth:rl:*'`. |
 | `/2fa/setup` or `/2fa/verify` answers 403 `recent_login_required` | The session's login (`auth_time`) is older than 10 minutes, or the token predates the claim; refreshing does not renew it. | Log in again (password or OAuth) and retry. |
-| Users logged out everywhere unexpectedly | A rotated refresh token was reused (`refresh_token_reuse_detected`). | Search auth-service logs; check the client does not reuse old refresh tokens. |
+| A user is logged out in one browser unexpectedly | A rotated refresh token came back after the 30-second grace (`refresh_token_reuse_detected`), so that browser's session chain was revoked. Usually a browser that holds an old cookie (for example a second browser left idle for days). | Search auth-service logs; check the client does not reuse old refresh tokens. |
 | 503 "Portfolio ownership check is unavailable" | core-service or auth-service down. | `make health`. |
 | Public API always 401 `invalid_api_key` right after creating a key | Wrong header or a typo; the key is shown only once. | Header must be `X-API-Key`. |
 | OAuth sign-in ends at `/oauth/complete#error=oauth_failed&message=...` | The sign-in failed; the `message` says why (expired state, other browser, provider error, ...). | Log `oauth_callback_failed` in auth-service gives the error code. |
@@ -1066,8 +1089,10 @@ permissions, so write routes answer 403.
 <summary>3. What happens when someone presents a refresh token that was already rotated?</summary>
 
 The atomic claim finds no live session; the token is known and was
-revoked as `rotated`, so every session of the user is revoked (reason
-`reuse`) and the request gets 401.
+revoked as `rotated`. Within 30 seconds of the rotation the request gets
+401 `refresh_token_superseded` and nothing else happens. Later, the
+sessions descending from that token are revoked (reason `reuse`) and the
+request gets 401; the user's other logins stay valid.
 </details>
 
 <details>
@@ -1143,10 +1168,12 @@ or if any container could be compromised, you would add `requirepass`.
 - Two error-body shapes: token and missing-permission errors use
   FastAPI's `{"detail": ...}`, service errors the `{"error": {...}}`
   envelope (section 3.4).
-- Open WebSocket JSON channels are not re-checked when rights change; they
-  end at token expiry at the latest. Only Yjs editor sockets are
-  re-checked, and only on the replica that receives the event (one
-  core-service replica is assumed).
+- Open sockets are re-checked when a user event changes rights (Yjs
+  editor sockets and `/ws/{channel}` sockets), but only on the replica
+  that receives the event (one core-service replica is assumed).
+  `analysis:<id>` and `document:<id>` sockets are not closed when the
+  resource stops being shared, because no user event is published then;
+  they end at token expiry at the latest ([25](25-realtime-yjs.md)).
 - nginx's error log can still contain a full request line (with a token
   query string) when an upstream fails.
 - Swagger pages (`/docs/auth/`, `/docs/core/`, `/docs/ai/`) and
@@ -1184,9 +1211,9 @@ or if any container could be compromised, you would add `requirepass`.
 | `shared/schemas.py` | The ticker rule. |
 | `services/auth-service/security.py` | bcrypt, token creation, special tokens, TOTP, Fernet encryption of stored TOTP secrets; auth limits and 2FA lockout. |
 | `services/auth-service/domains/auth/service.py` | Login, refresh rotation and reuse detection, 2FA, OAuth. |
-| `services/auth-service/domains/auth/repository.py` | `claim_session_for_rotation`, `revoke_all_sessions`, `consume_totp_step`. |
+| `services/auth-service/domains/auth/repository.py` | `claim_session_for_rotation`, `revoke_rotation_successors`, `revoke_all_sessions`, `consume_totp_step`. |
 | `services/auth-service/user_state_sync.py` | Writer side of the live state. |
-| `services/core-service/apikeys.py`, `api/apikeys_api.py` | API keys and the public API guard. |
+| `services/core-service/apikeys.py`, `api/public.py` | API keys and their `/api/v1/api-keys` routes, the public API and its guard. |
 | `services/core-service/domains/portfolio/service.py` | `_require_readable`, `_require_owner`. |
 | `services/ai-service/deps.py` | `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
 | `services/ai-service/domains/rag/qa.py` | RAG ask rate limit. |

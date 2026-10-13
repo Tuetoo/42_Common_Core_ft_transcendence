@@ -9,9 +9,9 @@ from ai.llm.router import LLMRouter
 from ai.providers.base import (MacroDataPoint, ProviderError,
                                ProviderQuotaError, ProviderUnavailableError)
 from ai.providers.fred import FredProvider
-from ai.providers.news_filters import (build_ticker_news_query,
-                                       company_search_name)
-from ai.providers.news_relevance import (clean_articles, lookup_company_name,
+from ai.providers.news_relevance import (build_ticker_news_query,
+                                         clean_articles, company_search_name,
+                                         lookup_company_name,
                                          stored_evidence_articles)
 from ai.providers.newsapi import NewsApiProvider
 from ai.providers.sec_edgar import load_ticker_to_title

@@ -35,7 +35,8 @@ from ai.tools.base import Tool
 from config import settings
 from helpers import _TSLA_FILINGS, _TSLA_ROWS
 from helpers import _state
-from helpers import _events, _pad, _ScriptedAgentRouter, _validator
+from helpers import (_action, _events, _finish, _pad, _ScriptedAgentRouter,
+                     _validator)
 from structlog.testing import capture_logs
 from shared.enums import AgentRole, AgentStatus
 
@@ -94,29 +95,6 @@ _AMZN_GOOD = (
     "regulatory developments, including workforce restructuring, ongoing "
     "antitrust oversight, and recent scrutiny regarding workplace practices "
     "and aviation safety. Sentiment: positive")
-
-
-def _finish(
-        answer: str, reported_metrics: Any = None,
-        thought: str = "done") -> str:
-    return json.dumps({
-        "thought": thought,
-        "action": None,
-        "action_input": None,
-        "finish_answer": answer,
-        "reported_metrics": reported_metrics
-    })
-
-
-def _action(
-        action: str, action_input: dict[str, Any] | None,
-        thought: str = "checking") -> str:
-    return json.dumps({
-        "thought": thought,
-        "action": action,
-        "action_input": action_input,
-        "finish_answer": None
-    })
 
 
 def _entry(
@@ -262,8 +240,7 @@ class _FixedAgent:
 class TestToolFailures:
 
     @pytest.mark.asyncio
-    async def test_bad_arguments_and_tool_exceptions_become_errored_steps(
-            self):
+    async def test_errored_steps_and_cancellation(self):
         router = _ScriptedRouter([
             _action("get_price", {"symbol": "AAPL"}),
             _action("get_price", {"ticker": "AAPL"}),
@@ -291,9 +268,6 @@ class TestToolFailures:
         assert boom.tool_error is True
         assert good.tool_error is False
         assert result.final_answer == "AAPL last close 227.40."
-
-    @pytest.mark.asyncio
-    async def test_cancellation_inside_a_tool_still_propagates(self):
 
         class _Cancelled(Tool):
             name = "get_cancel"
@@ -344,7 +318,7 @@ class TestParseResponse:
 class TestCorrectionTurns:
 
     @pytest.mark.asyncio
-    async def test_bad_reply_gets_a_correction_turn(self):
+    async def test_correction_turns_and_their_cumulative_budget(self):
         cases = {
             "truncated-reply-gets-the-shorter-thought-nudge": (
                 _Truncated(
@@ -374,9 +348,6 @@ class TestCorrectionTurns:
             for text in absent:
                 assert text not in first.observation, case_id
 
-    @pytest.mark.asyncio
-    async def test_correction_budget_is_cumulative_and_ends_in_best_effort(
-            self):
         tool = _FakeTool("get_price", _PRICE_OBS)
         router = _ScriptedRouter([
             "bad 1",
@@ -441,7 +412,7 @@ class TestIterationCap:
 class TestRepeatedCalls:
 
     @pytest.mark.asyncio
-    async def test_duplicate_block_budget_ends_in_best_effort(self):
+    async def test_duplicate_near_duplicate_and_errored_repeats(self):
         tool = _FakeTool("get_x", _PRICE_OBS)
         router = _ScriptedRouter([_action("get_x", {"q": "AAPL"})] * 4)
         result = await _loop(router, [tool], max_iterations=10).run("t")
@@ -455,9 +426,6 @@ class TestRepeatedCalls:
             "Best-effort summary from the last observation gathered: "
             f"{_PRICE_OBS}")
 
-    @pytest.mark.asyncio
-    async def test_near_duplicate_result_gets_nudge_then_repeat_is_blocked(
-            self):
         tool = _FakeTool(
             "get_current_price", lambda kw: (
                 _QUOTE_OBS if kw["ticker"] == "AAPL" else (
@@ -483,8 +451,6 @@ class TestRepeatedCalls:
         assert pad[4].is_tool_result is True
         assert result.iterations_used == 4
 
-    @pytest.mark.asyncio
-    async def test_errored_call_may_be_retried_once_then_blocked(self):
         tool = _FakeTool("get_x", "Price lookup failed for 'AAPL': 503")
         router = _ScriptedAgentRouter([
             _action("get_x", {"q": "AAPL"}),
@@ -538,8 +504,7 @@ class TestPeerTickerCalls:
 class TestPromptAndFinishMeta:
 
     @pytest.mark.asyncio
-    async def test_system_prompt_carries_agent_prompt_tools_date_contract(
-            self):
+    async def test_system_prompt_contract_and_finish_meta(self):
         tools = [_FakeTool("get_price", "x"), _FakeTool("search_news", "y")]
         router = _ScriptedRouter([_finish("x")])
         await _loop(
@@ -556,8 +521,6 @@ class TestPromptAndFinishMeta:
         ) in system
         assert '"reported_metrics"' in system
 
-    @pytest.mark.asyncio
-    async def test_finish_meta_records_accepted_turn(self):
         tool = _FakeTool("get_x", _PRICE_HISTORY_OBS)
         router = _ScriptedAgentRouter(
             [_action("get_x", {"q": "A"}),
@@ -607,7 +570,7 @@ class TestPromptAndFinishMeta:
 class TestAnswerAnchoring:
 
     @pytest.mark.asyncio
-    async def test_off_topic_answer_is_rewritten_once_from_the_summary(self):
+    async def test_off_topic_rewrite_and_word_share(self):
         router = _ScriptedRouter([_finish(_AMZN_IPHONE), _finish(_AMZN_GOOD)])
         loop = _loop(
             router, [], role=AgentRole.SENTIMENT, system_prompt="s",
@@ -623,6 +586,23 @@ class TestAnswerAnchoring:
             second_prompt)
         assert "from the other agent's summary in the context above" in (
             second_prompt)
+
+        news = (
+            "Amazon sentiment is positive on AWS cloud growth, AI "
+            "investments and analyst backing; FTC antitrust oversight "
+            "continues.")
+        paraphrase = (
+            "Sentiment for AMZN is positive, driven by AWS growth, AI "
+            "investments and antitrust oversight.")
+        off_topic = (
+            "Here is how the iPhone 16 Pro Max thermal design and display "
+            "work.")
+        minimum = settings.FALLBACK_ANCHOR_MIN_WORD_SHARE
+        assert word_share(paraphrase, news) >= minimum
+        assert word_share(off_topic, news) < minimum
+        assert loosely_anchored(paraphrase, news)
+        assert not loosely_anchored(off_topic, news)
+        assert word_share("", news) == 0.0
 
     @pytest.mark.asyncio
     async def test_outlet_names_are_not_a_gate(self):
@@ -646,24 +626,6 @@ class TestAnswerAnchoring:
         result = await loop.run("task")
         assert result.final_answer == answer
         assert result.unresolved_finish_validation_issue is None
-
-    def test_word_share_separates_paraphrase_from_off_topic_text(self):
-        news = (
-            "Amazon sentiment is positive on AWS cloud growth, AI "
-            "investments and analyst backing; FTC antitrust oversight "
-            "continues.")
-        paraphrase = (
-            "Sentiment for AMZN is positive, driven by AWS growth, AI "
-            "investments and antitrust oversight.")
-        off_topic = (
-            "Here is how the iPhone 16 Pro Max thermal design and display "
-            "work.")
-        minimum = settings.FALLBACK_ANCHOR_MIN_WORD_SHARE
-        assert word_share(paraphrase, news) >= minimum
-        assert word_share(off_topic, news) < minimum
-        assert loosely_anchored(paraphrase, news)
-        assert not loosely_anchored(off_topic, news)
-        assert word_share("", news) == 0.0
 
 
 class TestAgentQuality:
@@ -900,7 +862,7 @@ class TestProceduralMemoryGate:
     }
 
     @pytest.mark.asyncio
-    async def test_each_gate_and_only_clean_output_is_remembered(
+    async def test_each_gate_and_prefetch_only_trajectory_is_not_stored(
             self, monkeypatch):
         gates = {
             "score": ({
@@ -940,6 +902,21 @@ class TestProceduralMemoryGate:
             })
         assert written is False
 
+        prefetched = ScratchpadEntry(
+            thought="(fetched in code before the first turn)",
+            action="get_technical_indicators", action_input={"ticker": "AAPL"},
+            observation="RSI(14): 50", prefetched=True)
+        with capture_logs() as logs:
+            written = await memory_module.maybe_remember_trajectory(
+                agent_id=None, user_id=None, ticker="AAPL",
+                scratchpad=[vars(prefetched)], **self._OK)
+        assert written is False
+        skipped = [
+            log for log in logs
+            if log["event"] == "procedural_memory.write_skipped"
+        ]
+        assert skipped[0]["reason"] == "no_model_chosen_calls"
+
     def test_trajectory_steps_and_owner_ids(self):
         pad = [
             vars(e) for e in (
@@ -966,28 +943,6 @@ class TestProceduralMemoryGate:
         assert memory_module.owner_uuid("") is None
         assert memory_module.owner_uuid(None) is None
         assert memory_module.owner_uuid("not-a-uuid") is None
-
-    @pytest.mark.asyncio
-    async def test_prefetch_only_trajectory_is_not_stored(self, monkeypatch):
-
-        def _no_session():
-            raise AssertionError("must not write")
-
-        monkeypatch.setattr(memory_module, "SessionLocal", _no_session)
-        prefetched = ScratchpadEntry(
-            thought="(fetched in code before the first turn)",
-            action="get_technical_indicators", action_input={"ticker": "AAPL"},
-            observation="RSI(14): 50", prefetched=True)
-        with capture_logs() as logs:
-            written = await memory_module.maybe_remember_trajectory(
-                agent_id=None, user_id=None, ticker="AAPL",
-                scratchpad=[vars(prefetched)], **self._OK)
-        assert written is False
-        skipped = [
-            log for log in logs
-            if log["event"] == "procedural_memory.write_skipped"
-        ]
-        assert skipped[0]["reason"] == "no_model_chosen_calls"
 
     @pytest.mark.asyncio
     async def test_hints_carry_tool_pattern_but_not_final_answer(
@@ -1073,7 +1028,7 @@ class TestProceduralMemoryGate:
 
 class TestFinishChecks:
 
-    def test_own_evidence_check_message_and_fail_open(self, monkeypatch):
+    def test_own_evidence_check_fresh_counts_and_fail_open(self, monkeypatch):
         check = own_evidence_figure_check()
         pad = [_entry("get_price", "close 100.0")]
         issue = check("Up 25% to $125.", None, pad)
@@ -1085,17 +1040,6 @@ class TestFinishChecks:
         issue = check("Expenses of $170-172 billion.", None, guide)
         assert issue is not None and '"$170-172 billion"' in issue
 
-        def _boom(*args: Any) -> set[str]:
-            raise ValueError("boom")
-
-        monkeypatch.setattr(
-            finish_checks_module, "find_ungrounded_figures", _boom)
-        with capture_logs() as logs:
-            assert check("Up 25%.", None, pad) is None
-        assert logs[0]["event"] == "finish_checks.own_evidence_check_failed"
-
-    def test_counts_need_fresh_evidence_not_prior_notes(self):
-        check = own_evidence_figure_check()
         note = (
             "Prior news note search results (1 passages):\n"
             "- (TSLA) [agent:news] (2026-10-06): deliveries rose from "
@@ -1123,7 +1067,17 @@ class TestFinishChecks:
         reference = finish_checks_module.primary_reference_text([mixed])
         assert "435,012" in reference and "496,579" not in reference
 
-    def test_agents_wire_the_shared_checks(self):
+        def _boom(*args: Any) -> set[str]:
+            raise ValueError("boom")
+
+        monkeypatch.setattr(
+            finish_checks_module, "find_ungrounded_figures", _boom)
+        pad = [_entry("get_price", "close 100.0")]
+        with capture_logs() as logs:
+            assert check("Up 25%.", None, pad) is None
+        assert logs[0]["event"] == "finish_checks.own_evidence_check_failed"
+
+    def test_agents_wire_the_shared_checks_and_budget(self):
         figure = "own_evidence_figure_check("
         token = "InternalTokenValidator("
         cases = {
@@ -1146,7 +1100,6 @@ class TestFinishChecks:
             source = inspect.getsource(module)
             assert (needle in source) is wired, case_id
 
-    def test_news_and_risk_validators_share_the_budget_and_token_check(self):
         assert issubclass(_NewsFinishValidator, RejectOnceBudget)
         assert issubclass(_CapturingRiskEventsValidator, RejectOnceBudget)
         assert not hasattr(news_module, "_LOOP_FINISH_RETRIES")

@@ -136,7 +136,7 @@ Close codes in one table (`websocket_manager.py`):
 | 1011 | `CLOSE_INTERNAL_ERROR` | unexpected server error; also a socket whose send failed |
 | 4400 | `CLOSE_BAD_REQUEST` | unknown channel family or empty target |
 | 4401 | `CLOSE_UNAUTHORIZED` | bad/expired token, deactivated account (at connect, or later through `recheck_user_sessions`), and also a malformed note id on `/ws/yjs/` (reason `invalid token or note id`) |
-| 4403 | `CLOSE_FORBIDDEN` | not allowed to read that channel or note; also sent to every open Yjs socket of a note that a moderator hid or that was deleted (`close_note_sessions`, reason `note hidden by a moderator`, `note deleted by a moderator` or `note deleted`), and to a Yjs socket whose user lost read access (reason `access to this note was revoked`) |
+| 4403 | `CLOSE_FORBIDDEN` | not allowed to read that channel or note; also sent to every open Yjs socket of a note that a moderator hid or that was deleted (`close_note_sessions`, reason `note hidden by a moderator`, `note deleted by a moderator` or `note deleted`), to a Yjs socket whose user lost read access (reason `access to this note was revoked`), and to a writable Yjs socket whose user lost write access (reason `write access to this note was revoked`) |
 | 4429 | `CLOSE_TOO_MANY_CONNECTIONS` | more than 20 sockets for this user |
 
 ### 3.2 Message shapes: `WebSocketEnvelope` (`websocket_manager.py`)
@@ -268,8 +268,8 @@ accepted friends watching them.
 ### 3.6 Yjs collaborative editing: `/ws/yjs/{note_id}`
 
 Files: `services/core-service/api/websocket.py` (`yjs_router`, endpoint),
-`services/core-service/yjs_relay.py` (rooms, merge, snapshots),
-`services/core-service/domains/research/yjs_guard.py` (safe decoding).
+`services/core-service/yjs_relay.py` (rooms, merge, snapshots, and the
+safe decoding in its "Yjs decode/validate layer" section).
 
 **The contract.** The note body is the `Y.Text` named `"content"`
 (`ydoc.getText("content")`), markdown or plain text. Title and tags are
@@ -318,13 +318,14 @@ updates and receives raw updates.
   at most one `yjs_read_only_update_dropped` log line per 30 seconds per
   socket. The reader still receives the sync and all live updates. The
   loop reads the session's *current* `access.can_write` for every frame,
-  so a downgrade (below) takes effect on the next frame. The frontend
+  so an upgrade (below) takes effect on the next frame; a downgrade
+  closes the socket instead. The frontend
   should open the editor read-only when the REST note says `can_edit`
   is false.
 - Otherwise `relay.handle_local_update(room, update, sender)`:
   1. size check: `len(update) > YJS_MAX_UPDATE_BYTES` (default 1 MiB) ->
      `InvalidYjsUpdate`;
-  2. `yjs_guard.validator.validate(update)` decodes it in a separate worker
+  2. `validator.validate(update)` (in `yjs_relay.py`) decodes it in a separate worker
      process (below);
   3. under the room lock: apply to the room document, send to every other
      local socket of the room (not back to the sender), decide whether a
@@ -359,7 +360,7 @@ whole process (a huge allocation from a corrupt length prefix, `SIGABRT`)
 or segfault. No `except` can catch an abort. So every client update is
 first decoded by a pool of `_VALIDATION_WORKERS = 2` small `python -c`
 child processes with a `_VALIDATION_TIMEOUT_SECONDS = 5.0` limit
-(`yjs_guard.UpdateValidator`, workers used in turn). How it works:
+(`yjs_relay.UpdateValidator`, workers used in turn). How it works:
 
 - Each worker is a plain `python -c` child (not `multiprocessing`), so
   nothing of the service is imported into it and a crash only ends that
@@ -407,10 +408,11 @@ replica is assumed; an accepted limitation).
 deactivated=False)`). A WebSocket is authorized only when it connects. So
 that a removed, demoted or deactivated user does not keep editing until
 their token expires (up to 15 minutes), core-service re-checks the open Yjs
-sockets of a user when one of seven events arrives:
+sockets of a user when one of nine events arrives:
 `organization.member.removed`, `organization.member.left`,
 `organization.role.changed`, `organization.deleted` (every former member),
-`user.role.changed`, `user.deactivated` and `user.deleted` (see
+`user.role.changed`, `user.deactivated`, `user.deleted`, `friend.removed`
+and `connection.blocked` (both users of the connection; see
 [24-events.md](24-events.md) section 3.8). For every local socket of the
 user:
 
@@ -420,10 +422,11 @@ user:
 2. Otherwise `_note_access` is run again with the live identity (the same
    rule as at connect). Not readable any more -> closed with **4403**
    "access to this note was revoked".
-3. Still readable but no longer writable -> the socket is **downgraded to
-   read-only**: it stays open and keeps receiving updates, but its own
-   updates are dropped from the next frame on
-   (`yjs_session_downgraded_to_read_only`).
+3. Still readable but no longer writable -> closed with **4403** "write
+   access to this note was revoked". The frontend treats 4403 as final:
+   the editor stops, says that access to the note changed and asks for a
+   reload; the reload opens the editor read-only. A socket that only
+   gains rights keeps running with the new rights.
 4. If the new rights cannot be determined (the access check raises, for
    example auth-service is down), the socket keeps its current rights and
    `yjs_session_recheck_failed` is logged (fail open, the same rule as
@@ -437,9 +440,19 @@ check now fails (log `websocket_session_closed_on_access_change` with
 `channel`, `code`, `reason`); if the check itself fails, the socket stays
 open (`websocket_session_recheck_failed`). auth-service drops the membership cache and
 mirrors the new user state before it publishes, so the re-check sees the
-new rights. Like `close_note_sessions`, it reaches only sockets on this
-replica. JSON channel sockets (`/ws/{channel}`) are not re-checked: they
-only receive, and they end at token expiry at the latest.
+new rights. The two connection events matter for `presence:<id>`
+sockets: once the two users are no longer connected, the watcher's
+socket is closed with 4403. `auth_client.are_users_connected` answers
+False on an auth-service HTTP error, so during an auth outage this
+re-check closes presence sockets instead of keeping them open. Like
+`close_note_sessions`, it reaches only sockets on this replica.
+
+An accepted limitation: `analysis:<id>` and `document:<id>` sockets are
+not closed when the resource stops being shared (a portfolio PATCH to
+`visibility="private"`, a portfolio delete, a document delete). No user
+event is published for these changes, so an organization member's open
+socket keeps receiving status payloads until its token expires (15
+minutes or less). REST reads of the resource return 404 at once.
 
 **Other replicas** (`run_cross_replica_listener`): `PSUBSCRIBE yjs:note:*`.
 A message whose prefix is this replica's id is its own echo and is skipped
@@ -575,7 +588,7 @@ overwritten by the next snapshot. So:
   edited collaboratively..." for a body change while the room is active.
   Title changes are always allowed.
 - A REST body edit when no room is open is applied to the stored
-  `yjs_state` as one Yjs edit (`yjs_guard.replace_text`), not as a new
+  `yjs_state` as one Yjs edit (`yjs_relay.replace_text`), not as a new
   document. It loads the stored state, compares its text with the new
   text, keeps the common start and end, and in one transaction deletes
   the old middle part and inserts the new one. Positions are counted in
@@ -658,8 +671,8 @@ Rooms live only in the process memory (`YjsRelay._rooms`). On a restart:
 | `_ACTIVE_TTL_SECONDS` | `90` | lifetime of an active-room marker | `yjs_relay.py` |
 | `ACTIVE_HEARTBEAT_SECONDS` | `30.0` | marker refresh and snapshot flush interval | `yjs_relay.py` |
 | `_REDIS_CHANNEL_PREFIX` | `"yjs:note:"` | cross-replica Yjs channel | `yjs_relay.py` |
-| `_VALIDATION_WORKERS` | `2` | decoder child processes | `domains/research/yjs_guard.py` |
-| `_VALIDATION_TIMEOUT_SECONDS` | `5.0` | decode time limit per update | `domains/research/yjs_guard.py` |
+| `_VALIDATION_WORKERS` | `2` | decoder child processes | `yjs_relay.py` |
+| `_VALIDATION_TIMEOUT_SECONDS` | `5.0` | decode time limit per update | `yjs_relay.py` |
 | `_READ_ONLY_LOG_INTERVAL_SECONDS` | `30.0` | log throttle for dropped reader updates | `api/websocket.py` |
 | `proxy_read_timeout` (`/ws`) | `3600s` | gateway idle limit for a socket | `infra/gateway/nginx.conf` |
 
@@ -715,10 +728,9 @@ that exist nowhere else on the server.
 |---|---|---|
 | Client closes immediately with 4401 | expired/invalid token, refresh token used instead of access, deactivated user | make a new token: `bash scripts/token.sh owner` |
 | 4403 on `analysis:` | not the owner; ai-service unreachable (any error means deny) | core log `websocket_channel_auth_denied` |
-| 4403 on an open Yjs socket | a moderator hid the note, it was deleted, or the user lost access (removed from the organization) | core log `yjs_note_sessions_closed` with `note_id` and `reason`, or `yjs_session_closed_on_access_change` |
+| 4403 on an open Yjs socket | a moderator hid the note, it was deleted, the user lost access (removed from the organization), or lost write access (made organization VIEWER or guest; reason "write access to this note was revoked") | core log `yjs_note_sessions_closed` with `note_id` and `reason`, or `yjs_session_closed_on_access_change` |
 | 4401 or 4403 on an open `/ws/{channel}` socket | the account was deactivated or deleted, or the user lost access to the channel | `websocket_session_closed_on_access_change` with `channel`, `code` and `reason` |
 | 4401 on an open Yjs socket | token expired, or the account was deactivated or deleted | `yjs_session_closed_on_access_change` with `code=4401`; otherwise refresh the token |
-| A writer's edits stop being applied | the user was demoted (organization VIEWER, or lost `NOTE_WRITE`) | `yjs_session_downgraded_to_read_only`, then `yjs_read_only_update_dropped` |
 | 4400 | channel family not in the allowlist, or `analysis:` with empty id | check the URL |
 | 4429 | more than 20 sockets for that user | `WebSocketManager._user_counts` (in code only); close old tabs |
 | 1011 after a while | a send to the socket failed; the server closed it | core log `websocket_send_failed` |
@@ -905,7 +917,8 @@ and isolates the risky decoding in child processes."
     handler calls `recheck_user_sessions` for that member: the note is no
     longer readable, so the socket is closed with 4403 "access to this note
     was revoked" at once, not at token expiry. A member who was only
-    demoted to VIEWER keeps the socket, read-only.
+    demoted to VIEWER also gets 4403 ("write access to this note was
+    revoked"); after a reload the editor opens read-only.
 
 </details>
 
@@ -921,8 +934,7 @@ and isolates the risky decoding in child processes."
 | `services/auth-service/api/internal.py` | `POST /internal/users/{id}/presence`, `GET /internal/connections/check` |
 | `services/auth-service/domains/auth/service.py` | `set_presence`, `_mark_online`, `presence_event` |
 | `services/core-service/api/websocket.py` (`yjs_router`) | `/ws/yjs/{note_id}`, read-only handling, `_YjsSession` registry, `recheck_user_sessions` |
-| `services/core-service/yjs_relay.py` | `YjsRoom`, `YjsRelay` (`_in_use`, `flush_due_snapshots`, `persist_all_dirty`), snapshots, cross-replica listener, active-room markers |
-| `services/core-service/domains/research/yjs_guard.py` | decoder worker pool, `guarded`, `seed_state`, `replace_text` (REST body edits), `merge_states`, `extract_text` |
+| `services/core-service/yjs_relay.py` | `YjsRoom`, `YjsRelay` (`_in_use`, `flush_due_snapshots`, `persist_all_dirty`), snapshots, cross-replica listener, active-room markers; decoder worker pool (`UpdateValidator`, `validator`), `guarded`, `seed_state`, `replace_text` (REST body edits), `merge_states`, `extract_text` |
 | `services/core-service/domains/research/model.py` | `ResearchNote` (`yjs_state`, `content`, `search_vector`) |
 | `services/core-service/domains/research/service.py` | `note_access`, the 409 rule |
 | `services/core-service/main.py` | starts the listeners and the room heartbeat; saves dirty rooms at shutdown (`persist_all_dirty`) and stops the decoder workers |

@@ -855,7 +855,7 @@ class TestSharedContracts:
 
 class TestApiKeys:
 
-    async def test_api_key_access_owner_state_and_rate_limit(
+    async def test_api_key_access_owner_state_rate_and_active_limit(
             self, real_client, mock_cross_service, monkeypatch):
         client = real_client
         user_id, headers = _headers()
@@ -999,6 +999,30 @@ class TestApiKeys:
         assert (
             await client.get(url, headers={"X-API-Key": created["key"]
                                            })).status_code == 401
+
+        import asyncio
+
+        monkeypatch.setattr(settings, "MAX_ACTIVE_API_KEYS_PER_USER", 2)
+        _, headers = _headers()
+
+        async def create(name: str) -> httpx.Response:
+            return await real_client.post(
+                "/api/v1/api-keys", json={"name": name}, headers=headers)
+
+        first = await create("k1")
+        assert (await create("k2")).status_code == 201
+        third = await create("k3")
+        assert third.status_code == 409
+        assert "maximum 2" in third.json()["error"]["message"]
+        revoked = await real_client.delete(
+            f"/api/v1/api-keys/{first.json()['data']['id']}", headers=headers)
+        assert revoked.status_code == 204
+        assert (await create("k3")).status_code == 201
+
+        monkeypatch.setattr(settings, "MAX_ACTIVE_API_KEYS_PER_USER", 1)
+        _, headers = _headers()
+        racing = await asyncio.gather(create("a"), create("b"))
+        assert sorted(r.status_code for r in racing) == [201, 409]
 
     async def test_api_key_revoke_and_cache(
             self, client, mock_cross_service, monkeypatch, db_session):

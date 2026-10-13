@@ -7,6 +7,8 @@ import type { Organization } from "./types";
 
 const initialState: CreateNoteState = {};
 
+// After an error the action returns what was typed, and the reset form
+// shows it again.
 export function CreateNoteForm({ organizations }: { organizations: Organization[] }) {
   const [state, formAction, pending] = useActionState(createNote, initialState);
   const [tagError, setTagError] = useState<string | null>(null);
@@ -21,19 +23,28 @@ export function CreateNoteForm({ organizations }: { organizations: Organization[
     <form action={formAction} className="form">
       <div className="field">
         <label htmlFor="title">Title</label>
-        <input id="title" name="title" type="text" required maxLength={NOTE_TITLE_MAX} />
+        <input id="title" name="title" autoComplete="off" type="text" required maxLength={NOTE_TITLE_MAX} defaultValue={state.values?.title ?? ""} />
       </div>
       <div className="field">
         <label htmlFor="content">Content</label>
-        <textarea id="content" name="content" rows={4} maxLength={NOTE_CONTENT_MAX} />
+        <textarea
+          id="content"
+          name="content"
+          autoComplete="off"
+          rows={4}
+          maxLength={NOTE_CONTENT_MAX}
+          defaultValue={state.values?.content ?? ""}
+        />
       </div>
       <div className="field">
         <label htmlFor="tags">Tags (comma-separated)</label>
         <input
           id="tags"
           name="tags"
+          autoComplete="off"
           type="text"
           placeholder="e.g. AAPL, tech"
+          defaultValue={state.values?.tags ?? ""}
           onChange={checkTags}
           aria-describedby="tags-help"
           aria-invalid={tagError ? true : undefined}
@@ -49,7 +60,13 @@ export function CreateNoteForm({ organizations }: { organizations: Organization[
       </div>
       <div className="field">
         <label htmlFor="note-organization">Share with</label>
-        <select id="note-organization" name="organization_id" defaultValue="" aria-describedby="share-help">
+        <select
+          id="note-organization"
+          name="organization_id"
+          autoComplete="off"
+          defaultValue={state.values?.organization_id ?? ""}
+          aria-describedby="share-help"
+        >
           <option value="">Nobody (private note)</option>
           {organizations.map((org) => (
             <option key={org.id} value={org.id}>

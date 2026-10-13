@@ -78,3 +78,29 @@ export const ANALYSIS_TYPES = ["full", "technical", "fundamental", "sentiment", 
 // domains/decision/schema.py InvestmentDecisionCreate.
 export const DECISION_ACTIONS = ["followed", "partial", "ignored", "declined"];
 export const DECISION_NOTES_MAX_LENGTH = 2000;
+
+// Analysis status, shared by the list and detail pages so a status
+// (pending, running, completed, failed) is colored the same everywhere.
+export function statusPillClass(status: string): string {
+  if (status === "completed") return "pill pill-up";
+  if (status === "failed") return "pill pill-down";
+  if (status === "running" || status === "pending") return "pill pill-accent";
+  return "pill";
+}
+
+export function isFinished(status: string): boolean {
+  return status === "completed" || status === "failed";
+}
+
+// Analytics metrics. Kept in this plain module (no "use client") so both
+// the server page and the client charts can call these. Anything exported
+// from a "use client" file becomes a client reference that the server can
+// render but never call.
+export type Metric = "analyses" | "confidence" | "accuracy";
+
+export type TimeseriesPoint = { period_start: string; value: number | null; count: number };
+
+export function formatMetric(metric: Metric, value: number | null): string {
+  if (value === null) return "—";
+  return metric === "analyses" ? value.toLocaleString("en-US") : `${Math.round(value * 100)}%`;
+}

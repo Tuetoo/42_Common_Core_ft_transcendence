@@ -30,6 +30,7 @@ export function PortfolioSettingsForm({
         <input
           id="portfolio-name"
           name="name"
+          autoComplete="off"
           type="text"
           required
           maxLength={NAME_MAX_LENGTH}
@@ -39,7 +40,7 @@ export function PortfolioSettingsForm({
       {organizationName !== null && (
         <div className="field">
           <label htmlFor="portfolio-visibility">Who can see it</label>
-          <select id="portfolio-visibility" name="visibility" defaultValue={values.visibility ?? visibility}>
+          <select id="portfolio-visibility" name="visibility" autoComplete="off" defaultValue={values.visibility ?? visibility}>
             <option value="private">Only me</option>
             <option value="organization">Members of {organizationName}</option>
           </select>

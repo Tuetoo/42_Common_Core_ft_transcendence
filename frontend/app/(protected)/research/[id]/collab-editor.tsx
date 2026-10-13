@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as Y from "yjs";
 import { wsUrl } from "@/app/lib/ws-url";
+import { NOTE_CONTENT_MAX } from "../limits";
 
 // Lifecycle of the live connection, as shown to the user.
 type ConnectionStatus = "connecting" | "synced" | "reconnecting" | "ended";
@@ -23,7 +24,7 @@ const STATUS_COLOR: Record<ConnectionStatus, string> = {
 
 // Close codes from services/core-service/websocket_manager.py.
 const CLOSE_UNAUTHORIZED = 4401; // token expired or invalid: get a new one
-const CLOSE_FORBIDDEN = 4403; // no access (or the note was deleted)
+const CLOSE_FORBIDDEN = 4403; // access revoked or reduced to read-only (or the note was deleted)
 const FATAL_CLOSE_CODES = new Set([1003, 1008, 4400, CLOSE_FORBIDDEN]);
 
 const REMOTE = "remote";
@@ -178,7 +179,7 @@ export function CollabEditor({
           setStatus("ended");
           setDetail(
             event.code === CLOSE_FORBIDDEN
-              ? `You no longer have access to this note${event.reason ? ` (${event.reason})` : ""}.`
+              ? `Your access to this note changed${event.reason ? ` (${event.reason})` : ""}. Reload the page to continue.`
               : "The server refused an edit. Reload the page to continue."
           );
           return;
@@ -293,6 +294,7 @@ export function CollabEditor({
       </div>
       <textarea
         id={`collab-${noteId}`}
+        autoComplete="off"
         ref={textareaRef}
         value={text}
         onChange={handleChange}
@@ -300,6 +302,7 @@ export function CollabEditor({
         aria-readonly={!editable}
         aria-describedby={`collab-help-${noteId}`}
         rows={12}
+        maxLength={NOTE_CONTENT_MAX}
         placeholder={canEdit ? "Start typing. Everyone with this note open sees your edits live." : ""}
         className={`w-full min-w-0 rounded-md border border-[var(--border)] bg-[var(--bg)] px-[11px] py-[9px] text-[13px] leading-relaxed text-[var(--text)] focus:border-[var(--accent)] focus:outline-none ${
           editable ? "" : "cursor-default opacity-80"

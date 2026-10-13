@@ -1,6 +1,6 @@
 import { LocalTime } from "@/app/(protected)/local-time";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import {
   changeMemberRole,
   deleteOrganization,

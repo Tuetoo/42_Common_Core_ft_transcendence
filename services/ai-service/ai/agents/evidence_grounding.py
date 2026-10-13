@@ -3,7 +3,7 @@ import re
 import unicodedata
 from collections import Counter
 from typing import Any
-from ai.llm.json_fence import strip_json_code_fence
+from ai.llm.base import strip_json_code_fence
 
 _PERCENTAGE_RE = re.compile(r"\d+(?:\.\d+)?%")
 

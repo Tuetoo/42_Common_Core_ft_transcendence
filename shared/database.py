@@ -1,6 +1,5 @@
 import asyncio
 import configparser
-import warnings
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime
 from pathlib import Path
@@ -8,13 +7,10 @@ from typing import Any
 from uuid import UUID
 import structlog
 from alembic import command
-from alembic.autogenerate import compare_metadata
 from alembic.config import Config
-from alembic.runtime.migration import MigrationContext
 from sqlalchemy import DateTime, MetaData, func, select, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import (AsyncConnection, AsyncEngine, AsyncSession,
+from sqlalchemy.ext.asyncio import (AsyncEngine, AsyncSession,
                                     async_sessionmaker, create_async_engine)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import Select
@@ -159,39 +155,6 @@ async def count_tables(engine: AsyncEngine, schema: str) -> int:
 def exclude_alembic_version(
         object_: Any, name: str | None, type_: str, *_args: Any) -> bool:
     return not (type_ == "table" and name == "alembic_version")
-
-
-def describe_difference(diff: Any) -> str:
-    if isinstance(diff, list):
-        return "; ".join(describe_difference(item) for item in diff)
-    if not isinstance(diff, tuple) or not diff:
-        return repr(diff)
-    kind = str(diff[0])
-    if kind.startswith("modify_") and len(diff) >= 4:
-        return f"{kind} {diff[2]}.{diff[3]}"
-    if kind in ("add_column", "remove_column") and len(diff) >= 4:
-        return f"{kind} {diff[2]}.{getattr(diff[3], 'name', diff[3])}"
-    target = diff[1] if len(diff) > 1 else None
-    name = getattr(target, "name", None) or repr(target)
-    table = getattr(getattr(target, "table", None), "name", None)
-    return f"{kind} {table}.{name}" if table else f"{kind} {name}"
-
-
-def _differences_sync(connection: Connection) -> list[str]:
-    context = MigrationContext.configure(
-        connection, opts={
-            "compare_type": True,
-            "compare_server_default": True,
-            "include_object": exclude_alembic_version
-        })
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        diffs = compare_metadata(context, Base.metadata)
-    return [describe_difference(diff) for diff in diffs]
-
-
-async def schema_differences(conn: AsyncConnection) -> list[str]:
-    return await conn.run_sync(_differences_sync)
 
 
 async def bootstrap_schema(

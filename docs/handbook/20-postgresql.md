@@ -317,7 +317,7 @@ file ("head") and runs each `upgrade()` in order.
 
 | Service | `alembic.ini` | Migrations | Chain (oldest -> head) |
 |---|---|---|---|
-| auth | `services/auth-service/alembic.ini` | `services/auth-service/migrations/versions/` | `f1160b000001` (baseline, creates every table) -> `f1190b000001` (adds nullable `user_sessions.revoked_reason`; old revoked rows keep NULL, treated as `rotated`) -> `f1210b000001` (drops `organization_roles` with its rows: custom organization roles were never assigned or checked, owner decision; the downgrade recreates the table empty). Head `f1210b000001` |
+| auth | `services/auth-service/alembic.ini` | `services/auth-service/migrations/versions/` | `f1160b000001` (baseline, creates every table) -> `f1190b000001` (adds nullable `user_sessions.revoked_reason`; old revoked rows keep NULL; refreshing with such a token just gets 401) -> `f1210b000001` (drops `organization_roles` with its rows: custom organization roles were never assigned or checked, owner decision; the downgrade recreates the table empty). Head `f1210b000001` |
 | core | `services/core-service/alembic.ini` | `services/core-service/migrations/versions/` | `f1160c000001` (baseline) -> `f1170c000001` (document unique indexes become `NULLS NOT DISTINCT`; unused `api_keys.owner_org_id` and `scopes` dropped, `owner_user_id` NOT NULL; refuses with a list when duplicates or ownerless keys exist) -> `f1200c000001` (adds the `event_outbox` table and its partial index; additive) -> `f1250c000001` (adds `documents.status_changed_at`, filled from `uploaded_at`). Head `f1250c000001` |
 | ai | `services/ai-service/alembic.ini` | `services/ai-service/migrations/versions/` | `f1160a000001` (baseline) -> `f1170a000001` (drops `technical_indicator_cache`, `memory_references`, `rag_collections`, `retrieval_logs`, created from the ERD but never written or read; refuses if any holds rows) -> `f1210a000001` (drops the write-only `analysis_sources`, `analysis_citations`, `backtest_positions`, `backtest_trades` with their rows, owner decision; the downgrade recreates them empty) -> `f1220a000001` (adds `filing_records`) -> `f1230a000001` (adds nullable `kg_relations.kind` and `kg_relations.as_of`) -> `f1240a000001` (adds nullable `recommendations.judge_leaning` and `recommendations.judge_confidence`) -> `f1250a000001` (adds nullable `agent_memories.user_id`, the owner of a procedural-memory row). Head `f1250a000001` |
 
@@ -401,7 +401,7 @@ Details worth knowing:
   healthcheck then stays unhealthy and the reason is in the service log.
 
 **Backups from before the baselines.** A database restored from a
-backup taken before the current baselines (before round 116) carries a
+backup taken before the current baselines carries a
 revision of an older migration chain that is no longer in the repository.
 Alembic then stops with "Can't locate revision" and the service does not
 start: such a backup cannot be restored with this version. See
@@ -414,7 +414,7 @@ star-imported by `tests/auth-service/test_platform.py`,
 checks every schema in a throwaway schema of the test database:
 
 - a fresh schema built by `alembic upgrade head` equals the models
-  (`shared/database.py::schema_differences`: tables, columns,
+  (`tests/alembic_contract.py::differences`: tables, columns,
   types, nullability, server defaults, indexes, unique constraints,
   foreign keys; column order is not compared, PostgreSQL cannot reorder
   columns);
@@ -839,7 +839,7 @@ healthy too early on a first start.
 | Symptom | Likely cause | What the system does | How to diagnose |
 |---|---|---|---|
 | A service does not become healthy after start | migration failed or bootstrap refused | lifespan raises, service exits/restarts | `make service-logs S=core-service` (or `bash scripts/logs.sh core-service`); look for `SchemaBootstrapError` or an Alembic traceback; `schema_bootstrap_complete` is the success line |
-| Alembic "Can't locate revision" | database restored from a backup taken before round 116 | service does not start | restore a backup made by the current code |
+| Alembic "Can't locate revision" | database restored from a backup taken before the current migration baselines | service does not start | restore a backup made by the current code |
 | "schema 'x' has N table(s) but no Alembic revision" | tables were created by hand or `alembic_version` was lost | refuses to start | restore a backup, or inspect by hand; the service will not guess |
 | `relation "..." does not exist` | wrong `search_path`, or a table missing | request fails with 500 | `bash scripts/psql.sh -c "\dt core.*"`; check `POSTGRES_SCHEMA` is not set in the shared env file |
 | All requests slow, `/health` 503 with `"database": false` | Postgres down or out of connections | `pool_pre_ping` reconnects when it comes back; alert `PostgresDown` fires after 1 min | `make health`; Grafana panel "Connections" vs max connections |
@@ -1035,7 +1035,7 @@ rejects the second insert.
 | `infra/postgres/init-schemas.sql` | first-start script: `pgcrypto`, schemas `auth`, `core`, `ai` |
 | `docker-compose.yaml` (`postgres`, `postgres-exporter`, `adminer`) | image, volume, healthcheck, exporter, Adminer profile |
 | `shared/config.py` | `POSTGRES_*`, `DB_*` settings, URL assembly |
-| `shared/database.py` | `Base` + naming convention, `UUIDPKMixin`, `TimestampColumnsMixin`, engine factory (`search_path`), session factory, `make_get_db`, `count_query`, `check_database_connection`, `bootstrap_schema`, `schema_differences` |
+| `shared/database.py` | `Base` + naming convention, `UUIDPKMixin`, `TimestampColumnsMixin`, engine factory (`search_path`), session factory, `make_get_db`, `count_query`, `check_database_connection`, `bootstrap_schema` |
 | `services/*/database.py` | the service's `engine`, `SessionLocal`, `get_db`, `ensure_schema`, `register_models` |
 | `services/*/alembic.ini`, `services/*/migrations/env.py` | Alembic configuration per service |
 | `services/*/migrations/versions/` | the active migration chain |

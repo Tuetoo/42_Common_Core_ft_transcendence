@@ -17,6 +17,7 @@ export function InviteMemberForm({ orgId, roles }: { orgId: string; roles: reado
         <input
           id="invite-email"
           name="email"
+          autoComplete="off"
           type="email"
           required
           maxLength={254}
@@ -26,7 +27,7 @@ export function InviteMemberForm({ orgId, roles }: { orgId: string; roles: reado
       </div>
       <div className="field">
         <label htmlFor="invite-role">Role</label>
-        <select id="invite-role" name="role" defaultValue={state.values?.role ?? "member"}>
+        <select id="invite-role" name="role" autoComplete="off" defaultValue={state.values?.role ?? "member"}>
           {roles.map((r) => (
             <option key={r} value={r}>
               {r}

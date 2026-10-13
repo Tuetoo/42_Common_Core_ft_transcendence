@@ -19,6 +19,7 @@ export function AccountByIdForm() {
         <input
           id="user_id"
           name="user_id"
+          autoComplete="off"
           type="text"
           required
           pattern={UUID_PATTERN}

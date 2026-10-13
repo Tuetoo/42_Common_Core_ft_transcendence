@@ -192,13 +192,12 @@ class TestYahooFinanceProvider:
         assert snap.net_margin == 0.25
         assert snap.source == "yahoo_finance"
 
-    async def test_current_price(self):
+    async def test_current_price_history_and_fundamentals(self):
         await _run_steps(
             self._get_current_price_maps_info_dict,
             self._get_current_price_without_a_price_field_raises,
             self._get_current_price_exception_does_not_double_retry)
 
-    async def test_history_and_fundamentals(self):
         await _run_steps(
             self._get_recent_price_history_maps_dataframe_rows,
             self._get_price_history_range_passes_inclusive_end,
@@ -319,13 +318,12 @@ class TestSecEdgarProvider:
             await SecEdgarProvider().get_fundamentals("AAPL")
         assert calls["n"] == 1
 
-    async def test_annual_values_growth_and_margins(self):
+    async def test_annual_values_lookup_errors_and_retries(self):
         self._picks_latest_two_fiscal_years_and_dedupes_amendments()
         await _run_steps(
             self._get_fundamentals_computes_growth_and_margins,
             self._margin_note_names_the_fiscal_year)
 
-    async def test_lookup_errors_and_retries(self):
         await _run_steps(
             self._unknown_ticker_raises_request_error,
             self._company_facts_5xx_retries_then_succeeds,

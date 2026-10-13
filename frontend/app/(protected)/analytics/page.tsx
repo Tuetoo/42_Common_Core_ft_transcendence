@@ -1,11 +1,9 @@
 import Form from "next/form";
-import { backendFetch, requireOk } from "@/app/lib/backend";
-import { readApiError } from "@/app/lib/api-error";
-import { getMe } from "@/app/lib/me";
-import { TICKER_PATTERN, TICKER_TITLE } from "@/app/lib/format";
+import { backendFetch, readApiError, requireOk } from "@/app/lib/backend";
+import { getMe } from "@/app/lib/session";
+import { TICKER_PATTERN, TICKER_TITLE, formatMetric, type Metric, type TimeseriesPoint } from "@/app/lib/format";
 import { ActionDistributionChart, StatusDonutChart, TimeseriesChart } from "./charts";
 import { LiveRefresh } from "./live-refresh";
-import { formatMetric, type Metric, type TimeseriesPoint } from "./metrics";
 import { PrintButton } from "./print-button";
 
 type Accuracy = { evaluated: number; rate: number | null };
@@ -130,17 +128,18 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
       <Form action="/analytics" className="filter-row print:hidden">
         <div className="field">
           <label htmlFor="from">From</label>
-          <input id="from" name="from" type="date" defaultValue={filters.from || overview?.range.from} />
+          <input id="from" name="from" autoComplete="off" type="date" defaultValue={filters.from || overview?.range.from} />
         </div>
         <div className="field">
           <label htmlFor="to">To</label>
-          <input id="to" name="to" type="date" defaultValue={filters.to || overview?.range.to} />
+          <input id="to" name="to" autoComplete="off" type="date" defaultValue={filters.to || overview?.range.to} />
         </div>
         <div className="field">
           <label htmlFor="ticker">Ticker</label>
           <input
             id="ticker"
             name="ticker"
+            autoComplete="off"
             type="text"
             maxLength={10}
             pattern={TICKER_PATTERN}
@@ -152,7 +151,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
         </div>
         <div className="field">
           <label htmlFor="action">Recommendation</label>
-          <select id="action" name="action" defaultValue={filters.action}>
+          <select id="action" name="action" autoComplete="off" defaultValue={filters.action}>
             <option value="">All</option>
             {ACTIONS.map((a) => (
               <option key={a} value={a}>
@@ -163,7 +162,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
         </div>
         <div className="field">
           <label htmlFor="status">Status</label>
-          <select id="status" name="status" defaultValue={filters.status}>
+          <select id="status" name="status" autoComplete="off" defaultValue={filters.status}>
             <option value="">All</option>
             {STATUSES.map((st) => (
               <option key={st} value={st}>
@@ -174,7 +173,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
         </div>
         <div className="field">
           <label htmlFor="metric">Chart</label>
-          <select id="metric" name="metric" defaultValue={metric}>
+          <select id="metric" name="metric" autoComplete="off" defaultValue={metric}>
             {METRICS.map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}
@@ -184,7 +183,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
         </div>
         <div className="field">
           <label htmlFor="interval">Per</label>
-          <select id="interval" name="interval" defaultValue={interval}>
+          <select id="interval" name="interval" autoComplete="off" defaultValue={interval}>
             <option value="day">day</option>
             <option value="week">week</option>
           </select>

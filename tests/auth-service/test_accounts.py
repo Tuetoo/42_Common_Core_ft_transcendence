@@ -7,9 +7,9 @@ from uuid import UUID, uuid4
 import httpx
 import pyotp
 import pytest
-from helpers import (PASSWORD, current_user_id, enable_2fa, login_response,
-                     make_user, next_code, register, register_and_login,
-                     reset_rate_limits)
+from helpers import (PASSWORD, current_user_id, enable_2fa, login,
+                     login_response, make_user, next_code, register,
+                     register_and_login, reset_rate_limits)
 from jose import jwt
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -235,7 +235,8 @@ class TestRegistration:
 
 class TestTokens:
 
-    async def test_refresh_rotation_and_me(self, client, mock_email):
+    async def test_refresh_rotation_supersede_logout_and_reuse(
+            self, client, mock_email, db_session):
         _, data = await register_and_login(
             client, mock_email, "grace@example.com", "grace")
         old_refresh = data["refresh_token"]
@@ -244,9 +245,6 @@ class TestTokens:
         assert refreshed.status_code == 200
         new_refresh = refreshed.json()["data"]["refresh_token"]
         assert new_refresh != old_refresh
-        reused = await client.post(
-            "/api/v1/auth/refresh", json={"refresh_token": old_refresh})
-        assert reused.status_code == 401
 
         headers, _ = await register_and_login(
             client, mock_email, "heidi@example.com", "heidi")
@@ -256,6 +254,132 @@ class TestTokens:
         assert me.status_code == 200
         assert me.json()["data"]["email"] == "heidi@example.com"
         assert me.json()["data"]["profile"]["avatar_url"]
+
+        await register(client, mock_email, "ivan@example.com", "ivan")
+        _, first = await login(client, "ivan@example.com")
+        _, other = await login(client, "ivan@example.com")
+        rotated = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": first["refresh_token"]})
+        assert rotated.status_code == 200
+        duplicate = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": first["refresh_token"]})
+        assert duplicate.status_code == 401
+        assert duplicate.json()["error"]["code"] == "refresh_token_superseded"
+
+        out = await client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": other["refresh_token"]})
+        assert out.status_code == 204
+        after_logout = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": other["refresh_token"]})
+        assert after_logout.status_code == 401
+
+        successor = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": rotated.json()["data"]["refresh_token"]})
+        assert successor.status_code == 200
+
+        from domains.auth.model import SessionRevokeReason
+        from domains.auth.repository import UserRepository
+
+        await register(client, mock_email, "judy@example.com", "judy")
+        _, safari = await login(client, "judy@example.com")
+        _, chrome = await login(client, "judy@example.com")
+        old = safari["refresh_token"]
+        middle = (await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": old})).json()["data"]["refresh_token"]
+        newest = (await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": middle})).json()["data"]["refresh_token"]
+
+        repo = UserRepository(db_session)
+        old_row = await repo.get_session_by_refresh_token(old)
+        middle_row = await repo.get_session_by_refresh_token(middle)
+        assert middle_row.created_at == old_row.revoked_at
+        # Inside the grace period (a thief who refreshed first) the answer
+        # only says "superseded", so the victim keeps the token and its
+        # later reuse still revokes the thief's chain.
+        early = await client.post(
+            "/api/v1/auth/refresh", json={"refresh_token": old})
+        assert early.json()["error"]["code"] == "refresh_token_superseded"
+        await db_session.refresh(old_row)
+        assert old_row.revoked_reason == SessionRevokeReason.ROTATED
+        old_row.revoked_at -= timedelta(days=3)
+        middle_row.created_at -= timedelta(days=3)
+        await db_session.flush()
+
+        reused = await client.post(
+            "/api/v1/auth/refresh", json={"refresh_token": old})
+        assert reused.status_code == 401
+        newest_row = await repo.get_session_by_refresh_token(newest)
+        await db_session.refresh(newest_row)
+        assert newest_row.revoked_reason == SessionRevokeReason.REUSE
+        stolen = await client.post(
+            "/api/v1/auth/refresh", json={"refresh_token": newest})
+        assert stolen.status_code == 401
+        kept = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": chrome["refresh_token"]})
+        assert kept.status_code == 200
+
+    async def test_concurrent_refresh_and_chain_revocation_races(
+            self, real_client, mock_email, db_session):
+        from domains.auth.model import SessionRevokeReason
+        from domains.auth.repository import UserRepository
+
+        tag = uuid4().hex[:8]
+        _, data = await register_and_login(
+            real_client, mock_email, f"rr_{tag}@example.com", f"rr_{tag}")
+        token = data["refresh_token"]
+        results = await asyncio.gather(*(
+            real_client.post(
+                "/api/v1/auth/refresh", json={"refresh_token": token})
+            for _ in range(2)))
+        assert sorted(r.status_code for r in results) == [200, 401]
+        winner, loser = sorted(results, key=lambda r: r.status_code)
+        assert loser.json()["error"]["code"] == "refresh_token_superseded"
+        successor = await real_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": winner.json()["data"]["refresh_token"]})
+        assert successor.status_code == 200
+        row = await UserRepository(db_session).get_session_by_refresh_token(
+            token)
+        assert row.revoked_reason == SessionRevokeReason.ROTATED
+
+        from database import SessionLocal
+
+        tag = uuid4().hex[:8]
+        _, data = await register_and_login(
+            real_client, mock_email, f"rc_{tag}@example.com", f"rc_{tag}")
+        old = data["refresh_token"]
+        current = (await real_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": old})).json()["data"]["refresh_token"]
+        stolen = f"attacker-{tag}"
+        async with SessionLocal() as thief_db, SessionLocal() as victim_db:
+            thief = UserRepository(thief_db)
+            claimed = await thief.claim_session_for_rotation(current)
+            await thief.create_session(
+                user_id=claimed.user_id, refresh_token=stolen,
+                expires_at=claimed.expires_at, created_at=claimed.revoked_at)
+            victim = UserRepository(victim_db)
+            reused = await victim.get_session_by_refresh_token(old)
+            revoking = asyncio.create_task(
+                victim.revoke_rotation_successors(
+                    reused, reason=SessionRevokeReason.REUSE))
+            await asyncio.sleep(0.5)
+            assert not revoking.done()
+            await thief_db.commit()
+            assert await revoking == 1
+            await victim_db.commit()
+        async with SessionLocal() as check_db:
+            row = await UserRepository(
+                check_db).get_session_by_refresh_token(stolen)
+            assert row.revoked_reason == SessionRevokeReason.REUSE
 
     async def test_malformed_tokens_are_rejected(self, client):
         for case, claims in (("subject-not-a-uuid",
@@ -696,6 +820,13 @@ class TestConnections:
         url = f"/api/v1/connections/{conn['id']}"
         blocked = await client.post(f"{url}/block", headers=a)
         assert blocked.status_code == 200
+        seen_by_a = (await client.get(
+            "/api/v1/connections", headers=a)).json()["data"]
+        assert [c["status"] for c in seen_by_a] == ["blocked"]
+        for query in ("", "?status=blocked"):
+            seen_by_b = await client.get(
+                f"/api/v1/connections{query}", headers=b)
+            assert seen_by_b.json()["data"] == []
 
         assert (await client.delete(url, headers=b)).status_code == 403
         assert (

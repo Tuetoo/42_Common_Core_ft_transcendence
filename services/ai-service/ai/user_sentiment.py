@@ -2,8 +2,7 @@ import json
 import math
 from typing import Literal
 import structlog
-from ai.llm.base import LLMError, LLMMessage, LLMTier
-from ai.llm.json_fence import strip_json_code_fence
+from ai.llm.base import LLMError, LLMMessage, LLMTier, strip_json_code_fence
 from ai.llm.router import LLMRouter
 from config import settings
 from pydantic import BaseModel, Field, field_validator

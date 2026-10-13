@@ -2,8 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
-import { backendFetch } from "@/app/lib/backend";
-import { extractErrorMessage } from "@/app/lib/api-error";
+import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
 import { boundedText, NAME_MAX_LENGTH, normalizeTicker } from "@/app/lib/format";
 
 export type CreateWatchlistState = {

@@ -2,8 +2,8 @@ from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 import structlog
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
-                         LLMRequestError, LLMTier)
-from ai.llm.json_fence import parse_json_dict
+                         LLMNonEnglishOutputError, LLMRequestError, LLMTier,
+                         parse_json_dict)
 from ai.llm.router import LLMRouter
 from ai.providers.base import ProviderError
 from ai.providers.registry import get_market_data_provider
@@ -353,7 +353,7 @@ async def generate_position_sizing(
     try:
         response = await router.complete(
             LLMTier.HIGHEST_ACCURACY, messages, retries=AGENT_LLM_CALL_RETRIES)
-    except LLMRequestError as exc:
+    except (LLMRequestError, LLMNonEnglishOutputError) as exc:
         logger.info(
             "position_sizing.llm_call_failed_retrying_lite", ticker=ticker,
             error=str(exc))

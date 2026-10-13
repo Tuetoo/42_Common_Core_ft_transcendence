@@ -20,16 +20,20 @@ alphamind/
 ├── scripts/                 host-side operator scripts (§8)
 ├── docs/                    design, API, ERD, disaster recovery, module
 │                            mapping, this file; handbook/ (§9)
-├── rag_seed_documents/      seed corpus for
-│                            scripts/upload_seed_documents.py:
+├── rag_seed_documents/      seed corpus for services/ai-service/
+│                            scripts/upload_seed_documents.py (kept
+│                            locally, ignored by git):
 │   ├── analyst_report/
 │   ├── earnings_call/
 │   ├── filing/
 │   ├── macro_research/
 │   └── news/
 ├── .github/workflows/       one CI workflow per service, frontend CI,
-│                            stack smoke and deploy (cloud host,
+│                            infrastructure checks and stack smoke
+│                            (integration-ci.yml), deploy (cloud host,
 │                            docs/DEPLOYMENT.md)
+├── README.md                the project, how to run it, team, modules,
+│                            use of AI
 ├── docker-compose.yaml      the whole stack
 ├── docker-compose.override.yml  local development (source mounted into the
 │                            containers, development image stage)
@@ -37,16 +41,20 @@ alphamind/
 │                            service, promtool-test, lint (flake8 + mypy),
 │                            clean, and short targets for scripts/
 ├── pyproject.toml, uv.lock  one dependency list for all services; pytest,
-│                            mypy and isort configuration
+│                            mypy, isort and pyright (editor import
+│                            resolution only) configuration
 ├── .style.yapf              yapf layout settings (formatting helper)
 ├── .env.example             template for .env.docker (never committed)
-└── .dockerignore, .gitignore
+└── .dockerignore, .gitignore, .gitattributes (LF endings for shell
+                             scripts and the crontab)
 ```
 
 ## 2. `services/auth-service/`
 
 ```
-├── Dockerfile, alembic.ini
+├── Dockerfile               also creates /app/data/avatars, where compose
+│                            mounts the avatar_data volume
+├── alembic.ini
 ├── main.py, config.py, deps.py
 ├── database.py              engine, sessions, schema bootstrap at startup
 ├── security.py              password hashing, token issuing, TOTP
@@ -61,12 +69,10 @@ alphamind/
 ├── domains/                 api.py, model.py, repository.py, schema.py,
 │   │                        service.py per domain
 │   ├── auth/                users, profiles, settings, sessions, OAuth
-│   │                        accounts, 2FA, avatar files
+│   │                        accounts, 2FA, avatar files, presence
 │   ├── admin/               /api/v1/admin: users, soft delete, statistics
 │   ├── organization/        organizations, members, invitations
-│   └── social/              friends (connections), presence
-├── data/avatars/            empty folder; in compose the avatar_data
-│                            volume is mounted at /app/data/avatars
+│   └── social/              friends (connections)
 ├── migrations/              Alembic: env.py, script.py.mako,
 │                            versions/ (f1160b000001 baseline,
 │                            f1190b000001, f1210b000001)
@@ -89,7 +95,9 @@ alphamind/
 ├── websocket_manager.py     WebSocketEnvelope, sockets per channel,
 │                            cross-replica fan-out; socket close codes and
 │                            the handshake helpers of both endpoints
-├── yjs_relay.py             Yjs rooms, body write-back, active-room markers
+├── yjs_relay.py             Yjs rooms, body write-back, active-room
+│                            markers; Yjs updates decoded and validated in
+│                            worker processes
 ├── job_health.py            scheduled-job heartbeat and market-close skip
 │                            gauges, kept in Redis across restarts
 ├── outbox.py                transactional outbox (core.event_outbox) for
@@ -98,8 +106,8 @@ alphamind/
 │   ├── internal.py          /internal/*: scheduler jobs, heartbeats,
 │   │                        portfolios, stats, tracked tickers, ingestion
 │   │                        and system documents
-│   ├── public.py            /api/v1/public/* (API key)
-│   ├── apikeys_api.py       /api/v1/api-keys/*
+│   ├── public.py            /api/v1/public/* (API key) and
+│   │                        /api/v1/api-keys/* (key management, JWT)
 │   └── websocket.py         /ws/{channel} and /ws/yjs/{note_id}
 ├── clients/                 auth_client.py, ai_client.py
 ├── domains/
@@ -107,9 +115,7 @@ alphamind/
 │   │                        snapshots, watchlists; ledger.py (pure ledger
 │   │                        math)
 │   ├── research/            notes, comments, tags, documents;
-│   │                        moderation routes (in api.py), sentiment.py,
-│   │                        yjs_guard.py (Yjs updates decoded in worker
-│   │                        processes)
+│   │                        moderation routes (in api.py), sentiment.py
 │   └── notification/        notifications; service.py holds the one path
 │                            every core notification goes through
 ├── migrations/              env.py, script.py.mako, versions/
@@ -157,13 +163,15 @@ alphamind/
 │   ├── graph/               LangGraph: state, builder (incl. routing),
 │   │                        nodes (incl. the agent registry and selection)
 │   ├── llm/                 router.py (incl. capacity), base.py (incl. the
-│   │                        concurrency gate), adapters
-│   │                        (google, mistral, openai, anthropic),
-│   │                        json_fence.py
+│   │                        concurrency gate and JSON parsing of
+│   │                        replies), adapters
+│   │                        (google, mistral, openai, anthropic)
 │   ├── providers/           yahoo_finance, sec_edgar, fred, newsapi,
-│   │                        tavily, news_filters, news_relevance,
-│   │                        registry, base (incl. retry)
-│   ├── tools/               agent tools, indicators.py,
+│   │                        tavily, news_relevance (incl. news queries
+│   │                        and rule-based prechecks), registry, base
+│   │                        (incl. retry)
+│   ├── tools/               agent tools, indicators.py (incl. backtest
+│   │                        metrics: returns, drawdown, Sharpe, ...),
 │   │                        market_data_cache.py, web_search_tool.py
 │   │                        (incl. the result classifier)
 │   ├── rag/                 chunking (incl. parsing), embedding, indexing,
@@ -177,7 +185,6 @@ alphamind/
 │   ├── memory/              agent_memory.py (L2 episodic, L4 procedural)
 │   ├── recommendation/      engine.py (incl. the position limit),
 │   │                        position_sizing.py
-│   ├── benchmark/           metrics.py (returns, drawdown, Sharpe, ...)
 │   ├── evaluation/          rag_recall.py (golden set and recall)
 │   ├── user_sentiment.py    sentiment of notes and comments
 │   └── workflows/           analysis, RAG ingestion, auto ingestion, tier
@@ -196,8 +203,7 @@ alphamind/
                              (backfill_filing_records.py,
                              regenerate_filing_summaries.py),
                              verify_portfolio_backtest.py,
-                             probe_model_latency.py,
-                             _text.py (output helpers)
+                             probe_model_latency.py
 ```
 
 ## 5. `shared/`
@@ -219,7 +225,7 @@ alphamind/
 ├── redis.py                 Redis client, fixed-window limiter and 429
 │                            response, lock shared by the end-to-end
 │                            scripts
-├── http_client.py, storage.py (S3), email.py, concurrency.py
+├── http_client.py, storage.py (S3), email.py
 ├── market_calendar.py       NYSE trading days and holidays
 ├── exceptions.py            error hierarchy and error body
 ├── logging.py               structured logs (structlog), request id
@@ -245,8 +251,8 @@ alphamind/
 │                            (agents, API, data agents, debate and Judge,
 │                            filings, graph, knowledge, LLM, market data,
 │                            news, RAG, scripts, tools, workflows)
-├── integration/             conftest.py, test_rag_recall.py (needs the
-│                            running stack with the real corpus)
+├── integration/             test_rag_recall.py (needs the running stack
+│                            with the real corpus)
 ├── fixtures/                rag_golden_set.json
 ├── alembic_contract.py      migration-versus-model checks, star-imported by
 │                            one test file per service
@@ -298,7 +304,8 @@ process cannot import two of them.
 ├── health.sh, logs.sh, rebuild.sh, probe.sh
 ├── psql.sh, redis-cli.sh, qdrant.sh, objectstore.sh   data store shells
 ├── backups.sh               list, make, check and drill backups
-└── deploy.sh                deploy main on the cloud host (run there)
+└── deploy.sh                deploy a checked commit of main on the cloud
+                             host (run there)
 ```
 
 ## 9. `docs/`
@@ -313,8 +320,8 @@ process cannot import two of them.
 ├── PROJECT_STRUCTURE.md     this file
 └── handbook/                00-index.md and one chapter per part
                              (01-02 overview and operations, 10-19
-                             services and AI, 20-31 data stores,
-                             infrastructure, shared code, testing)
+                             services and AI, 20-32 data stores,
+                             infrastructure, shared code, testing, CI/CD)
 ```
 
 ## 10. `frontend/`
@@ -332,17 +339,22 @@ process cannot import two of them.
     │                        Policy and Terms links), not-found.tsx,
     │                        global-error.tsx
     ├── healthz/route.ts     GET /healthz: 200 only when the API answers
-    ├── lib/                 backend.ts (API calls), session.ts and
-    │   │                    session-cookies.ts (httpOnly cookies), me.ts
-    │   │                    (permissions), ws-url.ts, api-error.ts,
-    │   │                    format.ts
-    │   └── actions/         Server Actions per area (auth, profile,
-    │                        twofa, portfolios, research, documents,
-    │                        organizations, admin, moderation, ...)
+    ├── lib/                 backend.ts (API calls and backend error
+    │   │                    parsing), session.ts (httpOnly cookies, the
+    │   │                    signed-in user and permissions),
+    │   │                    session-cookies.ts (cookie names for proxy.ts),
+    │   │                    ws-url.ts (WebSocket URL and close helper),
+    │   │                    format.ts (display and form helpers)
+    │   └── actions/         Server Actions per area (auth incl. OAuth,
+    │                        email-links, profile incl. 2FA, portfolios,
+    │                        research incl. documents, organizations,
+    │                        admin incl. moderation, ...)
     ├── (public)/            pages without login: login, register,
     │                        forgot-password, reset-password,
     │                        verify-email, invitations/accept,
     │                        oauth/complete
+    ├── (legal)/             privacy and terms pages, readable signed in
+    │                        or not; legal.ts (their last-updated date)
     └── (protected)/         pages that need a login (layout.tsx checks the
                              session; sidebar and mobile navigation):
                              portfolios, watchlists, analyses, analytics,

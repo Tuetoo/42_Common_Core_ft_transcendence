@@ -30,7 +30,7 @@ export const TOTP_CODE_TITLE = "The 6-digit code from your authenticator app.";
 // The browser check also keeps files away from Next's 6MB Server Action
 // body limit, which would otherwise fail the whole request.
 export const AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-export const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 
 export function avatarFileError(file: { size: number; type: string }): string | null {
   if (!AVATAR_TYPES.includes(file.type)) return "Use a PNG, JPEG, WebP or GIF image.";

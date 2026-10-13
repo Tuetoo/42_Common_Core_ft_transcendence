@@ -1,5 +1,5 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { CreateWatchlistForm } from "./create-watchlist-form";
 import { AddTickerForm } from "./add-ticker-form";
 import { RemoveTickerButton } from "./remove-ticker-button";

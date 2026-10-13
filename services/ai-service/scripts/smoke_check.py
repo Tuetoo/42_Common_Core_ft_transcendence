@@ -14,7 +14,22 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TextIO
 from uuid import UUID
-from scripts._text import flatten
+
+# Text helpers shared with e2e_tier_check.py and delete_analyses.py.
+
+SAMPLE_CHARS = 220
+
+
+def flatten(text: object, limit: int = 300) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit - 3] + "..."
+
+
+def one_line(text: str | None, limit: int = SAMPLE_CHARS) -> str:
+    if not text:
+        return "(empty)"
+    return repr(flatten(text, limit))
+
 
 OK = "OK"
 FAIL = "FAIL"
@@ -512,7 +527,7 @@ async def check_internal_api(ctx: SmokeContext) -> str:
 
 
 async def check_backtest_metrics(ctx: SmokeContext) -> str:
-    from ai.benchmark import metrics
+    from ai.tools import indicators as metrics
 
     prices = [100.0, 110.0, 99.0, 108.9, 120.0]
     returns = metrics.simple_returns(prices)

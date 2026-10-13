@@ -1,3 +1,6 @@
+import asyncio
+from collections.abc import Awaitable, Iterable
+from typing import TypeVar
 import httpx
 from shared.config import get_settings
 
@@ -50,3 +53,19 @@ async def close_http_clients() -> None:
     for client in _clients.values():
         await client.aclose()
     _clients.clear()
+
+
+# Bounded fan-out for the internal HTTP calls made with these clients.
+
+T = TypeVar("T")
+
+
+async def gather_bounded(coros: Iterable[Awaitable[T]],
+                         limit: int = 10) -> list[T]:
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _run(coro: Awaitable[T]) -> T:
+        async with semaphore:
+            return await coro
+
+    return list(await asyncio.gather(*(_run(coro) for coro in coros)))

@@ -1,9 +1,8 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { formatNumber } from "@/app/lib/format";
-import { can, getMe } from "@/app/lib/me";
+import { formatNumber, isFinished, statusPillClass } from "@/app/lib/format";
+import { can, getMe } from "@/app/lib/session";
 import { LocalTime } from "@/app/(protected)/local-time";
-import { isFinished, statusPillClass } from "../status";
 import { LiveStatus } from "./live-status";
 import { DecisionForm } from "./decision-form";
 
@@ -109,7 +108,7 @@ export default async function AnalysisDetailPage({ params }: { params: Promise<{
         </p>
       </div>
 
-      {!isFinished(analysis.status) && <LiveStatus analysisId={analysis.id} accessToken={accessToken} />}
+      {!isFinished(analysis.status) && <LiveStatus analysisId={analysis.id} accessToken={accessToken} shownStatus={analysis.status} />}
 
       {analysis.status === "failed" && (
         <div className="panel" style={{ fontSize: 13 }}>

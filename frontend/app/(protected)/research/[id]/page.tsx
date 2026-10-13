@@ -3,7 +3,7 @@ import { deleteNote } from "@/app/lib/actions/research";
 import { LocalTime } from "@/app/(protected)/local-time";
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Pager, pageParam } from "../../pager";
 import { AddCommentForm } from "./add-comment-form";
 import { CollabEditor } from "./collab-editor";

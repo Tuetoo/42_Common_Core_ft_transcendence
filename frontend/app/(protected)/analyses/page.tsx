@@ -1,10 +1,10 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Pager, pageParam } from "../pager";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { StartAnalysisForm } from "./start-analysis-form";
-import { statusPillClass } from "./status";
+import { statusPillClass } from "@/app/lib/format";
 
 type Analysis = {
   id: string;

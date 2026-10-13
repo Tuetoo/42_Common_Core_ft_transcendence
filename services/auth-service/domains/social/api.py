@@ -56,10 +56,13 @@ async def accept_connection(
 @router.post(
     "/{connection_id}/block", response_model=APIResponse[ConnectionRead])
 async def block_connection(
-    connection_id: UUID, current_user: CurrentUser = Depends(get_current_user),
+    connection_id: UUID, background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[ConnectionRead]:
-    result = await SocialService(db).block(connection_id, current_user.user_id)
+    service = SocialService(db)
+    result = await service.block(connection_id, current_user.user_id)
+    schedule_events(background_tasks, service.pending_events)
     return APIResponse(data=result)
 
 

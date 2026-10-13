@@ -56,7 +56,7 @@ step is stored so it can be inspected later:
 6. later, measure whether the call was right and whether following it
    paid off ([19](19-ai-workflows-backtest.md), section 3.11).
 
-What a user can do through the API:
+What a user can do in the web pages (every action is also an API route):
 
 - keep portfolios with a transaction ledger, see holdings, cash and daily
   values, and keep watchlists ([12](12-core-service.md));
@@ -75,7 +75,8 @@ What a user can do through the API:
 - work in organizations, with friends, presence and notifications
   ([11](11-auth-service.md), [12](12-core-service.md)).
 
-There is no user interface yet (section 8).
+The web pages are the Next.js app in `frontend/`
+([01](01-architecture.md) section 3.11).
 
 ## 2. How to use this handbook
 
@@ -213,7 +214,7 @@ day before, outside the busy windows, and run
 | 23-26 | Live updates over a WebSocket. | [25](25-realtime-yjs.md) |
 | 26-30 | Monitoring: Prometheus queries, alert rules, Grafana, the scheduled jobs and backups. | [26](26-scheduler-jobs.md), [27](27-observability.md) |
 
-A full analysis takes a few minutes and uses LLM quota. For a tight time
+One analysis usually takes about 1.5 to 4 minutes (up to 10 minutes more when a new SEC filing must be summarised first) and uses LLM quota. For a tight time
 slot, show a finished run folder and start a new analysis only as a live
 "it really runs" moment.
 
@@ -271,8 +272,8 @@ not finished; the chapters give the details.
 | Item | State | Chapter |
 |---|---|---|
 | Frontend | Built: the Next.js app in `frontend/`, served by the gateway at `/`; its server side calls the API on the gateway's internal listener (port 8080). The Privacy Policy and Terms of Service pages are written (`frontend/app/(legal)/privacy`, `terms`; linked from the footer). Every route can also be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) section 3.11, [10](10-gateway.md) section 3.3 |
-| Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main`. The first deployment waits for the new `infra/` to reach `main`. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
-| Top-level README | None. The only READMEs are `tests/README.md`, `infra/gateway/certs/README.md` and `frontend/README.md` (the default text of `create-next-app`). | - |
+| Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main` (the head of `main` is deployed only after every workflow run of that exact commit succeeded; per-service checks run only for the services a commit touches). The host keeps its scheduler stopped, so it makes no automatic backups and runs no scheduled jobs; backups are made on the local stack. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
+| Top-level README | `README.md` at the repository root: the project, how to run it, the team, the modules and the use of AI. Other READMEs: `tests/README.md`, `infra/gateway/certs/README.md` and `frontend/README.md` (how to run the frontend, its environment variables and its structure). | - |
 | Calibration of the confidence rules | The penalties and caps in `ai/recommendation/engine.py`, the HOLD flat band of the accuracy score (`review_workflow.py::_HOLD_FLAT_BAND`) and the procedural-memory score bar (`_MIN_SCORE_TO_REMEMBER`) are fixed constants. Nothing derives them from scored outcomes yet; that needs enough rows in `ai.recommendation_metrics`. | [16](16-ai-analysis-pipeline.md) section 3.12, [19](19-ai-workflows-backtest.md) section 3.11 |
 | Debate and Reflection quality signals | Debate convergence and Reflection retries are stored per analysis but not aggregated into a metric. | [19](19-ai-workflows-backtest.md) section 3.11 |
 | Restore drill | `make restore-drill` restores a backup into a throwaway compose project and verifies every part, but it has not yet been run against a real nightly backup of the object-storage format written by the S3 copy. | [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md) section 6 |

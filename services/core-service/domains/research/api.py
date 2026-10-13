@@ -202,7 +202,8 @@ async def update_comment(
 @router.delete(
     "/notes/{note_id}/comments/{comment_id}",
     status_code=status.HTTP_204_NO_CONTENT, description=(
-        "Delete a comment. Allowed for the comment author or the note author."
+        "Delete a comment. Allowed for the comment author or the note author; "
+        "a comment hidden by a moderator can only be deleted by its author."
     ))
 async def delete_comment(
     note_id: UUID, comment_id: UUID, background_tasks: BackgroundTasks,

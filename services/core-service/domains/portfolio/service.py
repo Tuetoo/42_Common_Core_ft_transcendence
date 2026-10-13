@@ -32,10 +32,10 @@ from domains.portfolio.schema import (CASH_TICKER, HoldingAdjustmentRead,
                                       TransactionRead, WatchlistCreate,
                                       WatchlistItemCreate, WatchlistItemRead,
                                       WatchlistRead, WatchlistUpdate)
-from shared.concurrency import gather_bounded
 from shared.enums import Currency, TransactionType
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
+from shared.http_client import gather_bounded
 from shared.market_calendar import market_today
 from shared.schemas import PaginationParams
 from shared.user_state import get_user_state

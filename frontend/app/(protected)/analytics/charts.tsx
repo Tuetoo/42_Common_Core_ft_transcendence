@@ -15,7 +15,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { formatMetric, type Metric, type TimeseriesPoint } from "./metrics";
+import { formatMetric, type Metric, type TimeseriesPoint } from "@/app/lib/format";
 
 // Chart colors are hex, not CSS variables: Recharts writes them into SVG
 // attributes, where var() isn't reliably supported. SERIES is the single

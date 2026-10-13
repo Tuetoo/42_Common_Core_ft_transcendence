@@ -696,7 +696,6 @@ class TestResearchContent:
     async def test_rest_body_edit_with_active_room_and_crdt_history(
             self, client, db_session, mock_cross_service, research_doubles):
         import yjs_relay
-        from domains.research import yjs_guard
 
         _, headers = _headers()
         note = await _create_note(client, headers, content="Start")
@@ -730,7 +729,7 @@ class TestResearchContent:
 
         row = await db_session.get(ResearchNote, UUID(note["id"]))
         await db_session.refresh(row)
-        assert yjs_guard.extract_text(row.yjs_state) == "After"
+        assert yjs_relay.extract_text(row.yjs_state) == "After"
 
         import y_py as Y
 
@@ -758,25 +757,24 @@ class TestResearchContent:
         server = Y.YDoc()
         Y.apply_update(server, new_state)
         update = Y.encode_state_as_update(held, Y.encode_state_vector(server))
-        merged = yjs_guard.merge_states(new_state, update)
-        assert yjs_guard.extract_text(merged) == str(held_text)
+        merged = yjs_relay.merge_states(new_state, update)
+        assert yjs_relay.extract_text(merged) == str(held_text)
 
         row.yjs_state = b"\x01\x02broken"
         await db_session.flush()
-        assert yjs_guard.extract_text(await _patch("reseeded")) == "reseeded"
+        assert yjs_relay.extract_text(await _patch("reseeded")) == "reseeded"
 
     async def test_persist_and_load_of_note_state(
             self, committed_note, monkeypatch):
         import y_py as Y
         import yjs_relay
-        from domains.research import yjs_guard
 
         scheduled: list[UUID] = []
         monkeypatch.setattr(
             yjs_relay, "schedule_note_sentiment", scheduled.append)
 
         state = await yjs_relay._load_snapshot(str(committed_note))
-        assert yjs_guard.extract_text(state) == "Seed text"
+        assert yjs_relay.extract_text(state) == "Seed text"
         first = await _note_row(committed_note)
         assert first.yjs_state == state
         assert await yjs_relay._load_snapshot(str(committed_note)) == state
@@ -821,12 +819,12 @@ class TestResearchContent:
             await session.commit()
         room = yjs_relay.YjsRoom(str(committed_note), b"\x01\x02broken")
         room.apply(
-            yjs_guard.seed_state("room text"), counts_toward_snapshot=True)
+            yjs_relay.seed_state("room text"), counts_toward_snapshot=True)
         assert await yjs_relay._persist_snapshot(
             str(committed_note), room.encode_state())
         row = await _note_row(committed_note)
         assert row.content == "room text"
-        assert yjs_guard.extract_text(row.yjs_state) == "room text"
+        assert yjs_relay.extract_text(row.yjs_state) == "room text"
 
     async def test_document_list_and_title_patch(
             self, client, db_session, mock_cross_service, research_doubles):

@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 import ai.agents.loop as loop_module
-import ai.knowledge.extraction as extraction_module
+import ai.knowledge.archival as archival_module
 import ai.knowledge.kg_context as kg_context_module
 import ai.providers.news_relevance as relevance_module
 import ai.recommendation.position_sizing as sizing_module
@@ -43,7 +43,7 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, ISSUE_NOT_RETRIED,
                             EpisodicMemoryHit, JudgeVerdict, ReflectionIssue,
                             ReflectionVerdict, _classify_reflection_causes)
 from ai.knowledge import filing_records as frec
-from ai.llm.base import LLMConfigError, LLMResponse, LLMUsage
+from ai.llm.base import LLMResponse, LLMUsage
 from ai.providers.base import (FundamentalsSnapshot, InstrumentMetadata,
                                MacroDataPoint, NewsArticle, PriceBar,
                                PriceQuote, ProviderRequestError,
@@ -53,8 +53,9 @@ from ai.tools.base import Tool
 from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.news_tool import counts_as_live_search
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
-from helpers import (_TSLA_ROWS, _events, _news_output, _NoCallRouter, _pad,
-                     _Row, _ScriptedAgentRouter, _state, _validator)
+from helpers import (_TSLA_ROWS, _action, _AlwaysFailsRouter, _events,
+                     _finish, _news_output, _NoCallRouter, _pad, _Router, _Row,
+                     _ScriptedAgentRouter, _state, _validator)
 from structlog.testing import capture_logs
 from shared.enums import (AgentRole, AgentStatus, AnalysisType,
                           DocumentCategory, RecommendationAction)
@@ -91,49 +92,6 @@ _GONE_FROM_PROMPTS = [
 _NO_TRIGGER_WORDS = ["maintaining, remains", "(maintaining, remains)"]
 _NO_CATALOG_PHRASES = ["[catalog outlet]", "[not in catalog]"]
 _LIVE_NEWS_LINE = "[2026-10-02 Fri] Src: Tesla deliveries 486,532 units"
-
-
-def _finish(answer: str, reported_metrics: Any = None) -> str:
-    return json.dumps({
-        "thought": "done",
-        "action": None,
-        "action_input": None,
-        "finish_answer": answer,
-        "reported_metrics": reported_metrics
-    })
-
-
-def _action(action: str, action_input: dict[str, Any]) -> str:
-    return json.dumps({
-        "thought": "checking",
-        "action": action,
-        "action_input": action_input,
-        "finish_answer": None
-    })
-
-
-class _Router:
-
-    def __init__(
-            self, script: list[str], finish_reason: str | None = None) -> None:
-        self._script = list(script)
-        self._finish_reason = finish_reason
-        self.calls: list[Any] = []
-
-    async def complete(self, tier, messages, **kwargs) -> LLMResponse:
-        self.calls.append(messages)
-        content = (
-            self._script.pop(0) if len(self._script) > 1 else self._script[0])
-        return LLMResponse(
-            content=content, provider="fake", model="fake-model",
-            usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
-            finish_reason=self._finish_reason)
-
-
-class _AlwaysFailsRouter:
-
-    async def complete(self, tier, messages, **kwargs):
-        raise LLMConfigError("no key configured")
 
 
 class _Stop(Exception):
@@ -414,7 +372,7 @@ _REMOVED_NAMES = {
     "kg-context-legal-filter": (
         kg_context_module, ["drop_resolved_legal_relations"]),
     "extraction-legal-filter": (
-        extraction_module, ["drop_resolved_legal_triples"]),
+        archival_module, ["drop_resolved_legal_triples"]),
     "debate-common-word-lists": (
         dc, [
             "profit_changes_in_passage", "newest_quarter_changes",
@@ -1119,7 +1077,7 @@ class TestAgentSetup:
 
 class TestPromptsAndSettings:
 
-    def test_prompt_wording(self):
+    def test_prompt_wording_removed_names_and_defaults(self):
         for case_id, (prompt_of, present, absent) in _PROMPT_CASES.items():
             prompt = prompt_of()
             assert prompt, case_id
@@ -1128,7 +1086,6 @@ class TestPromptsAndSettings:
             for text in absent:
                 assert text not in prompt, (case_id, text)
 
-    def test_removed_helpers_modules_and_settings_defaults(self):
         for case_id, (owner, names) in _REMOVED_NAMES.items():
             for name in names:
                 assert not hasattr(owner, name), (case_id, name)
@@ -1145,7 +1102,7 @@ class TestMarketAgent:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("fake_web_search")
-    async def test_output_mapping_with_and_without_tool_evidence(
+    async def test_output_mapping_and_reported_metrics_check(
             self, monkeypatch):
         router = _Router([_finish("AAPL is trending up.")])
         monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
@@ -1184,6 +1141,23 @@ class TestMarketAgent:
         assert output.is_well_supported is True
         assert output.score == 0.84
         assert len(router.calls) == 2
+
+        pad = [
+            ScratchpadEntry(
+                "t", "get_recent_price_history", {}, _PRICE_HISTORY_OBS)
+        ]
+        cases = {
+            "missing-metrics": (None, "latest_close, period_high, period_low"),
+            "wrong-value": ({
+                "latest_close": 440.50,
+                "period_high": 231.35,
+                "period_low": 221.0
+            }, "latest_close=440.5")
+        }
+        for case_id, (metrics, expected) in cases.items():
+            issue = market._market_claims_disagree_with_prices(
+                "x", metrics, pad)
+            assert expected in issue, case_id
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("fake_web_search")
@@ -1240,24 +1214,6 @@ class TestMarketAgent:
 
         assert output.retry_of_feedback == "check a longer window"
         assert "check a longer window" in router.calls[0][-1].content
-
-    def test_reported_metrics_must_match_the_prices(self):
-        pad = [
-            ScratchpadEntry(
-                "t", "get_recent_price_history", {}, _PRICE_HISTORY_OBS)
-        ]
-        cases = {
-            "missing-metrics": (None, "latest_close, period_high, period_low"),
-            "wrong-value": ({
-                "latest_close": 440.50,
-                "period_high": 231.35,
-                "period_low": 221.0
-            }, "latest_close=440.5")
-        }
-        for case_id, (metrics, expected) in cases.items():
-            issue = market._market_claims_disagree_with_prices(
-                "x", metrics, pad)
-            assert expected in issue, case_id
 
 
 class TestNewsAgent:
@@ -1529,7 +1485,7 @@ class TestSentimentAgent:
         assert output.raw_output["no_evidence"] is True
 
     @pytest.mark.asyncio
-    async def test_unverified_fallback_news_is_thin_evidence(
+    async def test_unverified_fallback_is_thin_and_news_anchor_rule(
             self, monkeypatch):
         captured: dict[str, Any] = {}
         real = loop_module.derive_agent_quality
@@ -1556,9 +1512,6 @@ class TestSentimentAgent:
             role=AgentRole.SENTIMENT, llm_router=_NoCallRouter()).run(state)
         assert captured["thin_evidence"] is True
 
-    @pytest.mark.asyncio
-    async def test_news_summary_is_the_anchor_only_when_building_on_news(
-            self, monkeypatch):
         seen: dict[str, Any] = {}
 
         class _FakeLoop:
@@ -1594,8 +1547,8 @@ class TestFilingAgent:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("fake_web_search")
-    async def test_retrieved_passages_reach_the_agent(self, monkeypatch):
-
+    async def test_retrieved_passages_one_off_items_and_key_records(
+            self, monkeypatch):
         class _FakeFilingRetriever:
 
             async def retrieve(self, query, *, ticker=None):
@@ -1621,8 +1574,6 @@ class TestFilingAgent:
         observation = output.raw_output["scratchpad"][0]["observation"]
         assert "Supply chain risk disclosed" in observation
 
-    @pytest.mark.asyncio
-    async def test_one_off_items_and_key_records_from_filing_rows(self):
         assert one_off_item_lines(_KO_ROWS) == [
             "Escrowed shares mark-to-market loss: $12.5 billion (Q2 2026) "
             "[F1.O1, 10-Q filed 2026-07-29]",
@@ -2178,7 +2129,7 @@ class TestRiskAgent:
         assert output.raw_output["risk_events"] == []
         assert output.summary.startswith("[VERIFICATION WARNING:")
 
-    def test_filing_sourced_events_are_kept_and_note_only_one_dropped(self):
+    def test_sourced_events_and_their_plain_words_line(self):
         pad = _steps(("search_prior_risk_notes", _UNH_PRIOR_NOTES),
                      ("search_filings", _UNH_FILINGS))
         metrics = {
@@ -2199,157 +2150,6 @@ class TestRiskAgent:
         kept = [e["entity"] for e in _sourced_risk_events(metrics, pad)]
         assert kept == ["DOJ", "CMS"]
 
-    def test_status_mismatch_is_logged_and_cited_source_must_be_shown(
-            self, capsys):
-        assert (
-            _ko_issue(_baltimore_event(status="dismissed", source_id="F1.L1"))
-            is None)
-        assert "risk.record_status_mismatch" not in capsys.readouterr().out
-        assert (
-            _ko_issue(_baltimore_event(status="pending", source_id="F1.L1"))
-            is None)
-        out = capsys.readouterr().out
-        assert "risk.record_status_mismatch" in out
-        assert "record_status=dismissed" in out
-
-        issue = _ko_issue(
-            _baltimore_event(status="dismissed", source_id="F7.L1"))
-        assert issue is not None and "no filing record with that id" in issue
-        unshown = _baltimore_event(status="dismissed", source_id="F1.L1")
-        assert _ko_issue(unshown, shown=False) is not None
-        shown_name = _baltimore_event(
-            status="dismissed", source_id="KO_10-Q_2026-07-29.txt")
-        assert _ko_issue(shown_name) is None
-        issue = _ko_issue(
-            _baltimore_event(status="pending", source_id="KO_10-Q_2025-04-29"))
-        assert issue is not None and "not a filing shown" in issue
-        assert (
-            _ko_issue(
-                _baltimore_event(
-                    status="pending", source_id="KO_10-Q_2026-07-29")) is None)
-        issue = _ko_issue(_baltimore_event(status="pending"))
-        assert issue is not None and "no source_id" in issue
-
-    def test_risk_schema_has_the_status_enum_and_source_id(self):
-        item = risk._RISK_REPORTED_SCHEMA["properties"]["risk_events"]["items"]
-        assert item["required"] == ["entity", "evidence_tool", "status"]
-        assert item["properties"]["status"]["enum"] == [
-            "pending", "dismissed", "settled", "judgment", "appeal", "other",
-            "announced", "completed", "terminated", "not_applicable"
-        ]
-        assert item["properties"]["source_id"] == {"type": "string"}
-
-    def test_filing_label_is_resolved_and_bad_labels_are_rejected(
-            self, capsys):
-        pad = _pad(_MSFT_FILINGS)
-        assert _risk_answer_issue(
-            "x", _irs("F1"), pad, rows=_MSFT_ROWS,
-            shown=True) == (None, False)
-        out = capsys.readouterr().out
-        assert "risk.filing_label_resolved" in out
-        assert "filename=MSFT_10-K_2026-07-29" in out
-        events = _sourced_risk_events(
-            _irs("f1"), pad, rows=_MSFT_ROWS, shown=True)
-        assert _risk_events_line(events, _MSFT_ROWS, True) == (
-            "Named risk events (sourced): IRS (status pending; "
-            "source: 10-K filed 2026-07-29)")
-        for source, shown in (("F3", True), ("F1", False), ("F1.L", True)):
-            issue = _risk_answer_issue(
-                "x", _irs(source), pad, rows=_MSFT_ROWS, shown=shown)[0]
-            assert issue is not None and source in issue, source
-
-    def test_empty_events_check_rejects_once_only_with_shown_records(self):
-        validator = _validator(_TSLA_ROWS)
-        pad = _pad("search_filings result")
-        legal = sum(
-            len(row.records.get("legal_matters") or []) for row in _TSLA_ROWS)
-        assert legal >= 1
-        with capture_logs() as logs:
-            issue = validator("Litigation risk remains.", {}, pad)
-        assert issue is not None
-        assert issue.startswith("Risk events check:")
-        assert f"list {legal} legal matter(s)" in issue
-        assert "empty_risk_events" in validator.fired
-        found = [
-            e for e in logs
-            if e["event"] == "risk.empty_events_with_legal_records"
-        ]
-        assert [e["legal_records"] for e in found] == [legal]
-        assert validator("Litigation risk remains.", {}, pad) is None
-        assert validator.rejections == 1
-
-        cases = {
-            "records-not-shown": (_TSLA_ROWS, False, {}),
-            "no-legal-records": ([
-                _Row(
-                    "X_10-Q_2026-07-01.txt", "10-Q", date(2026, 7, 1), None,
-                    {"legal_matters": []})
-            ], True, {}),
-            "events-listed": (
-                _TSLA_ROWS, True,
-                _events(("Benavides v. Tesla, Inc.", "pending", "F2.L1")))
-        }
-        for case_id, (rows, shown, metrics) in cases.items():
-            validator = _validator(rows)
-            validator.records.shown = shown
-            validator("Risk remains.", metrics, _pad("search_filings result"))
-            assert "empty_risk_events" not in validator.fired, case_id
-
-    def test_record_of_another_matter_is_rejected_once_with_all_events(
-            self, capsys):
-        validator = _validator(_TSLA_TWO_ROWS)
-        pad = _pad(_TSLA_TWO_FILINGS)
-        issue = validator("x", _TSLA_DRAFT, pad)
-        assert issue is not None and issue.startswith("Record check:")
-        assert "'NHTSA' cites F1.L1" in issue
-        assert "no record names it" in issue
-        assert "'Benavides v. Tesla' cites F1.L1" in issue
-        assert "the record that names it: F2.L1" in issue
-        assert "record_name" in validator.fired
-        out = capsys.readouterr().out
-        assert "risk.record_name_mismatch" in out and "rejected=True" in out
-        assert "risk.record_status_mismatch" not in out
-        assert validator("x", _TSLA_DRAFT, pad) is None
-        out = capsys.readouterr().out
-        assert "risk.record_name_mismatch" in out and "rejected=False" in out
-        text = RECORD_NAME_MESSAGE.format(parts="a; b")
-        assert "never cite another matter's record" in text
-        assert "a; b" in text
-
-    def test_hint_for_a_record_in_the_newest_filing_has_no_age_note(self):
-        rows = [_TSLA_ROWS[1], _TSLA_ROWS[2]]
-        rows[0] = _Row(
-            rows[0].filename, rows[0].form, rows[0].filing_date,
-            rows[0].report_date, {
-                "legal_matters": [
-                    _TSLA_ROWS[0].records["legal_matters"][0],
-                    *_TSLA_ROWS[1].records["legal_matters"]
-                ]
-            })
-        issue = _validator(rows)(
-            "x", _events(("Benavides v. Tesla", "appeal", "F1.L1")),
-            _pad(frec.render_filing_records(rows)))
-        assert issue is not None
-        assert "the record that names it: F1.L2)" in issue
-        assert "older than the newest filing" not in issue
-
-    def test_record_quote_naming_the_entity_is_its_record(self):
-        record = {
-            "category": "legal_matters",
-            "name": "Illinois Biometric Information Privacy Act litigation",
-            "quote": "Beginning in June 2019 with Wilcosky v. Amazon.com, "
-            "Inc., now pending in the United States District Court"
-        }
-        assert _record_names_entity("Wilcosky v. Amazon.com, Inc.", record)
-        assert not _record_names_entity(
-            "Frame-Wilson v. Amazon.com, Inc.", record)
-        assert _record_names_entity(
-            "NHTSA", {
-                "category": "guidance",
-                "metric": "capex"
-            })
-
-    def test_events_line_names_sources_in_plain_words(self):
         pad = _pad(_TSLA_TWO_FILINGS)
         events = _sourced_risk_events(
             _TSLA_DRAFT, pad, rows=_TSLA_TWO_ROWS, shown=True)
@@ -2407,6 +2207,149 @@ class TestRiskAgent:
         pending = {**event, "status": "pending"}
         assert _event_line(pending, [], False) == "FTC (status pending)"
 
+    def test_schema_status_mismatch_source_id_and_filing_label(self, capsys):
+        item = risk._RISK_REPORTED_SCHEMA["properties"]["risk_events"]["items"]
+        assert item["required"] == ["entity", "evidence_tool", "status"]
+        assert item["properties"]["status"]["enum"] == [
+            "pending", "dismissed", "settled", "judgment", "appeal", "other",
+            "announced", "completed", "terminated", "not_applicable"
+        ]
+        assert item["properties"]["source_id"] == {"type": "string"}
+
+        assert (
+            _ko_issue(_baltimore_event(status="dismissed", source_id="F1.L1"))
+            is None)
+        assert "risk.record_status_mismatch" not in capsys.readouterr().out
+        assert (
+            _ko_issue(_baltimore_event(status="pending", source_id="F1.L1"))
+            is None)
+        out = capsys.readouterr().out
+        assert "risk.record_status_mismatch" in out
+        assert "record_status=dismissed" in out
+
+        issue = _ko_issue(
+            _baltimore_event(status="dismissed", source_id="F7.L1"))
+        assert issue is not None and "no filing record with that id" in issue
+        unshown = _baltimore_event(status="dismissed", source_id="F1.L1")
+        assert _ko_issue(unshown, shown=False) is not None
+        shown_name = _baltimore_event(
+            status="dismissed", source_id="KO_10-Q_2026-07-29.txt")
+        assert _ko_issue(shown_name) is None
+        issue = _ko_issue(
+            _baltimore_event(status="pending", source_id="KO_10-Q_2025-04-29"))
+        assert issue is not None and "not a filing shown" in issue
+        assert (
+            _ko_issue(
+                _baltimore_event(
+                    status="pending", source_id="KO_10-Q_2026-07-29")) is None)
+        issue = _ko_issue(_baltimore_event(status="pending"))
+        assert issue is not None and "no source_id" in issue
+
+        pad = _pad(_MSFT_FILINGS)
+        assert _risk_answer_issue(
+            "x", _irs("F1"), pad, rows=_MSFT_ROWS,
+            shown=True) == (None, False)
+        out = capsys.readouterr().out
+        assert "risk.filing_label_resolved" in out
+        assert "filename=MSFT_10-K_2026-07-29" in out
+        events = _sourced_risk_events(
+            _irs("f1"), pad, rows=_MSFT_ROWS, shown=True)
+        assert _risk_events_line(events, _MSFT_ROWS, True) == (
+            "Named risk events (sourced): IRS (status pending; "
+            "source: 10-K filed 2026-07-29)")
+        for source, shown in (("F3", True), ("F1", False), ("F1.L", True)):
+            issue = _risk_answer_issue(
+                "x", _irs(source), pad, rows=_MSFT_ROWS, shown=shown)[0]
+            assert issue is not None and source in issue, source
+
+    def test_empty_events_check_rejects_once_only_with_shown_records(self):
+        validator = _validator(_TSLA_ROWS)
+        pad = _pad("search_filings result")
+        legal = sum(
+            len(row.records.get("legal_matters") or []) for row in _TSLA_ROWS)
+        assert legal >= 1
+        with capture_logs() as logs:
+            issue = validator("Litigation risk remains.", {}, pad)
+        assert issue is not None
+        assert issue.startswith("Risk events check:")
+        assert f"list {legal} legal matter(s)" in issue
+        assert "empty_risk_events" in validator.fired
+        found = [
+            e for e in logs
+            if e["event"] == "risk.empty_events_with_legal_records"
+        ]
+        assert [e["legal_records"] for e in found] == [legal]
+        assert validator("Litigation risk remains.", {}, pad) is None
+        assert validator.rejections == 1
+
+        cases = {
+            "records-not-shown": (_TSLA_ROWS, False, {}),
+            "no-legal-records": ([
+                _Row(
+                    "X_10-Q_2026-07-01.txt", "10-Q", date(2026, 7, 1), None,
+                    {"legal_matters": []})
+            ], True, {}),
+            "events-listed": (
+                _TSLA_ROWS, True,
+                _events(("Benavides v. Tesla, Inc.", "pending", "F2.L1")))
+        }
+        for case_id, (rows, shown, metrics) in cases.items():
+            validator = _validator(rows)
+            validator.records.shown = shown
+            validator("Risk remains.", metrics, _pad("search_filings result"))
+            assert "empty_risk_events" not in validator.fired, case_id
+
+    def test_record_of_another_matter_and_record_naming(self, capsys):
+        validator = _validator(_TSLA_TWO_ROWS)
+        pad = _pad(_TSLA_TWO_FILINGS)
+        issue = validator("x", _TSLA_DRAFT, pad)
+        assert issue is not None and issue.startswith("Record check:")
+        assert "'NHTSA' cites F1.L1" in issue
+        assert "no record names it" in issue
+        assert "'Benavides v. Tesla' cites F1.L1" in issue
+        assert "the record that names it: F2.L1" in issue
+        assert "record_name" in validator.fired
+        out = capsys.readouterr().out
+        assert "risk.record_name_mismatch" in out and "rejected=True" in out
+        assert "risk.record_status_mismatch" not in out
+        assert validator("x", _TSLA_DRAFT, pad) is None
+        out = capsys.readouterr().out
+        assert "risk.record_name_mismatch" in out and "rejected=False" in out
+        text = RECORD_NAME_MESSAGE.format(parts="a; b")
+        assert "never cite another matter's record" in text
+        assert "a; b" in text
+
+        rows = [_TSLA_ROWS[1], _TSLA_ROWS[2]]
+        rows[0] = _Row(
+            rows[0].filename, rows[0].form, rows[0].filing_date,
+            rows[0].report_date, {
+                "legal_matters": [
+                    _TSLA_ROWS[0].records["legal_matters"][0],
+                    *_TSLA_ROWS[1].records["legal_matters"]
+                ]
+            })
+        issue = _validator(rows)(
+            "x", _events(("Benavides v. Tesla", "appeal", "F1.L1")),
+            _pad(frec.render_filing_records(rows)))
+        assert issue is not None
+        assert "the record that names it: F1.L2)" in issue
+        assert "older than the newest filing" not in issue
+
+        record = {
+            "category": "legal_matters",
+            "name": "Illinois Biometric Information Privacy Act litigation",
+            "quote": "Beginning in June 2019 with Wilcosky v. Amazon.com, "
+            "Inc., now pending in the United States District Court"
+        }
+        assert _record_names_entity("Wilcosky v. Amazon.com, Inc.", record)
+        assert not _record_names_entity(
+            "Frame-Wilson v. Amazon.com, Inc.", record)
+        assert _record_names_entity(
+            "NHTSA", {
+                "category": "guidance",
+                "metric": "capex"
+            })
+
 
 class TestMacroAgent:
 
@@ -2440,7 +2383,8 @@ class TestMacroAgent:
         assert "5.33" in observation
 
     @pytest.mark.asyncio
-    async def test_unresolved_rate_mismatch_gets_a_warning(self, monkeypatch):
+    async def test_reported_rates_must_match_live_fred_or_warn(
+            self, monkeypatch):
         provider = _FakeMacroProvider()
         monkeypatch.setattr(
             macro_tool_module, "get_macro_data_provider", lambda: provider)
@@ -2459,7 +2403,6 @@ class TestMacroAgent:
         assert "4.33" in output.raw_output["verification_warnings"][0]
         assert output.is_well_supported is False
 
-    def test_reported_rates_must_match_live_fred(self):
         scratchpad = [
             _entry(
                 "get_macro_indicators",
@@ -2585,7 +2528,8 @@ class TestPortfolioAgent:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("fake_web_search")
-    async def test_finishes_and_maps_to_agent_output(self, monkeypatch):
+    async def test_finish_needs_a_scenario_and_verbatim_percentages(
+            self, monkeypatch):
         router = _Router(
             [_finish("adding to AAPL would raise concentration modestly")])
         monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
@@ -2597,7 +2541,6 @@ class TestPortfolioAgent:
         assert output.status == AgentStatus.COMPLETED
         assert "concentration" in output.summary
 
-    def test_finish_needs_a_scenario_and_verbatim_percentages(self):
         base = [_entry("get_portfolio_composition", _COMPOSITION_OBS)]
         other_ticker = [
             *base,
@@ -2684,7 +2627,8 @@ class TestPortfolioAgent:
 class TestDebateSides:
 
     @pytest.mark.asyncio
-    async def test_bull_cites_agent_evidence_in_prompt(self, monkeypatch):
+    async def test_bull_prompt_and_one_regeneration_of_a_flagged_draft(
+            self, monkeypatch):
         router = _Router(["Strong buy case."])
         monkeypatch.setattr(dc, "LLMRouter", lambda: router)
 
@@ -2701,8 +2645,6 @@ class TestDebateSides:
         assert argument.argument == "Strong buy case."
         assert "uptrend confirmed" in router.calls[0][-1].content
 
-    @pytest.mark.asyncio
-    async def test_flagged_draft_gets_one_regeneration_then_is_logged(self):
         router = _TextRouter("Close 151.23 [market].")
         argument = await dc.generate_debate_argument(
             side="bull", state=_market_state(), llm_router=router,
@@ -2809,7 +2751,7 @@ class TestJudgeAgent:
             if not superseded:
                 assert "prior" not in content, case_id
 
-    def test_trailing_pe_line_needs_net_above_operating_and_a_gap(self):
+    def test_trailing_pe_and_quarter_change_lines(self):
         amd = judge.trailing_pe_line(
             _margins_state({
                 "operating_margin_pct": 10.7,
@@ -2833,7 +2775,6 @@ class TestJudgeAgent:
         assert "trailing P/E is LOWER" in judge.trailing_pe_line(
             _pe_state("P/E=17.24 forward P/E=22.79 P/B=7.1"))
 
-    def test_quarter_changes_and_lagging_xbrl_are_stated(self):
         state = _state(
             "QCOM", agent_outputs={
                 AgentRole.FUNDAMENTAL: _quarter_fundamental(_INTC_QUARTER)
@@ -2904,7 +2845,7 @@ class TestJudgeAgent:
 class TestReflectionAgent:
 
     @pytest.mark.asyncio
-    async def test_llm_cannot_flag_bull_if_bull_never_argued(
+    async def test_unargued_side_and_no_outputs_are_not_reviewed(
             self, monkeypatch):
         llm_response = json.dumps({
             "issues": [{
@@ -2925,8 +2866,6 @@ class TestReflectionAgent:
         verdict = await ReflectionAgent().check(state)
         assert verdict.retry_agents == {}
 
-    @pytest.mark.asyncio
-    async def test_no_agent_outputs_skips_llm_call_entirely(self, monkeypatch):
         router = _Router([])
         monkeypatch.setattr(reflection, "LLMRouter", lambda: router)
         verdict = await ReflectionAgent().check(_state())
@@ -2955,7 +2894,7 @@ class TestReflectionAgent:
         assert "Round 2 bull (LATEST): NEW BULL" in user
 
     @pytest.mark.asyncio
-    async def test_issue_is_routed_by_role_or_kept_unrouted(self, monkeypatch):
+    async def test_issue_routing_and_cause_wording(self, monkeypatch):
         verdict = await _review(
             monkeypatch, {
                 "role": "bull",
@@ -2987,7 +2926,6 @@ class TestReflectionAgent:
         causes = _classify_reflection_causes(verdict.issue_details, verdict)
         assert "other problems the LLM citation review raised" in causes
 
-    def test_causes_name_unsupported_claims_and_capacity(self):
         causes = " | ".join(
             _classify_reflection_causes([
                 ReflectionIssue(

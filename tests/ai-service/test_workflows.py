@@ -10,12 +10,12 @@ import ai.workflows.backtest_workflow as backtest_workflow
 import ai.workflows.review_workflow as review_workflow
 import ai.workflows.tier_monitoring_workflow as tier_workflow
 import pytest
-from ai.benchmark import metrics as metrics_module
 from ai.ingestion.sec_edgar_filings import NewFiling
 from ai.providers.base import PriceBar, ProviderError
+from ai.tools import indicators as metrics_module
 from database import SessionLocal
 from helpers import _headers
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 from structlog.testing import capture_logs
 from domains.analysis.model import Analysis, Recommendation, RecommendationTier
 from domains.analysis.repository import (AgentCatalogRepository,
@@ -37,6 +37,8 @@ TODAY_TS = datetime(2026, 8, 13, 4, tzinfo=UTC)
 SERIES_START = date(2026, 1, 5)
 CYRILLIC = "".join(chr(c) for c in range(0x0430, 0x0440))
 RUSSIAN_SENTENCE = f"{CYRILLIC} {CYRILLIC} {CYRILLIC}"
+_PENDING = TierStatus.PENDING_ACCEPTANCE.value
+_ACCEPTED = TierStatus.ACCEPTED_AWAITING_TRIGGER.value
 
 
 def _price_bars(
@@ -122,6 +124,7 @@ class _FakeMarketProvider:
 class _StubAnalysis:
     ticker: str = "AMD"
     portfolio_id: UUID | None = field(default_factory=uuid4)
+    user_id: UUID | None = None
 
 
 @dataclass
@@ -129,6 +132,7 @@ class _StubRecommendation:
     window_expires_at: datetime | None
     analysis: _StubAnalysis = field(default_factory=_StubAnalysis)
     accepted_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass
@@ -1438,7 +1442,8 @@ class TestReviewRollup:
 class TestTierMonitoringGating:
 
     @pytest.mark.asyncio
-    async def test_gated_and_untriggered_outcomes(self, monkeypatch):
+    async def test_gated_untriggered_and_sell_trigger_outcomes(
+            self, monkeypatch):
         called = {"yes": False}
 
         async def _should_not_be_called(*args, **kwargs):
@@ -1508,9 +1513,6 @@ class TestTierMonitoringGating:
                 tier_workflow._tier_outcome_event(object(), outcome)
                 is None), outcome  # type: ignore[arg-type]
 
-    @pytest.mark.asyncio
-    async def test_sell_trigger_and_bar_that_opened_before_acceptance(
-            self, monkeypatch):
         bar = _bar(
             ts=TODAY_TS, open_=498.0, high=502.0, low=496.0, close=500.0)
 
@@ -1717,8 +1719,7 @@ class TestDecisionUpdates:
             data=InvestmentDecisionCreate(action_taken=action, notes=notes))
 
     @pytest.mark.asyncio
-    async def test_repost_resets_outcomes_and_ignoring_cancels_tiers(
-            self, db_session):
+    async def test_repost_ignore_decline_and_note_bounds(self, db_session):
         from domains.decision.repository import DecisionOutcomeRepository
 
         owner = uuid4()
@@ -1755,14 +1756,21 @@ class TestDecisionUpdates:
         again = await self._post(
             db_session, owner, analysis.id, "followed", "note")
         assert again.notes == "note"
+        await self._post(db_session, owner, analysis.id, "partial")
+        await db_session.execute(
+            update(RecommendationTier).where(
+                RecommendationTier.recommendation_id == rec.id,
+                RecommendationTier.target_price == Decimal("95")).values(
+                    status=TierStatus.TRIGGERED.value).execution_options(
+                        synchronize_session="fetch"))
+        back = await self._post(db_session, owner, analysis.id, "followed")
+        assert back.action_taken == "followed"
+        assert await _tier_statuses(db_session, rec.id) == [
+            TierStatus.TRIGGERED.value, _ACCEPTED]
         await self._post(db_session, owner, analysis.id, "ignored")
-        assert (
-            await _tier_statuses(db_session,
-                                 rec.id) == [TierStatus.DECLINED.value] * 2)
+        assert await _tier_statuses(db_session, rec.id) == [
+            TierStatus.TRIGGERED.value, TierStatus.DECLINED.value]
 
-    @pytest.mark.asyncio
-    async def test_declined_is_terminal_and_notes_are_bounded(
-            self, db_session):
         from pydantic import ValidationError
         from domains.decision.schema import InvestmentDecisionCreate
 
@@ -1775,6 +1783,230 @@ class TestDecisionUpdates:
         InvestmentDecisionCreate(action_taken="ignored", notes="x" * 2000)
         with pytest.raises(ValidationError):
             InvestmentDecisionCreate(action_taken="ignored", notes="x" * 2001)
+
+
+async def _tier_set(
+        session, *, portfolio_id, ticker, statuses, user_id=None,
+        side=TierSide.BUY.value, window_days=5, age_hours=0,
+        price=Decimal("100"), quantity=Decimal("2")):
+    analysis = await AnalysisRepository(session).create(
+        user_id=user_id, portfolio_id=portfolio_id, ticker=ticker,
+        status="completed")
+    rec = Recommendation(
+        analysis_id=analysis.id, recommendation="buy", confidence=0.7,
+        reasoning="r", debate_converged=True,
+        created_at=datetime.now(UTC) - timedelta(hours=age_hours),
+        window_expires_at=datetime.now(UTC) + timedelta(days=window_days))
+    session.add(rec)
+    await session.flush()
+    session.add_all([
+        RecommendationTier(
+            recommendation_id=rec.id, side=side, target_price=price - i,
+            quantity=quantity, status=status)
+        for i, status in enumerate(statuses)
+    ])
+    await session.flush()
+    return analysis, rec
+
+
+class TestTierBudgetAndAcceptance:
+
+    @pytest.mark.asyncio
+    async def test_committed_cash_counts_only_open_buy_tiers(
+            self, db_session):
+        from domains.analysis.repository import RecommendationTierRepository
+
+        pf, other_pf = uuid4(), uuid4()
+        system, _ = await _tier_set(
+            db_session, portfolio_id=pf, ticker="SYS", statuses=[_PENDING])
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="USR", user_id=uuid4(),
+            statuses=[_ACCEPTED], price=Decimal("50"))
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="DONE", statuses=[
+                TierStatus.DECLINED.value, TierStatus.SUPERSEDED.value,
+                TierStatus.EXPIRED.value, TierStatus.TRIGGERED.value,
+                TierStatus.EXECUTION_FAILED.value
+            ])
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="SHUT", statuses=[_PENDING],
+            window_days=-1)
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="SELL", statuses=[_PENDING],
+            side=TierSide.SELL.value)
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="SELF", statuses=[_PENDING])
+        await _tier_set(
+            db_session, portfolio_id=other_pf, ticker="ELSE",
+            statuses=[_PENDING])
+        repo = RecommendationTierRepository(db_session)
+
+        assert await repo.committed_buy_cash(
+            portfolio_id=pf, exclude_ticker="self") == Decimal("300")
+        holders = await repo.committed_buy_holders(
+            portfolio_id=pf, exclude_ticker="SELF")
+        assert [(h.ticker, h.status) for h in holders
+                ] == [("SYS", _PENDING), ("USR", _ACCEPTED)]
+        assert holders[0].describe() == (
+            f"SYS 200.00 (analysis {system.id}, pending acceptance)")
+
+    async def test_weekend_deadline_and_system_tiers_lapse_after_it(
+            self, db_session, owners):
+        from config import AIServiceSettings
+        from domains.analysis.repository import acceptance_lapsed
+
+        assert AIServiceSettings.model_fields[
+            "SYSTEM_TIER_ACCEPTANCE_HOURS"].default == 72
+        friday_evening = datetime(2026, 10, 9, 22, 0, tzinfo=UTC)
+        monday_open = datetime(2026, 10, 12, 13, 30, tzinfo=UTC)
+        tuesday_evening = datetime(2026, 10, 13, 22, 0, tzinfo=UTC)
+
+        def lapsed(now):
+            return acceptance_lapsed(
+                status=_PENDING, user_id=None, issued_at=friday_evening,
+                now=now)
+
+        assert not lapsed(monday_open)
+        assert lapsed(tuesday_evening)
+
+        from config import settings
+        from domains.analysis.repository import RecommendationTierRepository
+        from domains.analysis.service import tier_reads
+
+        owner = uuid4()
+        pf = owners(owner)
+        stale = settings.SYSTEM_TIER_ACCEPTANCE_HOURS + 6
+        lapsed, lapsed_rec = await _tier_set(
+            db_session, portfolio_id=pf, ticker="OLD", statuses=[_PENDING],
+            age_hours=stale)
+        fresh, _ = await _tier_set(
+            db_session, portfolio_id=pf, ticker="NEW", statuses=[_PENDING],
+            age_hours=1)
+        await _tier_set(
+            db_session, portfolio_id=pf, ticker="ACC", statuses=[_ACCEPTED],
+            age_hours=stale, price=Decimal("50"))
+        users, users_rec = await _tier_set(
+            db_session, portfolio_id=pf, ticker="USR", user_id=owner,
+            statuses=[_PENDING], age_hours=stale, price=Decimal("25"))
+        tiers = RecommendationTierRepository(db_session)
+        analyses = AnalysisRepository(db_session)
+
+        assert await tiers.committed_buy_cash(
+            portfolio_id=pf, exclude_ticker="X") == Decimal("350")
+        assert await tiers.unfilled_buy_tier_count(
+            portfolio_id=pf, ticker="OLD") == 0
+        assert await analyses.get_open_recommendation_for(
+            portfolio_id=pf, ticker="OLD") is None
+        assert (
+            await analyses.get_open_recommendation_for(
+                portfolio_id=pf, ticker="USR")).id == users_rec.id
+        assert await tiers.invalidate_unfilled_tiers_for_new_recommendation(
+            portfolio_id=pf, ticker="OLD",
+            new_action=RecommendationAction.HOLD, new_prices=[]) == []
+
+        loaded = await analyses.get_by_id(lapsed.id, with_details=True)
+        assert [t.status for t in tier_reads(loaded)
+                ] == [TierStatus.EXPIRED.value]
+        assert [t.status for t in tier_reads(
+            await analyses.get_by_id(fresh.id, with_details=True))
+                ] == [_PENDING]
+        for status in (_PENDING, _ACCEPTED):
+            shut, _ = await _tier_set(
+                db_session, portfolio_id=pf, ticker="SHUT", user_id=owner,
+                statuses=[status], window_days=-1)
+            assert [t.status for t in tier_reads(
+                await analyses.get_by_id(shut.id, with_details=True))
+                    ] == [TierStatus.EXPIRED.value]
+
+        with pytest.raises(ValidationAppError, match="already expired"):
+            await TestDecisionUpdates()._post(
+                db_session, owner, lapsed.id, "followed")
+        assert await _tier_statuses(db_session, lapsed_rec.id) == [_PENDING]
+        await TestDecisionUpdates()._post(
+            db_session, owner, users.id, "followed")
+        assert await _tier_statuses(db_session, users_rec.id) == [_ACCEPTED]
+
+        tier_id = (
+            await db_session.execute(
+                select(RecommendationTier.id).where(
+                    RecommendationTier.recommendation_id ==
+                    lapsed_rec.id))).scalar_one()
+        tier = await tiers.get_tier_with_details(tier_id)
+        assert await tier_workflow._check_one_tier(
+            tier, today=TODAY) == "expired"
+        assert tier.status == TierStatus.EXPIRED.value
+
+    @pytest.mark.asyncio
+    async def test_accept_that_updates_no_tier_is_rejected_and_not_stored(
+            self, db_session, monkeypatch):
+        from domains.analysis.repository import RecommendationTierRepository
+
+        owner = uuid4()
+        analysis, rec = await _analysis_with_tiers(db_session, user_id=owner)
+        original = RecommendationTierRepository.accept_pending
+
+        async def _expired_meanwhile(self, recommendation_id):
+            await self.session.execute(
+                text(
+                    "UPDATE ai.recommendation_tiers SET status = 'expired' "
+                    "WHERE recommendation_id = :r"), {"r": recommendation_id})
+            return await original(self, recommendation_id)
+
+        monkeypatch.setattr(
+            RecommendationTierRepository, "accept_pending", _expired_meanwhile)
+        with pytest.raises(ValidationAppError, match="no tier still awaiting"):
+            await TestDecisionUpdates()._post(
+                db_session, owner, analysis.id, "followed")
+
+        stored = (
+            await db_session.execute(
+                text(
+                    "SELECT count(*) FROM ai.investment_decisions "
+                    "WHERE recommendation_id = :r"),
+                {"r": rec.id})).scalar_one()
+        accepted_at = (
+            await db_session.execute(
+                text("SELECT accepted_at FROM ai.recommendations "
+                     "WHERE id = :r"), {"r": rec.id})).scalar_one()
+        assert stored == 0
+        assert accepted_at is None
+
+    @pytest.mark.asyncio
+    async def test_budget_blocked_note_names_the_cash_holders(
+            self, db_session, monkeypatch):
+        import ai.workflows.analysis_workflow as wf
+        from ai.recommendation.position_sizing import BudgetBlockedNote
+
+        pf = uuid4()
+        from shared.market_calendar import market_today
+
+        holder, holder_rec = await _tier_set(
+            db_session, portfolio_id=pf, ticker="JPM", statuses=[_PENDING])
+        seen: dict = {}
+
+        async def _blocked(**kwargs):
+            seen["committed"] = kwargs["committed_buy_cash"]
+            return None, BudgetBlockedNote("No entry tiers: no budget.")
+
+        monkeypatch.setattr(wf, "generate_position_sizing", _blocked)
+        target = await AnalysisRepository(db_session).create(
+            user_id=None, portfolio_id=pf, ticker="AMD")
+        rec = await wf._save_recommendation_and_tiers(
+            db_session, AnalysisPersistenceRepository(db_session),
+            analysis_id=str(target.id), analysis_uuid=target.id,
+            ticker="AMD", portfolio_id=str(pf), final_rec={
+                "action": "buy",
+                "confidence": 0.8,
+                "reasoning": "r",
+                "debate_converged": True
+            })
+
+        assert seen["committed"] == Decimal("200")
+        issued = market_today(holder_rec.created_at)
+        assert rec.tier_generation_note == (
+            "No entry tiers: no budget. The committed cash is held by open "
+            f"BUY tiers on: JPM (issued {issued}).")
+        assert str(holder.id) not in rec.tier_generation_note
 
 
 class TestMarketCalendar:
@@ -1796,9 +2028,10 @@ class TestMarketCalendar:
 
 class TestKnowledgeGraphGuards:
 
-    def test_triples_validated_and_blank_scenarios_skipped(self, monkeypatch):
+    async def test_triples_scenarios_and_non_english_kg_rows(
+            self, monkeypatch):
         import ai.agents.portfolio as portfolio
-        from ai.knowledge.extraction import _parse_response
+        from ai.knowledge.archival import _parse_response
 
         def _t(**kw):
             base = {
@@ -1843,9 +2076,6 @@ class TestKnowledgeGraphGuards:
         lines = portfolio._computed_scenarios(entries, "AMD")
         assert lines == ["additional_shares=7 -> weight 12%"]
 
-    @pytest.mark.asyncio
-    async def test_non_english_rows_are_dropped_from_kg_context(
-            self, monkeypatch):
         from ai.knowledge import kg_context
 
         async def fake_fetch(

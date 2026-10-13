@@ -27,10 +27,10 @@ from ai.graph.state import (MAX_DEBATE_ROUNDS, AgentOutput, AnalysisState,
                             DebateArgument, DebateState, EpisodicMemoryHit,
                             JudgeVerdict, ReflectionVerdict,
                             merge_debate_state, replace_reflection_feedback)
-from ai.llm.base import (LLMConfigError, LLMResponse, LLMServerOverloadedError,
-                         LLMTier, LLMUsage)
+from ai.llm.base import (LLMResponse, LLMServerOverloadedError, LLMTier,
+                         LLMUsage)
 from alembic import command
-from helpers import _ALL_ROLES, _BUY, _P
+from helpers import _ALL_ROLES, _BUY, _P, _AlwaysFailsRouter, _RaisingRouter
 from helpers import _args, _ok
 from helpers import _state as _base_state
 from helpers import _StubGraph, _tool_entry, _verdict
@@ -134,23 +134,6 @@ class _EchoRouter:
         return LLMResponse(
             content=messages[-1].content, provider="fake", model="m",
             usage=LLMUsage(prompt_tokens=1, completion_tokens=1))
-
-
-class _AlwaysFailsRouter:
-
-    async def complete(self, tier, messages, **kwargs):
-        raise LLMConfigError("no key configured")
-
-
-class _RaisingRouter:
-
-    def __init__(self, exc: Exception):
-        self.exc = exc
-        self.calls = 0
-
-    async def complete(self, tier, messages, **kwargs):
-        self.calls += 1
-        raise self.exc
 
 
 class _ReplyRouter:
@@ -461,6 +444,35 @@ class TestSupervisorEnrichment:
         assert update["kg_context"] is None
         assert update["portfolio_kg_context"] is None
 
+    @pytest.mark.asyncio
+    async def test_slow_fresh_filing_ingest_times_out_and_keeps_running(
+            self, monkeypatch):
+        import ai.ingestion.sec_edgar_filings as filings_module
+
+        release = asyncio.Event()
+        runs: list[str] = []
+
+        async def _slow_ingest(ticker):
+            runs.append(ticker)
+            await release.wait()
+            return filings_module.FilingIngestResult(new_filings=[])
+
+        monkeypatch.setattr(
+            filings_module, "_ingest_new_filings", _slow_ingest)
+        monkeypatch.setattr(nodes_module, "FRESH_FILING_BUDGET_SECONDS", 0.01)
+        with capture_logs() as logs:
+            assert await nodes_module.load_fresh_filing_context("SLOW") is None
+        assert "fresh_filing_check.timed_out" in [e["event"] for e in logs]
+        task = filings_module._ingests_in_flight["SLOW"]
+        assert not task.done()
+
+        joined = asyncio.create_task(filings_module.ingest_new_filings("SLOW"))
+        await asyncio.sleep(0)
+        release.set()
+        assert (await joined).new_filings == []
+        assert runs == ["SLOW"]
+        assert "SLOW" not in filings_module._ingests_in_flight
+
 
 def _patch_debate_sides(monkeypatch, bull_router, bear_router) -> _Sleeps:
     routers = {"bull": bull_router, "bear": bear_router}
@@ -511,8 +523,7 @@ class TestDebateNodes:
         assert merged.unavailable_latest_sides() == ["bear"]
 
     @pytest.mark.asyncio
-    async def test_failed_correction_keeps_the_previous_argument(
-            self, monkeypatch):
+    async def test_failed_correction_and_side_repair_wait(self, monkeypatch):
         _patch_debate_sides(
             monkeypatch, _RaisingRouter(LLMServerOverloadedError("503")),
             _ReplyRouter("Bear case.", repeat=True))
@@ -527,9 +538,6 @@ class TestDebateNodes:
         update = await bull_node(state)
         assert update["debate"].arguments[0].available is False
 
-    @pytest.mark.asyncio
-    async def test_side_repair_wait_failure_and_skipped_cases(
-            self, monkeypatch):
         monkeypatch.setattr(
             config.settings, "DEBATE_SIDE_REPAIR_DELAY_SECONDS", 60.0)
         cases = {
@@ -779,7 +787,7 @@ class TestReflectionNode:
 
     @pytest.mark.usefixtures("no_memory_io")
     @pytest.mark.asyncio
-    async def test_retry_need_and_one_single_side_correction_per_round(
+    async def test_retry_need_correction_per_round_crash_and_feedback(
             self, monkeypatch):
         state = _state(
             agent_outputs={
@@ -814,10 +822,6 @@ class TestReflectionNode:
         update = await reflection_node(state)
         assert update["pending_retry_agents"] == []
         assert "debate" not in update
-
-    @pytest.mark.asyncio
-    async def test_crash_is_unverified_and_feedback_is_per_round(
-            self, monkeypatch):
 
         async def _boom(self, state):
             raise RuntimeError("bug")
@@ -1019,20 +1023,9 @@ class TestEpisodicMemory:
         assert counts == {me: 1, other: 3, None: 1}
         assert AgentMemory.__table__.c.user_id.nullable
 
-    def test_hit_line_and_stored_judge_verdict_pair(self) -> None:
-        line = _hit("hold", 0.4, 60, "correct").track_record_line(30)
-        assert line.endswith("(confidence 0.40), call was correct")
-        assert "summary" not in EpisodicMemoryHit.model_fields
-        assert "reasoning" not in EpisodicMemoryHit.model_fields
-        f = memory_module.stored_judge_verdict
-        assert f("buy", 0.7) == (RecommendationAction.BUY, 0.7)
-        assert f("buy", None) == (None, None)
-        assert f(None, 0.7) == (None, None)
-        assert f("strong_buy", 0.7) == (None, None)
-
     @pytest.mark.asyncio
-    async def test_hits_carry_the_raw_judge_verdict(
-            self, db_session: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_hits_carry_the_raw_judge_verdict_and_hit_line(
+            self, db_session, monkeypatch):
         ticker = "EPG" + uuid4().hex[:4].upper()
         persist = AnalysisPersistenceRepository(db_session)
         episodes = EpisodicMemoryRepository(db_session)
@@ -1066,6 +1059,16 @@ class TestEpisodicMemory:
         assert raw.judge_confidence == pytest.approx(0.8)
         old = by_id[str(without.id)]
         assert (old.judge_leaning, old.judge_confidence) == (None, None)
+
+        line = _hit("hold", 0.4, 60, "correct").track_record_line(30)
+        assert line.endswith("(confidence 0.40), call was correct")
+        assert "summary" not in EpisodicMemoryHit.model_fields
+        assert "reasoning" not in EpisodicMemoryHit.model_fields
+        f = memory_module.stored_judge_verdict
+        assert f("buy", 0.7) == (RecommendationAction.BUY, 0.7)
+        assert f("buy", None) == (None, None)
+        assert f(None, 0.7) == (None, None)
+        assert f("strong_buy", 0.7) == (None, None)
 
     @pytest.mark.asyncio
     async def test_judge_and_owner_columns_migrate_up_and_down(
@@ -1538,8 +1541,8 @@ class TestAnalysisQueueOwnerCheck:
         return ran, failed, logs
 
     @pytest.mark.asyncio
-    async def test_only_an_inactive_owner_skips_the_job(self) -> None:
-
+    async def test_only_an_inactive_owner_skips_and_default_check(
+            self, monkeypatch):
         async def inactive(_: UUID) -> bool | None:
             return False
 
@@ -1561,9 +1564,6 @@ class TestAnalysisQueueOwnerCheck:
             ran, failed, _ = await self._run(check, uuid4())
             assert len(ran) == 1 and failed == [], case_id
 
-    @pytest.mark.asyncio
-    async def test_default_check_reads_the_cached_user_state(
-            self, monkeypatch: pytest.MonkeyPatch) -> None:
         import shared.user_state as user_state_module
         from domains.analysis import queue as queue_module
         from shared.user_state import UserState

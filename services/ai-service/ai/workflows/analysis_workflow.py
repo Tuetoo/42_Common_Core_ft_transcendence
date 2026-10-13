@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 import structlog
@@ -9,7 +10,8 @@ from ai.knowledge.archival import archive_agent_report, is_archivable_role
 from ai.knowledge.recycled_content import recycled_share
 from ai.memory.agent_memory import (maybe_remember_trajectory, owner_uuid,
                                     stored_judge_verdict)
-from ai.recommendation.position_sizing import (KeepEarlierTiersNote,
+from ai.recommendation.position_sizing import (BudgetBlockedNote,
+                                               KeepEarlierTiersNote,
                                                current_position_weight_pct,
                                                generate_position_sizing,
                                                tier_side_for_action)
@@ -432,16 +434,22 @@ async def _save_recommendation_and_tiers(
 
     if action != RecommendationAction.HOLD and portfolio_uuid is not None:
         try:
-            committed = await tier_repo.committed_buy_cash(
+            holders = await tier_repo.committed_buy_holders(
                 portfolio_id=portfolio_uuid, exclude_ticker=ticker)
             await session.commit()
             sizing, sizing_note = await generate_position_sizing(
                 ticker=ticker, action=action,
                 confidence=final_rec["confidence"],
                 reasoning=final_rec["reasoning"], portfolio_id=portfolio_id
-                or "", committed_buy_cash=committed)
+                or "", committed_buy_cash=sum(
+                    (h.amount for h in holders), Decimal(0)))
             if sizing_note:
                 notes.append(sizing_note)
+            if isinstance(sizing_note, BudgetBlockedNote) and holders:
+                notes.append(
+                    "The committed cash is held by open BUY tiers on: " +
+                    ", ".join(dict.fromkeys(
+                        h.public_label() for h in holders)) + ".")
             if (action == RecommendationAction.BUY and sizing is None
                     and isinstance(sizing_note, KeepEarlierTiersNote)):
                 keep_note = sizing_note

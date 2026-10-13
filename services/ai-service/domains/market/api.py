@@ -1,12 +1,14 @@
 from datetime import UTC, datetime
 from uuid import uuid4
+from ai.providers.base import ProviderError
 from ai.tools.market_data_cache import get_bars_cache_first
 from deps import get_current_user
 from fastapi import APIRouter, Depends, Query
 from domains.market.repository import MAX_PRICE_LOOKBACK_DAYS
 from domains.market.schema import PriceBarRead
 from domains.market.service import NoPriceDataError
-from shared.exceptions import NotFoundError, ValidationAppError
+from shared.exceptions import (NotFoundError, UpstreamServiceError,
+                               ValidationAppError)
 from shared.schemas import APIResponse, normalize_ticker
 from shared.security import CurrentUser
 
@@ -51,6 +53,9 @@ async def price_bars_response(
             ticker, interval=interval, lookback_days=lookback_days)
     except NoPriceDataError:
         raise NotFoundError(f"No price data for ticker {ticker}") from None
+    except ProviderError as exc:
+        raise UpstreamServiceError(
+            "Market data provider unavailable") from exc
     bars = list(reversed(bars))
     results: list[PriceBarRead] = []
     for bar in bars:

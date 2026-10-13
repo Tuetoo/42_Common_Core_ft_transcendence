@@ -168,6 +168,33 @@ class TestOrganizations:
         assert await invalidate(settings, ["u1", None]) == 0
         assert await invalidate(settings, [None]) == 0
 
+        class _Corrupt:
+            stored: list[str] = []
+
+            def __init__(self, raw):
+                self.raw = raw
+
+            async def get(self, key):
+                return self.raw
+
+            async def set(self, key, value, ex):
+                self.stored.append(value)
+
+        class _Auth:
+
+            async def get(self, url):
+                return httpx.Response(
+                    200, json=items, request=httpx.Request("GET", url))
+
+        for raw in ("not json", '{"not-a-uuid": "owner"}', "[1]"):
+            monkeypatch.setattr(
+                cache_module, "get_cache_client", lambda s, raw=raw:
+                _Corrupt(raw))
+            roles = await cache_module.organization_roles(
+                settings, _Auth(), "http://auth", owner["id"])
+            assert roles == {UUID(org_id): "owner"}
+        assert len(_Corrupt.stored) == 3
+
     async def test_deleted_owner_hands_the_organization_to_an_admin(
             self, client, mock_email, db_session, captured_events):
         from sqlalchemy import select
@@ -476,6 +503,7 @@ class TestAdminUsers:
         assert updated[-1] == {
             "user_id": target["id"],
             "actor_id": admin["id"],
+            "username": new_name,
             "role": "user",
             "is_active": True,
             "changed": ["first_name", "username"]
@@ -529,6 +557,7 @@ class TestAdminUsers:
         assert events_named(captured_events, "user.role.changed") == [{
             "user_id": target["id"],
             "actor_id": admin["id"],
+            "username": target["username"],
             "role": "moderator",
             "is_active": True,
             "changed": ["role"]
@@ -736,6 +765,7 @@ class TestAdminUsers:
         assert events_named(captured_events, "user.deleted") == [{
             "user_id": target["id"],
             "actor_id": admin["id"],
+            "username": target["username"],
             "role": "user",
             "is_active": False,
             "changed": ["deleted_at", "email", "is_active", "username"]
@@ -943,8 +973,6 @@ class TestNotificationSettings:
         r = await client.get(f"/internal/users/{user['id']}/state")
         assert r.status_code == 200
         assert r.json() == {"role": "moderator", "is_active": True}
-
-        from domains.auth.repository import UserRepository
 
         row = await UserRepository(db_session).get_by_id(UUID(user["id"]))
         row.is_active = False
@@ -1179,6 +1207,29 @@ class TestAuthEvents:
             "organization_name": "Fund II"
         }]
 
+        r = await client.get(
+            f"{ORGS}/{oid}/invitations", headers=owner["headers"])
+        open_invitation = r.json()["data"][0]
+        r = await client.delete(
+            f"{ORGS}/{oid}/invitations/{open_invitation['id']}",
+            headers=owner["headers"])
+        assert r.status_code == 204
+        assert events_named(
+            captured_events, "organization.invitation.revoked") == [{
+                **base(owner["id"], None, "viewer", [owner["id"]]),
+                "organization_name": "Fund II"
+            }]
+        r = await client.post(
+            f"{ORGS}/{oid}/invitations", headers=owner["headers"],
+            json={"email": bob["email"], "role": "member"})
+        r = await client.delete(
+            f"{ORGS}/{oid}/invitations/{r.json()['data']['id']}",
+            headers=owner["headers"])
+        assert r.status_code == 204
+        assert events_named(
+            captured_events,
+            "organization.invitation.revoked")[-1]["user_id"] == bob["id"]
+
         await invite_and_join(
             client, mock_email, oid, owner["headers"], bob, "member")
         r = await client.delete(f"{ORGS}/{oid}", headers=owner["headers"])
@@ -1205,7 +1256,8 @@ class TestAuthEvents:
         assert events_named(captured_events, "friend.requested") == [{
             "actor_id": a["id"],
             "user_id": b["id"],
-            "actor_username": a["username"]
+            "actor_username": a["username"],
+            "other_username": b["username"]
         }]
 
         await client.post(
@@ -1213,7 +1265,8 @@ class TestAuthEvents:
         assert events_named(captured_events, "friend.accepted") == [{
             "actor_id": b["id"],
             "user_id": a["id"],
-            "actor_username": b["username"]
+            "actor_username": b["username"],
+            "other_username": a["username"]
         }]
 
         await client.delete(
@@ -1221,7 +1274,9 @@ class TestAuthEvents:
         assert events_named(captured_events, "friend.removed") == [{
             "actor_id": a["id"],
             "user_id": b["id"],
-            "actor_username": a["username"]
+            "actor_username": a["username"],
+            "other_username": b["username"],
+            "action": "removed"
         }]
 
         r = await client.post(
@@ -1230,7 +1285,34 @@ class TestAuthEvents:
         await client.delete(
             f"/api/v1/connections/{r.json()['data']['id']}",
             headers=a["headers"])
-        assert len(events_named(captured_events, "friend.removed")) == 1
+        r = await client.post(
+            "/api/v1/connections", headers=c["headers"],
+            json={"addressee_username": a["username"]})
+        await client.delete(
+            f"/api/v1/connections/{r.json()['data']['id']}",
+            headers=c["headers"])
+        assert [(p["actor_id"], p["action"]) for p in events_named(
+            captured_events, "friend.removed")[1:]] == [
+                (a["id"], "declined"), (c["id"], "cancelled")]
+
+        r = await client.post(
+            "/api/v1/connections", headers=c["headers"],
+            json={"addressee_username": a["username"]})
+        block_url = f"/api/v1/connections/{r.json()['data']['id']}/block"
+        captured_events.clear()
+        for _ in range(2):
+            r = await client.post(block_url, headers=a["headers"])
+            assert r.status_code == 200
+        assert captured_events == [("connection.blocked", {
+            "actor_id": a["id"],
+            "blocked_user_id": c["id"],
+            "blocked_username": c["username"]
+        })]
+        r = await client.delete(
+            block_url.removesuffix("/block"), headers=a["headers"])
+        assert r.status_code == 204
+        assert events_named(captured_events, "friend.removed")[-1][
+            "action"] == "unblocked"
 
         await reset_rate_limits()
         captured_events.clear()
@@ -1243,6 +1325,7 @@ class TestAuthEvents:
             return {
                 "user_id": user["id"],
                 "actor_id": user["id"],
+                "username": user["username"],
                 "role": "user",
                 "is_active": True,
                 "changed": changed

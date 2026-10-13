@@ -20,9 +20,9 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, ISSUE_NO_EVIDENCE_NOT_RETRIED,
                             EpisodicMemoryHit, JudgeVerdict,
                             PriorRecommendation, ReflectionIssue,
                             ReflectionVerdict)
-from ai.llm.base import (LLMConfigError, LLMNonEnglishOutputError, LLMResponse,
-                         LLMServerOverloadedError, LLMTier, LLMUsage)
-from ai.llm.json_fence import parse_json_object
+from ai.llm.base import (LLMNonEnglishOutputError, LLMResponse,
+                         LLMServerOverloadedError, LLMTier, LLMUsage,
+                         parse_json_object)
 from ai.providers import sec_edgar
 from ai.providers.base import PriceQuote, ProviderRequestError
 from ai.recommendation.engine import (build_final_recommendation,
@@ -30,7 +30,7 @@ from ai.recommendation.engine import (build_final_recommendation,
 from ai.recommendation.position_sizing import (_validated_sizing,
                                                generate_position_sizing)
 from ai.tools.base import Tool
-from helpers import _ALL_ROLES, _BUY, _P
+from helpers import _ALL_ROLES, _BUY, _P, _AlwaysFailsRouter, _RaisingRouter
 from helpers import (_args, _make_decision_with_outcome, _ok,
                      _ScriptedReviewRouter)
 from helpers import _state as _base_state
@@ -135,17 +135,6 @@ class _Router:
                            completion_tokens=1), finish_reason="STOP")
 
 
-class _RaisingRouter:
-
-    def __init__(self, exc: Exception):
-        self.exc = exc
-        self.calls = 0
-
-    async def complete(self, tier, messages, **kwargs):
-        self.calls += 1
-        raise self.exc
-
-
 class _CountingReviewRouter:
 
     def __init__(self) -> None:
@@ -160,12 +149,6 @@ class _CountingReviewRouter:
                 "checked_claims": ["c"]
             }), provider="fake", model="fake-model",
             usage=LLMUsage(prompt_tokens=1, completion_tokens=1))
-
-
-class _AlwaysFailsRouter:
-
-    async def complete(self, tier, messages, **kwargs):
-        raise LLMConfigError("no key configured")
 
 
 def _judge_json(
@@ -236,7 +219,7 @@ def _hold_verdict_state(
 
 class TestFinalRecommendation:
 
-    def test_unavailable_bull_and_skipped_agent_shape_the_note(self):
+    def test_unavailable_bull_skipped_agent_and_unverified_reflection(self):
         outputs = {r: _ok(r) for r in _ALL_ROLES}
         outputs[AgentRole.SENTIMENT] = _ok(
             AgentRole.SENTIMENT, is_well_supported=False)
@@ -264,6 +247,39 @@ class TestFinalRecommendation:
         rec = _final(state)
         assert rec.confidence_adjustment_note is not None
         assert "macro" in rec.confidence_adjustment_note
+
+        unverified = _hold_verdict_state(
+            converged=True, history=[
+                ReflectionVerdict(
+                    round_number=1, verified=False,
+                    issues=["fabricated figure A"]),
+                ReflectionVerdict(
+                    round_number=2, verified=False, issues=[
+                        "fabricated figure A", "fabricated figure B",
+                        "fabricated figure C", "fabricated figure D"
+                    ])
+            ])
+        rec = _final(unverified)
+        note = unverified.confidence_adjustment_note()
+        assert rec.confidence == 0.85 - 0.15
+        assert rec.debate_converged is True
+        assert note is not None
+        assert "Reflection could not fully verify" in note
+        assert "4 unresolved issues" in note
+
+        clean = _hold_verdict_state(
+            converged=True, history=[
+                ReflectionVerdict(round_number=1, verified=True, issues=[])
+            ])
+        assert _final(clean).confidence == 0.85
+        assert clean.confidence_adjustment_note() is None
+
+        stacked = _hold_verdict_state(
+            converged=False, history=[
+                ReflectionVerdict(
+                    round_number=1, verified=False, issues=["x"])
+            ])
+        assert abs(_final(stacked).confidence - 0.55) < 1e-9
 
     def test_reaffirmation_cap_rules(self):
         cases = {
@@ -303,40 +319,6 @@ class TestFinalRecommendation:
         assert rec.confidence == pytest.approx(0.6)
         assert rec.confidence_adjustment_note is not None
         assert "reaffirms the prior HOLD" in rec.confidence_adjustment_note
-
-    def test_unverified_reflection_lowers_confidence(self):
-        unverified = _hold_verdict_state(
-            converged=True, history=[
-                ReflectionVerdict(
-                    round_number=1, verified=False,
-                    issues=["fabricated figure A"]),
-                ReflectionVerdict(
-                    round_number=2, verified=False, issues=[
-                        "fabricated figure A", "fabricated figure B",
-                        "fabricated figure C", "fabricated figure D"
-                    ])
-            ])
-        rec = _final(unverified)
-        note = unverified.confidence_adjustment_note()
-        assert rec.confidence == 0.85 - 0.15
-        assert rec.debate_converged is True
-        assert note is not None
-        assert "Reflection could not fully verify" in note
-        assert "4 unresolved issues" in note
-
-        clean = _hold_verdict_state(
-            converged=True, history=[
-                ReflectionVerdict(round_number=1, verified=True, issues=[])
-            ])
-        assert _final(clean).confidence == 0.85
-        assert clean.confidence_adjustment_note() is None
-
-        stacked = _hold_verdict_state(
-            converged=False, history=[
-                ReflectionVerdict(
-                    round_number=1, verified=False, issues=["x"])
-            ])
-        assert abs(_final(stacked).confidence - 0.55) < 1e-9
 
     def test_no_verdict_reason(self):
         assert no_verdict_reason(_state()) == "no_evidence"
@@ -440,7 +422,8 @@ def _previous(
 class TestJudge:
 
     @pytest.mark.asyncio
-    async def test_unavailable_sides_skip_or_are_stated(self, monkeypatch):
+    async def test_unavailable_sides_and_prior_recommendation_context(
+            self, monkeypatch):
         router = _Router(_judge_json(), repeat=True)
         monkeypatch.setattr(judge_module, "LLMRouter", lambda: router)
         state = _state(
@@ -462,9 +445,6 @@ class TestJudge:
         assert "Bull argument: (UNAVAILABLE" in user
         assert "[bull argument unavailable]" not in user
 
-    @pytest.mark.asyncio
-    async def test_prior_is_action_confidence_date_and_holding(
-            self, monkeypatch):
         router = _Router(_judge_json(), repeat=True)
         monkeypatch.setattr(judge_module, "LLMRouter", lambda: router)
         prior = PriorRecommendation(
@@ -515,8 +495,7 @@ class TestJudge:
         assert "30-day return -6.3%, call was incorrect" in user
         assert "outcome not known yet" in user
 
-    async def test_trailing_pe_reading_and_skip_log(self, monkeypatch):
-
+    async def test_trailing_pe_skip_log_and_explained_move(self, monkeypatch):
         def _fund(pad: list[dict[str, Any]]) -> AgentOutput:
             return AgentOutput(
                 role=AgentRole.FUNDAMENTAL, status=AgentStatus.COMPLETED,
@@ -564,9 +543,6 @@ class TestJudge:
         skipped = _events(logs, "judge.trailing_pe_note_skipped")
         assert len(skipped) == 1
 
-    @pytest.mark.asyncio
-    async def test_explained_move_from_raw_verdict_is_not_flagged(
-            self, monkeypatch) -> None:
         hit = _previous(
             RecommendationAction.HOLD, 0.45, RecommendationAction.BUY, 0.75)
         logs = await _judge_logs(
@@ -577,7 +553,7 @@ class TestJudge:
         assert "judge.change_since_previous_missing" not in events
         assert "judge.change_basis_missing" not in events
 
-    async def test_opposing_points_are_kept_and_logged(self, monkeypatch):
+    async def test_opposing_points_and_converged_parsing(self, monkeypatch):
         parsed = {
             "opposing_points": [{
                 "point": " a  b ",
@@ -631,7 +607,6 @@ class TestJudge:
         logged = _events(logs, "judge.opposing_points")
         assert logged[0]["opposing_points"] == points
 
-    def test_parse_converged(self):
         cases = [(True, True), (False, False), ("true", True), ("TRUE", True),
                  ("false", False), ("False", False), ("yes", False),
                  (1, False), (None, False), ("", False)]
@@ -725,8 +700,7 @@ async def _run_judge(
 class TestJudgeFigureRewrite:
 
     @pytest.mark.asyncio
-    async def test_unit_slip_triggers_one_rewrite_that_is_used(
-            self, monkeypatch) -> None:
+    async def test_unit_slip_gets_exactly_one_rewrite(self, monkeypatch):
         router = _Router(
             _answer(_UNIT_SLIP), _answer(_UNIT_FIXED, leaning="hold"))
         verdict, logs = await _run_judge(router, monkeypatch)
@@ -749,9 +723,6 @@ class TestJudgeFigureRewrite:
         assert "value, unit and period" in request
         assert "Do not add items together" in request
 
-    @pytest.mark.asyncio
-    async def test_second_or_failed_rewrite_ends_without_a_loop(
-            self, monkeypatch) -> None:
         still = "Net income rose to $62.65B with $99.9 billion of gains."
         router = _Router(_answer(_UNIT_SLIP), _answer(still))
         verdict, logs = await _run_judge(router, monkeypatch)
@@ -786,8 +757,8 @@ _BROKEN_JSON = (
 class TestJudgeJsonRecovery:
 
     @pytest.mark.asyncio
-    async def test_unparseable_answer_is_reasked_once(
-            self, monkeypatch) -> None:
+    async def test_unparseable_answer_reasked_once_and_slips_parsed(
+            self, monkeypatch):
         router = _Router(_BROKEN_JSON, _answer(_UNIT_FIXED, leaning="hold"))
         verdict, logs = await _run_judge(router, monkeypatch)
         assert len(router.calls) == 2
@@ -822,9 +793,6 @@ class TestJudgeJsonRecovery:
             failed = _events(logs, "judge.json_reask_failed")
             assert len(failed) == 1, case_id
 
-    @pytest.mark.asyncio
-    async def test_json_slips_parse_without_a_second_call(
-            self, monkeypatch) -> None:
         slips = {
             "trailing-text": (
                 _answer(_UNIT_FIXED) + "\nDone.", "trailing_chars_ignored", 5),
@@ -1005,7 +973,7 @@ def _xbrl_four(q: float, q_prior: float, ytd: float,
 
 class TestFigures:
 
-    def test_figure_reading_and_ungrounded_figures(self) -> None:
+    def test_figure_reading_ungrounded_and_precision(self):
         readings = {
             "spaced-amounts": (
                 "a $ 1.00 billion gain, write-downs of $ 68 million "
@@ -1052,7 +1020,6 @@ class TestFigures:
             got = dc.find_ungrounded_figures(claim, evidence)
             assert got == expected, case_id
 
-    def test_precise_figures_must_match_at_their_own_precision(self) -> None:
         cases = {
             "made-up-sum-near-a-real-line": (
                 "$593 million year-to-date", "other income was $598 million",
@@ -1176,7 +1143,7 @@ def _tsla_fundamental(
 
 class TestEvidenceBlocks:
 
-    def test_absent_or_bad_filing_period_lists_render_nothing(self) -> None:
+    def test_filing_period_lists_and_profit_trend_block(self):
         old = _state(
             ticker="META",
             agent_outputs={AgentRole.FILING: _meta_filing(one_off_items=[])})
@@ -1196,7 +1163,6 @@ class TestEvidenceBlocks:
             })
         assert dc.filing_period_texts(failed) == []
 
-    def test_judge_profit_trend_block_with_and_without_ytd(self) -> None:
         state = _state(
             ticker="META", agent_outputs={
                 AgentRole.FILING: _meta_filing(
@@ -1320,7 +1286,7 @@ def _both_sides_flagged_state() -> AnalysisState:
 class TestDebateSides:
 
     @pytest.mark.asyncio
-    async def test_one_regeneration_with_mechanical_recheck(self, monkeypatch):
+    async def test_one_regeneration_then_kept_or_logged(self, monkeypatch):
         assert dc.DEBATE_MAX_REGENERATIONS == 1
         for side in ("bull", "bear"):
             router = _Router("Growth 25% [market].", "Still 25% [market].")
@@ -1341,8 +1307,6 @@ class TestDebateSides:
             assert argument.argument == "Up 4% [market].", side
             assert len(router.calls) == 2, side
 
-    @pytest.mark.asyncio
-    async def test_still_ungrounded_after_the_one_regeneration(self) -> None:
         state = _state(
             ticker="META", agent_outputs={AgentRole.FILING: _meta_filing()})
         router = _Router(
@@ -1559,7 +1523,8 @@ class TestReflection:
             "found no evidence, not retried" in i for i in verdict.issues)
 
     @pytest.mark.asyncio
-    async def test_bull_regeneration_rules(self, monkeypatch):
+    async def test_bull_regeneration_and_badly_shaped_review(
+            self, monkeypatch):
         review = json.dumps({
             "checked_claims": ["x"],
             "issues": [{
@@ -1596,8 +1561,6 @@ class TestReflection:
         assert "$30B buyback" in verdict.issues[0]
         assert "$30B buyback" in verdict.retry_agents[AgentRole.BULL]
 
-    @pytest.mark.asyncio
-    async def test_badly_shaped_review_parts_and_issue_text(self, monkeypatch):
         state = _fundamental_debate_state()
         state.debate.verdicts.append(
             JudgeVerdict(
@@ -1915,7 +1878,7 @@ async def _follow(analysis_id, portfolio_id):
 class TestTierReplacement:
 
     @pytest.mark.asyncio
-    async def test_new_recommendation_replaces_unfilled_tiers(self, rows):
+    async def test_new_or_accepted_recommendation_replaces_tiers(self, rows):
         pf = uuid4()
         _, low_buy, _ = await rows.recommendation(
             ticker="AMD", portfolio_id=pf, action="buy",
@@ -1954,8 +1917,6 @@ class TestTierReplacement:
         assert await rows.tier_statuses(old_buy) == [_S]
         assert await rows.tier_statuses(old_sell) == [_A]
 
-    @pytest.mark.asyncio
-    async def test_accepting_replaces_buys_and_hold_is_a_no_op(self, rows):
         from database import SessionLocal
 
         pf = uuid4()
@@ -2037,7 +1998,8 @@ async def _decision_without_outcome(
 class TestDecisionReview:
 
     @pytest.mark.asyncio
-    async def test_success_persists_and_returns_review(self, db_session):
+    async def test_review_success_errors_and_unusable_answers(
+            self, db_session):
         from domains.decision.service import DecisionService
 
         decision = await _make_decision_with_outcome(db_session)
@@ -2058,10 +2020,6 @@ class TestDecisionReview:
         assert stored is not None
         assert stored.review_text == result.review_text
 
-    @pytest.mark.asyncio
-    async def test_review_errors(self, db_session):
-        from domains.decision.service import DecisionService
-
         pending = await _decision_without_outcome(
             db_session, "TSLA", "hold", 0.5, "mixed signals")
         with pytest.raises(ValidationAppError):
@@ -2075,8 +2033,6 @@ class TestDecisionReview:
             await DecisionService(db_session).generate_review(
                 uuid4(), user_id=uuid4())
 
-    @pytest.mark.asyncio
-    async def test_failed_or_unusable_answer_stores_nothing(self, db_session):
         from domains.decision.service import (DecisionService,
                                               ReviewUnavailableError)
 

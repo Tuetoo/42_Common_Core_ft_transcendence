@@ -335,9 +335,6 @@ class TestSharedDurableEvents:
                 await task
             await real.delete(f"stream:{name}")
 
-        import asyncio
-        import shared.events as events
-
         logged = []
         monkeypatch.setattr(
             events.logger, "error", lambda event, **kw: logged.append(

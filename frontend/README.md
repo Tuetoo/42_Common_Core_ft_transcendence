@@ -1,36 +1,54 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AlphaMind frontend
 
-## Getting Started
+The web interface of AlphaMind: a Next.js 16 app (React 19, TypeScript,
+Tailwind CSS 4). Pages are server components that fetch their data on the
+server; client components are used only where a page is interactive
+(forms, live updates, the shared note editor).
 
-First, run the development server:
+## Run it
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+The frontend is part of the Docker stack. From the repository root:
+
+```
+make up
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+This builds the image from `Dockerfile` and starts it with the rest of the
+stack. The gateway serves it at https://localhost:8443/ (the frontend has
+no host port of its own). The image is a multi-stage build: `npm ci`,
+`next build` with `output: "standalone"`, then only the standalone server
+and static files run as an unprivileged user.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+For development outside Docker (the rest of the stack still running in
+Docker): copy `.env.example` to `.env.local`, then `npm ci` and
+`npm run dev`. `npm run dev` trusts the gateway's self-signed certificate
+through `NODE_EXTRA_CA_CERTS` (see `package.json`).
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Environment variables
 
-## Learn More
+| Variable | Used by | Docker value | Meaning |
+|---|---|---|---|
+| `BACKEND_API_URL` | server code (`app/lib/backend.ts`, `proxy.ts`, `app/healthz`) | `http://gateway:8080/api/v1` (set in `docker-compose.yaml`) | The API as the frontend server reaches it: the gateway's internal listener |
+| `NEXT_PUBLIC_WS_URL` | browser (`app/lib/ws-url.ts`) | not set: the page's own origin is used (`wss://host:8443/ws`) | WebSocket base URL |
+| `NEXT_PUBLIC_GATEWAY_URL` | browser (OAuth buttons, avatars) | not set: same origin | The gateway as the browser sees it |
 
-To learn more about Next.js, take a look at the following resources:
+`NEXT_PUBLIC_*` values are fixed at build time. The frontend receives none
+of the backend's secrets (`.env.docker` is not passed to it).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Structure
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Path | Content |
+|---|---|
+| `app/(public)/` | Pages without a session: login, register, OAuth callback, password reset, email verification, invitations |
+| `app/(protected)/` | Pages that need a session: analyses, portfolios, watchlists, research, analytics, organizations, friends, notifications, profile, admin |
+| `app/(legal)/` | Privacy Policy and Terms of Service |
+| `app/lib/` | Backend calls, session cookies, Server Actions (`actions/`), formatting helpers |
+| `app/healthz/` | Health route: 200 only when the server reaches the API through the gateway |
+| `proxy.ts` | Runs before each request: renews the access token before it expires |
 
-## Deploy on Vercel
+## Checks
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`npm run lint`, `npx tsc --noEmit` (after `npx next typegen`) and
+`npm run build`. The frontend CI workflow (`.github/workflows/frontend-ci.yml`)
+runs the same three. See `docs/MODULE_MAPPING.md` for how the pages map to
+the project's modules.

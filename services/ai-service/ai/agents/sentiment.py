@@ -5,8 +5,8 @@ from ai.agents.finish_checks import InternalTokenValidator
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
                             is_thin_evidence)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.llm.base import AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier
-from ai.llm.json_fence import parse_json_dict
+from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier,
+                         parse_json_dict)
 from ai.llm.router import LLMRouter
 from ai.tools.news_tool import (SearchNewsTool, live_search_yield,
                                 ran_live_search)

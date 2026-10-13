@@ -31,7 +31,7 @@ export function StartAnalysisForm({ portfolios }: { portfolios: { id: string; na
       </div>
       <div className="field">
         <label htmlFor="analysis_type">Analysis type</label>
-        <select id="analysis_type" name="analysis_type" defaultValue={values.analysis_type ?? "full"}>
+        <select id="analysis_type" name="analysis_type" autoComplete="off" defaultValue={values.analysis_type ?? "full"}>
           {ANALYSIS_TYPES.map((t) => (
             <option key={t} value={t}>
               {t}
@@ -41,7 +41,7 @@ export function StartAnalysisForm({ portfolios }: { portfolios: { id: string; na
       </div>
       <div className="field">
         <label htmlFor="portfolio_id">Portfolio (optional)</label>
-        <select id="portfolio_id" name="portfolio_id" defaultValue={values.portfolio_id ?? ""}>
+        <select id="portfolio_id" name="portfolio_id" autoComplete="off" defaultValue={values.portfolio_id ?? ""}>
           <option value="">None — analyze the ticker on its own</option>
           {portfolios.map((p) => (
             <option key={p.id} value={p.id}>

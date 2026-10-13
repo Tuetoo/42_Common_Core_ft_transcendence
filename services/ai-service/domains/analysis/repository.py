@@ -4,7 +4,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 from ai_events import TierEventInfo
-from sqlalchemy import func, select, update
+from config import settings
+from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -16,19 +17,62 @@ from shared.database import count_query
 from shared.enums import (RecommendationAction, TierSide, TierStatus,
                           WorkflowStatus)
 from shared.exceptions import NotFoundError
+from shared.market_calendar import market_today
 from shared.schemas import PaginationParams
 
 _ACTIVE_STATUSES = (WorkflowStatus.PENDING.value, WorkflowStatus.RUNNING.value)
 
-_UNFILLED_TIER_STATUSES = (
+UNFILLED_TIER_STATUSES = (
     TierStatus.PENDING_ACCEPTANCE.value,
     TierStatus.ACCEPTED_AWAITING_TRIGGER.value)
+
+
+def system_acceptance_deadline(now: datetime | None = None) -> datetime:
+    return (now or datetime.now(UTC)) - timedelta(
+        hours=settings.SYSTEM_TIER_ACCEPTANCE_HOURS)
+
+
+def acceptance_lapsed(
+        *, status: str, user_id: UUID | None, issued_at: datetime,
+        now: datetime | None = None) -> bool:
+    return (
+        status == TierStatus.PENDING_ACCEPTANCE.value and user_id is None
+        and issued_at <= system_acceptance_deadline(now))
+
+
+def unfilled_tier_condition() -> ColumnElement[bool]:
+    now = datetime.now(UTC)
+    return and_(
+        RecommendationTier.status.in_(UNFILLED_TIER_STATUSES),
+        Recommendation.window_expires_at > now,
+        or_(
+            RecommendationTier.status ==
+            TierStatus.ACCEPTED_AWAITING_TRIGGER.value,
+            Analysis.user_id.is_not(None),
+            Recommendation.created_at > system_acceptance_deadline(now)))
 
 
 def bands_cross(buy_prices: list[Decimal], sell_prices: list[Decimal]) -> bool:
     if not buy_prices or not sell_prices:
         return False
     return max(buy_prices) >= min(sell_prices)
+
+
+@dataclass(frozen=True)
+class CommittedBuyHolder:
+    analysis_id: UUID
+    ticker: str
+    status: str
+    amount: Decimal
+    issued_at: datetime
+
+    def describe(self) -> str:
+        return (
+            f"{self.ticker} {self.amount:.2f} (analysis {self.analysis_id}, "
+            f"{self.status.replace('_', ' ')})")
+
+    def public_label(self) -> str:
+        return f"{self.ticker} (issued {market_today(self.issued_at)})"
 
 
 @dataclass(frozen=True)
@@ -61,13 +105,10 @@ class AnalysisRepository:
                 Analysis, Recommendation.analysis_id == Analysis.id).where(
                     Analysis.portfolio_id == portfolio_id,
                     Analysis.ticker == ticker.upper(),
-                    Recommendation.window_expires_at.is_not(None),
-                    Recommendation.window_expires_at > datetime.now(UTC),
                     select(RecommendationTier.id).where(
                         RecommendationTier.recommendation_id ==
                         Recommendation.id,
-                        RecommendationTier.status.in_(
-                            _UNFILLED_TIER_STATUSES)).exists()).order_by(
+                        unfilled_tier_condition()).exists()).order_by(
                                 Recommendation.created_at.desc()).limit(1))
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
@@ -156,7 +197,7 @@ class AnalysisRepository:
             pagination: PaginationParams) -> tuple[list[Analysis], int]:
         stmt = (
             select(Analysis).where(Analysis.user_id == user_id).order_by(
-                Analysis.created_at.desc()))
+                Analysis.created_at.desc(), Analysis.id.desc()))
         total = await count_query(self.session, stmt)
         stmt = stmt.offset(pagination.offset).limit(pagination.limit)
         result = await self.session.execute(stmt)
@@ -285,9 +326,7 @@ class RecommendationTierRepository:
     async def list_open_tier_ids(self) -> list[UUID]:
         result = await self.session.execute(
             select(RecommendationTier.id).where(
-                RecommendationTier.status.in_((
-                    TierStatus.PENDING_ACCEPTANCE.value,
-                    TierStatus.ACCEPTED_AWAITING_TRIGGER.value))))
+                RecommendationTier.status.in_(UNFILLED_TIER_STATUSES)))
         return list(result.scalars().all())
 
     async def get_tier_with_details(
@@ -302,6 +341,42 @@ class RecommendationTierRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def accept_pending(
+            self, recommendation_id: UUID) -> list[tuple[str, Decimal]]:
+        result = await self.session.execute(
+            update(RecommendationTier).where(
+                RecommendationTier.recommendation_id == recommendation_id,
+                RecommendationTier.status ==
+                TierStatus.PENDING_ACCEPTANCE.value).values(
+                    status=TierStatus.ACCEPTED_AWAITING_TRIGGER.value).
+            returning(
+                RecommendationTier.side,
+                RecommendationTier.target_price).execution_options(
+                    synchronize_session="fetch"))
+        accepted = [(str(row[0]), Decimal(row[1])) for row in result.all()]
+        if accepted:
+            await self.session.execute(
+                update(Recommendation).where(
+                    Recommendation.id == recommendation_id).values(
+                        accepted_at=datetime.now(UTC)).execution_options(
+                            synchronize_session="fetch"))
+        return accepted
+
+    async def decline_unfilled(
+        self, recommendation_id: UUID
+    ) -> list[tuple[UUID, str, Decimal, Decimal]]:
+        result = await self.session.execute(
+            update(RecommendationTier).where(
+                RecommendationTier.recommendation_id == recommendation_id,
+                RecommendationTier.status.in_(UNFILLED_TIER_STATUSES)).values(
+                    status=TierStatus.DECLINED.value).returning(
+                        RecommendationTier.id, RecommendationTier.side,
+                        RecommendationTier.quantity,
+                        RecommendationTier.target_price).execution_options(
+                            synchronize_session="fetch"))
+        return [(row[0], str(row[1]), Decimal(row[2]), Decimal(row[3]))
+                for row in result.all()]
+
     async def unfilled_buy_tier_count(
             self, *, portfolio_id: UUID, ticker: str) -> int:
         stmt = (
@@ -312,28 +387,40 @@ class RecommendationTierRepository:
                         Analysis.portfolio_id == portfolio_id,
                         Analysis.ticker == ticker.upper(),
                         RecommendationTier.side == TierSide.BUY.value,
-                        RecommendationTier.status.in_(_UNFILLED_TIER_STATUSES),
-                        Recommendation.window_expires_at > datetime.now(UTC)))
+                        unfilled_tier_condition()))
         return int((await self.session.execute(stmt)).scalar_one())
 
-    async def committed_buy_cash(
-            self, *, portfolio_id: UUID, exclude_ticker: str) -> Decimal:
+    async def committed_buy_holders(
+            self, *, portfolio_id: UUID,
+            exclude_ticker: str) -> list[CommittedBuyHolder]:
+        amount = func.sum(
+            RecommendationTier.target_price * RecommendationTier.quantity)
         stmt = (
             select(
-                RecommendationTier.target_price,
-                RecommendationTier.quantity).join(
+                Analysis.id, Analysis.ticker, RecommendationTier.status,
+                amount, func.max(Recommendation.created_at)).join(
                     Recommendation,
                     RecommendationTier.recommendation_id == Recommendation.id).
             join(Analysis, Recommendation.analysis_id == Analysis.id).where(
                 Analysis.portfolio_id == portfolio_id, Analysis.ticker
                 != exclude_ticker.upper(),
                 RecommendationTier.side == TierSide.BUY.value,
-                RecommendationTier.status.in_(_UNFILLED_TIER_STATUSES),
-                Recommendation.window_expires_at > datetime.now(UTC)))
-        rows = (await self.session.execute(stmt)).all()
-        return sum(
-            (Decimal(price) * Decimal(quantity) for price, quantity in rows),
-            Decimal(0))
+                unfilled_tier_condition()).group_by(
+                    Analysis.id, Analysis.ticker,
+                    RecommendationTier.status).order_by(
+                        amount.desc(), Analysis.ticker))
+        return [
+            CommittedBuyHolder(
+                analysis_id=row[0], ticker=row[1], status=row[2],
+                amount=Decimal(row[3]), issued_at=row[4])
+            for row in (await self.session.execute(stmt)).all()
+        ]
+
+    async def committed_buy_cash(
+            self, *, portfolio_id: UUID, exclude_ticker: str) -> Decimal:
+        holders = await self.committed_buy_holders(
+            portfolio_id=portfolio_id, exclude_ticker=exclude_ticker)
+        return sum((h.amount for h in holders), Decimal(0))
 
     async def invalidate_unfilled_tiers_for_new_recommendation(
             self, *, portfolio_id: UUID, ticker: str,
@@ -348,9 +435,7 @@ class RecommendationTierRepository:
                     RecommendationTier.recommendation_id == Recommendation.id).
             join(Analysis, Recommendation.analysis_id == Analysis.id).where(
                 Analysis.portfolio_id == portfolio_id,
-                Analysis.ticker == ticker.upper(),
-                RecommendationTier.status.in_(_UNFILLED_TIER_STATUSES),
-                Recommendation.window_expires_at > datetime.now(UTC)))
+                Analysis.ticker == ticker.upper(), unfilled_tier_condition()))
         if exclude_recommendation_id is not None:
             stmt = stmt.where(
                 RecommendationTier.recommendation_id !=
@@ -399,7 +484,7 @@ class RecommendationTierRepository:
                 update(RecommendationTier).where(
                     RecommendationTier.id.in_(ids),
                     RecommendationTier.status.in_(
-                        _UNFILLED_TIER_STATUSES)).values(
+                        UNFILLED_TIER_STATUSES)).values(
                             status=TierStatus.SUPERSEDED.value).returning(
                                 RecommendationTier.id).execution_options(
                                     synchronize_session="fetch"))
@@ -435,13 +520,13 @@ class RecommendationTierRepository:
                             Recommendation.analysis_id == Analysis.id).where(
                                 Analysis.portfolio_id == portfolio_id,
                                 RecommendationTier.status.in_(
-                                    _UNFILLED_TIER_STATUSES)))).all()
+                                    UNFILLED_TIER_STATUSES)))).all()
         if not rows:
             return []
         result = await self.session.execute(
             update(RecommendationTier).where(
                 RecommendationTier.id.in_([row[0] for row in rows]),
-                RecommendationTier.status.in_(_UNFILLED_TIER_STATUSES)).values(
+                RecommendationTier.status.in_(UNFILLED_TIER_STATUSES)).values(
                     status=TierStatus.EXPIRED.value).returning(
                         RecommendationTier.id).execution_options(
                             synchronize_session=False))

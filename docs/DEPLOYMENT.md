@@ -4,7 +4,7 @@ The cloud deployment runs the same `docker-compose.yaml` stack as a
 local machine, on one virtual machine. Nothing in the code differs
 between the two: the differences live in the host's own `.env.docker`
 and gateway certificate, which are never committed. The local setup is
-unchanged and stays the development environment.
+the development environment.
 
 | | Local | Cloud |
 |---|---|---|
@@ -86,26 +86,53 @@ These steps were done once; repeat them only for a new host.
 ## 3. Continuous deployment
 
 ```
- merge to main -> "stack smoke CI" (build + start the whole stack)
-                       | success
-                       v
-                 deploy workflow -> SSH to the host -> scripts/deploy.sh
-                                                         git merge --ff-only origin/main
-                                                         docker compose up -d --build --wait
+ merge to main (commit X) -> "stack smoke CI" (build + start the whole stack)
+                                 | success
+                                 v
+                           deploy workflow: wait until every other check of X
+                                 | all succeeded or skipped
+                                 v
+                           SSH to the host, command = X -> scripts/deploy.sh
+                                                             git merge --ff-only X
+                                                             docker compose up -d --build --wait
 ```
 
 - `.github/workflows/deploy.yml` runs when the stack smoke workflow
   succeeded for a push to `main`, or by hand (Actions -> deploy -> Run
   workflow). A failed smoke run deploys nothing; the host keeps running
   the previous version.
-- `scripts/deploy.sh` fast-forwards the checkout, rebuilds, restarts what
+- Before it connects, the workflow checks that X is still the head of
+  `main` (otherwise it stops: the newer commit's own run deploys that
+  one). It then waits, up to 30 minutes, for every other workflow run of
+  X triggered by the push (per-service CI, frontend CI). It deploys only
+  when all of them succeeded or were skipped; a failed or unfinished
+  check fails the deploy run and nothing is deployed. A failed GitHub API
+  call is retried twice.
+- The gate checks only the workflow runs of X itself. The per-service
+  workflows have path filters, so they run only for the services a
+  commit touches. If an earlier commit's per-service check failed and X
+  touches other paths, X's own runs pass and the deploy goes ahead; X
+  contains the earlier commit, so its code is deployed too. Fix a failed
+  check in the next commit to `main` before relying on the deploy.
+- The deploy is triggered only by the stack smoke run. If another check
+  failed for a flaky reason and you re-run it until it passes, no deploy
+  starts by itself: start one with Actions -> deploy -> Run workflow.
+- The workflow sends X as the SSH command. `deploy.sh` reads it from
+  `SSH_ORIGINAL_COMMAND`, accepts only a 40-character hex commit that is
+  on `origin/main`, and fast-forwards to exactly X, so a newer commit
+  whose checks are still running is never deployed by X's run. Run by
+  hand on the host (no SSH command), it fast-forwards to `origin/main`.
+- `scripts/deploy.sh` then rebuilds, restarts what
   changed and waits up to 5 minutes for every health check. It refuses to
-  run without `.env.docker` or the certificate. Compose restarts only
+  run without `.env.docker` or the certificate. It needs only bash 3.2
+  (no `mapfile`), so it also runs with the bash that macOS ships.
+  Compose restarts only
   services whose image or configuration changed; a restart of ai-service
   ends an analysis that is still running.
 - The scheduler keeps the state it had before the deploy. The host keeps
   it stopped (the cloud and the local stack share the LLM and news
-  quotas). When it is not running, `deploy.sh` rebuilds its image but
+  quotas), so the host runs no scheduled jobs and makes no automatic
+  backups (section 6). When it is not running, `deploy.sh` rebuilds its image but
   leaves it out of `docker compose up`, so it never starts, not even for
   a minute; `--wait` then waits for every other service. The script prints
   `scheduler was not running before the deploy: kept stopped`. To start
@@ -116,8 +143,9 @@ These steps were done once; repeat them only for a new host.
   answers `{"status":"ok"}` only when the frontend runs and its server
   side reaches the API through the gateway; otherwise 503 (or 502 when
   the frontend is down).
-- The workflow's SSH key may only run the deploy script: its line in the
-  host's `~/.ssh/authorized_keys` is
+- The workflow's SSH key may only run the deploy script; the commit it
+  sends is only data for that script, never run as a command. Its line
+  in the host's `~/.ssh/authorized_keys` is
 
   ```
   command="bash /home/ubuntu/alphamind/scripts/deploy.sh",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... github-actions-deploy
@@ -141,7 +169,14 @@ make backup                                  # local
 scp -i <key> -r backups/<YYYY-MM-DD_HHMM> ubuntu@<host>:/home/ubuntu/alphamind/backups/
 make restore BACKUP=<YYYY-MM-DD_HHMM>              # on the host: dry run
 make restore BACKUP=<YYYY-MM-DD_HHMM> CONFIRM=yes  # on the host
+docker compose --env-file .env.docker stop scheduler  # on the host
 ```
+
+`make restore ... CONFIRM=yes` ends with `docker compose up -d`, which
+also starts the scheduler. Stop it again at once: otherwise its jobs
+(market-open analyses, news ingestion) spend the LLM and news quotas
+that the cloud shares with the local stack, and every later deploy keeps
+it running.
 
 After a restore, users sign in again (the cloud has its own
 `JWT_SECRET`). Two-factor secrets written locally without a
@@ -183,9 +218,15 @@ using the other address:
 | Certificate status | `sudo certbot certificates` |
 | Free space | `df -h /` and `docker system df` |
 
-Backups run nightly on the host as they do locally (`backups/` on the
-host's disk). They protect against mistakes, not against losing the
-machine: copy one off the host before stopping the instance for good.
+The host keeps the scheduler stopped (section 3), so it makes no
+automatic backups and runs no scheduled jobs. `make backup` does not work
+there either, because it runs `backup.sh` inside the running scheduler
+container. Backups are made on the local stack: nightly by its scheduler,
+or by hand with `make backup`. The cloud's data is not backed up: copy
+what you need to keep off the host before stopping the instance for
+good. For the same reason the job-health alerts (`DailyJobStale`,
+`TradingDayJobStale`) fire on the host; show backups, scheduled jobs and
+alerting on the local stack.
 
 ## 7. Cost and shutdown
 

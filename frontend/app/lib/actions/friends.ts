@@ -2,8 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
-import { backendFetch } from "@/app/lib/backend";
-import { readApiError } from "@/app/lib/api-error";
+import { backendFetch, readApiError } from "@/app/lib/backend";
 
 export type FriendActionState = {
   error?: string;

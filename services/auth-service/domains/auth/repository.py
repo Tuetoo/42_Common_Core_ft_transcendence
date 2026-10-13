@@ -4,6 +4,7 @@ import security
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from domains.auth.model import (OAuthAccount, SessionRevokeReason,
                                 TwoFactorSecret, User, UserProfile,
                                 UserSession, UserSettings)
@@ -124,8 +125,8 @@ class UserRepository:
 
     async def create_session(
             self, *, user_id: UUID, refresh_token: str, expires_at: datetime,
-            ip_address: str | None = None,
-            device_info: str | None = None) -> UserSession:
+            ip_address: str | None = None, device_info: str | None = None,
+            created_at: datetime | None = None) -> UserSession:
         await self._db.execute(
             delete(UserSession).where(
                 UserSession.user_id == user_id, UserSession.expires_at
@@ -135,6 +136,8 @@ class UserRepository:
             refresh_token_hash=security.hash_refresh_token(refresh_token),
             expires_at=expires_at, ip_address=ip_address,
             device_info=device_info)
+        if created_at is not None:
+            row.created_at = created_at
         self._db.add(row)
         await self._db.flush()
         return row
@@ -179,6 +182,44 @@ class UserRepository:
                     revoked_reason=reason).execution_options(
                         synchronize_session="fetch"))
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def revoke_rotation_successors(
+            self, rotated: UserSession, *, reason: str) -> int:
+        # A session created by rotation has created_at equal to the
+        # revoked_at of the session it replaced (see AuthService.refresh), so
+        # the chain of sessions descending from one refresh token can be
+        # followed without a family column.
+        chain = select(
+            UserSession.id, UserSession.revoked_at,
+            UserSession.revoked_reason).where(
+                UserSession.id == rotated.id).cte(
+                    "rotation_chain", recursive=True)
+        successor = aliased(UserSession)
+        chain = chain.union(
+            select(
+                successor.id, successor.revoked_at,
+                successor.revoked_reason).where(
+                    successor.user_id == rotated.user_id,
+                    successor.created_at == chain.c.revoked_at,
+                    chain.c.revoked_reason == SessionRevokeReason.ROTATED))
+        # Repeat until the chain stops growing: each statement takes a new
+        # snapshot, so a successor committed by a rotation that ran at the
+        # same time (the UPDATE waited for its row lock, then skipped the
+        # rotated row) is found by the next round. This needs READ COMMITTED
+        # (the default); under REPEATABLE READ the loop would stop too early.
+        statement = update(UserSession).where(
+            UserSession.id.in_(select(chain.c.id)),
+            UserSession.revoked_at.is_(None)).values(
+                revoked_at=datetime.now(UTC),
+                revoked_reason=reason).execution_options(
+                    synchronize_session="fetch")
+        size, total = -1, 0
+        while (found := int(await self._db.scalar(
+                select(func.count()).select_from(chain)) or 0)) != size:
+            size = found
+            result = await self._db.execute(statement)
+            total += int(getattr(result, "rowcount", 0) or 0)
+        return total
 
     async def count_live_sessions(
             self, user_id: UUID, *, used_since: datetime) -> int:

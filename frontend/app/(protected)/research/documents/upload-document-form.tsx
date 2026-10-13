@@ -129,7 +129,7 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
       </div>
       <div className="field">
         <label htmlFor="category">Category</label>
-        <select id="category" name="category" required disabled={busy}>
+        <select id="category" name="category" autoComplete="off" required disabled={busy}>
           {DOCUMENT_CATEGORIES.map((c) => (
             <option key={c} value={c}>
               {c.replaceAll("_", " ")}
@@ -142,6 +142,7 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
         <input
           id="upload-ticker"
           name="ticker"
+          autoComplete="off"
           type="text"
           maxLength={10}
           pattern={TICKER_HTML_PATTERN}
@@ -156,6 +157,7 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
         <input
           id="upload-title"
           name="title"
+          autoComplete="off"
           type="text"
           maxLength={DOCUMENT_TITLE_MAX}
           placeholder="Defaults to the file name"
@@ -164,11 +166,11 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
       </div>
       <div className="field">
         <label htmlFor="upload-date">Document date (optional)</label>
-        <input id="upload-date" name="content_date" type="date" disabled={busy} />
+        <input id="upload-date" name="content_date" autoComplete="off" type="date" disabled={busy} />
       </div>
       <div className="field">
         <label htmlFor="upload-org">Visible to</label>
-        <select id="upload-org" name="organization_id" disabled={busy} defaultValue="">
+        <select id="upload-org" name="organization_id" autoComplete="off" disabled={busy} defaultValue="">
           <option value="">Only me</option>
           {organizations.map((org) => (
             <option key={org.id} value={org.id}>

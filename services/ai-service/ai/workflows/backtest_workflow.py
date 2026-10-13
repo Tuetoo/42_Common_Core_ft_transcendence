@@ -5,12 +5,12 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 import structlog
-from ai.benchmark.metrics import (alpha_beta, information_ratio, max_drawdown,
-                                  paired_simple_returns, sharpe_ratio,
-                                  simple_returns, sortino_ratio, total_return,
-                                  tracking_error, win_rate)
 from ai.providers.base import PriceBar
 from ai.providers.registry import get_market_data_provider
+from ai.tools.indicators import (alpha_beta, information_ratio, max_drawdown,
+                                 paired_simple_returns, sharpe_ratio,
+                                 simple_returns, sortino_ratio, total_return,
+                                 tracking_error, win_rate)
 from ai_events import backtest_event_payload, publish_event
 from clients.core_client import (get_portfolio_cash_flows,
                                  get_portfolio_snapshots)

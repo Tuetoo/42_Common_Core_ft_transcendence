@@ -10,8 +10,8 @@ recommendation is later scored against the real market.
 This document describes the system as built. Details live in `API_SPEC.md` (routes, events), `ERD.md`
 (tables), the handbook (`handbook/15-ai-agents.md` and
 `handbook/16-ai-analysis-pipeline.md` for the agents and the graph),
-`DISASTER_RECOVERY.md` (backups and restore) and `PROJECT_STRUCTURE.md`
-(the file tree).
+`DISASTER_RECOVERY.md` (backups and restore), `DEPLOYMENT.md` (the cloud
+host) and `PROJECT_STRUCTURE.md` (the file tree).
 
 ## 1. Goals
 
@@ -211,7 +211,8 @@ load off the database the other services use.
 
 - **Scheduling.** A `scheduler` container runs cron: market open and
   close (weekdays, NYSE holidays skipped by the services), tier
-  monitoring, the nightly review, RAG ingestion, log cleanup and the
+  monitoring, the nightly review, RAG ingestion, the purge of unverified
+  accounts, the deletion of old read notifications, log cleanup and the
   nightly backup.
 - **Observability.** Structured JSON logs (every HTTP request
   gets a request id, taken from a valid `X-Request-ID` or newly made; it is
@@ -220,11 +221,18 @@ load off the database the other services use.
   (with unit tests, `make promtool-test`) routed by Alertmanager; Grafana
   dashboards; `/health` per service and a gateway status page.
 - **Backups.** Nightly Postgres dump, object storage and Qdrant snapshots,
-  with a dry-run-first restore (`DISASTER_RECOVERY.md`).
+  with a dry-run-first restore (`DISASTER_RECOVERY.md`). They run on the
+  local stack; the cloud host keeps its scheduler stopped, so it runs no
+  scheduled jobs and makes no backups (`DEPLOYMENT.md`).
 - **CI.** One GitHub Actions workflow per service (flake8, mypy, the test
   suite against real Postgres and Redis containers, the image build) on
-  changes to that service or `shared`, and a stack smoke workflow that
-  starts the whole stack and checks the gateway and the alert rules.
+  changes to that service or `shared`, a frontend workflow (lint, type
+  check, build), and a stack smoke workflow that starts the whole stack
+  and checks the gateway and the alert rules. A deploy workflow then
+  deploys that exact commit to the cloud host once every other workflow
+  run of that commit has succeeded (`DEPLOYMENT.md`). The per-service
+  workflows run only for the services a commit touches, so the gate does
+  not re-check an earlier commit whose own checks failed.
 
 ## 8. Testing
 
@@ -246,5 +254,6 @@ load off the database the other services use.
 - Code quality: `make lint` runs flake8 with its default settings (no
   configuration file, 79-character lines) on `services`, `shared`,
   `tests` and `infra`, then `mypy --strict` on `shared` and each service. The code carries
-  no comments or docstrings except tool pragmas; the handbook explains it
+  few comments (tool pragmas, section names in multi-topic modules, and
+  reasons the code cannot show); the handbook explains it
   (`handbook/31-testing-quality.md` section 3.0).

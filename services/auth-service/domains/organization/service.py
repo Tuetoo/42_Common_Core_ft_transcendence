@@ -263,7 +263,12 @@ class OrganizationService:
                 and requester_id != org.owner_id):
             raise PermissionDeniedError(
                 "Only the organization owner can revoke admin invitations.")
+        role = str(invitation.role)
+        invitee = await self.users.get_by_email(invitation.email)
         await self.orgs.delete_invitation(invitation)
+        await self._org_event(
+            EventName.ORGANIZATION_INVITATION_REVOKED, org, requester_id,
+            user_id=invitee.id if invitee is not None else None, role=role)
 
     async def accept_invitation(
             self, token: str, current_user_id: UUID) -> InvitationAcceptResult:

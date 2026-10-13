@@ -11,7 +11,7 @@ from config import settings
 from database import SessionLocal
 from qdrant import get_qdrant_client
 from qdrant_client.http import models as qmodels
-from scripts._text import one_line
+from scripts.smoke_check import one_line
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 

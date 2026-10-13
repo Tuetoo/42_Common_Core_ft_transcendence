@@ -1,5 +1,5 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
+import { can, getMe } from "@/app/lib/session";
 import { Avatar } from "../avatar";
 import { AddFriendForm, AutoRefresh, ConnectionButton } from "./friend-forms";
 

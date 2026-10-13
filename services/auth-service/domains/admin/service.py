@@ -1,6 +1,5 @@
 import secrets
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -65,7 +64,6 @@ class UnverifiedPurgeResult:
     deleted: int = 0
     skipped: int = 0
     failed: int = 0
-    removed_avatar_urls: list[str] = dataclass_field(default_factory=list)
 
     @property
     def attempted(self) -> int:
@@ -205,7 +203,6 @@ class AdminService:
         result = UnverifiedPurgeResult(candidates=len(candidates))
         for user_id in candidates:
             events_before = len(self.pending_events)
-            self.removed_avatar_url = None
             try:
                 user = await self.admin.lock_unverified_account(
                     user_id, cutoff)
@@ -229,8 +226,6 @@ class AdminService:
                     "unverified_account_purge_failed", user_id=str(user_id),
                     error=str(exc))
                 continue
-            if self.removed_avatar_url:
-                result.removed_avatar_urls.append(self.removed_avatar_url)
             result.deleted += 1
         logger.info(
             "unverified_accounts_purged", candidates=result.candidates,
@@ -242,6 +237,7 @@ class AdminService:
     async def _delete(self, user: User, actor_id: UUID) -> None:
         await self._ensure_not_last_admin(user)
         previous_state = state_of(user)
+        username = user.username
 
         user.deleted_at = datetime.now(UTC)
         user.is_active = False
@@ -263,7 +259,8 @@ class AdminService:
         await commit_with_state(self._db, user, previous_state)
         self._user_event(
             EventName.USER_DELETED, user, actor_id,
-            ["deleted_at", "email", "is_active", "username"])
+            ["deleted_at", "email", "is_active", "username"],
+            username=username)
 
     async def _transfer_owned_organizations(
             self, user: User, actor_id: UUID) -> None:
@@ -349,11 +346,12 @@ class AdminService:
 
     def _user_event(
             self, name: EventName, user: User, actor_id: UUID,
-            changed: list[str]) -> None:
+            changed: list[str], *, username: str | None = None) -> None:
         self.pending_events.append((
             name,
             user_event_payload(
-                user_id=user.id, actor_id=actor_id, role=user.system_role,
+                user_id=user.id, actor_id=actor_id,
+                username=username or user.username, role=user.system_role,
                 is_active=user.is_active, changed=changed)))
 
     @staticmethod

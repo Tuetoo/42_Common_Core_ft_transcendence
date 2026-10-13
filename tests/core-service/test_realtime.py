@@ -189,7 +189,6 @@ def _shared_client():
     import anyio.from_thread
     import main
     from fastapi.testclient import TestClient
-    from domains.research import yjs_guard
 
     client = TestClient(main.app)
     with anyio.from_thread.start_blocking_portal() as portal:
@@ -197,7 +196,7 @@ def _shared_client():
         try:
             yield client
         finally:
-            portal.call(yjs_guard.validator.aclose)
+            portal.call(yjs_relay.validator.aclose)
             client.portal = None
 
 
@@ -232,7 +231,7 @@ def _session(user_id: str, *, can_write: bool):
         note_id=uuid4(),  # type: ignore[arg-type]
         identity=SocketIdentity(user_id=user_id, expires_at=4e9),
         access=NoteAccess(can_read=True, can_write=can_write))
-    yjs_ws._register_session(session)
+    yjs_ws._register(yjs_ws._sessions_by_user, session)
     return session
 
 
@@ -1093,8 +1092,9 @@ class TestNotificationEvents:
         ]
         assert all("Team thesis" in c["content"] for c in notified_user_calls)
 
-    async def test_document_organization_friend_and_user_events(
-            self, notified_user_calls, _schema_ready, event_broadcasts):
+    async def test_document_org_friend_user_and_actor_only_events(
+            self, notified_user_calls, _schema_ready, event_broadcasts,
+            monkeypatch):
         import event_listener
         from database import SessionLocal
         from domains.research.model import Document
@@ -1144,6 +1144,13 @@ class TestNotificationEvents:
             and '"b.txt"' in notified_user_calls[1]["content"])
 
         notified_user_calls.clear()
+        rechecks: list[tuple[str, bool]] = []
+
+        async def _recheck(user_id, *, reason, deactivated=False):
+            rechecks.append((user_id, deactivated))
+            return 0
+
+        monkeypatch.setattr(event_listener, "recheck_user_sessions", _recheck)
 
         user = str(uuid4())
         await event_listener._handle_organization_member_joined({
@@ -1198,14 +1205,22 @@ class TestNotificationEvents:
         friend = {
             "actor_id": actor,
             "user_id": other,
-            "actor_username": "alice"
+            "actor_username": "alice",
+            "other_username": "bob"
         }
         await event_listener._handle_friend_requested(dict(friend))
         await event_listener._handle_friend_accepted(dict(friend))
-        await event_listener._handle_friend_removed(dict(friend))
+        await event_listener._handle_friend_removed({
+            **friend, "action": "removed"
+        })
+        for action in ("declined", "cancelled", "unblocked", "other"):
+            await event_listener._handle_friend_removed({
+                **friend, "action": action
+            })
         base = {
             "user_id": user,
             "actor_id": actor,
+            "username": "carol",
             "role": "moderator",
             "is_active": True,
             "changed": ["display_name"]
@@ -1230,7 +1245,21 @@ class TestNotificationEvents:
         assert (
             notified_user_calls[0]["content"] ==
             "alice sent you a friend request.")
-        assert _types(notified_user_calls, actor) == []
+        actor_calls = [c for c in notified_user_calls if c["user_id"] == actor]
+        assert [c["content"] for c in actor_calls] == [
+            "You sent a friend request to bob.",
+            "You are now friends with bob.",
+            "You removed bob from your friends.",
+            "You declined the friend request from bob.",
+            "You cancelled your friend request to bob.",
+            "You unblocked bob.",
+            "Your connection with bob changed.",
+            "You updated the account of carol (display_name).",
+            "You changed the role of carol to moderator.",
+            "You deactivated the account of carol.",
+            "You reactivated the account of carol.",
+            "You deleted the account of carol."
+        ]
         assert _types(notified_user_calls, user) == [
             "account_updated", "account_role_changed", "account_updated",
             "account_updated"
@@ -1239,6 +1268,73 @@ class TestNotificationEvents:
             "moderator" in next(
                 c for c in notified_user_calls
                 if c["type"] == "account_role_changed")["content"])
+        notified_user_calls.clear()
+        await event_listener._handle_user_updated({
+            **base, "actor_id": user, "changed": ["bio"]
+        })
+        await event_listener._handle_user_deleted({
+            **base, "actor_id": user, "changed": ["deleted_at"]
+        })
+        assert [(c["user_id"], c["content"]) for c in notified_user_calls
+                ] == [(user, "Your account was updated (bio).")]
+        assert rechecks == [
+            (b, False), (joiner, False), (b, False), (a, False), (b, False),
+            *[(actor, False), (other, False)] * 5,
+            (user, False), (user, True), (user, True), (user, True)
+        ]
+
+        notified_user_calls.clear()
+        rechecked: list[str] = []
+
+        async def _recheck(user_id, *, reason, deactivated=False):
+            rechecked.append(user_id)
+            return 0
+
+        monkeypatch.setattr(event_listener, "recheck_user_sessions", _recheck)
+        actor, invitee, blocked = (str(uuid4()) for _ in range(3))
+        await event_listener._handle_organization_invitation_revoked(
+            _org_payload(actor_id=actor, role="viewer", member_ids=[actor]))
+        await event_listener._handle_connection_blocked({
+            "actor_id": actor,
+            "blocked_user_id": blocked,
+            "blocked_username": "mallory"
+        })
+        await event_listener._handle_backtest_deleted({
+            "backtest_id": "b3",
+            "user_id": actor,
+            "kind": "portfolio"
+        })
+        await event_listener._handle_connection_blocked(
+            {"blocked_user_id": blocked})
+
+        assert _types(notified_user_calls, actor) == [
+            "organization_invitation_revoked", "connection_blocked",
+            "backtest_deleted"
+        ]
+        assert _types(notified_user_calls, invitee) == []
+        assert _types(notified_user_calls, blocked) == []
+        assert rechecked == [actor, blocked, blocked]
+        assert notified_user_calls[0]["content"] == (
+            'You revoked an invitation to the organization "Acme" '
+            "(role viewer).")
+        assert "mallory" in notified_user_calls[1]["content"]
+        assert notified_user_calls[2]["content"] == (
+            "Your portfolio backtest (b3) was deleted.")
+
+        notified_user_calls.clear()
+        await event_listener._handle_organization_invitation_created(
+            _org_payload(actor_id=actor, role="member"))
+        await event_listener._handle_organization_invitation_revoked(
+            _org_payload(actor_id=actor, user_id=invitee, role="member"))
+        assert [(c["user_id"], c["content"]) for c in notified_user_calls] == [
+            (actor,
+             'You invited a user to join the organization "Acme" '
+             "(role member)."),
+            (invitee, 'Your invitation to the organization "Acme" was '
+             "withdrawn."),
+            (actor, 'You revoked an invitation to the organization "Acme" '
+             "(role member).")
+        ]
 
     async def test_ai_and_tier_events_notify_and_broadcast(
             self, notified_user_calls, event_broadcasts, _schema_ready):
@@ -1266,6 +1362,13 @@ class TestNotificationEvents:
             "ticker": "AMD",
             "decision": "followed"
         })
+        await event_listener._handle_decision_reviewed({
+            "decision_id": str(uuid4()),
+            "analysis_id": analysis,
+            "user_id": user,
+            "ticker": "AMD",
+            "decision": "followed"
+        })
         await event_listener._handle_backtest_completed({
             "backtest_id": "b1",
             "user_id": user,
@@ -1283,7 +1386,7 @@ class TestNotificationEvents:
 
         assert _types(notified_user_calls, user) == [
             "analysis_started", "analysis_failed", "decision_recorded",
-            "backtest_completed", "backtest_failed"
+            "decision_reviewed", "backtest_completed", "backtest_failed"
         ]
         assert "no data" in notified_user_calls[1]["content"]
         channel = f"analysis:{analysis}"
@@ -1375,7 +1478,8 @@ class TestNotificationEvents:
         }
         await event_listener._handle_friend_requested(dict(payload))
         await event_listener._handle_friend_requested(dict(payload))
-        assert len(notified_user_calls) == 1
+        assert sorted(c["user_id"] for c in notified_user_calls) == sorted(
+            [payload["actor_id"], payload["user_id"]])
 
         def _broken(settings):
             raise ConnectionError("redis down")
@@ -1658,11 +1762,9 @@ class TestYjsCollaboration:
 
     async def test_malformed_updates_are_rejected_and_close_the_sender(
             self, monkeypatch, mock_cross_service, presence_calls, yjs_env):
-        from domains.research import yjs_guard
-
-        validator = yjs_guard.UpdateValidator(workers=1)
+        validator = yjs_relay.UpdateValidator(workers=1)
         try:
-            good = yjs_guard.seed_state("hello")
+            good = yjs_relay.seed_state("hello")
             assert await validator.validate(good) is None
             for payload in (ABORTING_UPDATE, SEGFAULTING_UPDATE,
                             PANICKING_UPDATE, b"\x00\x01\x02garbage"):
@@ -1677,14 +1779,14 @@ class TestYjsCollaboration:
         def _panic():
             raise PanicLike("rust panic")
 
-        with pytest.raises(yjs_guard.YjsDecodeError):
-            yjs_guard.guarded(_panic, what="test")
+        with pytest.raises(yjs_relay.YjsDecodeError):
+            yjs_relay.guarded(_panic, what="test")
         with pytest.raises(KeyboardInterrupt):
-            yjs_guard.guarded(
+            yjs_relay.guarded(
                 lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
                 what="test")
 
-        worker = yjs_guard._DecoderWorker()
+        worker = yjs_relay._DecoderWorker()
         worker.kill()
         assert worker._process is None
         process = worker._ensure()
@@ -1695,7 +1797,6 @@ class TestYjsCollaboration:
 
         import api.websocket as yjs_ws
         import main
-        import yjs_relay
         from fastapi.testclient import TestClient
         from websocket_manager import manager
 
@@ -1775,7 +1876,7 @@ class TestYjsCollaboration:
                 assert _room_text(client, note_id) == "hello world"
             assert _wait_room_evicted(note_id)
 
-    def test_viewer_and_downgraded_socket_cannot_write(self, yjs_env):
+    def test_viewer_cannot_write_and_downgrade_closes_socket(self, yjs_env):
         writer, writer_token = _token()
         viewer, viewer_token = _token()
         guest, guest_token = _token(role="guest")
@@ -1822,7 +1923,6 @@ class TestYjsCollaboration:
                   w, client.websocket_connect(url + member_token) as m):
                 w.receive_bytes()
                 m.receive_bytes()
-                editor = _Editor()
 
                 yjs_env[member] = (True, False)
                 assert (
@@ -1830,18 +1930,6 @@ class TestYjsCollaboration:
                         functools.partial(
                             yjs_ws.recheck_user_sessions, member,
                             reason="role")) == 1)
-                m.send_bytes(_update("member edit"))
-                first = editor.type("from writer")
-                w.send_bytes(first)
-                assert m.receive_bytes() == first
-                assert _room_text(client, note_id) == "from writer"
-
-                yjs_env[member] = (False, False)
-                assert (
-                    client.portal.call(
-                        functools.partial(
-                            yjs_ws.recheck_user_sessions, member,
-                            reason="removed")) == 1)
                 assert _bytes_close_code(m) == 4403
 
                 assert (
@@ -1923,22 +2011,23 @@ class TestYjsCollaboration:
         revoked = _session(user, can_write=True)
         demoted = _session(user, can_write=True)
         unchanged = _session(user, can_write=True)
+        reader = _session(user, can_write=False)
         other = _session(str(uuid4()), can_write=True)
         note_access[revoked.note_id] = (False, False)
         note_access[demoted.note_id] = (True, False)
+        note_access[reader.note_id] = (True, False)
 
         changed = await yjs_ws.recheck_user_sessions(user, reason="test")
         assert changed == 2
         assert revoked.websocket.closed == (
             4403, "access to this note was revoked")
-        assert demoted.websocket.closed is None
-        assert (
-            demoted.access.can_write is False
-            and demoted.access.can_read is True)
+        assert demoted.websocket.closed == (
+            4403, "write access to this note was revoked")
         assert (
             unchanged.websocket.closed is None and unchanged.access.can_write)
+        assert reader.websocket.closed is None
         assert other.websocket.closed is None
-        assert yjs_ws._sessions_by_user[user] == {demoted, unchanged}
+        assert yjs_ws._sessions_by_user[user] == {unchanged, reader}
 
         async def _down(note_id, identity):
             raise ConnectionError("auth down")

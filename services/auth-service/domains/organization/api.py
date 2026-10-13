@@ -170,12 +170,14 @@ async def list_invitations(
         "Revoke an open invitation; its link stops working. Owner and admins "
         "only; an admin invitation can be revoked by the owner only."))
 async def revoke_invitation(
-    org_id: UUID, invitation_id: UUID,
+    org_id: UUID, invitation_id: UUID, background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(require_organization_create),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
-    await OrganizationService(db).revoke_invitation(
+    service = OrganizationService(db)
+    await service.revoke_invitation(
         org_id, current_user.user_id, invitation_id)
+    schedule_events(background_tasks, service.pending_events)
 
 
 @router.post(

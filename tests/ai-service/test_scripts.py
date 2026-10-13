@@ -22,8 +22,8 @@ import httpx
 import pytest
 import pytest_asyncio
 import qdrant as qdrant_module
-from ai.benchmark import metrics as production_metrics
 from ai.providers.base import PriceBar
+from ai.tools import indicators as production_metrics
 from ai.workflows.backtest_workflow import _twr_daily_returns
 from config import settings
 from database import SessionLocal
@@ -154,7 +154,7 @@ async def _add_chunk(
 
 class TestSmokeRunner:
 
-    def test_isolation_timeouts_llm_flag_and_memo(self) -> None:
+    def test_isolation_timeouts_memo_main_and_registry(self):
         results = _run([
             smoke.Check("a_crash", _crash),
             smoke.Check("b_fail", _fail),
@@ -207,7 +207,6 @@ class TestSmokeRunner:
         asyncio.run(scenario())
         assert calls == [1]
 
-    def test_main_exit_codes_only_filter_summary_and_registry(self) -> None:
         checks = [smoke.Check("good", _ok), smoke.Check("bad", _fail)]
         cleanups: list[int] = []
 
@@ -1134,7 +1133,8 @@ class TestE2eTierCheck:
 
 class TestAnalysisCli:
 
-    def test_invalid_uuid_and_access_denied(self, monkeypatch):
+    async def test_invalid_uuid_access_denied_and_committed_budget(
+            self, monkeypatch, rows):
         from scripts import analysis_cli
 
         def _no_urlopen(*args, **kwargs):
@@ -1162,6 +1162,20 @@ class TestAnalysisCli:
             ])
         assert code == 1
         assert "not_found" in out.getvalue()
+
+        pf = uuid4()
+        analysis_id, _, _ = await rows.recommendation(
+            ticker="KO", portfolio_id=pf, action="buy",
+            tiers=[("buy", "60", "5", "pending_acceptance"),
+                   ("sell", "70", "5", "pending_acceptance")])
+
+        assert await analysis_cli._committed(str(pf)) == (
+            f"KO 300.00 (analysis {analysis_id}, pending acceptance)\n"
+            "total committed BUY cash: 300.00")
+        assert await analysis_cli._committed(str(uuid4())) == (
+            "total committed BUY cash: 0.00")
+        with pytest.raises(SystemExit):
+            analysis_cli.main(["committed", "not-a-uuid"])
 
 
 class TestUploadSeedAsSystem:
@@ -1363,7 +1377,7 @@ def _txn(
 
 class TestVerifyPortfolioBacktest:
 
-    def test_cash_and_shares_as_of_a_day_and_tolerances(self) -> None:
+    def test_positions_tolerances_and_independent_metrics(self):
         txns = [
             _txn("2026-09-01T14:00:00", "deposit", "", "10000"),
             _txn("2026-09-02T15:00:00", "buy", "MSFT", "10", "500"),
@@ -1390,7 +1404,6 @@ class TestVerifyPortfolioBacktest:
         assert not verify.same(None, 0.1) and verify.same(None, None)
         assert verify.same(0.0314085297327937, Decimal("0.0314085297327937"))
 
-    def test_independent_metrics_agree_with_production(self) -> None:
         days = [date(2026, 9, d) for d in (1, 2, 3, 4, 7, 8)]
         values = [10000.0, 10100.0, 11050.0, 10900.0, 10700.0, 11200.0]
         benchmark = [500.0, 503.0, 501.0, 498.0, 505.0, 507.0]
@@ -1547,7 +1560,7 @@ class TestRepositoryConfiguration:
         clean = makefile.split("\nclean:\n", 1)[1].split("\n\n", 1)[0]
         assert '".mypy_cache"' in clean
 
-    def test_files_keep_required_text_and_drop_forbidden_text(self) -> None:
+    def test_files_keep_required_text_and_vector_keeps_compose_only(self):
         cases = {
             "heartbeat-names-the-scheduled-job-label": ((
                 "infra", "scheduler", "heartbeat.sh"), [
@@ -1585,7 +1598,6 @@ class TestRepositoryConfiguration:
             for snippet in forbidden:
                 assert snippet not in text, case_id
 
-    def test_vector_keeps_only_compose_containers(self) -> None:
         config = tomllib.loads(
             (ROOT / "infra" / "vector" / "vector.toml").read_text())
         source = config["transforms"]["prepare"]["source"]
@@ -1677,3 +1689,97 @@ class TestPromptStringHygiene:
             if _HISTORY.search(text)
         ]
         assert found == []
+
+
+_FAKE_DEPLOY_DOCKER = """#!/bin/sh
+echo "docker $*" >> "$FAKE_LOG"
+case "$*" in
+  *" ps -q "*) [ -n "$FAKE_RUNNING" ] && echo 0123abcd ;;
+  *" config --services"*) printf '%s' "$FAKE_SERVICES" ;;
+esac
+exit 0
+"""
+
+_FAKE_DEPLOY_GIT = """#!/bin/sh
+echo "git $*" >> "$FAKE_LOG"
+case "$1" in
+  merge-base) exit "$FAKE_ANCESTOR_RC" ;;
+  log) echo "abc1234 subject" ;;
+esac
+exit 0
+"""
+
+
+def _run_deploy(tmp_path: Path, *, running: bool = False,
+                services: str = "gateway\npostgres\nscheduler\n",
+                ssh_command: str | None = None,
+                ancestor: bool = True) -> tuple[int, list[str]]:
+    # A copy of the script in a fake checkout, so `cd ..` lands there and
+    # the required files are test placeholders; docker and git only log.
+    checkout = tmp_path / "checkout"
+    (checkout / "scripts").mkdir(parents=True)
+    (checkout / "scripts" / "deploy.sh").write_text(
+        (ROOT / "scripts" / "deploy.sh").read_text())
+    (checkout / ".env.docker").write_text("")
+    certs = checkout / "infra" / "gateway" / "certs"
+    certs.mkdir(parents=True)
+    (certs / "server.crt").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("docker", _FAKE_DEPLOY_DOCKER),
+                       ("git", _FAKE_DEPLOY_GIT)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    log = tmp_path / "calls.log"
+    env = {
+        k: v
+        for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"
+    }
+    env.update(PATH=f"{bin_dir}:{os.environ['PATH']}", FAKE_LOG=str(log),
+               FAKE_RUNNING="1" if running else "", FAKE_SERVICES=services,
+               FAKE_ANCESTOR_RC="0" if ancestor else "1")
+    if ssh_command is not None:
+        env["SSH_ORIGINAL_COMMAND"] = ssh_command
+    result = subprocess.run(
+        ["bash", str(checkout / "scripts" / "deploy.sh")], env=env,
+        capture_output=True, text=True)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return result.returncode, calls
+
+
+def test_deploy_script_commit_choice_and_scheduler_state(tmp_path) -> None:
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    compose = "docker compose --env-file .env.docker"
+
+    rc, calls = _run_deploy(tmp_path / "running", running=True)
+    assert rc == 0
+    assert "git merge --ff-only --quiet origin/main" in calls
+    ups = [c for c in calls if f"{compose} up " in c]
+    assert ups == [f"{compose} up -d --build --remove-orphans --wait "
+                   "--wait-timeout 300"]
+    assert not any("stop scheduler" in c for c in calls)
+
+    rc, calls = _run_deploy(tmp_path / "stopped", ssh_command=sha)
+    assert rc == 0
+    assert f"git merge-base --is-ancestor {sha} origin/main" in calls
+    assert f"git merge --ff-only --quiet {sha}" in calls
+    ups = [i for i, c in enumerate(calls) if f"{compose} up " in c]
+    assert len(ups) == 1
+    assert calls[ups[0]].endswith("--wait-timeout 300 gateway postgres")
+    assert calls.index(f"{compose} build scheduler") < ups[0]
+    assert calls.index(f"{compose} stop scheduler") > ups[0]
+
+    for case_id, kwargs in {
+            "no-services": {"services": ""},
+            "only-scheduler": {"services": "scheduler\n"},
+            "not-a-sha": {"ssh_command": "main; rm -rf /"},
+            "short-sha": {"ssh_command": sha[:12]},
+            "not-on-main": {"ssh_command": sha, "ancestor": False},
+    }.items():
+        rc, calls = _run_deploy(tmp_path / case_id, **kwargs)
+        assert rc == 1, case_id
+        assert not any(f"{compose} up " in c for c in calls), case_id
+        if "ssh_command" in kwargs:
+            assert not any("git merge --ff" in c for c in calls), case_id
+        if case_id in ("not-a-sha", "short-sha"):
+            assert not any(c.startswith("git ") for c in calls), case_id

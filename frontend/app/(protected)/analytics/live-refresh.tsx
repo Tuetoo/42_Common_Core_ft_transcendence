@@ -3,8 +3,7 @@
 import { useEffect, useState } from "react";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { useRouter } from "next/navigation";
-import { wsUrl } from "@/app/lib/ws-url";
-import { CLOSE_UNAUTHORIZED, closeSocket } from "../close-socket";
+import { CLOSE_UNAUTHORIZED, closeSocket, wsUrl } from "@/app/lib/ws-url";
 
 type ConnectionStatus = "connecting" | "live" | "reconnecting";
 

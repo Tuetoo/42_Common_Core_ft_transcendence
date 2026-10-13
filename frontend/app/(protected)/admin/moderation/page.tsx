@@ -3,8 +3,8 @@ import Form from "next/form";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { can, getMe } from "@/app/lib/me";
-import { moderateContent } from "@/app/lib/actions/moderation";
+import { can, getMe } from "@/app/lib/session";
+import { moderateContent } from "@/app/lib/actions/admin";
 import { Pager, pageParam } from "../../pager";
 import { ActionButton } from "../inline-actions";
 import { ModerateByIdForm } from "./moderate-by-id-form";
@@ -116,7 +116,7 @@ export default async function ModerationPage({ searchParams }: { searchParams: P
         <Form action="/admin/moderation" className="filter-row">
           <div className="field">
             <label htmlFor="q">Search notes</label>
-            <input id="q" name="q" type="search" maxLength={200} defaultValue={q} placeholder="Words in title or text" />
+            <input id="q" name="q" autoComplete="off" type="search" maxLength={200} defaultValue={q} placeholder="Words in title or text" />
           </div>
           <button type="submit" className="btn btn-primary">
             Search

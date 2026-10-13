@@ -1,7 +1,7 @@
 "use client";
 
 import { useActionState, useState } from "react";
-import { moderateById, type ModerateByIdState } from "@/app/lib/actions/moderation";
+import { moderateById, type ModerateByIdState } from "@/app/lib/actions/admin";
 
 const initialState: ModerateByIdState = {};
 const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
@@ -25,7 +25,7 @@ export function ModerateByIdForm() {
       <div className="filter-row">
         <div className="field">
           <label htmlFor="mod-kind">Type</label>
-          <select id="mod-kind" name="kind" value={kind} onChange={(e) => setKind(e.target.value)}>
+          <select id="mod-kind" name="kind" autoComplete="off" value={kind} onChange={(e) => setKind(e.target.value)}>
             <option value="note">Note</option>
             <option value="comment">Comment</option>
           </select>
@@ -35,6 +35,7 @@ export function ModerateByIdForm() {
           <input
             id="mod-id"
             name="id"
+            autoComplete="off"
             type="text"
             required
             maxLength={36}

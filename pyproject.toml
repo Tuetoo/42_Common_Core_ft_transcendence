@@ -99,6 +99,26 @@ disallow_untyped_defs = true
 # an absolute path cannot be set portably in this file.
 explicit_package_bases = true
 
+[tool.pyright]
+# Editor import resolution only (Pylance in VS Code reads this section).
+# Each service and its tests import the service's own top-level modules
+# (config, database, domains, ...) and the repository-root `shared`
+# package, the same paths tests/*/conftest.py puts on sys.path. mypy
+# --strict remains the type checker, so pyright's own checks stay off.
+typeCheckingMode = "off"
+venvPath = "."
+venv = ".venv"
+executionEnvironments = [
+  { root = "services/auth-service", extraPaths = ["."] },
+  { root = "services/core-service", extraPaths = ["."] },
+  { root = "services/ai-service", extraPaths = ["."] },
+  { root = "tests/auth-service", extraPaths = ["services/auth-service", "tests", "."] },
+  { root = "tests/core-service", extraPaths = ["services/core-service", "tests", "."] },
+  { root = "tests/ai-service", extraPaths = ["services/ai-service", "tests", "."] },
+  { root = "tests/integration", extraPaths = ["services/ai-service", "tests", "."] },
+  { root = "." },
+]
+
 [tool.pytest.ini_options]
 
 asyncio_mode = "auto"

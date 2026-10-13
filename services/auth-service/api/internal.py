@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 from config import settings
@@ -12,7 +11,7 @@ from user_state_sync import state_of
 from domains.admin.service import AdminService
 from domains.auth.repository import UserRepository
 from domains.auth.service import (AuthService, avatar_or_default,
-                                  delete_stored_avatar, is_user_online)
+                                  is_user_online)
 from domains.organization.repository import OrganizationRepository
 from domains.social.repository import ConnectionRepository
 from shared.enums import ConnectionStatus
@@ -119,10 +118,6 @@ async def purge_unverified_accounts(
     service = AdminService(db)
     result = await service.purge_unverified_accounts()
     schedule_events(background_tasks, service.pending_events)
-    for avatar_url in result.removed_avatar_urls:
-        background_tasks.add_task(
-            delete_stored_avatar, avatar_url,
-            Path(settings.AVATAR_STORAGE_DIR))
     return job_response(
         "purge-unverified", {
             "retention_days": settings.UNVERIFIED_ACCOUNT_RETENTION_DAYS,

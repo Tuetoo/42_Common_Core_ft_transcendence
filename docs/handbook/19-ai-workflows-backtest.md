@@ -59,6 +59,7 @@ The life of a recommendation tier across workflows:
                                                     +-- 5xx/timeout: stays accepted,
                                                         tried again next trading day
                  window passed (any open status) --> expired
+                 system analysis pending > SYSTEM_TIER_ACCEPTANCE_HOURS --> expired
 ```
 
 ---
@@ -190,9 +191,12 @@ recorded as a success, however many tiers are still pending.
    ticker ignores tiers whose window has passed (it does not mark them
    `superseded` and does not count them as kept; chapter 16, section
    3.14).
-2. **Only accepted tiers can trigger.** A `pending_acceptance` tier inside
-   its window (or a tier whose recommendation has no window yet) is left
-   alone (`pending`).
+2. **Only accepted tiers can trigger.** A `pending_acceptance` tier of a
+   system analysis (`user_id` null) whose recommendation is older than
+   `SYSTEM_TIER_ACCEPTANCE_HOURS` (72) becomes `expired`
+   (`acceptance_lapsed`; chapter 16, section 3.15). Any other
+   `pending_acceptance` tier inside its window (or a tier whose
+   recommendation has no window yet) is left alone (`pending`).
 3. **Price data.** `get_bars_cache_first(ticker, interval="1d",
    lookback_days=1)` (`ai/tools/market_data_cache.py`, the same cache the
    agents use, so every check leaves a `price_bars` row behind for
@@ -387,10 +391,11 @@ Cost and failure rules (`ai/workflows/auto_ingestion_workflow.py`):
   filings step or the news step attempted failed, or when the macro step
   failed (steps `filings`, `news`, `macro`).
 
-### 3.7 Metrics: `ai/benchmark/metrics.py`
+### 3.7 Metrics: `ai/tools/indicators.py`
 
 Pure functions, no database, no network, shared by the three backtests and
-the review. Each returns `None` (not 0.0) when there is too little data,
+the review. They form the section "Backtest and performance metrics" of
+`ai/tools/indicators.py`, next to the technical indicators. Each returns `None` (not 0.0) when there is too little data,
 so "not enough data" never looks like "zero risk".
 
 | Function | Formula | Notes |
@@ -521,7 +526,9 @@ shutdown, `stop_background_backtests` cancels the running tasks and waits
 for them before the database engine and clients are closed; a cancelled
 backtest stays `running`. At startup, `fail_stale_backtests_on_startup`
 fails backtests left `pending` or `running` by a stopped process. `DELETE /api/v1/backtests/{id}` removes
-a finished backtest (409 while pending or running).
+a finished backtest (409 while pending or running) and, after the commit,
+publishes `backtest.deleted` (`backtest_id`, `user_id`, `kind`) as a
+background task, which notifies the owner.
 
 **The response.** `GET /api/v1/backtests/{id}` returns
 `BacktestDetailRead`: the backtest fields (`strategy_name`,
@@ -564,6 +571,11 @@ with `reviews_removed`), because a review describes the old action.
   string; otherwise it is empty.
 - Only the decision's own user may generate or read it (another user's
   decision is a 404); generating needs `analysis:create`.
+- A stored review publishes `decision.reviewed` (same payload as
+  `decision.recorded`) after the response; core-service turns it into a
+  `decision_reviewed` notification for the user ("A new review of your
+  decision on T is ready."). A failed generation (503) publishes
+  nothing.
 
 ### 3.10 User sentiment scoring
 
@@ -600,7 +612,7 @@ per-agent rollup:
 | RAG retrieval | Does search find the chunk that holds the answer? | golden set of (question, chunk) pairs; Recall@K and MRR for BM25, vector and fused search; an integration-test floor | chapter 17, section 3.15; chapter 31, section 3.6 |
 | Recommendation accuracy | Was the BUY, HOLD or SELL call right in direction? | review pass 1: every recommendation, 30 days later, into `ai.recommendation_metrics` | 3.5 |
 | Decision outcome | Did following (or not following) the call pay off against the benchmark? | review pass 2: only explicit decisions, at 7, 30 and 90 days, into `ai.decision_outcomes` | 3.5 |
-| Backtest | How did the real triggered trades, or the real portfolio, do over a period against a benchmark? | the three backtests and `ai/benchmark/metrics.py` | 3.7, 3.8 |
+| Backtest | How did the real triggered trades, or the real portfolio, do over a period against a benchmark? | the three backtests and the metrics in `ai/tools/indicators.py` | 3.7, 3.8 |
 | Agent rollup | Is one agent role pulling its weight? | review pass 3: average score and success rate per agent, into `ai.agent_metrics` | 3.5 |
 
 **Why the layers stay separate.** A low recall points at retrieval; a low
@@ -659,16 +671,17 @@ layers on synthetic price series from a fake market-data provider.
 | curl limit rag-ingest | 3600 s | same | |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | `services/ai-service/config.py` | accuracy checkpoint |
 | `ANALYSIS_TIMEOUT_SECONDS` | 2700.0 | same | per analysis |
+| `SYSTEM_TIER_ACCEPTANCE_HOURS` | 72 | same | pending tier of a system analysis waits this long for acceptance (3.3) |
 | `SENTIMENT_MAX_INPUT_CHARS` | 6000 | same | text cut for sentiment |
 | `_DECISION_EVALUATION_WINDOWS` | 7, 30, 90 | `ai/workflows/review_workflow.py` | decision outcome windows |
 | `_DEFAULT_BENCHMARK` | `SPY` | same | decision outcome benchmark |
 | `_HOLD_FLAT_BAND` | 0.02 | same | HOLD correct within +-2% |
 | `benchmark_symbol` default | `SPY` | `domains/backtest/schema.py` | backtests; `^GSPC` allowed |
 | `initial_capital` default (replay) | 100000.0 | same | |
-| `_TRADING_DAYS_PER_YEAR` | 252 | `ai/benchmark/metrics.py` | annualization |
+| `_TRADING_DAYS_PER_YEAR` | 252 | `ai/tools/indicators.py` | annualization |
 | `POSITIVE_THRESHOLD` / `NEGATIVE_THRESHOLD` | 0.15 / -0.15 | `ai/user_sentiment.py` | sentiment labels |
 | `BACKTEST_MAX_ACTIVE_PER_USER` | 2 | `domains/backtest/api.py` | backtests pending or running per user |
-| `_TIER_FAILED_OUTCOMES` | `execution_failed`, `no_fresh_data` | `api/internal.py` | tier outcomes counted as failed for the 500 rule |
+| `_TIER_FAILED_OUTCOMES` | `execution_failed`, `no_fresh_data`, `price_lookup_failed` | `api/internal.py` | tier outcomes counted as failed for the 500 rule |
 
 ---
 
@@ -897,7 +910,7 @@ real accepted tiers into the portfolio.
 | `services/ai-service/ai/workflows/review_workflow.py` | accuracy, decision outcomes, agent metrics |
 | `services/ai-service/ai/workflows/auto_ingestion_workflow.py` | nightly ingestion (chapter 17) |
 | `services/ai-service/ai/workflows/backtest_workflow.py` | all three backtests: single-ticker replay and replay of all the user's fills (one runner, `_replay_backtest`), the snapshot-based TWR backtest; shared helpers |
-| `services/ai-service/ai/benchmark/metrics.py` | return, drawdown, Sharpe, Sortino, alpha/beta, IR, TE, win rate |
+| `services/ai-service/ai/tools/indicators.py` | backtest and performance metrics: return, drawdown, Sharpe, Sortino, alpha/beta, IR, TE, win rate (the technical indicators are in chapter 15) |
 | `services/ai-service/api/internal.py` | scheduler routes, `/internal/sentiment` |
 | `services/ai-service/domains/backtest/` | backtest API, schemas, repository, models |
 | `services/ai-service/domains/decision/service.py` | decisions and the decision review |

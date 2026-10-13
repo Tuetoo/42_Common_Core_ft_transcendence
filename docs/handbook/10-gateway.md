@@ -636,7 +636,7 @@ override does not set `command`).
 
 Without these flags, every request in auth-service would appear to come
 from the gateway's container address. auth-service's per-IP limits
-(`rate_limit.client_ip`, used for register, login and password reset)
+(`security.py::client_ip`, used for register, login and password reset)
 would then put every user in the world in one bucket: ten registrations
 per hour for everyone together.
 
@@ -1027,7 +1027,7 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
    `POST /internal/scheduler/market-close`?
 7. You edit one word in the `<script>` of `status.html`. What breaks, and
    which command fixes it?
-8. Why is `/api/v1/rag` the only location with `proxy_buffering off`?
+8. Why do `/api/v1/rag` and the frontend `location /` turn buffering off?
 9. Why does the access log use `$uri` instead of `$request`?
 10. How long is the development certificate valid and for which names?
 11. Why does the frontend call `http://gateway:8080` and not
@@ -1055,8 +1055,9 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 7. The script's SHA-256 no longer matches the CSP, so the browser refuses
    to run it and the page stays on "Checking...".
    `python3 infra/gateway/csp_hashes.py --write`, then restart the gateway.
-8. `/api/v1/rag/ask/stream` sends Server-Sent Events; buffering would hold
-   the tokens back. It also needs a longer read timeout (180 s).
+8. `/api/v1/rag/ask/stream` sends Server-Sent Events, and the frontend
+   streams its own answer page (`/research/ask/stream`); buffering would
+   hold the tokens back. Both also need a longer read timeout (180 s).
 9. `$request` contains the query string, which can hold a WebSocket access
    token or an OAuth code.
 10. 825 days, for `DNS:localhost` and `IP:127.0.0.1`.

@@ -3,8 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { getAccessToken } from "@/app/lib/session";
-import { backendFetch } from "@/app/lib/backend";
-import { extractErrorMessage } from "@/app/lib/api-error";
+import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
 import {
   COMMENT_MAX,
   NOTE_CONTENT_MAX,
@@ -15,6 +14,8 @@ import {
 
 export type CreateNoteState = {
   error?: string;
+  // What was typed, returned with an error so the reset form shows it again.
+  values?: { title: string; content: string; tags: string; organization_id: string };
 };
 
 // POST /research/notes (services/core-service/domains/research/api.py,
@@ -25,35 +26,38 @@ export async function createNote(
   _prevState: CreateNoteState,
   formData: FormData
 ): Promise<CreateNoteState> {
-  const title = formData.get("title");
-  const content = formData.get("content");
-  const tagsRaw = formData.get("tags");
-  const organizationRaw = formData.get("organization_id");
+  const values = {
+    title: String(formData.get("title") ?? ""),
+    content: String(formData.get("content") ?? ""),
+    tags: String(formData.get("tags") ?? ""),
+    organization_id: String(formData.get("organization_id") ?? ""),
+  };
+  const { title, content, organization_id: organizationRaw } = values;
 
-  if (typeof title !== "string" || !title.trim()) {
-    return { error: "Please enter a title" };
+  if (!title.trim()) {
+    return { values, error: "Please enter a title" };
   }
   if (title.trim().length > NOTE_TITLE_MAX) {
-    return { error: `The title must be at most ${NOTE_TITLE_MAX} characters` };
+    return { values, error: `The title must be at most ${NOTE_TITLE_MAX} characters` };
   }
-  if (typeof content === "string" && content.length > NOTE_CONTENT_MAX) {
-    return { error: `The content must be at most ${NOTE_CONTENT_MAX.toLocaleString("en-US")} characters` };
+  if (content.length > NOTE_CONTENT_MAX) {
+    return { values, error: `The content must be at most ${NOTE_CONTENT_MAX.toLocaleString("en-US")} characters` };
   }
-  const { tags, error: tagError } = parseTags(typeof tagsRaw === "string" ? tagsRaw : "");
+  const { tags, error: tagError } = parseTags(values.tags);
   if (tagError) {
-    return { error: tagError };
+    return { values, error: tagError };
   }
   let organizationId: string | null = null;
-  if (typeof organizationRaw === "string" && organizationRaw) {
+  if (organizationRaw) {
     if (!UUID_RE.test(organizationRaw)) {
-      return { error: "Please choose a valid organization" };
+      return { values, error: "Please choose a valid organization" };
     }
     organizationId = organizationRaw;
   }
 
   const accessToken = await getAccessToken();
   if (!accessToken) {
-    return { error: "You're not logged in" };
+    return { values, error: "You're not logged in" };
   }
 
   let res: Response;
@@ -63,17 +67,17 @@ export async function createNote(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         title: title.trim(),
-        content: typeof content === "string" && content.trim() ? content : null,
+        content: content.trim() ? content : null,
         tags,
         organization_id: organizationId,
       }),
     });
   } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
+    return { values, error: "Could not reach the server. Is the backend running?" };
   }
 
   if (!res.ok) {
-    return { error: await extractErrorMessage(res, "Could not create note") };
+    return { values, error: await extractErrorMessage(res, "Could not create note") };
   }
 
   const { data } = (await res.json()) as { data: { id: string } };
@@ -86,6 +90,8 @@ export type AddCommentState = {
   error?: string;
   // Changes after every successful post so the form can reset itself.
   posted?: number;
+  // The comment, returned with an error so the reset form shows it again.
+  values?: { content: string };
 };
 
 // POST /research/notes/{id}/comments (body ResearchCommentCreate:
@@ -95,21 +101,22 @@ export async function addComment(
   _prevState: AddCommentState,
   formData: FormData
 ): Promise<AddCommentState> {
-  const content = formData.get("content");
+  const content = String(formData.get("content") ?? "");
+  const values = { content };
 
-  if (typeof content !== "string" || !content.trim()) {
-    return { error: "Please enter a comment" };
+  if (!content.trim()) {
+    return { values, error: "Please enter a comment" };
   }
   if (content.length > COMMENT_MAX) {
-    return { error: `A comment must be at most ${COMMENT_MAX.toLocaleString("en-US")} characters` };
+    return { values, error: `A comment must be at most ${COMMENT_MAX.toLocaleString("en-US")} characters` };
   }
   if (!UUID_RE.test(noteId)) {
-    return { error: "Invalid note" };
+    return { values, error: "Invalid note" };
   }
 
   const accessToken = await getAccessToken();
   if (!accessToken) {
-    return { error: "You're not logged in" };
+    return { values, error: "You're not logged in" };
   }
 
   let res: Response;
@@ -120,11 +127,11 @@ export async function addComment(
       body: JSON.stringify({ content }),
     });
   } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
+    return { values, error: "Could not reach the server. Is the backend running?" };
   }
 
   if (!res.ok) {
-    return { error: await extractErrorMessage(res, "Could not add comment") };
+    return { values, error: await extractErrorMessage(res, "Could not add comment") };
   }
 
   revalidatePath(`/research/${noteId}`);
@@ -155,4 +162,39 @@ export async function deleteNote(
   }
   revalidatePath("/research");
   redirect("/research");
+}
+
+// Uploads do not go through a Server Action (their body is capped at 6MB in
+// next.config.ts, and they can't report progress). The browser posts the
+// file to the route handler app/(protected)/research/documents/upload.
+
+export type DeleteDocumentState = {
+  error?: string;
+};
+
+// DELETE /research/documents/{id}: only the owner may delete; the backend
+// removes the row, its RAG chunks and the stored object.
+export async function deleteDocument(documentId: string): Promise<DeleteDocumentState> {
+  if (!UUID_RE.test(documentId)) {
+    return { error: "Invalid document" };
+  }
+
+  const accessToken = await getAccessToken();
+  if (!accessToken) {
+    return { error: "You're not logged in" };
+  }
+
+  let res: Response;
+  try {
+    res = await backendFetch(`/research/documents/${documentId}`, accessToken, { method: "DELETE" });
+  } catch {
+    return { error: "Could not reach the server. Is the backend running?" };
+  }
+
+  if (!res.ok && res.status !== 404) {
+    return { error: await extractErrorMessage(res, "Could not delete the document") };
+  }
+
+  revalidatePath("/research/documents");
+  return {};
 }
