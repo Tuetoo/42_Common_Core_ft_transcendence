@@ -269,7 +269,7 @@ accepted friends watching them.
 
 Files: `services/core-service/api/websocket.py` (`yjs_router`, endpoint),
 `services/core-service/yjs_relay.py` (rooms, merge, snapshots, and the
-safe decoding in its "Yjs decode/validate layer" section).
+safe decoding of updates: `guarded`, `validator`, `UpdateValidator`).
 
 **The contract.** The note body is the `Y.Text` named `"content"`
 (`ydoc.getText("content")`), markdown or plain text. Title and tags are

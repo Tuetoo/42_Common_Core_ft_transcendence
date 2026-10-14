@@ -185,10 +185,6 @@ class UserRepository:
 
     async def revoke_rotation_successors(
             self, rotated: UserSession, *, reason: str) -> int:
-        # A session created by rotation has created_at equal to the
-        # revoked_at of the session it replaced (see AuthService.refresh), so
-        # the chain of sessions descending from one refresh token can be
-        # followed without a family column.
         chain = select(
             UserSession.id, UserSession.revoked_at,
             UserSession.revoked_reason).where(
@@ -202,11 +198,6 @@ class UserRepository:
                     successor.user_id == rotated.user_id,
                     successor.created_at == chain.c.revoked_at,
                     chain.c.revoked_reason == SessionRevokeReason.ROTATED))
-        # Repeat until the chain stops growing: each statement takes a new
-        # snapshot, so a successor committed by a rotation that ran at the
-        # same time (the UPDATE waited for its row lock, then skipped the
-        # rotated row) is found by the next round. This needs READ COMMITTED
-        # (the default); under REPEATABLE READ the loop would stop too early.
         statement = update(UserSession).where(
             UserSession.id.in_(select(chain.c.id)),
             UserSession.revoked_at.is_(None)).values(

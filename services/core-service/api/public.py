@@ -117,8 +117,6 @@ async def remove_watchlist_item(
         service.get_watchlist_name(watchlist_id), ticker.upper(), added=False)
 
 
-# API key management: the keys that unlock the public API above.
-
 apikeys_router = APIRouter(prefix="/api-keys", tags=["api-keys"])
 
 api_key_manager = require_permission(

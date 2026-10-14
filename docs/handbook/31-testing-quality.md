@@ -77,13 +77,9 @@
 
 The rules below apply to all Python code in the repository.
 
-- **Few comments and docstrings.** Most comments are tool pragmas
+- **No comments or docstrings.** The only comments are tool pragmas
   (`# type: ignore[...]`, `# noqa: <code>`, `# pragma: no cover`, and the
-  `# pyright: ...` header of the two shared test modules). Other comments
-  only name a section of a module that holds several topics (for example
-  `# Yjs decode/validate layer` in `yjs_relay.py`) or explain a choice the
-  code cannot show (a time budget, a concurrency rule); a few helpers in
-  `ai/agents/debate_common.py` have docstrings. The handbook is the
+  `# pyright: ...` header of the two shared test modules). The handbook is the
   explanation of the code. Text the program needs at run
   time is an explicit string: error messages (for example `default_message` on each `AppError` subclass, see
   [30-shared-library.md](30-shared-library.md)), a script's `--help`

@@ -293,8 +293,6 @@ async def released_while_waiting() -> AsyncIterator[None]:
         yield
 
 
-# Parsing JSON out of LLM replies (code fences, lenient objects, lists).
-
 _JSON_CODE_FENCE_RE = re.compile(
     r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
@@ -356,13 +354,6 @@ def _failed(text: str, exc: json.JSONDecodeError) -> JsonObjectParse:
 
 
 def _without_trailing_commas(text: str) -> str:
-    """Drops a comma that directly precedes a closing brace or bracket.
-
-    Models sometimes end an object with `"last": 1,}`. That comma is the
-    only syntax fault seen in real answers that otherwise parse, and a
-    re-ask costs a full model call. Only commas outside JSON strings are
-    touched, so string content is never changed.
-    """
     out: list[str] = []
     in_string = escaped = False
     pending_comma: int | None = None

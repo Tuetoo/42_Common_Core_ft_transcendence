@@ -19,7 +19,6 @@ from pydantic import BaseModel
 
 logger = structlog.get_logger(__name__)
 
-# Company aliases, news queries and rule-based prechecks.
 
 T = TypeVar("T")
 M = TypeVar("M", bound=BaseModel)
@@ -226,8 +225,6 @@ def relink_consent_items(
             log_event, count=len(changed), items=changed, **log_context)
     return out
 
-
-# LLM relevance classification.
 
 _company_name_cache: dict[str, str | None] = {}
 

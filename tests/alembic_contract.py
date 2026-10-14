@@ -1,6 +1,4 @@
 # pyright: reportMissingImports=false
-# Shared by the service suites: `config` and `database` resolve to the
-# modules of whichever service's tests import this file.
 import asyncio
 import warnings
 from uuid import uuid4

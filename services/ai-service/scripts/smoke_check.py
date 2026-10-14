@@ -15,7 +15,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, TextIO
 from uuid import UUID
 
-# Text helpers shared with e2e_tier_check.py and delete_analyses.py.
 
 SAMPLE_CHARS = 220
 

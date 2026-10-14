@@ -1714,8 +1714,6 @@ def _run_deploy(tmp_path: Path, *, running: bool = False,
                 services: str = "gateway\npostgres\nscheduler\n",
                 ssh_command: str | None = None,
                 ancestor: bool = True) -> tuple[int, list[str]]:
-    # A copy of the script in a fake checkout, so `cd ..` lands there and
-    # the required files are test placeholders; docker and git only log.
     checkout = tmp_path / "checkout"
     (checkout / "scripts").mkdir(parents=True)
     (checkout / "scripts" / "deploy.sh").write_text(
