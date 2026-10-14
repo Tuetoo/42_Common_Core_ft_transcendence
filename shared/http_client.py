@@ -55,8 +55,6 @@ async def close_http_clients() -> None:
     _clients.clear()
 
 
-# Bounded fan-out for the internal HTTP calls made with these clients.
-
 T = TypeVar("T")
 
 

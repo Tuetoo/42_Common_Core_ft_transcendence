@@ -300,9 +300,6 @@ class TestTokens:
         old_row = await repo.get_session_by_refresh_token(old)
         middle_row = await repo.get_session_by_refresh_token(middle)
         assert middle_row.created_at == old_row.revoked_at
-        # Inside the grace period (a thief who refreshed first) the answer
-        # only says "superseded", so the victim keeps the token and its
-        # later reuse still revokes the thief's chain.
         early = await client.post(
             "/api/v1/auth/refresh", json={"refresh_token": old})
         assert early.json()["error"]["code"] == "refresh_token_superseded"

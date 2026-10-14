@@ -231,7 +231,6 @@ def _numeral_core(figure: str) -> str:
 FIGURE_MATCH_REL_TOLERANCE = 0.015
 _PRECISE_MIN_SIGNIFICANT_DIGITS = 3
 
-# An evidence number as (value, one unit in its last shown decimal).
 _EvidenceNumber = tuple[float, float]
 
 
@@ -243,13 +242,6 @@ def _whole_and_decimals(figure: str) -> tuple[str, str]:
 
 
 def _precise_unit(figure: str) -> float | None:
-    """One unit in a stated figure's last significant digit.
-
-    Returns None for a rounded figure (one or two significant digits, such
-    as "$600 million" or "$2.3B"; trailing zeros of an integer are not
-    significant). A figure with three or more significant digits ("$593
-    million", "27.46%", "$1.13B") states its own precision.
-    """
     whole, decimals = _whole_and_decimals(figure)
     if decimals:
         significant = (whole + decimals).lstrip("0")
@@ -263,11 +255,6 @@ def _precise_unit(figure: str) -> float | None:
 
 
 def _evidence_number(figure: str) -> _EvidenceNumber:
-    """Value of an evidence figure and how much its shown decimals round.
-
-    Only decimals mark display rounding ("$3.47B" may be 3,466 million); an
-    integer such as "$598 million" or "$600 million" is taken as exact.
-    """
     _, decimals = _whole_and_decimals(figure)
     unit = (
         10.0**-len(decimals) * (_scale_multiplier(figure) or 1)
@@ -277,22 +264,11 @@ def _evidence_number(figure: str) -> _EvidenceNumber:
 
 def _figure_matches(figure: str, value: float, evidence: _EvidenceNumber,
                     rel_tolerance: float) -> bool:
-    """Whether one evidence number supports a stated figure.
-
-    A precise figure must agree with the evidence number to within one
-    unit in the last digit of the coarser of the two, which allows either
-    side to be rounded or truncated: "$593 million" is not supported by 598
-    (a made-up sum once passed a plain 1.5% rule), while "$27.5B" is
-    supported by 27.46, "$15.84B" by "$15,848 million" and "$3,466 million"
-    by "$3.47B". A rounded figure keeps the relative tolerance, so "$600
-    million" still matches 598.
-    """
     evidence_value, evidence_unit = evidence
     if value == evidence_value:
         return True
     unit = _precise_unit(figure)
     if unit is not None:
-        # The tiny factor absorbs float error at the exact edge.
         return abs(value - evidence_value) <= max(
             unit, evidence_unit) * (1 + 1e-9)
     return evidence_value != 0 and abs(
@@ -301,11 +277,6 @@ def _figure_matches(figure: str, value: float, evidence: _EvidenceNumber,
 
 def find_ungrounded_figures(argument_text: str,
                             evidence_text: str) -> set[str]:
-    """Return the dollar and percent figures no evidence number supports.
-
-    A figure is grounded by an exact numeral match, or by an evidence
-    number that matches it at the figure's precision (_figure_matches).
-    """
     argument_figures = _figure_readings(argument_text)
     if not argument_figures:
         return set()

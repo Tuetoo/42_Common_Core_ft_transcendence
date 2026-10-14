@@ -228,19 +228,14 @@ deployment is described in `docs/DEPLOYMENT.md`.
   blockers were discussed in calls arranged when needed, and in person
   when possible.
 - **Tools.** GitHub Issues and a GitHub Project board (Backlog, Ready,
-  In progress, In review, Done, with start and target dates) tracked
-  the tasks, each with one assignee. Every change went through a feature
-  branch and a pull request; the CI workflows had to pass, and the Tech
-  Lead (backend) reviewed each pull request before merging it.
+  In progress, In review, Done) tracked the tasks, each with an
+  assignee. Changes reached `main` mainly through pull requests, checked
+  by the CI workflows.
 - **Communication.** Slack and WhatsApp for day-to-day messages, calls
   for progress updates, and meetings in person to plan the work and solve
   problems together.
-- **Git.** Each member committed their own work: the frontend and the
-  infrastructure arrived through their own pull requests, and the
-  backend through feature branches. Commit messages describe the change
-  in one line (for example "Add the Privacy Policy and Terms of Service
-  pages"). The full history is in the repository (`git log`, or Insights
-  → Contributors on GitHub).
+- **Git.** Each member committed their own work. The full history is in
+  the repository (`git log`, or Insights → Contributors on GitHub).
 
 ## Technical Stack
 

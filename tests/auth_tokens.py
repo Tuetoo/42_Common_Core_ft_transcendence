@@ -1,6 +1,4 @@
 # pyright: reportMissingImports=false
-# Shared by the service suites: `config` and `database` resolve to the
-# modules of whichever service's tests import this file.
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4

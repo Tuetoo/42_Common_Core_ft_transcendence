@@ -316,8 +316,6 @@ async def _extract_and_store_kg(
                             and t.as_of > datetime.now(UTC).date()))
 
 
-# Knowledge-graph extraction: turns an archived report into triples.
-
 _ENTITY_TYPES = (
     "company", "person", "institution", "economic_indicator", "event",
     "concept", "product", "position", "country")

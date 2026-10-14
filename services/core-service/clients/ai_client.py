@@ -18,8 +18,6 @@ logger = structlog.get_logger(__name__)
 _CACHE_TTL_SECONDS = 10
 _TIMEOUT = 3.0
 _CLOSES_TIMEOUT = 15.0
-# Longer than ai-service SENTIMENT_TIMEOUT_SECONDS (240 s), so its answer
-# or its 503 arrives instead of a client-side timeout.
 _SENTIMENT_TIMEOUT = 270.0
 _LABELS = frozenset({"positive", "neutral", "negative"})
 

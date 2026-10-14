@@ -34,9 +34,6 @@ _ACTIVE_TTL_SECONDS = 90
 ACTIVE_HEARTBEAT_SECONDS = 30.0
 
 
-# Yjs decode/validate layer: every y_py call runs through guarded(), and
-# incoming updates are checked in a separate decoder process first.
-
 NOTE_TEXT_NAME = "content"
 _VALIDATION_WORKERS = 2
 _VALIDATION_TIMEOUT_SECONDS = 5.0

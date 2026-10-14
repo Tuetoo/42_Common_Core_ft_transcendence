@@ -145,8 +145,6 @@ def annualized_volatility(
     return float((variance**0.5) * (trading_periods_per_year**0.5))
 
 
-# Backtest and performance metrics (simple returns, ratios, drawdown).
-
 _TRADING_DAYS_PER_YEAR = 252
 
 

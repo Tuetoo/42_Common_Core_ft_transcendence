@@ -458,13 +458,6 @@ class AuthService:
 
     async def _rotated_token_reused(
             self, known: UserSession, rotated_at: datetime) -> None:
-        # Shortly after a rotation this is a benign race (two requests sent
-        # the same token), or a thief who refreshed first: answer with a
-        # distinct code so the client keeps its cookie and a later reuse
-        # still revokes the chain. After the grace it may be theft, or a
-        # browser that never stored the new cookie: revoke only the sessions
-        # descending from this token, never the user's other logins.
-        # rotated_at is known.revoked_at, passed separately as non-None.
         if datetime.now(UTC) - rotated_at < REFRESH_REUSE_GRACE:
             logger.warning(
                 "refresh_token_superseded", user_id=str(known.user_id),
