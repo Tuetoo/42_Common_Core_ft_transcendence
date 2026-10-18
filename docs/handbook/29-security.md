@@ -8,7 +8,7 @@
 > validation, CORS, secrets handling and container exposure. For each
 > control it says where the code is, what it protects against, and where
 > its limits are. The goal is that you can explain the whole security
-> model to an evaluator and show each part live.
+> model to a reviewer or an interviewer and show each part live.
 
 ---
 
@@ -617,6 +617,7 @@ answers 401 `Internal token not configured` (fail closed).
 | Where | Key | Limit | On failure of the store | Code |
 |---|---|---|---|---|
 | Gateway, `/api/v1/auth` | client address | 10 requests/s, burst 20, `nodelay` -> 429 | - | `infra/gateway/nginx.conf` (`auth_zone`) |
+| Gateway, `/api/v1/public` | client address | 5 requests/s, burst 20, `nodelay` -> 429; limits guessing of API keys before the key lookup | - | `infra/gateway/nginx.conf` (`public_zone`) |
 | Login | per address / per email | 30 / 10 per 15 min | fail open | `services/auth-service/domains/auth/api.py`, `security.py` |
 | Registration | per address | 10 per hour | fail open | same |
 | Password reset request | per address / per email | 10 / 3 per hour | fail open | same |
@@ -847,6 +848,7 @@ off-machine copies encrypted. See `../DISASTER_RECOVERY.md`.
 | `RAG_ASK_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `10` / `200` | RAG assistant limits. | `services/ai-service/config.py` |
 | `AVATAR_MAX_SIZE_MB` | `5` | Avatar size. | `services/auth-service/config.py` |
 | gateway `auth_zone` | `10r/s`, burst 20 | Gateway limit on `/api/v1/auth`. | `infra/gateway/nginx.conf` |
+| gateway `public_zone` | `5r/s`, burst 20 | Gateway limit on `/api/v1/public`. | `infra/gateway/nginx.conf` |
 | `client_max_body_size` | `25m` | Largest request body the gateway forwards. | same |
 
 ---
@@ -1202,7 +1204,7 @@ or if any container could be compromised, you would add `requirepass`.
 | File | What it holds |
 |---|---|
 | `infra/gateway/nginx.conf` | TLS, redirects, security headers, CSP, path allow-list, `/internal` 404, auth rate zone, `X-Forwarded-For` replacement, log format, the internal listener with `real_ip`. |
-| `infra/gateway/api_locations.conf` | API and `/health/*` locations shared by both listeners; the `/api/v1/auth` rate limit. |
+| `infra/gateway/api_locations.conf` | API and `/health/*` locations shared by both listeners; the `/api/v1/auth` and `/api/v1/public` rate limits. |
 | `frontend/app/lib/session-cookies.ts`, `frontend/proxy.ts` | session cookie options; token refresh before a page runs. |
 | `infra/gateway/gen-certs.sh`, `csp_hashes.py`, `status.html` | Development certificate; CSP hash tool; the status page. |
 | `shared/security.py` | `CurrentUser`, `decode_token`, `make_get_current_user`, `require_permission`, `ensure_permission`, `require_internal_token`, `is_uuid_claim`. |

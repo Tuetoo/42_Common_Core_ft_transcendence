@@ -98,15 +98,12 @@ class OrganizationRepository:
                                        OrganizationMember.id).limit(1))
         return result.scalar_one_or_none()
 
-    async def remove_memberships_of_user(
-            self, user_id: UUID, *, keep_owner: bool = True) -> int:
-        stmt = delete(OrganizationMember).where(
-            OrganizationMember.user_id == user_id)
-        if keep_owner:
-            stmt = stmt.where(OrganizationMember.role != "owner")
-        result = await self._db.execute(
-            stmt.execution_options(synchronize_session="fetch"))
-        return int(getattr(result, "rowcount", 0) or 0)
+    async def remove_memberships_of_user(self, user_id: UUID) -> None:
+        await self._db.execute(
+            delete(OrganizationMember).where(
+                OrganizationMember.user_id == user_id,
+                OrganizationMember.role != "owner").execution_options(
+                    synchronize_session="fetch"))
 
     async def count_for_user(self, user_id: UUID) -> int:
         result = await self._db.execute(
@@ -128,12 +125,22 @@ class OrganizationRepository:
         await self._db.flush()
         return invitation
 
-    async def get_invitation_by_id(
+    async def lock_invitation(
             self, invitation_id: UUID) -> OrganizationInvitation | None:
         result = await self._db.execute(
             select(OrganizationInvitation).where(
-                OrganizationInvitation.id == invitation_id))
+                OrganizationInvitation.id == invitation_id).with_for_update()
+            .execution_options(populate_existing=True))
         return result.scalar_one_or_none()
+
+    async def delete_open_invitations_by(
+            self, organization_id: UUID, inviter_id: UUID) -> None:
+        await self._db.execute(
+            delete(OrganizationInvitation).where(
+                OrganizationInvitation.organization_id == organization_id,
+                OrganizationInvitation.invited_by == inviter_id,
+                OrganizationInvitation.accepted_at.is_(None)
+            ).execution_options(synchronize_session="fetch"))
 
     async def list_open_invitations(
             self, organization_id: UUID,

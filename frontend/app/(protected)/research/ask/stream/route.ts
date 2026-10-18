@@ -1,9 +1,8 @@
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, readApiError } from "@/app/lib/backend";
-import { QUESTION_MAX, tickerError } from "../../limits";
+import { DOCUMENT_CATEGORIES, QUESTION_MAX, tickerError } from "../../limits";
 
 const MODES = ["ask", "draft"];
-const CATEGORIES = ["filing", "analyst_report", "earnings_call", "news", "macro_research", "risk_analysis"];
 
 // The backend streams the answer as Server-Sent Events from a POST that
 // needs the access token. The browser's EventSource can only send GETs
@@ -39,7 +38,7 @@ export async function POST(request: Request) {
     mode: MODES.includes(input.mode as string) ? input.mode : "ask",
     ticker: typeof input.ticker === "string" && input.ticker.trim() ? input.ticker.trim().toUpperCase() : null,
     categories: Array.isArray(input.categories)
-      ? input.categories.filter((c): c is string => CATEGORIES.includes(c as string))
+      ? input.categories.filter((c): c is string => (DOCUMENT_CATEGORIES as readonly string[]).includes(c as string))
       : null,
   };
 

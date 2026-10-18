@@ -17,6 +17,7 @@ const BASE_GROUPS: NavGroup[] = [
       { href: "/research", label: "Research" },
       { href: "/organizations", label: "Organizations" },
       { href: "/analyses", label: "Analyses" },
+      { href: "/backtests", label: "Backtests" },
       { href: "/analytics", label: "Analytics" },
     ],
   },

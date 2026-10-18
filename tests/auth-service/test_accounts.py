@@ -105,9 +105,9 @@ def provider(monkeypatch):
 NONCE_COOKIE = "alphamind_oauth_nonce"
 
 
-async def oauth_start(client, provider_name="google"):
+async def oauth_start(client, provider_name="google", params=None):
     auth = await client.get(
-        f"/api/v1/auth/oauth/{provider_name}/authorize",
+        f"/api/v1/auth/oauth/{provider_name}/authorize", params=params,
         follow_redirects=False)
     query = parse_qs(urlparse(auth.headers["location"]).query)
     cookie = auth.headers["set-cookie"]
@@ -744,6 +744,60 @@ class TestOAuth:
         username = me.json()["data"]["username"]
         assert re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username)
 
+    async def test_next_and_marker_survive_the_round_trip(
+            self, client, mock_email, provider):
+        from domains.auth.service import OAuthFlow
+
+        marker = "m" * 24
+        invite = "/invitations/accept?token=abc.def"
+        provider.userinfo = {
+            "sub": "g-next",
+            "email": "next@example.com",
+            "email_verified": True
+        }
+
+        async def finish(params, nonce_override=None):
+            query, nonce, _ = await oauth_start(client, params=params)
+            return oauth_result(await oauth_callback(
+                client, "google", query["state"][0], nonce_override or nonce))
+
+        ok = await finish({"next": invite, "marker": marker})
+        assert ok["access_token"] and ok["refresh_token"]
+        assert ok["next"] == invite and ok["marker"] == marker
+
+        for bad_next in ("//evil.com", "https://evil.com/", "/\\evil.com",
+                         "/a\tb", "relative", "/" + "a" * 600):
+            dropped = await finish({"next": bad_next, "marker": "short"})
+            assert dropped["access_token"]
+            assert "next" not in dropped and "marker" not in dropped
+
+        foreign = await finish(
+            {"next": invite, "marker": marker}, "nonce-of-another-browser")
+        assert foreign["error"] == "oauth_failed"
+        assert "next" not in foreign and "marker" not in foreign
+
+        headers, _ = await register_and_login(
+            client, mock_email, "next2fa@example.com", "next2fa")
+        secret = await enable_2fa(client, headers)
+        provider.userinfo = {
+            "sub": "g-next-2fa",
+            "email": "next2fa@example.com",
+            "email_verified": True
+        }
+        challenge = await finish({"next": invite, "marker": marker})
+        assert challenge["challenge_token"] and "access_token" not in challenge
+        assert challenge["next"] == invite and challenge["marker"] == marker
+        done = await client.post(
+            "/api/v1/auth/oauth/2fa", json={
+                "challenge_token": challenge["challenge_token"],
+                "code": next_code(secret)
+            })
+        assert done.status_code == 200
+
+        legacy = OAuthFlow.from_json(
+            '{"provider": "google", "nonce_hash": "h", "code_verifier": "v"}')
+        assert legacy is not None and legacy.next_path is None
+
 
 class TestProfile:
 
@@ -833,6 +887,43 @@ class TestConnections:
             headers=b)
         assert again.status_code == 409
         assert (await client.delete(url, headers=a)).status_code == 204
+
+    async def test_internal_friend_ids_lists_accepted_only(
+            self, client, mock_email, db_session):
+        me = await make_user(client, mock_email, db_session)
+        friend = await make_user(client, mock_email, db_session)
+        inviter = await make_user(client, mock_email, db_session)
+        pending = await make_user(client, mock_email, db_session)
+        blocked = await make_user(client, mock_email, db_session)
+
+        async def connect(requester, addressee):
+            r = await client.post(
+                "/api/v1/connections",
+                json={"addressee_username": addressee["username"]},
+                headers=requester["headers"])
+            assert r.status_code == 201, r.text
+            return f"/api/v1/connections/{r.json()['data']['id']}"
+
+        for requester, addressee in ((me, friend), (inviter, me)):
+            url = await connect(requester, addressee)
+            r = await client.post(
+                f"{url}/accept", headers=addressee["headers"])
+            assert r.status_code == 200, r.text
+        await connect(me, pending)
+        url = await connect(blocked, me)
+        assert (await client.post(
+            f"{url}/block", headers=me["headers"])).status_code == 200
+
+        r = await client.get(f"/internal/users/{me['id']}/friends")
+        assert r.status_code == 200
+        assert sorted(r.json()["friend_ids"]) == sorted(
+            [friend["id"], inviter["id"]])
+        r = await client.get(f"/internal/users/{pending['id']}/friends")
+        assert r.json() == {"friend_ids": []}
+        denied = await client.get(
+            f"/internal/users/{me['id']}/friends",
+            headers={"X-Internal-Token": "wrong"})
+        assert denied.status_code in (401, 403)
 
 
 class TestEmails:

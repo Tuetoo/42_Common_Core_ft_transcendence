@@ -14,7 +14,6 @@ services:
     volumes:
       - ./shared:/app/shared
       - ./services/auth-service:/app
-      - avatar_data:/app/data/avatars
 
   core-service:
     build:

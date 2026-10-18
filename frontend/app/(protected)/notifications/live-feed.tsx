@@ -1,13 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { closeSocket, wsUrl } from "@/app/lib/ws-url";
-
-type WebSocketEnvelope = {
-  event: string;
-  payload: Record<string, unknown>;
-  emitted_at: string;
-};
+import { useRef, useState } from "react";
+import { type ChannelEnvelope, PRESENCE_EVENT, parseEnvelope, useChannel } from "@/app/lib/use-channel";
 
 // One line in the feed. `key` is a client-side counter: new events are
 // added at the top, so an array index would not identify a row.
@@ -41,12 +35,12 @@ function humanize(event: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-function toFeedItem(envelope: WebSocketEnvelope, key: number): FeedItem {
+function toFeedItem(envelope: ChannelEnvelope, key: number): FeedItem {
   const { title, content } = envelope.payload ?? {};
   // Notifications carry their own title and text; other events only
   // have a name, which is turned into words.
   const isNotification = envelope.event === "notification" && typeof title === "string";
-  const when = new Date(envelope.emitted_at);
+  const when = new Date(envelope.emitted_at ?? "");
   return {
     key,
     title: isNotification ? title : humanize(envelope.event),
@@ -56,50 +50,25 @@ function toFeedItem(envelope: WebSocketEnvelope, key: number): FeedItem {
 }
 
 export function LiveFeed({ accessToken, userId }: { accessToken: string; userId: string }) {
-  const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [items, setItems] = useState<FeedItem[]>([]);
   const nextKey = useRef(0);
 
-  useEffect(() => {
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let attempts = 0;
-    let ws: WebSocket | null = null;
-
-    function connect() {
-      ws = new WebSocket(wsUrl(`/user:${userId}?token=${accessToken}`));
-      ws.onopen = () => {
-        attempts = 0;
-        setStatus("open");
-      };
-      ws.onmessage = (event) => {
-        let envelope: WebSocketEnvelope;
-        try {
-          envelope = JSON.parse(event.data);
-        } catch {
-          return; // not an event this page understands
-        }
-        const item = toFeedItem(envelope, nextKey.current++);
-        setItems((prev) => [item, ...prev].slice(0, MAX_ITEMS));
-      };
-      // Same backoff as the unread badge (5s, 10s, 20s ... 60s). An expired
-      // token is renewed by the badge's page refresh, which re-renders this
-      // component with a fresh token and restarts the effect.
-      ws.onclose = () => {
-        setStatus("reconnecting");
-        const delay = Math.min(5000 * 2 ** attempts, 60_000);
-        attempts += 1;
-        retryTimer = setTimeout(connect, delay);
-      };
-    }
-
-    connect();
-    // Stop the connection when leaving the page; otherwise it would keep
-    // running in the background.
-    return () => {
-      if (retryTimer) clearTimeout(retryTimer);
-      if (ws) closeSocket(ws);
-    };
-  }, [accessToken, userId]);
+  // Same backoff as the unread badge (5s, 10s, 20s ... 60s). An expired
+  // token is renewed by the badge's page refresh, which re-renders this
+  // component with a fresh token and reconnects. The socket closes when
+  // leaving the page.
+  const { status: channel } = useChannel({
+    path: `/user:${userId}`,
+    token: accessToken,
+    onMessage: (event) => {
+      const envelope = parseEnvelope(event.data);
+      // Friends' presence changes are for the friends page, not the feed.
+      if (!envelope || envelope.event === PRESENCE_EVENT) return;
+      const item = toFeedItem(envelope, nextKey.current++);
+      setItems((prev) => [item, ...prev].slice(0, MAX_ITEMS));
+    },
+  });
+  const status: ConnectionStatus = channel === "open" ? "open" : channel === "connecting" ? "connecting" : "reconnecting";
 
   return (
     <div className="flex flex-col gap-3">

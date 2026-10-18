@@ -94,7 +94,7 @@ Three ideas explain almost everything in this chapter:
 | **`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Real-IP`** | Headers a proxy adds so the backend knows the original client address, scheme and host. | Rate limits in auth-service key on the client address, so it must be the real one. |
 | **HSTS** (`Strict-Transport-Security`) | A header that tells a browser "use HTTPS only for this site for N seconds". | Sent for one year. |
 | **CSP** (`Content-Security-Policy`) | A header that tells the browser which scripts, styles and connections a page may use. | Only the `/status` page gets one, built from SHA-256 hashes of its inline script and style. |
-| **`limit_req`** | nginx's request rate limiter (a "leaky bucket": a steady rate plus a small burst allowance). | Protects `/api/v1/auth`. |
+| **`limit_req`** | nginx's request rate limiter (a "leaky bucket": a steady rate plus a small burst allowance). | Protects `/api/v1/auth` and `/api/v1/public`. |
 | **`real_ip` module** (`set_real_ip_from`, `real_ip_header`) | Replaces `$remote_addr` with an address taken from a request header, but only when the peer is in a trusted range. | Used only on the internal listener, so the frontend's calls carry the browser's address. |
 | **Docker embedded DNS** | Inside a user-defined Docker network, the resolver at `127.0.0.11` turns service names (`auth-service`) into container IP addresses. | The gateway re-resolves backend names every 10 seconds through it. |
 
@@ -175,7 +175,13 @@ the `http` block, in order:
    and **`limit_req_status 429;`** A rate-limit memory zone of 10 MB, keyed
    by the client address, refilling at 10 requests per second. Rejected
    requests get HTTP 429. The zone is used only in `location /api/v1/auth`
-   (in `api_locations.conf`, so on both listeners).
+   (in `api_locations.conf`, so on both listeners). A second zone,
+   **`limit_req_zone $binary_remote_addr zone=public_zone:10m rate=5r/s;`**,
+   is used only in `location /api/v1/public`. It stops a client from
+   trying many fake API keys, because each unknown key costs a database
+   lookup before core-service's per-key limit applies. A real client
+   uses at most 60 requests a minute per owner, so this limit never
+   slows it down.
 7. **`map $http_upgrade $connection_upgrade`**: `Connection: upgrade` when
    the client sent an `Upgrade` header, `Connection: close` otherwise.
    Used by `/ws` and `/grafana/`.
@@ -421,7 +427,7 @@ Grafana and the Swagger locations are on the HTTPS server only.
 | `/api/v1/api-keys` | API key management (JWT) |
 | `/api/v1/research` | notes, comments, documents, sentiment summary |
 | `/api/v1/notifications` | notifications |
-| `/api/v1/public` | the public API (authenticated by `X-API-Key`) |
+| `/api/v1/public` | the public API (authenticated by `X-API-Key`). `limit_req zone=public_zone burst=20 nodelay;` 5 requests/second per client address, a burst of 20, then 429. |
 | `/api/v1/moderation` | hide, unhide and delete of notes and comments |
 | `/ws` | WebSockets: `proxy_http_version 1.1`, `Upgrade $http_upgrade`, `Connection $connection_upgrade`, the five proxy headers repeated, `proxy_read_timeout 3600s` |
 
@@ -509,7 +515,7 @@ matches both spellings):
 
 ```
 default-src 'none';
-script-src 'sha256-MVTsSAtUtCXaPyO2kQmT5BOrBd+w4r79F6KN2bGhe6c=';
+script-src 'sha256-2bwQFs4FJqRRCcoHEdIxrH9Ivb20j84jwZsAaZZICpM=';
 style-src  'sha256-UhRAusrh4IV8C/aXR7OqIYTQUf+lU6fWGdtaucwCyME=';
 connect-src 'self'; img-src 'self' data:; base-uri 'none';
 form-action 'none'; frame-ancestors 'none'
@@ -686,6 +692,8 @@ accepted for this deployment.
 | `resolver` | `127.0.0.11 valid=10s ipv6=off` | Docker DNS, 10 s cache | `nginx.conf` |
 | `limit_req_zone` | `rate=10r/s`, zone `auth_zone:10m`, key `$binary_remote_addr` | login API rate | `nginx.conf` |
 | `limit_req` (auth) | `burst=20 nodelay`, status 429 | burst allowance | `nginx.conf`, `location /api/v1/auth` |
+| `limit_req_zone` (public) | `rate=5r/s`, zone `public_zone:10m`, key `$binary_remote_addr` | public API rate per client address | `nginx.conf` |
+| `limit_req` (public) | `burst=20 nodelay`, status 429 | burst allowance | `api_locations.conf`, `location /api/v1/public` |
 | `worker_processes` / `worker_connections` | `auto` / `1024` | one worker per CPU; connections per worker (client and upstream sides) | `nginx.conf` (top level) |
 | `proxy_read_timeout` `/ws` | `3600s` | an idle WebSocket closes after one hour without traffic | `nginx.conf` |
 | `proxy_read_timeout` `/api/v1/rag` | `180s` | long streamed answers | `nginx.conf` |

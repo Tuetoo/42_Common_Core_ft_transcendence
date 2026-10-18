@@ -38,7 +38,10 @@ async def set_system_role(
         session: AsyncSession, email: str, role: SystemRole, *,
         dry_run: bool = False) -> RoleChangeResult:
     users = UserRepository(session)
-    user = await users.get_by_email(normalize_email(email))
+    found = await users.get_by_email(normalize_email(email))
+    admins = AdminRepository(session)
+    await admins.lock_active_admin_ids()
+    user = await users.lock(found.id) if found is not None else None
     if user is None:
         raise RoleChangeRefused(f"No account with email '{email}'.")
     if user.deleted_at is not None:
@@ -50,7 +53,7 @@ async def set_system_role(
     if not result.changed:
         return result
     if old_role == SystemRole.ADMIN:
-        admin_ids = await AdminRepository(session).lock_active_admin_ids()
+        admin_ids = await admins.lock_active_admin_ids()
         if user.id in admin_ids and len(admin_ids) <= 1:
             raise RoleChangeRefused(
                 f"'{email}' is the last active admin; promote another "

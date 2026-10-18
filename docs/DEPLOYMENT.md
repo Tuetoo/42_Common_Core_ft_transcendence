@@ -110,16 +110,17 @@ These steps were done once; repeat them only for a new host.
 - Before it connects, the workflow checks that X is still the head of
   `main` (otherwise it stops: the newer commit's own run deploys that
   one). It then waits, up to 30 minutes, for every other workflow run of
-  X triggered by the push (per-service CI, frontend CI). It deploys only
-  when all of them succeeded or were skipped; a failed or unfinished
+  X triggered by the push (per-service CI, frontend CI), and for the
+  newest push run on `main` of every other active workflow. It deploys
+  only when all of them succeeded or were skipped; a failed or unfinished
   check fails the deploy run and nothing is deployed. A failed GitHub API
   call is retried twice.
-- The gate checks only the workflow runs of X itself. The per-service
-  workflows have path filters, so they run only for the services a
-  commit touches. If an earlier commit's per-service check failed and X
-  touches other paths, X's own runs pass and the deploy goes ahead; X
-  contains the earlier commit, so its code is deployed too. Fix a failed
-  check in the next commit to `main` before relying on the deploy.
+- The second set covers earlier commits. The per-service workflows have
+  path filters, so they run only for the services a commit touches. A
+  workflow that has no run for X is judged by its newest run on `main`,
+  from an earlier commit. So a failed check on `main`, from any earlier
+  commit, blocks every deploy until a later run of that workflow passes
+  or the failed run is re-run.
 - The deploy is triggered only by the stack smoke run. If another check
   failed for a flaky reason and you re-run it until it passes, no deploy
   starts by itself: start one with Actions -> deploy -> Run workflow.

@@ -54,8 +54,9 @@ def dummy_verify_password(plain_password: str) -> None:
     _pwd_context.verify(plain_password, _dummy_hash)
 
 
-def password_fingerprint(password_hash: str) -> str:
-    return hashlib.sha256(password_hash.encode()).hexdigest()[:32]
+def password_fingerprint(password_hash: str, email: str) -> str:
+    material = f"{password_hash}\n{email.lower()}"
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 def hash_refresh_token(refresh_token: str) -> str:
@@ -121,12 +122,13 @@ def create_email_verification_token(user_id: str, email: str) -> str:
         extra_claims={"email": email})
 
 
-def create_password_reset_token(user_id: str, password_hash: str) -> str:
+def create_password_reset_token(
+        user_id: str, password_hash: str, email: str) -> str:
     return _create_token(
         subject=user_id, expires_delta=timedelta(
             hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS),
         token_type=PASSWORD_RESET_TOKEN_TYPE,
-        extra_claims={"pwd": password_fingerprint(password_hash)})
+        extra_claims={"pwd": password_fingerprint(password_hash, email)})
 
 
 def create_oauth_2fa_token(user_id: str, provider: str) -> str:

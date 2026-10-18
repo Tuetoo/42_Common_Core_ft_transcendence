@@ -2,8 +2,12 @@
 # Runs after "stack smoke CI" succeeded for a push to main (or by hand:
 # Actions -> deploy -> Run workflow). Before connecting, it waits for every
 # other workflow run of the same commit (per-service CI, frontend CI) and
-# deploys only when all of them succeeded or were skipped, so a commit with
-# a failing test, lint or type check is never deployed. A commit that is no
+# for the newest push run on main of every other workflow, and deploys only
+# when all of them succeeded or were skipped. The second set covers earlier
+# commits: a workflow whose paths this commit did not touch has no run for
+# it, so its newest run (from an earlier commit) decides, and a failing
+# test, lint or type check on main blocks every deploy until a later run of
+# that workflow passes (or the failed run is re-run). A commit that is no
 # longer the head of main when the run starts is skipped: the newer
 # commit's run deploys it. A transient GitHub API error is retried.
 # The job only opens an SSH connection and sends the checked commit sha as
@@ -61,21 +65,29 @@ jobs:
             echo "SKIP_DEPLOY=1" >> "$GITHUB_ENV"
             exit 0
           fi
+          workflows=$(api "repos/$REPO/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active" and .name != "deploy") | .id')
           for _ in $(seq 1 90); do
-            runs=$(api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
-              --jq '.workflow_runs[] | select(.event == "push" and .name != "deploy")
-                    | "\(.name)|\(.status)|\(.conclusion)"')
+            runs=$({
+              api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+                --jq '.workflow_runs[] | select(.event == "push" and .name != "deploy")
+                      | "\(.name)|\(.status)|\(.conclusion)"' || exit 1
+              for id in $workflows; do
+                api "repos/$REPO/actions/workflows/$id/runs?branch=main&event=push&per_page=1" \
+                  --jq '.workflow_runs[] | "\(.name) (newest on main, \(.head_sha[0:7]))|\(.status)|\(.conclusion)"' || exit 1
+              done
+            } | sed '/^$/d')
             echo "$runs"
             if ! grep -qv '|completed|' <<< "$runs"; then
               if grep -qvE '\|(success|skipped)$' <<< "$runs"; then
-                echo "error: a check of $SHA did not succeed" >&2
+                echo "error: a check of $SHA or of an earlier commit on main did not succeed" >&2
                 exit 1
               fi
               exit 0
             fi
             sleep 20
           done
-          echo "error: checks of $SHA did not finish in 30 minutes" >&2
+          echo "error: checks of $SHA or of main did not finish in 30 minutes" >&2
           exit 1
       - name: Deploy over SSH
         if: env.SKIP_DEPLOY != '1'

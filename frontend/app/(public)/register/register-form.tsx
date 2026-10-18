@@ -15,8 +15,9 @@ import {
 
 const initialState: RegisterState = {};
 
-export function RegisterForm() {
+export function RegisterForm({ next }: { next: string }) {
   const [state, formAction, pending] = useActionState(register, initialState);
+  const loginHref = next ? `/login?next=${encodeURIComponent(next)}` : "/login";
   // Controlled on purpose, like the login form: React resets uncontrolled
   // fields after a form action returns, which would wipe what the user
   // typed when the server rejects it (e.g. username already taken).
@@ -30,7 +31,7 @@ export function RegisterForm() {
         <p className="form-message success">
           Registered! Check your email for a verification link, then come back and log in.
         </p>
-        <Link href="/login" className="link-btn">
+        <Link href={loginHref} className="link-btn">
           Go to login
         </Link>
       </div>
@@ -105,7 +106,7 @@ export function RegisterForm() {
         By registering you agree to the <Link href="/terms">Terms of Service</Link> and{" "}
         <Link href="/privacy">Privacy Policy</Link>.
       </p>
-      <Link href="/login" className="link-btn">
+      <Link href={loginHref} className="link-btn">
         Already have an account? Log in
       </Link>
     </form>

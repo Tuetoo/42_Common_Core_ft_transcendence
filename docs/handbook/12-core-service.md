@@ -590,8 +590,9 @@ tickers is what ai-service's nightly ingestion keeps fresh
   (NULL) until the next edit or `python -m scripts.backfill_sentiment
   --apply` (preview without `--apply`, `--rate` calls per minute, default
   30) fills it. After an edit, a failed refresh keeps the previous label
-  until the next successful refresh; the backfill only fills rows that
-  have no label. `GET /api/v1/research/sentiment/summary` aggregates it
+  until the next successful refresh; the backfill fills rows that have
+  no label and also re-analyses rows whose label is older than the last
+  edit. `GET /api/v1/research/sentiment/summary` aggregates it
   (counts per label, average score, a per-day series by UTC creation
   day; `ticker` selects notes tagged with it or mentioning it, and their
   comments). It counts the caller's own notes and the notes of the
@@ -729,9 +730,13 @@ ticker, category, filename):
   progress). Both live in `repository.py` (`stuck_after(status)`); the
   final statuses are `FINAL_DOCUMENT_STATUSES`, `ready` and `failed` -> the
   `document.uploaded` event is published again (log
-  `document_upload_republished`) and the existing document is returned;
-- anything else -> the existing document is returned (201), nothing is
-  uploaded or published.
+  `document_upload_republished`) and the existing document is returned
+  (201);
+- anything else -> nothing is uploaded or published. The public upload
+  route answers 409 `conflict` ("A document with this name already
+  exists. Delete it or rename the file before uploading again."). The
+  internal route for system documents (`POST /internal/documents/system`)
+  still returns the existing document with `duplicate: true`.
 
 The "stuck" rule is an extra repair path. A document can stay `uploaded`
 when its event was published but ai-service never processed it (for
@@ -873,6 +878,7 @@ How a notification is made (`domains/notification/service.py`):
        deliver: websocket on -> push {"event": "notification", "payload": row}
                 to channel user:<id>, cross_replica=True (every replica's sockets)
                 email on and address known -> send_notification_email
+                in a background task (the handler does not wait for SMTP)
  never raises (a failed notification never fails the action)
 ```
 
@@ -1439,7 +1445,7 @@ line and no alert.
 | alert `OutboxBacklog` | durable events waited in `core.event_outbox` for 15 minutes | core logs `outbox_publish_failed` (with `last_error`); is Redis up? The dispatcher publishes them once it is |
 | document status never reaches `ready` in core but ai-service finished | `document.status_changed` durable consumer stuck | core logs `durable_event_handler_failed`, `durable_event_dead_lettered`; `bash scripts/redis-cli.sh -n 3 XPENDING stream:document.status_changed workers` |
 | upload 422 "The file is not a valid PDF." | bytes do not start with `%PDF-` | the file is not really a PDF |
-| upload 201 but nothing processed | it was a duplicate of an existing non-failed document | the response is the existing document |
+| upload 409 "A document with this name already exists" | a document with the same ticker, category and file name exists and is not failed | delete it or rename the file |
 | public API 401 `invalid_api_key` right after revoking | expected; the cache was overwritten | |
 | a revoked key still works for up to 30 s | Redis failed during the revoke, so the old "valid" cache entry was not overwritten (the revoke itself committed) | log `api_key_cache_write_failed` (`action`, `api_key_id`) |
 | public API 429 `rate_limit_exceeded` | per-key or per-owner minute limit | `Retry-After`; counters `bash scripts/redis-cli.sh -n 1 --scan --pattern 'ratelimit:*'` |
@@ -1631,8 +1637,8 @@ events, start the WebSocket script with `CHANNEL="document:$DOC"` before
 the status reaches `ready`; it prints `document.status_changed` events.
 Show the stored object:
 `bash scripts/objectstore.sh ls documents/$USER_ID/`. Upload the same file
-again: the answer is the same document id (a duplicate, nothing new is
-processed).
+again: the answer is 409 "A document with this name already exists"
+(nothing new is processed).
 
 **Step 9: an API key and the public API.**
 
@@ -1758,7 +1764,7 @@ portfolio delete cascades to its transactions and holdings and publishes
 | `services/core-service/clients/ai_client.py`, `auth_client.py` | calls to the other services |
 | `services/core-service/scripts/recompute_snapshots.py` | snapshot check and repair |
 | `services/core-service/scripts/delete_documents.py` | operator delete of documents by id (preview, `--confirm`); per document: delete the row and enqueue `document.deleted` in the outbox in one transaction (`service.delete_document_row`, shared with the API), commit, publish with `outbox.publish_now`, then delete the stored file (a failure is reported as an orphan object) |
-| `services/core-service/scripts/backfill_sentiment.py` | fill missing note/comment sentiment (preview, `--apply`) |
+| `services/core-service/scripts/backfill_sentiment.py` | fill missing or outdated note/comment sentiment (preview, `--apply`) |
 | `services/core-service/scripts/e2e_check.py` | real-environment end-to-end check (`make e2e`) |
 | `services/core-service/migrations/` | Alembic `env.py`, `versions/` (`f1160c000001` -> `f1170c000001` -> `f1200c000001` -> `f1250c000001`, head), `script.py.mako` |
 | `services/core-service/deps.py` | `get_current_user`, the one `from <= to` check (422) for date-range query parameters (`check_date_range`), `day_start` |

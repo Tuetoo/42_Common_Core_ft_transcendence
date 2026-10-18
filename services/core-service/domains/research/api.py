@@ -23,7 +23,7 @@ from domains.research.sentiment import (schedule_after_commit,
 from domains.research.service import (CommentChange, NoteChange,
                                       ResearchService)
 from shared.enums import DocumentCategory, DocumentStatus, NotificationType
-from shared.exceptions import error_response
+from shared.exceptions import ConflictError, error_response
 from shared.permissions import Permission
 from shared.schemas import (MAX_PAGE, APIResponse, PaginatedResponse,
                             PaginationParams)
@@ -284,6 +284,10 @@ async def upload_document(
         filename=file.filename or "upload", content=content, category=category,
         ticker=ticker, content_date=content_date, title=(title or "").strip()
         or None, background_tasks=background_tasks)
+    if outcome.duplicate and not outcome.republished:
+        raise ConflictError(
+            "A document with this name already exists. Delete it or rename "
+            "the file before uploading again.")
     name = quoted_title(outcome.document.title or outcome.document.filename)
     if outcome.retried:
         notify_after_commit(

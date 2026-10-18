@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -50,17 +51,27 @@ async def delivery_preferences(user_id: str) -> DeliveryPreferences:
         email_address=info.get("email") or None)
 
 
-async def send_email_if_enabled(
+_email_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _send_email(
+        user_id: str, to: str, title: str, content: str | None) -> None:
+    try:
+        await send_notification_email(
+            settings=settings, to=to, title=title, content=content)
+    except Exception:
+        logger.warning("notification_email_send_failed", user_id=user_id)
+
+
+def send_email_if_enabled(
         user_id: str, preferences: DeliveryPreferences, *, title: str,
         content: str | None) -> None:
     if not (preferences.email and preferences.email_address):
         return
-    try:
-        await send_notification_email(
-            settings=settings, to=preferences.email_address, title=title,
-            content=content)
-    except Exception:
-        logger.warning("notification_email_send_failed", user_id=user_id)
+    task = asyncio.create_task(
+        _send_email(user_id, preferences.email_address, title, content))
+    _email_tasks.add(task)
+    task.add_done_callback(_email_tasks.discard)
 
 
 class NotificationService:
@@ -94,7 +105,7 @@ class NotificationService:
             except Exception:
                 logger.warning(
                     "notification_websocket_broadcast_failed", user_id=user_id)
-        await send_email_if_enabled(
+        send_email_if_enabled(
             user_id, preferences, title=notification.title,
             content=notification.content)
 
@@ -162,7 +173,7 @@ async def notify_user(
         return
     preferences = await delivery_preferences(str(uid))
     if not preferences.in_app:
-        await send_email_if_enabled(
+        send_email_if_enabled(
             str(uid), preferences, title=title, content=content)
         return
     try:

@@ -40,7 +40,9 @@ export default async function ProtectedLayout({ children }: { children: React.Re
       <SidebarNav
         accessToken={accessToken}
         userId={me.id}
-        initialUnread={unread}
+        // A new object on every server render: the badge takes it as a new
+        // count even when the number is unchanged.
+        unread={{ count: unread }}
         permissions={me.permissions ?? []}
         account={account}
       />

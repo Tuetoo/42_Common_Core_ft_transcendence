@@ -1769,6 +1769,57 @@ class TestPositionSizing:
         assert "single-position limit leaves room for" in note
         assert router.calls == []
 
+        class _AmdDown(_PricedMarket):
+
+            async def get_current_price(self, ticker):
+                if ticker == "AMD":
+                    raise ProviderError("quote unavailable")
+                return await super().get_current_price(ticker)
+
+        monkeypatch.setattr(
+            sizing_module, "get_market_data_provider",
+            lambda: _AmdDown({"MSFT": "500.00"}))
+        assert await current_position_weight_pct("p", "MSFT") is None
+        router = _Router([_tiers([(500.0, 0.1)])])
+        result, note = await generate_position_sizing(
+            ticker="MSFT", action=RecommendationAction.BUY, confidence=0.78,
+            reasoning="r", portfolio_id="p", llm_router=router)
+        assert result is None
+        assert "priced holdings plus cash because AMD had no" in note
+        assert "single-position limit leaves room for 0.00" in note
+        assert router.calls == []
+
+        class _MsftQuoteOnce(_PricedMarket):
+
+            async def get_current_price(self, ticker):
+                if ticker == "MSFT":
+                    if self.prices.pop("MSFT", None) is None:
+                        raise ProviderError("quote unavailable")
+                    return PriceQuote(
+                        ticker=ticker, price=Decimal("500.00"),
+                        as_of=datetime.now(UTC), source="fake")
+                return await super().get_current_price(ticker)
+
+        async def _small_msft(portfolio_id):
+            return [{"ticker": "MSFT", "quantity": 8.0},
+                    {"ticker": "AMD", "quantity": 5.0}]
+
+        async def _cash(portfolio_id):
+            return 1500.0
+
+        monkeypatch.setattr(
+            portfolio_tool_module, "get_portfolio_holdings", _small_msft)
+        monkeypatch.setattr(sizing_module, "get_portfolio_cash_balance", _cash)
+        monkeypatch.setattr(
+            sizing_module, "get_market_data_provider",
+            lambda: _MsftQuoteOnce({"MSFT": "500.00", "AMD": "600.00"}))
+        router = _Router([_tiers([(500.0, 0.4)])])
+        result, note = await generate_position_sizing(
+            ticker="MSFT", action=RecommendationAction.BUY, confidence=0.78,
+            reasoning="r", portfolio_id="p", llm_router=router)
+        assert router.calls != []
+        assert "leaves room for" not in (note or "")
+
     @pytest.mark.asyncio
     async def test_threshold_is_inclusive_and_sell_is_not_affected(
             self, monkeypatch):

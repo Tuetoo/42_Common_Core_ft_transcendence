@@ -34,8 +34,9 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 TICKERS=("$@")
-# lib.sh: repository root as cwd, COMPOSE, PORTFOLIO_ID default, psql_stdin.
+# lib.sh: repository root as cwd, COMPOSE, PORTFOLIO_ID, psql_stdin.
 . "$(dirname "$0")/lib.sh"
+require_portfolio_id
 
 AI_CLI=("${COMPOSE[@]}" exec -T ai-service python -m scripts.analysis_cli)
 POLL_INTERVAL_SECONDS=5

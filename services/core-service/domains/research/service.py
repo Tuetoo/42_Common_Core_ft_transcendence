@@ -49,6 +49,7 @@ class UploadOutcome:
     document: DocumentRead
     duplicate: bool = False
     retried: bool = False
+    republished: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,15 +170,17 @@ class ResearchService:
             owner_id=owner_id, organization_id=organization_id,
             ticker=ticker_normalized, category=category, filename=filename)
         if existing is not None:
-            if existing.status not in FINAL_DOCUMENT_STATUSES and _looks_stuck(
-                    existing):
+            stuck = existing.status not in FINAL_DOCUMENT_STATUSES and (
+                _looks_stuck(existing))
+            if stuck:
                 logger.warning(
                     "document_upload_republished",
                     document_id=str(existing.id))
                 await self._publish_uploaded(background_tasks, existing)
             if existing.status != "failed":
                 return UploadOutcome(
-                    DocumentRead.model_validate(existing), duplicate=True)
+                    DocumentRead.model_validate(existing), duplicate=True,
+                    republished=stuck)
             if existing.owner_id != owner_id:
                 raise ConflictError(
                     "A document with this name already exists in the "

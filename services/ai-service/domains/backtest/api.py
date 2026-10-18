@@ -8,7 +8,7 @@ from ai_events import backtest_deleted_payload, publish_event
 from clients.core_client import get_portfolio_snapshots
 from database import get_db
 from deps import ensure_portfolio_access, get_analysis_writer, get_current_user
-from fastapi import APIRouter, BackgroundTasks, Depends, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.repository import RecommendationTierRepository
 from domains.backtest.model import Backtest
@@ -217,6 +217,21 @@ async def create_portfolio_backtest(
         run_portfolio_backtest_workflow(
             str(backtest.id), portfolio_id=str(payload.portfolio_id)))
     return APIResponse(data=BacktestRead.model_validate(backtest))
+
+
+@router.get(
+    "", response_model=APIResponse[list[BacktestRead]],
+    description="The caller's own backtests, newest first.")
+async def list_backtests(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> APIResponse[list[BacktestRead]]:
+    backtests = await BacktestRepository(db).list_for_user(
+        user.user_id, limit=limit, offset=offset)
+    return APIResponse(
+        data=[BacktestRead.model_validate(b) for b in backtests])
 
 
 @router.get("/{backtest_id}", response_model=APIResponse[BacktestDetailRead])

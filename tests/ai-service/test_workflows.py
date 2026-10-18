@@ -24,7 +24,7 @@ from domains.analysis.repository import (AgentCatalogRepository,
 from domains.analytics.model import RecommendationMetric
 from domains.analytics.repository import AnalyticsRepository
 from domains.backtest.repository import BacktestRepository
-from domains.decision.model import DecisionOutcome
+from domains.decision.model import DecisionOutcome, InvestmentDecision
 from domains.decision.repository import InvestmentDecisionRepository
 from domains.memory.repository import EpisodicMemoryRepository
 from shared import events as shared_events
@@ -862,12 +862,26 @@ class TestBacktestWorkflow:
             initial_capital=10_000.0, log_prefix="test")
         cash_day1 = 10_000.0 - 1_000.0
         cash_day2 = cash_day1 - 250.0
-        cash_day3 = cash_day2 + 1_100.0 + 360.0
+        cash_day3 = cash_day2 + 1_100.0 + 5 * 60.0
         assert result.equity_curve == pytest.approx([
             cash_day1 + 10 * 101.0, cash_day2 + 10 * 102.0 + 5 * 51.0,
-            cash_day3 + (-1.0) * 51.0
+            cash_day3
         ])
         assert result.realized_trade_returns == pytest.approx([0.10, 0.20])
+
+        pre_window_sell = [("AAA", "sell", 4.0, 100.0, _at(1))]
+        result = replay_trade_events(
+            pre_window_sell, closes_by_ticker=closes, trading_days=days,
+            initial_capital=10_000.0, log_prefix="test")
+        assert result.equity_curve == pytest.approx([10_000.0] * 3)
+        assert result.realized_trade_returns == []
+
+        after_last_close = [("AAA", "buy", 1.0, 100.0, _at(1)),
+                            ("AAA", "buy", 1.0, 112.0, _at(4))]
+        with pytest.raises(ValueError, match="1 triggered tier.*2026-04-03"):
+            replay_trade_events(
+                after_last_close, closes_by_ticker=closes, trading_days=days,
+                initial_capital=10_000.0, log_prefix="test")
 
         day = date(2026, 4, 1)
         events = [
@@ -945,6 +959,25 @@ class TestPortfolioBacktestWorkflow:
         assert "1 aligned days" in text
         assert "no usable SPY close for 2026-09-29" in text
         assert text.endswith("hours after the close)")
+
+        backtest_id = await _create_portfolio_backtest(
+            start_date=start, end_date=date(2026, 9, 30),
+            initial_capital=10580.0)
+
+        async def _three(portfolio_id, *, start_date=None, end_date=None):
+            return _snapshot_rows([10580.0] * 3, start=start)
+
+        monkeypatch.setattr(workflow, "get_portfolio_snapshots", _three)
+        monkeypatch.setattr(
+            workflow, "get_market_data_provider",
+            lambda: _FakeBenchmarkProvider([765.6, 766.1, float("nan")],
+                                           start=start))
+        await workflow.run_portfolio_backtest_workflow(
+            str(backtest_id), portfolio_id=str(uuid4()))
+        await _delete_backtest(backtest_id)
+        assert len(errors) == 2
+        assert ("no usable SPY close for the newest snapshot day 2026-09-30"
+                in (errors[1] or ""))
         assert backtest_error_text(ValueError("x" *
                                               400)).startswith("ValueError: ")
 
@@ -1179,6 +1212,50 @@ class TestReviewAiAccuracy:
 
         await self._cleanup(analysis_id, recommendation_id, None)
 
+    @pytest.mark.asyncio
+    async def test_items_past_the_give_up_window_leave_the_batch(self):
+        async with SessionLocal() as session:
+            analysis = await AnalysisRepository(session).create(
+                user_id=None, portfolio_id=None, ticker="ZZZZ")
+            rows = []
+            for days in (35, 75):
+                rec = await AnalysisPersistenceRepository(
+                    session).save_recommendation(
+                        analysis_id=analysis.id,
+                        recommendation=RecommendationAction.BUY.value,
+                        confidence=0.6, reasoning="x",
+                        confidence_adjustment_note=None, debate_converged=True)
+                await _backdate(session, rec, days=days)
+                decision = await InvestmentDecisionRepository(session).create(
+                    user_id=uuid4(), portfolio_id=None,
+                    recommendation_id=rec.id, ticker="ZZZZ",
+                    action_taken="followed", notes=None)
+                await _backdate(session, decision, days=days)
+                rows.append((rec.id, decision.id))
+            await session.commit()
+
+            recs = await AnalyticsRepository(
+                session).list_recommendations_pending_metric(
+                    min_age_days=30, max_age_days=60, limit=10_000)
+            decisions = await InvestmentDecisionRepository(
+                session).list_pending_review(
+                    min_age_days=30, max_age_days=60, limit=10_000)
+            rec_ids = {r.id for r in recs}
+            decision_ids = {d.id for d in decisions}
+            assert rows[0][0] in rec_ids and rows[1][0] not in rec_ids
+            assert (rows[0][1] in decision_ids
+                    and rows[1][1] not in decision_ids)
+
+            await session.execute(
+                delete(InvestmentDecision).where(
+                    InvestmentDecision.id.in_([d for _, d in rows])))
+            await session.execute(
+                delete(Recommendation).where(
+                    Recommendation.id.in_([r for r, _ in rows])))
+            await session.execute(
+                delete(Analysis).where(Analysis.id == analysis.id))
+            await session.commit()
+
     @staticmethod
     async def _cleanup(analysis_id, recommendation_id, memory_id) -> None:
         async with SessionLocal() as session:
@@ -1306,8 +1383,6 @@ class TestReviewDecisionOutcomes:
             await session.execute(
                 delete(DecisionOutcome).where(
                     DecisionOutcome.decision_id == decision_id))
-            from domains.decision.model import InvestmentDecision
-
             await session.execute(
                 delete(InvestmentDecision).where(
                     InvestmentDecision.id == decision_id))

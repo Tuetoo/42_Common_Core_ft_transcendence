@@ -93,8 +93,12 @@ service. Access tokens are self-contained, and the role check reads Redis.
 2. `ensure_schema(engine)` (`database.py`): brings the `auth` schema to
    the newest Alembic revision (section 3.16).
 3. `mirror_all_users_safely(SessionLocal)` (`user_state_sync.py`): writes
-   every user's live role and active flag to Redis (section 3.10). A
-   failure is logged, not fatal.
+   every user's live role and active flag to Redis (section 3.10). It then
+   scans the `auth:user_state:*` keys and deletes the keys of users that
+   are not in the database (for example after a restore), logging
+   `user_state.startup_sync_removed` with the count. A key whose user was
+   created during the sync is rewritten, not deleted. A failure is
+   logged, not fatal.
 4. Creates `AVATAR_STORAGE_DIR` if missing.
 
 Then the app is built:
@@ -166,7 +170,7 @@ From `domains/auth/model.py`, `domains/organization/model.py` and
 |---|---|---|
 | `users` | `id`, `email`, `username`, `password_hash`, `system_role` (default `user`), `is_active`, `is_verified`, `last_seen_at`, `deleted_at`, `created_at`, `updated_at` | unique indexes on `lower(email)` and `lower(username)` (`uq_users_email_lower`, `uq_users_username_lower`) |
 | `user_profiles` | `user_id` (1:1), `first_name`, `last_name`, `avatar_url`, `bio`, `timezone`, `country` | |
-| `user_settings` | `user_id` (1:1), `preferred_currency` (`USD`), `theme` (`system`), `default_model`, `notification_preferences` (JSONB) | core-service reads `notification_preferences` through `/internal/users/{id}/notification-settings`; `preferred_currency`, `theme` and `default_model` are display preferences stored for the frontend: no backend service reads them (ai-service does not pick a per-user model, core-service does not convert amounts) |
+| `user_settings` | `user_id` (1:1), `preferred_currency` (`USD`), `theme` (`system`), `default_model`, `notification_preferences` (JSONB) | core-service reads `notification_preferences` through `/internal/users/{id}/notification-settings`; `preferred_currency`, `theme` and `default_model` are stored and returned by `/me`, but nothing reads them yet: neither the frontend nor any backend service (ai-service does not pick a per-user model, core-service does not convert amounts) |
 | `user_sessions` | `user_id`, `refresh_token_hash` (unique), `expires_at`, `ip_address`, `device_info`, `created_at`, `revoked_at`, `revoked_reason` | one row per refresh token |
 | `oauth_accounts` | `user_id`, `provider`, `provider_user_id` | unique (`provider`, `provider_user_id`) |
 | `two_factor_secrets` | `user_id` (1:1), `secret`, `enabled`, `last_used_step` | `secret` is stored encrypted (`fernet:<token>`, `security.py`) |
@@ -200,7 +204,7 @@ signed with `settings.JWT_SECRET` and `settings.JWT_ALGORITHM` (HS256).
 | access | `create_access_token` | `access` | `ACCESS_TOKEN_EXPIRE_MINUTES` = 15 min | `role` (the system role at issue time), `auth_time` (Unix time of the login that started the session) |
 | refresh | `create_refresh_token` | `refresh` | `REFRESH_TOKEN_EXPIRE_DAYS` = 30 days | `auth_time` (same value) |
 | email verification | `create_email_verification_token` | `email_verification` | `EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS` = 24 h | `email` |
-| password reset | `create_password_reset_token` | `password_reset` | `PASSWORD_RESET_TOKEN_EXPIRE_HOURS` = 1 h | `pwd` (fingerprint of the current password hash) |
+| password reset | `create_password_reset_token` | `password_reset` | `PASSWORD_RESET_TOKEN_EXPIRE_HOURS` = 1 h | `pwd` (fingerprint of the current password hash and the current email) |
 | OAuth 2FA challenge | `create_oauth_2fa_token` | `oauth_2fa` | `OAUTH_2FA_CHALLENGE_EXPIRE_MINUTES` = 5 min | `provider` |
 | organization invitation | `create_organization_invitation_token` | `organization_invitation` | `ORGANIZATION_INVITATION_EXPIRE_DAYS` = 7 days | subject is the invitation id |
 
@@ -721,6 +725,31 @@ builds the fragment with `urllib.parse.urlencode`:
 | the account has 2FA | `challenge_token=...&expires_in=300`; the frontend then calls `POST /api/v1/auth/oauth/2fa` |
 | any `AppError` listed above | `error=oauth_failed&message=<the error message>` |
 
+The authorize route also takes two optional query parameters, which are
+stored with the state in Redis (`OAuthFlow`): `next`, the same-site path
+to open after the sign-in (`safe_next_path`: one leading `/`, not `//`,
+no backslash or control characters, at most 512 characters), and
+`marker`, a random value from the frontend (16 to 128 characters of
+`A-Za-z0-9_-`). An invalid value is dropped, not refused, because the
+authorize route is a top-level navigation. Once the browser-binding check
+has passed, the callback adds `next` and `marker` to the fragment, for
+every outcome.
+
+The marker closes the last gap of login CSRF: the hop from the callback
+to `/oauth/complete#...` carries no proof by itself. Before the browser
+follows a Google or GitHub link, the frontend (`oauth-buttons.tsx`)
+stores a random marker for the tab in `sessionStorage` and adds it to the
+authorize link. `/oauth/complete` accepts tokens or a 2FA challenge only
+when the fragment's `marker` equals the stored one; otherwise it shows
+"This sign-in was not started in this browser tab ..." and stores no
+tokens. An attacker's link carries the attacker's marker, which never
+matches the victim's. A tab without `sessionStorage`, or a link opened
+with a middle-click in a new tab, cannot finish an OAuth sign-in and gets
+that message. After the sign-in (including the 2FA step) the user lands
+on `next`, checked again by the frontend's `safeNext`, instead of
+`/portfolios`; this is how an invitation link survives a Google or
+GitHub sign-in (the login and register pages pass their `next` on).
+
 On an error the route rolls back the request's database work, logs
 `oauth_callback_failed` with `provider`, the error `code` and `message`,
 and publishes no events. The nonce cookie is deleted on every outcome.
@@ -814,15 +843,16 @@ deactivated user would keep their power until the token expires.
    |                                | hit("reset:email", 3 / 3600 s) ->|         |
    |                                | user exists and not deleted?      |         |
    |                                |   token = JWT(type password_reset,|         |
-   |                                |     pwd = sha256(password_hash)[:32], 1 h)  |
+   |                                |     pwd = sha256(hash + email)[:32], 1 h)   |
    |<-- 200 "If an account exists for this email, a reset link has been sent."   |
    |                                | BackgroundTask: email ----------------------->|
    |                                |   link = FRONTEND_BASE_URL/reset-password?token=...
    | POST /password-reset/confirm {token, new_password}                            |
    |------------------------------->| decode; user exists, not deleted              |
-   |                                | pwd claim == fingerprint(current hash)?       |
+   |                                | pwd claim == fingerprint(hash, email)?        |
    |                                |   no -> 422 "already been used"               |
-   |                                | new bcrypt hash; revoke ALL sessions          |
+   |                                | new bcrypt hash; is_verified = true           |
+   |                                | revoke ALL sessions                           |
    |                                |   (reason revoked_all); event user.updated    |
    |<-- 200 "Password has been reset." (commit, then event)                        |
 ```
@@ -830,9 +860,14 @@ deactivated user would keep their power until the token expires.
 - Same answer and same timing whether or not the account exists (the email
   goes out in a background task).
 - **Single use without a database table:** the token carries a
-  fingerprint of the password hash it was issued for. After the password
-  changes, the fingerprint no longer matches, so every older reset link
-  dies at once.
+  fingerprint of the password hash and the account email it was issued
+  for (`password_fingerprint`: SHA-256 of the hash, a newline and the
+  lower-case email). After the password changes, or after an admin
+  changes the email, the fingerprint no longer matches, so every older
+  reset link dies at once.
+- A successful reset also marks the email as verified (the link reached
+  the current address); the `user.updated` event then lists
+  `is_verified` too.
 - A reset logs the account out everywhere.
 - The new password follows the same rule as registration: at least
   `PASSWORD_MIN_LENGTH` = 10 characters, at most 72 bytes in UTF-8
@@ -938,7 +973,9 @@ Invitation flow:
    |                    |   (user_id = invitee if they have an account)          |
    |                                                                              |
    |                    | POST /invitations/accept {token}  (invitee logged in) <--|
-   |                    | decode; invitation exists, not accepted, not expired   |
+   |                    | decode; lock the invitation row (FOR UPDATE)           |
+   |                    | invitation exists, not accepted, not expired           |
+   |                    | inviter still owner/admin of the org? else 404         |
    |                    | logged-in email == invitation email (case-insensitive)? |
    |                    |   else 403                                              |
    |                    | INSERT member (savepoint; double submit -> 409),       |
@@ -966,7 +1003,17 @@ have an account yet. No invitation can grant `owner` (422 when sent).
   get around the owner-only revocation rule below by re-inviting the
   address as a member).
 - **Revocation.** `DELETE /{org_id}/invitations/{id}` deletes an open
-  invitation; its link answers 404 from then on. It publishes
+  invitation; its link answers 404 from then on. Accept and revoke both
+  lock the invitation row (`lock_invitation`, `FOR UPDATE`), so an accept
+  that races a revoke gets 404, not a 500.
+- **The inviter must still be a manager.** When an owner or admin is
+  removed, leaves, or is demoted below admin, their open invitations of
+  that organization are deleted (`delete_open_invitations_by`). Accepting
+  also checks that the inviter is still an owner or admin member;
+  otherwise it answers 404 "Invitation no longer exists." (this also
+  covers a deleted inviter account). The invitations of a deleted admin
+  still appear in `GET .../invitations` until they expire, but cannot be
+  accepted. It publishes
   `organization.invitation.revoked`: core-service notifies the user who
   revoked and, when the invited email has an account, the invitee.
 - Accepted rows are kept (the accept route uses them to answer "already
@@ -1138,6 +1185,7 @@ admin page reads its counts from the database.
 | `POST /internal/users/{id}/presence` | core WebSocket heartbeat | 204 |
 | `GET /internal/users/{id}/organizations` | core and ai membership lookups | `[{id, name, role}]` |
 | `GET /internal/connections/check?user_a=&user_b=` | core WebSocket presence channel | `{connected: bool}` |
+| `GET /internal/users/{id}/friends` | core presence push to friends (`auth_client.list_friend_ids`) | `{friend_ids: [uuid, ...]}`: the other side of every `accepted` connection, in both directions (pending and blocked are left out) |
 | `GET /internal/users/{id}/notification-settings` | core notifications | `{email, notification_preferences}`; `email` is `null` when the account is deleted, deactivated or unverified (an anonymized, placeholder or unproven address), so core sends no email to it |
 | `POST /internal/scheduler/purge-unverified` | the scheduler (`call-job.sh purge-unverified`, daily 04:10 New York) | `{retention_days, candidates, deleted, skipped, failed}`; 500 with `all_units_failed: ["accounts"]` when every attempted account failed (`shared/scheduled_jobs.py`) |
 
@@ -1194,7 +1242,15 @@ row, keeps the sessions, queues `user.updated` with `changed:
 ["two_factor_enabled"]` and logs `admin_two_factor_reset`; an admin turns
 off their own 2FA only with a code (`/auth/2fa/disable`). Every role,
 active or delete change goes through `commit_with_state`, so the Redis
-mirror is updated before the request returns.
+mirror is updated before the request returns. The admin change paths
+(update, deactivate/reactivate, delete, 2FA reset), the unverified purge
+and the `set_system_role` script lock in one fixed order: first the
+active admin rows (`lock_active_admin_ids`, in id order), then the target
+user row (`UserRepository.lock`, `SELECT ... FOR UPDATE`). So two
+concurrent changes of one user are applied one after the other, the
+mirror gets the merged row, and two admin actions cannot deadlock. The
+price is that admin and moderator user actions wait for each other; each
+holds the locks for one request.
 
 **How the first admin is created** (`scripts/set_system_role.py`). There
 is no "make me admin" API: every admin route already needs an admin. So
@@ -1283,7 +1339,7 @@ From `services/auth-service/config.py` unless noted. Set them in
 | `USER_STATE_CHECK_ENABLED` | `true` (`shared/config.py`) | live role/active check on every request |
 | `USER_STATE_CACHE_TTL_SECONDS` | `300` (`shared/config.py`) | cache of a state fetched after a Redis miss |
 | `REDIS_DB_CACHE` / `_RATE_LIMIT` / `_EVENTS` | `0` / `1` / `2` (`shared/config.py`) | OAuth state and 2FA-challenge use in 0, limits in 1, events and user_state in 2 |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS`, ... | `mailhog`, `1025`, `noreply@alphamind.local`, `false` (`shared/config.py`) | email (chapter 28) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS`, `SMTP_TIMEOUT_SECONDS`, ... | `mailhog`, `1025`, `noreply@alphamind.local`, `false`, `10.0` (`shared/config.py`) | email (chapter 28) |
 | `INTERNAL_API_TOKEN` | empty (`shared/config.py`) | `/internal/*` secret |
 | `BACKEND_CORS_ORIGINS` | `http://localhost:3000` | CORS |
 

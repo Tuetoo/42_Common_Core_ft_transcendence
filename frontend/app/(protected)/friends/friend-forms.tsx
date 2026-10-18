@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect } from "react";
+import { useActionState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import {
   respondToConnection,
@@ -8,6 +8,7 @@ import {
   type ConnectionResponse,
   type FriendActionState,
 } from "@/app/lib/actions/friends";
+import { PRESENCE_EVENT, useUserEvents } from "@/app/lib/use-channel";
 
 const initialState: FriendActionState = {};
 
@@ -78,8 +79,30 @@ export function ConnectionButton({
   );
 }
 
-// Online status is computed by the backend from recent activity; re-fetch
-// the page now and then so the dots don't go stale while it stays open.
+// The backend pushes a friend's presence change to this user's user:<id>
+// channel; the sidebar's socket passes it on (useUserEvents), and the page
+// re-renders with the new dots. Changes close together share one refresh.
+export function LivePresence() {
+  const router = useRouter();
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useUserEvents((envelope) => {
+    if (envelope.event !== PRESENCE_EVENT || timer.current) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      router.refresh();
+    }, 1000);
+  });
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    []
+  );
+  return null;
+}
+
+// Online status also expires on the backend after a while without
+// activity, which sends no event; re-fetch the page now and then as well.
 export function AutoRefresh({ seconds }: { seconds: number }) {
   const router = useRouter();
   useEffect(() => {

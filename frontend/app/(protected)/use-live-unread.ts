@@ -1,70 +1,74 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CLOSE_UNAUTHORIZED, closeSocket, wsUrl } from "@/app/lib/ws-url";
+import { getUnreadCount } from "@/app/lib/actions/notifications";
+import { parseEnvelope, publishUserEvent, useChannel } from "@/app/lib/use-channel";
 
-// One WebSocket for as long as any signed-in page is open. It does two
+// One WebSocket for as long as any signed-in page is open. It does three
 // jobs: the backend counts a user as online while they have an open socket
-// (friends see the green dot), and each new notification bumps the unread
-// badge right away.
+// (friends see the green dot), each new notification bumps the unread
+// badge right away, and every message is passed on to other components
+// (publishUserEvent), e.g. a friend's presence change to the friends page.
 export function useLiveUnread({
   accessToken,
   userId,
-  initialUnread,
+  serverUnread,
 }: {
   accessToken: string;
   userId: string;
-  initialUnread: number;
+  // The count the layout read; a new object means a new read.
+  serverUnread: { count: number };
 }): number {
   const router = useRouter();
-  // `base` follows the server's count; `extra` counts live arrivals since.
-  const [base, setBase] = useState(initialUnread);
+  // `base` is the last count read from the server; `extra` counts live
+  // arrivals since that read.
+  const [snapshot, setSnapshot] = useState({ base: serverUnread.count, from: serverUnread });
   const [extra, setExtra] = useState(0);
+  const arrivals = useRef(0);
 
   // A new server count (e.g. after "mark all as read") replaces the
-  // live tally — adjusting state during render, as React recommends,
-  // instead of syncing it in an effect.
-  if (base !== initialUnread) {
-    setBase(initialUnread);
+  // live tally, even when the number is the same — adjusting state during
+  // render, as React recommends, instead of syncing it in an effect.
+  if (snapshot.from !== serverUnread) {
+    setSnapshot({ base: serverUnread.count, from: serverUnread });
     setExtra(0);
   }
 
-  useEffect(() => {
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let attempts = 0;
-    let ws: WebSocket | null = null;
+  useChannel({
+    path: `/user:${userId}`,
+    token: accessToken,
+    onMessage: (event) => {
+      const envelope = parseEnvelope(event.data);
+      if (!envelope) return;
+      if (envelope.event === "notification") {
+        arrivals.current += 1;
+        setExtra((n) => n + 1);
+      }
+      publishUserEvent(envelope);
+    },
+    // Notifications sent while the socket was down never reach it, so
+    // every open re-reads the count. Arrivals during the read are kept.
+    onOpen: () => {
+      const start = arrivals.current;
+      getUnreadCount().then(
+        (count) => {
+          if (count === null) return;
+          setSnapshot((prev) => ({ ...prev, base: count }));
+          setExtra(arrivals.current - start);
+        },
+        () => {}
+      );
+    },
+    // The server closes the socket with 4401 when the access token
+    // expires. The browser can't refresh the token itself (httpOnly
+    // cookie), so ask the server to re-render: the proxy swaps in a fresh
+    // token, the layout passes it down, and the socket reconnects with it.
+    // A drop for any other reason (network blip, core-service restart)
+    // only reconnects: re-rendering then could turn the page into the
+    // error page while the backend is down.
+    onUnauthorized: () => router.refresh(),
+  });
 
-    function connect() {
-      ws = new WebSocket(wsUrl(`/user:${userId}?token=${accessToken}`));
-      ws.onopen = () => {
-        attempts = 0;
-      };
-      ws.onmessage = () => setExtra((n) => n + 1);
-      // The server closes the socket with 4401 when the access token
-      // expires. The browser can't refresh the token itself (httpOnly
-      // cookie), so ask the server to re-render: the proxy swaps in a fresh
-      // token, the layout passes it down, and this effect reconnects with
-      // it. A drop for any other reason (network blip, core-service restart)
-      // only reconnects: re-rendering then could turn the page into the
-      // error page while the backend is down. Waits grow (5s, 10s, 20s ...
-      // 60s) so a socket that can't connect doesn't spin.
-      ws.onclose = (event) => {
-        const delay = Math.min(5000 * 2 ** attempts, 60_000);
-        attempts += 1;
-        retryTimer = setTimeout(() => {
-          if (event.code === CLOSE_UNAUTHORIZED) router.refresh();
-          connect();
-        }, delay);
-      };
-    }
-
-    connect();
-    return () => {
-      if (retryTimer) clearTimeout(retryTimer);
-      if (ws) closeSocket(ws);
-    };
-  }, [accessToken, userId, router]);
-
-  return base + extra;
+  return snapshot.base + extra;
 }

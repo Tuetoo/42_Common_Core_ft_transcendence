@@ -280,7 +280,11 @@ and returns `{"recommendations_scored", "recommendations_attempted",
 
 **1. AI accuracy** (`review_ai_accuracy`), for *every* recommendation at
 least `AI_ACCURACY_EVALUATION_DAYS` (30) days old without a metric (up to
-200 per run, oldest first), whether or not anybody acted on it:
+200 per run, oldest first), whether or not anybody acted on it. Only
+items whose 30-day window ended at most `REVIEW_GIVE_UP_AFTER_DAYS` (30)
+days ago are picked; an item that still cannot be scored after that is
+left unscored, so old unscorable items cannot fill every batch and
+starve newer ones:
 
 - return of the ticker from the analysis date to 30 days later
   (`_realized_return`: first to last daily close in the window);
@@ -296,7 +300,8 @@ followed ones would hide exactly the calls nobody trusted.
 **2. Decision outcomes** (`review_decision_outcomes`), for every
 `InvestmentDecision` at each window of 7, 30 and 90 days
 (`_DECISION_EVALUATION_WINDOWS`) that has no outcome for that window yet
-(up to 200 per window and run, oldest first):
+(up to 200 per window and run, oldest first, and only while the window
+ended at most `REVIEW_GIVE_UP_AFTER_DAYS` (30) days ago):
 
 - `strategy_return` = the ticker's return over the window, negated for a
   SELL recommendation (`_directional_return`). The direction is the
@@ -428,6 +433,11 @@ completed | failed`), and one polling contract (`GET
 /api/v1/backtests/{id}` and `/metrics`). `strategy_name` tells them apart.
 Creates need the `analysis:create` permission; reads and deletes are for
 the backtest's own user only (another user's is a 404).
+`GET /api/v1/backtests?limit=&offset=` lists the caller's own backtests,
+newest first (`limit` 1-100, default 20; `offset` 0-10000; system
+backtests are never listed); the web app shows it on the `/backtests`
+page ("Backtests" in the sidebar), 20 per page, up to page 501 (the
+backend's offset limit).
 
 Each backtest runs as a background task in the ai-service process. A
 user may have at most `BACKTEST_MAX_ACTIVE_PER_USER` (2, a constant in
@@ -459,7 +469,14 @@ optional `portfolio_id`.
   hypothetical buy-and-hold.
 - The workflow walks the benchmark's trading days. Each trade adjusts cash
   and quantity; SELLs are matched first-in-first-out (FIFO) against earlier
-  BUY lots to get per-trade returns for the win rate. Each day's equity is
+  BUY lots to get per-trade returns for the win rate. A SELL sells at most
+  the quantity held in the replay, so the replay never goes short; the
+  rest is not sold and is logged as `unmatched_sells`.
+- A triggered tier dated after the benchmark's last close fails the run:
+  "N triggered tier(s) fall after the last benchmark close on D; the
+  newest daily bar can be incomplete for hours after the close, so run
+  the backtest again later". The same rule applies to the recommendation
+  replay (B). Each day's equity is
   cash plus quantity times the last close. If a traded ticker has no
   price history in the window, the backtest fails with "no price history
   for <TICKER> between <start> and <end>" instead of valuing the position
@@ -491,9 +508,11 @@ days, both ends inclusive). A fill that lands after the
 window, while the replay waits to run, is left out instead of being
 replayed past `end_date`. Open positions are marked to market at each
 day's close; the win rate counts closed round trips only (FIFO). A SELL
-larger than anything bought in the replay changes cash and quantity but
-gives no win-rate observation. Without any triggered tier of the caller:
-422.
+larger than the replayed holding is capped at that holding (the rest is
+not sold) and gives no win-rate observation for the uncovered part. A
+triggered tier after the benchmark's last close fails the run, as in A,
+so no fill inside the window is silently dropped. Without any triggered
+tier of the caller: 422.
 
 **C. Portfolio backtest** -- `POST /api/v1/backtests/portfolio`,
 `ai/workflows/backtest_workflow.py::run_portfolio_backtest_workflow`. Body: `portfolio_id`,
@@ -512,7 +531,10 @@ with a clear error if fewer than 2 days remain.
 - Snapshot days are aligned with benchmark days by date; a day without a
   usable benchmark close is dropped from both (and named in the error if
   fewer than 2 aligned days remain; the newest daily bar can be incomplete
-  for hours after the close).
+  for hours after the close). The newest snapshot day is not dropped:
+  when it has no usable benchmark close, the run fails with "no usable
+  <BENCH> close for the newest snapshot day D; ... run the backtest again
+  later", so the stored `end_date` always has a value.
 - Returns are **time-weighted** (TWR): for each day, external cash flows
   (deposits minus withdrawals, and share adjustments valued at that day's
   close) are removed: `r = (v_curr - flow - v_prev) / v_prev`. The daily
@@ -604,7 +626,8 @@ stores `sentiment_label`, `sentiment_score`, `sentiment_model` and
   comment stays without a label (filled later by the next edit or
   `services/core-service/scripts/backfill_sentiment.py`), and an edited
   one keeps its previous label until the next successful refresh (the
-  backfill only fills rows that have no label).
+  backfill fills rows that have no label and also re-analyses rows whose
+  label is older than the last edit).
 - The text is never logged, only its length.
 
 core-service aggregates the scores at `GET /api/v1/research/sentiment/summary`.
@@ -678,6 +701,7 @@ layers on synthetic price series from a fake market-data provider.
 | curl limit review | 1800 s | same | |
 | curl limit rag-ingest | 3600 s | same | |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | `services/ai-service/config.py` | accuracy checkpoint |
+| `REVIEW_GIVE_UP_AFTER_DAYS` | 30 | `services/ai-service/config.py` | days after its window ends that an unscored item stays in the review |
 | `ANALYSIS_TIMEOUT_SECONDS` | 2700.0 | same | per analysis |
 | `SYSTEM_TIER_ACCEPTANCE_HOURS` | 72 | same | pending tier of a system analysis waits this long for acceptance (3.3) |
 | `SENTIMENT_MAX_INPUT_CHARS` | 6000 | same | text cut for sentiment |
@@ -764,7 +788,7 @@ that impossible.
 | tier monitoring did nothing on a weekday | market holiday | the job answer `{"skipped": true, ...}` in the scheduler log |
 | alert `TradingDayJobStale` (tier-monitoring) | job has not succeeded for over 100 hours | `bash scripts/logs.sh scheduler grep tier-monitoring`; `make health` |
 | alert `DailyJobStale` (review-run, rag-ingest) | daily job has not succeeded for over 26 hours | scheduler log; was the machine awake at the scheduled time? |
-| decision has no outcome | younger than 7 days, or no price data for the ticker or the benchmark (retried on the next run) | `GET /api/v1/decisions/{id}/outcome` (404 with "hasn't been evaluated yet"); log `review.decision_no_price_data` (`ticker_missing`, `benchmark_missing`) |
+| decision has no outcome | younger than 7 days, or no price data for the ticker or the benchmark (retried on each run for up to 30 days after its window ends, `REVIEW_GIVE_UP_AFTER_DAYS`) | `GET /api/v1/decisions/{id}/outcome` (404 with "hasn't been evaluated yet"); log `review.decision_no_price_data` (`ticker_missing`, `benchmark_missing`) |
 | tier-monitoring, review-run or rag-ingest answers 500 | every attempted unit failed (all accepted tiers without fresh data, with a failed price lookup or failed; all pending recommendations or decisions without price data or failed; every attempted ticker of the filings or the news step failed, including by a provider outage; or the macro step failed; a missing key or a used-up NewsAPI quota is not a failure) | `bash scripts/logs.sh ai-service grep scheduled_job_all_units_failed`; the body's `all_units_failed` names the step |
 | no news digest for a ticker | classifier unavailable, company name lookup failed, or no confirmed item | `auto_ingestion.news_unverified_skipped`, `auto_ingestion.no_news_articles` |
 | backtest create returns 429 | the user already has 2 backtests pending or running | `backtest_rejected_limit`; wait for one to finish |

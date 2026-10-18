@@ -44,6 +44,14 @@ class BacktestRepository:
             raise NotFoundError(f"Backtest {backtest_id} not found")
         return backtest
 
+    async def list_for_user(
+            self, user_id: UUID, *, limit: int, offset: int) -> list[Backtest]:
+        result = await self.session.execute(
+            select(Backtest).where(Backtest.user_id == user_id).order_by(
+                Backtest.created_at.desc(),
+                Backtest.id.desc()).limit(limit).offset(offset))
+        return list(result.scalars().all())
+
     async def delete(self, backtest: Backtest) -> None:
         await self.session.delete(backtest)
         await self.session.flush()

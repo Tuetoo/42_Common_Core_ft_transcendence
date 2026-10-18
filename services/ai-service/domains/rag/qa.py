@@ -287,6 +287,21 @@ def _done(
         })
 
 
+_TIMEOUT_EVENT = StreamEvent(
+    "error", {
+        "code": "timeout",
+        "message": UNAVAILABLE_MESSAGE
+    })
+
+
+async def _next_delta(
+        stream: AsyncIterator[str], deadline: float) -> str | None:
+    # The deadline covers only the wait for the next delta, never a paused
+    # yield to the client, so a slow reader cannot cancel the generator.
+    async with asyncio.timeout_at(deadline):
+        return await anext(stream, None)
+
+
 async def stream_answer(
     request: RagAskRequest, chunks: list[RetrievedChunk], *, started: float,
     llm_router: LLMRouter | None = None,
@@ -312,37 +327,35 @@ async def stream_answer(
     parts: list[str] = []
     error: StreamEvent | None = None
     fallback = False
+    deadline = (asyncio.get_running_loop().time()
+                + settings.RAG_ASK_STREAM_TIMEOUT_SECONDS)
     stream = router.stream(
         tier, messages, temperature=0.2,
         max_tokens=settings.RAG_ASK_MAX_OUTPUT_TOKENS)
     try:
-        async with asyncio.timeout(settings.RAG_ASK_STREAM_TIMEOUT_SECONDS):
-            async for delta in stream:
-                if is_disconnected is not None and await is_disconnected():
-                    logger.info("rag_ask.stream_client_disconnected")
-                    return
-                if not delta:
-                    continue
-                reason = non_english_reason("".join(parts) + delta)
-                if reason is not None:
-                    logger.warning("rag_ask.stream_non_english_rejected")
-                    error = StreamEvent(
-                        "error", {
-                            "code": "non_english_output",
-                            "message": NON_ENGLISH_MESSAGE
-                        })
-                    break
-                parts.append(delta)
-                yield StreamEvent("token", {"text": delta})
+        while (delta := await _next_delta(stream, deadline)) is not None:
+            if is_disconnected is not None and await is_disconnected():
+                logger.info("rag_ask.stream_client_disconnected")
+                return
+            if not delta:
+                continue
+            reason = non_english_reason("".join(parts) + delta)
+            if reason is not None:
+                logger.warning("rag_ask.stream_non_english_rejected")
+                error = StreamEvent(
+                    "error", {
+                        "code": "non_english_output",
+                        "message": NON_ENGLISH_MESSAGE
+                    })
+                break
+            parts.append(delta)
+            yield StreamEvent("token", {"text": delta})
     except TimeoutError:
         logger.warning(
             "rag_ask.stream_timed_out",
-            timeout_seconds=settings.RAG_ASK_STREAM_TIMEOUT_SECONDS)
-        error = StreamEvent(
-            "error", {
-                "code": "timeout",
-                "message": UNAVAILABLE_MESSAGE
-            })
+            timeout_seconds=settings.RAG_ASK_STREAM_TIMEOUT_SECONDS,
+            tokens_sent=len(parts))
+        error = _TIMEOUT_EVENT
     except LLMError as exc:
         logger.warning(
             "rag_ask.stream_failed", error_type=type(exc).__name__,
@@ -371,8 +384,15 @@ async def stream_answer(
 
     if fallback:
         try:
-            result = await answer_question(
-                request, chunks, started=started, llm_router=router)
+            async with asyncio.timeout_at(deadline):
+                result = await answer_question(
+                    request, chunks, started=started, llm_router=router)
+        except TimeoutError:
+            logger.warning(
+                "rag_ask.stream_fallback_timed_out",
+                timeout_seconds=settings.RAG_ASK_STREAM_TIMEOUT_SECONDS)
+            yield _TIMEOUT_EVENT
+            return
         except RagAnswerUnavailableError as exc:
             yield StreamEvent("error", {"code": exc.code, "message": str(exc)})
             return

@@ -89,9 +89,11 @@ def replay_trade_events(
                 positions[ticker] = positions.get(ticker, 0.0) + quantity
                 open_lots.setdefault(ticker, []).append([quantity, price])
             elif side == TierSide.SELL.value:
-                cash += quantity * price
-                positions[ticker] = positions.get(ticker, 0.0) - quantity
-                remaining = quantity
+                held = max(positions.get(ticker, 0.0), 0.0)
+                filled = min(quantity, held)
+                cash += filled * price
+                positions[ticker] = held - filled
+                remaining = filled
                 lots = open_lots.setdefault(ticker, [])
                 while remaining > _EPSILON and lots:
                     lot = lots[0]
@@ -102,7 +104,7 @@ def replay_trade_events(
                     remaining -= matched
                     if lot[0] <= _EPSILON:
                         lots.pop(0)
-                if remaining > _EPSILON:
+                if quantity - filled > _EPSILON:
                     unmatched_sells += 1
             else:
                 logger.warning(
@@ -119,6 +121,12 @@ def replay_trade_events(
                 qty * last_close[ticker] for ticker, qty in positions.items()
                 if abs(qty) > _EPSILON and ticker in last_close))
 
+    if event_idx < len(trade_events):
+        raise ValueError(
+            f"{len(trade_events) - event_idx} triggered tier(s) fall after "
+            f"the last benchmark close on {trading_days[-1]}; the newest "
+            f"daily bar can be incomplete for hours after the close, so run "
+            f"the backtest again later")
     if unmatched_sells:
         logger.warning(f"{log_prefix}.unmatched_sells", count=unmatched_sells)
     if lowest_cash < -_EPSILON:
@@ -545,6 +553,13 @@ async def run_portfolio_backtest_workflow(
                 f"{', '.join(d.isoformat() for d in missing) or 'none'}; the "
                 f"newest daily bar can be incomplete for hours after the "
                 f"close)")
+        newest_snapshot = max(snapshot_by_date)
+        if newest_snapshot not in benchmark_by_date:
+            raise ValueError(
+                f"no usable {benchmark_symbol} close for the newest snapshot "
+                f"day {newest_snapshot}; the newest daily bar can be "
+                f"incomplete for hours after the close, so run the backtest "
+                f"again later")
         unfunded = 0
         while (unfunded < len(aligned_dates)
                and snapshot_by_date[aligned_dates[unfunded]] <= 0):

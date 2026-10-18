@@ -98,8 +98,9 @@ old settings. `send_email`:
    - calls `aiosmtplib.send(message, hostname=SMTP_HOST, port=SMTP_PORT,
      username=SMTP_USER or None, password=SMTP_PASSWORD or None,
      start_tls=SMTP_USE_TLS)`. An empty user or password means "no login"
-     (MailHog needs none). No `timeout` is passed, so aiosmtplib's own
-     default applies (60 seconds in the installed aiosmtplib 5.x);
+     (MailHog needs none). It also passes
+     `timeout=SMTP_TIMEOUT_SECONDS` (default 10 seconds), so a hanging
+     SMTP server cannot hold a send for long;
    - on any exception logs `email_send_failed` (with `to`, `subject`,
      `error`) and raises `EmailSendError`; on success logs `email_sent`.
    - holds no connection: every call opens a fresh SMTP connection.
@@ -206,7 +207,8 @@ real problems (all three were seen in this project):
 
 - an SMTP failure turns every registration into a 500 error;
 - a hanging SMTP server holds the database connection open for up to the
-  SMTP timeout (60 seconds);
+  SMTP timeout (60 seconds at the time, before `SMTP_TIMEOUT_SECONDS`
+  existed);
 - if the commit fails after the email was sent, the user receives a link
   to an account (or invitation) that does not exist, because the row was
   rolled back.
@@ -251,7 +253,11 @@ account email and `user_settings.notification_preferences`):
 - `email` (default **off**, opt-in): also send `send_notification_email`.
 
 `notify_user` writes and commits the row in its own session first, then
-calls `deliver_notification`, which pushes and emails. If `in_app` is off,
+calls `deliver_notification`, which pushes and then starts the email as a
+separate background task (`send_email_if_enabled`), so event handlers and
+routes never wait for SMTP; a failed send is logged as
+`notification_email_send_failed`, and an email still pending when
+core-service stops is dropped. If `in_app` is off,
 no row is written but the email still follows its own switch. If
 auth-service cannot be reached, the defaults are used, which means no
 email. Routes call `notify_after_commit`, which schedules `notify_users`
@@ -307,6 +313,7 @@ core-service use them. The values in `.env.example` match the defaults.
 | `SMTP_PASSWORD` | `""` | Login password or provider SMTP key; empty = no login. | same |
 | `SMTP_FROM_EMAIL` | `noreply@alphamind.local` | The `From` address. A real provider requires a sender address it has verified. | same |
 | `SMTP_USE_TLS` | `false` | Use STARTTLS after connecting. Must be `true` with a real provider. | same |
+| `SMTP_TIMEOUT_SECONDS` | `10.0` | Time limit for one SMTP send (passed to `aiosmtplib.send` as `timeout`). | same |
 | `FRONTEND_BASE_URL` | `http://localhost:3000` | Base of every link in an email. | `shared/config.py`, `.env.example` |
 | `EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS` | `24` | Lifetime of a verification link. | `services/auth-service/config.py` |
 | `PASSWORD_RESET_TOKEN_EXPIRE_HOURS` | `1` | Lifetime of a reset link. | `services/auth-service/config.py` |

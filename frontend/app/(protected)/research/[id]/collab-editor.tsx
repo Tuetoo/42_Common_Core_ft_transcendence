@@ -2,7 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as Y from "yjs";
-import { wsUrl } from "@/app/lib/ws-url";
+import { CLOSE_FORBIDDEN, CLOSE_TOO_MANY, CLOSE_UNAUTHORIZED, useChannel } from "@/app/lib/use-channel";
 import { NOTE_CONTENT_MAX } from "../limits";
 
 // Lifecycle of the live connection, as shown to the user.
@@ -22,13 +22,7 @@ const STATUS_COLOR: Record<ConnectionStatus, string> = {
   ended: "var(--down)",
 };
 
-// Close codes from services/core-service/websocket_manager.py.
-const CLOSE_UNAUTHORIZED = 4401; // token expired or invalid: get a new one
-const CLOSE_FORBIDDEN = 4403; // access revoked or reduced to read-only (or the note was deleted)
-const FATAL_CLOSE_CODES = new Set([1003, 1008, 4400, CLOSE_FORBIDDEN]);
-
 const REMOTE = "remote";
-const MAX_BACKOFF_MS = 30_000;
 
 // Turns a plain "old string -> new string" edit into a targeted Y.Text
 // delete+insert instead of wiping and re-typing the whole field. This
@@ -104,154 +98,105 @@ export function CollabEditor({
   canEdit: boolean;
   initialText: string;
 }) {
-  const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  const [detail, setDetail] = useState<string | null>(null);
   const [text, setText] = useState(initialText);
+  const docRef = useRef<Y.Doc | null>(null);
   const ytextRef = useRef<Y.Text | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const tokenRef = useRef(accessToken);
+  // Whether the current socket has received the server's full state, and
+  // whether any socket ever did (then a reconnect sends back what is missing).
+  const syncedRef = useRef(false);
+  const everSyncedRef = useRef(false);
+  const [synced, setSynced] = useState(false);
   // Caret to restore after a remote edit re-renders the textarea.
   const pendingSelection = useRef<{ start: number; end: number } | null>(null);
 
-  // A server re-render (e.g. router.refresh) may bring a newer token; keep
-  // it for the next reconnect without tearing down a working socket.
-  useEffect(() => {
-    tokenRef.current = accessToken;
-  }, [accessToken]);
+  // Reconnects back off 1s, 2s, 4s ... 30s and fetch a fresh token first;
+  // an expired token is retried at once. The token prop only opens the
+  // first connection, so a server re-render never drops a working socket.
+  const channel = useChannel({
+    path: `/yjs/${noteId}`,
+    token: accessToken,
+    binary: true,
+    baseDelayMs: 1000,
+    maxDelayMs: 30_000,
+    refreshToken: fetchFreshToken,
+    onOpen: () => {
+      syncedRef.current = false;
+    },
+    onMessage: (event, socket) => {
+      const doc = docRef.current;
+      const ytext = ytextRef.current;
+      if (!doc || !ytext || !(event.data instanceof ArrayBuffer)) return;
+      const update = new Uint8Array(event.data);
+      const selection = captureSelection(textareaRef.current, ytext);
+      if (!syncedRef.current) {
+        // First message: the server's full state. On a reconnect, send
+        // back whatever this doc has that the server lacks (an edit that
+        // was in flight when the socket dropped).
+        const serverVector = Y.encodeStateVectorFromUpdate(update);
+        Y.applyUpdate(doc, update, REMOTE);
+        if (everSyncedRef.current) {
+          const missing = Y.encodeStateAsUpdate(doc, serverVector);
+          if (missing.length > 2) socket.send(missing);
+        }
+        syncedRef.current = true;
+        everSyncedRef.current = true;
+        pendingSelection.current = resolveSelection(selection, doc);
+        setText(ytext.toString());
+        setSynced(true);
+        return;
+      }
+      Y.applyUpdate(doc, update, REMOTE);
+      pendingSelection.current = resolveSelection(selection, doc);
+    },
+  });
+  const { send } = channel;
+  if (synced && channel.status !== "open") setSynced(false);
+
+  const status: ConnectionStatus =
+    channel.status === "ended"
+      ? "ended"
+      : channel.status === "open"
+        ? synced
+          ? "synced"
+          : "connecting"
+        : channel.status;
+  let detail: string | null = null;
+  if (channel.status === "ended") {
+    detail =
+      channel.code === CLOSE_UNAUTHORIZED
+        ? "Your session has ended. Log in again to keep editing."
+        : channel.code === CLOSE_FORBIDDEN
+          ? `Your access to this note changed${channel.reason ? ` (${channel.reason})` : ""}. Reload the page to continue.`
+          : "The server refused an edit. Reload the page to continue.";
+  } else if (channel.status === "reconnecting" && channel.code === CLOSE_TOO_MANY) {
+    detail = "Too many open connections for your account.";
+  }
 
   useEffect(() => {
     // One Y.Doc for the whole life of the editor, across reconnects, so
     // edits that had not reached the server yet are never thrown away.
     const doc = new Y.Doc();
     const ytext = doc.getText("content");
+    docRef.current = doc;
     ytextRef.current = ytext;
-
-    let ws: WebSocket | null = null;
-    let disposed = false;
-    let everSynced = false;
-    let attempts = 0;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function connect(token: string) {
-      if (disposed) return;
-      let synced = false;
-      const socket = new WebSocket(wsUrl(`/yjs/${noteId}?token=${encodeURIComponent(token)}`));
-      socket.binaryType = "arraybuffer";
-      ws = socket;
-
-      socket.onopen = () => {
-        // The component unmounted while connecting: close now that it is
-        // safe (closing a CONNECTING socket logs a browser warning).
-        if (disposed) socket.close(1000);
-      };
-
-      socket.onmessage = (event) => {
-        if (disposed || !(event.data instanceof ArrayBuffer)) return;
-        const update = new Uint8Array(event.data);
-        const selection = captureSelection(textareaRef.current, ytext);
-        if (!synced) {
-          // First message: the server's full state. On a reconnect, send
-          // back whatever this doc has that the server lacks (an edit that
-          // was in flight when the socket dropped).
-          const serverVector = Y.encodeStateVectorFromUpdate(update);
-          Y.applyUpdate(doc, update, REMOTE);
-          if (everSynced) {
-            const missing = Y.encodeStateAsUpdate(doc, serverVector);
-            if (missing.length > 2) socket.send(missing);
-          }
-          synced = true;
-          everSynced = true;
-          attempts = 0;
-          pendingSelection.current = resolveSelection(selection, doc);
-          setText(ytext.toString());
-          setStatus("synced");
-          setDetail(null);
-          return;
-        }
-        Y.applyUpdate(doc, update, REMOTE);
-        pendingSelection.current = resolveSelection(selection, doc);
-      };
-
-      socket.onclose = (event) => {
-        if (ws === socket) ws = null;
-        if (disposed) return;
-        if (FATAL_CLOSE_CODES.has(event.code)) {
-          setStatus("ended");
-          setDetail(
-            event.code === CLOSE_FORBIDDEN
-              ? `Your access to this note changed${event.reason ? ` (${event.reason})` : ""}. Reload the page to continue.`
-              : "The server refused an edit. Reload the page to continue."
-          );
-          return;
-        }
-        // An expired token gets an immediate retry with a new one; other
-        // drops back off (1s, 2s, 4s ... 30s, plus jitter).
-        const delay =
-          event.code === CLOSE_UNAUTHORIZED && attempts === 0
-            ? 0
-            : Math.min(1000 * 2 ** attempts, MAX_BACKOFF_MS) + Math.random() * 500;
-        attempts += 1;
-        setStatus("reconnecting");
-        setDetail(event.code === 4429 ? "Too many open connections for your account." : null);
-        scheduleReconnect(delay);
-      };
-    }
-
-    function scheduleReconnect(delay: number) {
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = setTimeout(async () => {
-        retryTimer = null;
-        const token = await fetchFreshToken();
-        if (disposed) return;
-        if (token === null) {
-          setStatus("ended");
-          setDetail("Your session has ended. Log in again to keep editing.");
-          return;
-        }
-        if (token === undefined) {
-          attempts += 1;
-          scheduleReconnect(Math.min(1000 * 2 ** attempts, MAX_BACKOFF_MS));
-          return;
-        }
-        tokenRef.current = token;
-        connect(token);
-      }, delay);
-    }
-
-    // Back online: don't wait for the rest of the backoff.
-    function onOnline() {
-      if (retryTimer) scheduleReconnect(0);
-    }
-    window.addEventListener("online", onOnline);
+    syncedRef.current = false;
+    everSyncedRef.current = false;
 
     const onDocUpdate = (update: Uint8Array, origin: unknown) => {
       setText(ytext.toString());
       // Don't echo a remote update straight back to the server that sent it.
-      if (origin === REMOTE) return;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(update);
-      }
+      if (origin !== REMOTE) send(update);
     };
     doc.on("update", onDocUpdate);
 
-    connect(tokenRef.current);
-
     return () => {
-      disposed = true;
-      window.removeEventListener("online", onOnline);
-      if (retryTimer) clearTimeout(retryTimer);
       doc.off("update", onDocUpdate);
-      const socket = ws;
-      ws = null;
-      if (socket) {
-        socket.onmessage = null;
-        // A CONNECTING socket is closed from its onopen (see above).
-        if (socket.readyState === WebSocket.OPEN) socket.close(1000);
-      }
       doc.destroy();
+      docRef.current = null;
       ytextRef.current = null;
     };
-  }, [noteId]);
+  }, [noteId, send]);
 
   useLayoutEffect(() => {
     const el = textareaRef.current;

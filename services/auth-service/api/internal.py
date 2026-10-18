@@ -81,6 +81,18 @@ async def list_user_organizations(
     ]
 
 
+class FriendIdsRead(BaseModel):
+    friend_ids: list[UUID]
+
+
+@router.get("/users/{user_id}/friends", response_model=FriendIdsRead)
+async def list_friend_ids(
+    user_id: UUID, db: AsyncSession = Depends(get_db, scope="function")
+) -> FriendIdsRead:
+    friend_ids = await ConnectionRepository(db).list_friend_ids(user_id)
+    return FriendIdsRead(friend_ids=friend_ids)
+
+
 @router.get("/connections/check")
 async def check_connection(
     user_a: UUID, user_b: UUID,

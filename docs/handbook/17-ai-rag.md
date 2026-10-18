@@ -744,15 +744,26 @@ characters), `model`, `latency_ms`, `mode`, `grounded`.
 citations), zero or more `token` events (`{"text": ...}`), then exactly
 one `done` (the full answer and metadata) or `error` (`code` one of
 `non_english_output`, `timeout`, `llm_unavailable`, `internal_error`,
-`empty_answer`). Details:
+`empty_answer`). The only stream without a final event is one whose
+client disconnected. Details:
 
 - The text produced so far is checked for non-English on every token.
-- After `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120) the stream ends with
-  `error`/`timeout`.
+- One deadline, `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120 s), is set when the
+  stream starts and covers the whole answer after `sources`, including
+  the fallback below. When it passes, the stream ends with
+  `error`/`timeout`. Each token is read under the deadline, but the
+  sending of each event to the client is not, so a slow reader does not
+  cut the stream.
 - If the stream fails *before* its first token, the answer is produced
   once with the non-streaming path (which has the router's retries and
-  fallback models) and sent as a single token.
+  fallback models) and sent as a single token. A fallback that passes
+  the deadline ends with `error`/`timeout` (log
+  `rag_ask.stream_fallback_timed_out`).
 - If the client disconnects, generation stops without a final event.
+- In the web app (`research/ask/ask-panel.tsx`), a stream that ends
+  without `done` or `error` shows "The answer was cut off. Please try
+  again." Leaving the page aborts the request, and the server then stops
+  generating.
 
 The question text is never logged, only its length (`rag_ask.request`).
 

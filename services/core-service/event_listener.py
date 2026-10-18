@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
+import clients.auth_client as auth_client
 import structlog
 from api.websocket import recheck_user_sessions
 from config import settings
@@ -642,10 +644,26 @@ async def _handle_user_presence_changed(payload: dict[str, Any]) -> None:
     if user_id is None:
         logger.warning("user_presence_changed_missing_user_id")
         return
-    await manager.broadcast(
-        f"presence:{user_id}",
-        WebSocketEnvelope(
-            event=EventName.USER_PRESENCE_CHANGED, payload=payload))
+    envelope = WebSocketEnvelope(
+        event=EventName.USER_PRESENCE_CHANGED, payload=payload)
+    await manager.broadcast(f"presence:{user_id}", envelope)
+    task = asyncio.create_task(
+        _push_presence_to_friends(str(user_id), envelope))
+    _presence_tasks.add(task)
+    task.add_done_callback(_presence_tasks.discard)
+
+
+_presence_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _push_presence_to_friends(
+        user_id: str, envelope: WebSocketEnvelope[Any]) -> None:
+    try:
+        for friend_id in await auth_client.list_friend_ids(user_id):
+            await manager.broadcast(f"user:{friend_id}", envelope)
+    except Exception:
+        logger.warning(
+            "presence_friend_push_failed", user_id=user_id, exc_info=True)
 
 
 _PUBSUB_HANDLERS: dict[EventName, Callable[[

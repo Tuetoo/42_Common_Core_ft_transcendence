@@ -42,7 +42,7 @@ class InvalidCredentialsError(AppError):
 
 
 class RateLimitExceededError(AppError):
-    default_message = "Public API rate limit exceeded for this API key."
+    default_message = "Rate limit exceeded."
     code = "rate_limit_exceeded"
 
 

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useActionState } from "react";
 import { runPortfolioBacktest, type RunBacktestState } from "@/app/lib/actions/backtests";
 
@@ -33,7 +34,10 @@ export function BacktestForm({ portfolioId }: { portfolioId: string }) {
         <input id="end_date" name="end_date" type="date" autoComplete="off" defaultValue={values.end_date} />
       </div>
       <p className="field-hint">
-        Replays this portfolio&apos;s daily values against the benchmark. Without dates the whole history is used.
+        Replays this portfolio&apos;s daily values against the benchmark. Without dates the whole history is used.{" "}
+        <Link href="/backtests" className="link-btn">
+          Your past backtests
+        </Link>
       </p>
       {state?.error && (
         <p aria-live="polite" className="form-message error">

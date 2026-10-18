@@ -86,7 +86,7 @@ Three ideas explain almost everything:
 |---|---|---|
 | **Continuous integration (CI)** | Every proposed change is merged often and checked automatically (build, lint, tests) before it joins the shared branch. | The five `*-ci.yml` workflows on pull requests and pushes to `main`. |
 | **Continuous delivery** | Every change that passed CI is ready to be released by one action. | `main` is always deployable; the deploy can also be started by hand. |
-| **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`, once every other workflow run of the same commit has succeeded or was skipped. Per-service checks run only for the services a commit touches (section 3.4). |
+| **Continuous deployment (CD)** | Every change that passed the checks is released automatically, with no manual step. | `deploy.yml` runs by itself after a successful stack smoke on `main`, once every other workflow run of the same commit, and the newest run on `main` of every other workflow, has succeeded or was skipped. Per-service checks run only for the services a commit touches (section 3.4). |
 | **Pipeline** | The ordered chain of automated steps from a change to a running release. | Section 1. |
 | **Gate** | A step that must succeed before the next may run. | Pull-request checks before the merge; stack smoke and every other check of the commit before the deploy. |
 | **Artifact** | What a build produces and the next step uses. | The Docker images, built again on the host from the same commit. |
@@ -287,21 +287,23 @@ manual run. The job has two steps.
    head of `main`, the job ends without deploying (a newer commit's run
    deploys it). Otherwise it lists every workflow run of that commit
    that was started by a push, except `deploy` itself (per-service CI,
-   frontend CI), every 20 seconds for up to 30 minutes. When all have
+   frontend CI), and the newest push run on `main` of every other active
+   workflow, every 20 seconds for up to 30 minutes. When all have
    finished, it continues only if each one succeeded or was skipped; one
    failure, or a check still running after 30 minutes, fails the job and
    nothing is deployed. Each GitHub API call is tried up to 3 times, 15
    seconds apart.
 
    What the gate checks, exactly: every workflow run of the deployed
-   commit must succeed (or be skipped). It does not look at earlier
-   commits. The per-service workflows have path filters, so they run
-   only for the services a commit touches. Example: commit W changes
-   ai-service and its ai-service CI fails, so W is not deployed. The next
-   commit X changes only `docs/`; X has no ai-service CI run, its own runs
-   succeed, and X is deployed. The host fast-forwards to X, which
-   contains W's code. So a red check on `main` must be fixed (or the
-   commit reverted) before anything else is merged.
+   commit must succeed (or be skipped), and so must the newest push run
+   on `main` of every other workflow. The per-service workflows have path
+   filters, so they run only for the services a commit touches. Example:
+   commit W changes ai-service and its ai-service CI fails, so W is not
+   deployed. The next commit X changes only `docs/`; X has no ai-service
+   CI run, so the newest ai-service CI run on `main` (W's failed run)
+   decides, and X is not deployed either. A red check on `main` blocks
+   every deploy until a later run of that workflow passes or the failed
+   run is re-run.
 2. **Deploy over SSH.** It writes the private key from `DEPLOY_SSH_KEY`
    to a file readable only by the runner's user, writes
    `DEPLOY_KNOWN_HOSTS` to `~/.ssh/known_hosts` and runs
@@ -476,10 +478,10 @@ Later deploys keep the scheduler in the state they find.
   machine exactly what the host will do. If it fails, deploying would
   most likely break the cloud too. The other checks (tests, lint, type
   checks) run in parallel workflows, so the deploy waits for them, and
-  it deploys exactly the commit it checked. The gate does not look at
-  earlier commits, and per-service checks run only for the services a
-  commit touches, so a red check on `main` is fixed before the next
-  merge (section 3.4).
+  it deploys exactly the commit it checked. Per-service checks run only
+  for the services a commit touches, so the gate also checks the newest
+  run on `main` of every workflow: a red check from an earlier commit
+  blocks the deploy until it is fixed or re-run (section 3.4).
 - **Pull over SSH with a forced command, not push files.** The host
   pulls from GitHub with a read-only key, and GitHub may only trigger
   that pull. Neither side holds a key that can do more than its job.
@@ -512,7 +514,7 @@ Later deploys keep the scheduler in the state they find.
 | The deploy job is grey (skipped) after a merge | stack smoke failed, or was not a push to `main` | open the stack smoke run and fix its failure; or deploy by hand (Actions -> deploy -> Run workflow) if you are sure |
 | The deploy job is red at "Wait for every check of the commit" | another check of the commit failed, or did not finish in 30 minutes | fix the failing check; a re-run that turns green does not start a deploy by itself, so then use Actions -> deploy -> Run workflow |
 | The deploy job ends with "skip: ... is not the head of main" | a newer commit reached `main` first | nothing to do: the newer commit's run deploys it |
-| Code whose check failed on an earlier commit is live | a later commit that does not touch that service passed its own checks and was deployed; the gate checks only the deployed commit's runs | fix the failing check (or revert the commit) on `main`; the next deploy carries the fix |
+| The deploy fails although X's own checks passed | an earlier commit's check on `main` failed, and the gate also checks the newest run on `main` of every workflow | fix the failing check (or revert the commit) on `main`, or re-run the failed run if it was flaky; then deploy with Actions -> deploy -> Run workflow if no new push follows |
 | `error: the SSH command must be a 40-hex commit sha` / `is not a commit on origin/main` | the client sent something other than a commit of `main` | check the workflow's `SHA`; by hand, run the script without a command |
 | `Host key verification failed` | `DEPLOY_KNOWN_HOSTS` does not match the host (new instance, or a typo) | on the host: `echo "alphamind-research.duckdns.org $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"`, update the secret |
 | `Permission denied (publickey)` | `DEPLOY_SSH_KEY` incomplete (missing the BEGIN/END lines) or its public key not in `authorized_keys` | recreate the key pair (section 3.7) |

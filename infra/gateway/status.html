@@ -137,9 +137,7 @@ footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
 
   function serviceState(result) {
     if (!result.body) { return "down"; }
-    var st = result.body.status;
-    if (result.httpStatus === 200 && (st === undefined || st === "ok")) {
-      // Older /health responses have no "status" key: derive it.
+    if (result.httpStatus === 200 && result.body.status === "ok") {
       var deps = Object.keys(result.body).filter(function (k) { return !META_KEYS[k]; });
       for (var i = 0; i < deps.length; i++) {
         if (depState(result.body[deps[i]]) === "down") { return "down"; }

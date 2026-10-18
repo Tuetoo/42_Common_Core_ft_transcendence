@@ -31,6 +31,18 @@ class ConnectionRepository:
                     & (Connection.addressee_id == user_a))))
         return result.scalar_one_or_none()
 
+    async def list_friend_ids(self, user_id: UUID) -> list[UUID]:
+        other_user_id = case(
+            (Connection.requester_id == user_id, Connection.addressee_id),
+            else_=Connection.requester_id)
+        result = await self._db.execute(
+            select(other_user_id).where(
+                or_(
+                    Connection.requester_id == user_id,
+                    Connection.addressee_id == user_id),
+                Connection.status == ConnectionStatus.ACCEPTED))
+        return list(result.scalars().all())
+
     async def create(
             self, *, requester_id: UUID, addressee_id: UUID) -> Connection:
         connection = Connection(

@@ -11,10 +11,6 @@ export function wsUrl(path: string): string {
   return `${base}${path}`;
 }
 
-// Close code from services/core-service/websocket_manager.py: the token
-// expired or is invalid, so the page needs a fresh one.
-export const CLOSE_UNAUTHORIZED = 4401;
-
 // Calling close() on a socket that is still connecting makes Chrome log
 // "WebSocket is closed before the connection is established". That happens
 // on every fast navigation and on React's dev double-mount, so a socket

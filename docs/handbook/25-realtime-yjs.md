@@ -9,7 +9,10 @@
 > rooms (`/ws/yjs/{note_id}`) that let several people edit one research
 > note at the same time. This chapter explains both, how each connection is
 > authorized, what the messages look like, how edits are saved, and what
-> happens when core-service restarts.
+> happens when core-service restarts. (The web app opens `user:`,
+> `analysis:` and Yjs sockets. The `document:` and `presence:` channels
+> are available to API clients; the documents page polls instead, and a
+> friend's online status reaches the web app over the `user:` channel.)
 
 ## 1. The big picture
 
@@ -18,8 +21,8 @@
  -----------                         ---------------            ------------
  wss://localhost:8443/ws/user:<me>?token=...  --/ws-->  api/websocket.py  -----+
  wss://localhost:8443/ws/analysis:<id>?token=...        (JSON channels)        |
- wss://localhost:8443/ws/document:<id>?token=...                               v
- wss://localhost:8443/ws/presence:<friend>?token=...           websocket_manager.manager
+ wss://localhost:8443/ws/document:<id>?token=...   (API clients)               v
+ wss://localhost:8443/ws/presence:<friend>?token=... (API clients) websocket_manager.manager
                                                                channel -> set of sockets
  wss://localhost:8443/ws/yjs/<note_id>?token=... --/ws--> api/websocket.py (yjs)
                                                           yjs_relay.relay
@@ -30,7 +33,8 @@
                                                      (+ content, search_vector)
 
  Inputs that cause JSON pushes:
-   Redis pub/sub events:*   -> event_listener.py -> manager.broadcast(analysis:/document:/presence:)
+   Redis pub/sub events:*   -> event_listener.py -> manager.broadcast(analysis:/document:/presence:,
+                                                    and user: of each friend for presence)
    a new notification row    -> deliver_notification -> manager.broadcast(user:, cross_replica)
  Cross-replica relays (Redis pub/sub):
    ws:fanout        (notifications pushed by another replica)
@@ -164,6 +168,7 @@ What arrives on each channel:
 | Channel | `event` values | Payload | Source |
 |---|---|---|---|
 | `user:<id>` | `notification` | the notification row: `id, user_id, type, title, content, read_at, created_at` (pushed only when the user's WebSocket delivery preference is on) | `NotificationService.deliver_notification` |
+| `user:<id>` | `user.presence.changed` | `user_id, is_online, event_id` of one of the user's accepted friends | `_handle_user_presence_changed` |
 | `analysis:<id>` | `analysis.status` (first message), `analysis.started`, `analysis.completed`, `analysis.failed`, `recommendation.ready`, `decision.recorded`, `tier.executed`, `tier.execution_failed`, `tier.cancelled` | the event payload (see [24-events.md](24-events.md)), including `event_id` | `event_listener._broadcast_analysis` |
 | `document:<id>` | `document.status_changed` | `document_id, status, event_id` | `_broadcast_document_status_changed` |
 | `presence:<id>` | `user.presence.changed` | `user_id, is_online, event_id` | `_handle_user_presence_changed` |
@@ -262,8 +267,23 @@ On the auth side (`AuthService.set_presence`): `online=true` bumps
 on an offline -> online transition; `online=false` moves `last_seen_at`
 just past the threshold and publishes `is_online: false`. Login, token
 refresh and logout (last session) also update presence. core-service then
-pushes the event to `presence:<user_id>` sockets, i.e. to the user and to
-accepted friends watching them.
+pushes the event to `presence:<user_id>` sockets (the user and accepted
+friends watching them, for API clients), and also to the `user:<friend_id>`
+channel of every accepted friend. The `presence:` push happens at once;
+the friend lookup and the `user:` pushes run in a tracked background task
+(`_push_presence_to_friends`), so the event dispatcher does not wait for
+auth-service. The friend list comes from `auth_client.list_friend_ids` ->
+auth `GET /internal/users/{id}/friends`; if that call fails, it logs
+`auth_friend_lookup_failed` and pushes only to `presence:` (other errors
+in the task are logged as `presence_friend_push_failed`).
+
+In the web app, the sidebar's `user:` socket (`use-live-unread.ts`) passes
+every message on as a window event (`publishUserEvent`). The friends page
+listens (`LivePresence` in `friends/friend-forms.tsx`, `useUserEvents`)
+and re-renders, at most once a second, when a `user.presence.changed`
+arrives. No extra socket is opened. The page also refreshes every 60
+seconds, because a user who just goes quiet drops offline by time
+(`PRESENCE_ONLINE_THRESHOLD_MINUTES`), and that sends no event.
 
 ### 3.6 Yjs collaborative editing: `/ws/yjs/{note_id}`
 
@@ -508,7 +528,13 @@ either:
    database error is not turned into `False`; it raises.
 
 The room is marked clean (`mark_snapshotted`) **only after** a confirmed
-write. If it were marked clean first, a failed write would leave the
+write, and only if no new edit arrived during the write. Each room counts
+its local updates (a version). A save takes the state and the version
+together under the room lock (`room.snapshot()`), and
+`mark_snapshotted(version)` clears the dirty flag only if the version is
+still the same. An edit made while the save was running (for example by a
+user who rejoined the note) keeps the room dirty, so the next save
+writes it. If it were marked clean first, a failed write would leave the
 database behind the room, and `should_snapshot()` would stay false until
 enough new updates arrived: no retry, no error. On the update path, a
 failed save is logged (`yjs_snapshot_persist_failed`) and the room stays
@@ -538,8 +564,9 @@ before the debounce) and evicts it once its edits are saved
 deleted meanwhile (`_persist_snapshot` returns `False`), there is nothing
 left to save, so the room is marked clean and evicted too.
 
-**Eviction is race-safe.** `_evict_if_empty` re-checks "nobody connected
-and this is still the room in the map" under `_creation_lock`, the same
+**Eviction is race-safe.** `_evict_if_empty` re-checks "not in use
+(nobody connected and no unsaved edits) and this is still the room in the
+map" under `_creation_lock`, the same
 lock `get_or_create_room` takes. Without it, a client reconnecting while
 the room was being saved could be handed the room that is about to be
 removed, and its new connection would vanish with it. `disconnect` also
@@ -623,8 +650,19 @@ Rooms live only in the process memory (`YjsRelay._rooms`). On a restart:
 - Every socket is closed. The server never reopens a socket; the client
   must reconnect (with a fresh token if the old one expired). A plain
   `WebSocket` object in the browser does not reconnect on its own, so the
-  frontend must do it (most Yjs provider libraries already include a
-  reconnect loop).
+  frontend must do it. All its sockets use one hook,
+  `frontend/app/lib/use-channel.ts`: it retries with a growing delay
+  (base x 2^n up to a maximum, plus up to 500 ms of random jitter), retries
+  at once when the browser comes back online, stops for good on 1003,
+  1008, 4400 and 4403, and keeps retrying with backoff on 4429. On 4401 it
+  gets a fresh token first (a page refresh, or the editor's
+  `/research/collab-token` route); the editor retries at once after the
+  first 4401, but a second 4401 in a row backs off like any other close.
+  The delay resets only when the socket proved useful: a message arrived,
+  or it stayed open for at least 10 seconds (`STABLE_OPEN_MS`). core-service
+  accepts a socket before it checks the token or the socket cap, so an
+  "open" alone proves nothing. Each client can act on every (re)open; the unread badge
+  uses this to read the unread count again.
 - A clean stop normally closes the sockets first, and each socket's
   `finally` runs `relay.disconnect`, which saves a dirty room before
   evicting it. After the background tasks stop, the lifespan also calls
@@ -743,6 +781,7 @@ that exist nowhere else on the server.
 | REST edit returns 409 | a Yjs room is open somewhere, a room with unsaved edits is waiting for its save (nobody connected), or a dead replica's marker has not expired yet (90 s) | `bash scripts/redis-cli.sh -n 2 ZRANGE yjs:active:<note_id> 0 -1 WITHSCORES` |
 | Stored Yjs state cannot be decoded | corrupt `yjs_state` | `yjs_stored_state_invalid` when the room opens: the room starts empty; at the first save `yjs_stored_state_replaced`: the room state replaces the corrupt row. A REST body edit of such a note logs `note_yjs_state_reseeded` and stores a fresh state |
 | Friend's online dot never changes | presence calls to auth failing | `auth_presence_update_failed`, `presence_loop_failed` |
+| Friend's online dot changes only every 60 s | the friend lookup for the `user:` push failed, so only `presence:` got the event | core logs `auth_friend_lookup_failed`, `presence_friend_push_failed` |
 
 Check a note's saved state:
 
@@ -933,8 +972,9 @@ and isolates the risky decoding in child processes."
 | `services/core-service/websocket_manager.py` | `WebSocketEnvelope`, `WebSocketManager`, per-user cap, presence loop, `ws:fanout` relay; close codes, `authenticate`, `resolve_live_identity`, `open_identity`, `acquire_or_close`, `accept_and_close`, `serve_until_expiry` |
 | `services/core-service/event_listener.py` | event handlers that call `manager.broadcast` |
 | `services/core-service/domains/notification/service.py` | `deliver_notification` (push to `user:<id>`) |
-| `services/core-service/clients/auth_client.py` | `set_user_presence`, `are_users_connected` |
-| `services/auth-service/api/internal.py` | `POST /internal/users/{id}/presence`, `GET /internal/connections/check` |
+| `services/core-service/clients/auth_client.py` | `set_user_presence`, `are_users_connected`, `list_friend_ids` |
+| `services/auth-service/api/internal.py` | `POST /internal/users/{id}/presence`, `GET /internal/connections/check`, `GET /internal/users/{id}/friends` |
+| `frontend/app/lib/use-channel.ts` | the shared browser WebSocket hook (reconnect, close codes), `publishUserEvent` / `useUserEvents` |
 | `services/auth-service/domains/auth/service.py` | `set_presence`, `_mark_online`, `presence_event` |
 | `services/core-service/api/websocket.py` (`yjs_router`) | `/ws/yjs/{note_id}`, read-only handling, `_YjsSession` registry, `recheck_user_sessions` |
 | `services/core-service/yjs_relay.py` | `YjsRoom`, `YjsRelay` (`_in_use`, `flush_due_snapshots`, `persist_all_dirty`), snapshots, cross-replica listener, active-room markers; decoder worker pool (`UpdateValidator`, `validator`), `guarded`, `seed_state`, `replace_text` (REST body edits), `merge_states`, `extract_text` |

@@ -7,7 +7,7 @@ from config import settings
 from database import get_db
 from deps import get_current_user, require_recent_login
 from events_out import schedule_events
-from fastapi import (APIRouter, BackgroundTasks, Depends, Request,
+from fastapi import (APIRouter, BackgroundTasks, Depends, Query, Request,
                      UploadFile, status)
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -177,9 +177,16 @@ async def logout(
     "/oauth/{provider}/authorize", description=(
         "Start an OAuth sign-in: redirects to the provider and sets a "
         "short-lived HttpOnly cookie that binds the sign-in to this browser. "
-        "Open it as a top-level navigation, not with fetch."))
-async def oauth_authorize(provider: str) -> RedirectResponse:
-    start = await oauth_authorize_url(provider)
+        "Open it as a top-level navigation, not with fetch. Optional: next, "
+        "a same-site path to open after the sign-in, and marker, a random "
+        "value (16-128 of A-Z a-z 0-9 _ -) the caller keeps; both are "
+        "returned in the completion fragment. Invalid values are dropped."))
+async def oauth_authorize(
+    provider: str, next_path: str | None = Query(None, alias="next"),
+    marker: str | None = None
+) -> RedirectResponse:
+    start = await oauth_authorize_url(
+        provider, next_path=next_path, marker=marker)
     response = RedirectResponse(
         start.url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
     response.set_cookie(
@@ -200,7 +207,9 @@ def _oauth_complete_url(fields: dict[str, str | int]) -> str:
         "FRONTEND_BASE_URL/oauth/complete with the result in the URL "
         "fragment: access_token and refresh_token; or challenge_token and "
         "expires_in when the account has 2FA enabled (then call POST "
-        "/api/v1/auth/oauth/2fa); or error=oauth_failed and message."))
+        "/api/v1/auth/oauth/2fa); or error=oauth_failed and message. The "
+        "next and marker given at the authorize step are added once the "
+        "browser binding has been checked."))
 async def oauth_callback(
     provider: str, request: Request, code: str | None = None,
     state: str | None = None, error: str | None = None, *,
@@ -232,6 +241,11 @@ async def oauth_callback(
                 "refresh_token": result.refresh_token
             }
         schedule_events(background_tasks, service.pending_events)
+    flow = service.oauth_flow
+    if flow is not None and flow.next_path is not None:
+        fields["next"] = flow.next_path
+    if flow is not None and flow.marker is not None:
+        fields["marker"] = flow.marker
     response = RedirectResponse(
         _oauth_complete_url(fields), status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(

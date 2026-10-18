@@ -59,6 +59,7 @@ class BaseServiceSettings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM_EMAIL: str = "noreply@alphamind.local"
     SMTP_USE_TLS: bool = False
+    SMTP_TIMEOUT_SECONDS: float = 10.0
 
     BACKEND_CORS_ORIGINS: str = "http://localhost:3000"
 

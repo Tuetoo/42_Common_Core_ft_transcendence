@@ -258,6 +258,7 @@ class YjsRoom:
         self._updates_since_snapshot = 0
         self._last_snapshot_at = time.monotonic()
         self._dirty = False
+        self._version = 0
         self.lock = asyncio.Lock()
 
     def encode_state(self) -> bytes:
@@ -271,6 +272,7 @@ class YjsRoom:
             lambda: Y.apply_update(self.doc, update), what="apply")
         if counts_toward_snapshot:
             self._updates_since_snapshot += 1
+            self._version += 1
             self._dirty = True
 
     def should_snapshot(self) -> bool:
@@ -279,7 +281,12 @@ class YjsRoom:
             (time.monotonic() - self._last_snapshot_at)
             >= _SNAPSHOT_DEBOUNCE_SECONDS)
 
-    def mark_snapshotted(self) -> None:
+    def snapshot(self) -> tuple[bytes, int]:
+        return self.encode_state(), self._version
+
+    def mark_snapshotted(self, version: int | None = None) -> None:
+        if version is not None and version != self._version:
+            return
         self._updates_since_snapshot = 0
         self._last_snapshot_at = time.monotonic()
         self._dirty = False
@@ -338,23 +345,23 @@ class YjsRelay:
         async with room.lock:
             if room.connections:
                 return
-            should_persist = room._dirty
-            snapshot = room.encode_state() if should_persist else None
-        if should_persist:
-            assert snapshot is not None
+            snapshot = room.snapshot() if room._dirty else None
+        if snapshot is not None:
+            state, version = snapshot
             try:
-                if await _persist_snapshot(room.note_id, snapshot):
-                    room.mark_snapshotted()
+                await _persist_snapshot(room.note_id, state)
             except Exception:
                 logger.exception(
                     "yjs_snapshot_persist_failed_on_disconnect",
                     note_id=room.note_id)
                 return
+            async with room.lock:
+                room.mark_snapshotted(version)
         await self._evict_if_empty(room)
 
     async def _evict_if_empty(self, room: YjsRoom) -> None:
         async with self._creation_lock:
-            if not room.connections and self._rooms.get(room.note_id) is room:
+            if not _in_use(room) and self._rooms.get(room.note_id) is room:
                 self._rooms.pop(room.note_id, None)
                 evicted = True
             else:
@@ -398,20 +405,19 @@ class YjsRelay:
             except YjsDecodeError as exc:
                 raise InvalidYjsUpdate(str(exc)) from exc
             await self._broadcast_local(room, update, exclude=sender)
-            do_snapshot = room.should_snapshot()
-            snapshot = room.encode_state() if do_snapshot else None
+            snapshot = room.snapshot() if room.should_snapshot() else None
         await _publish_cross_replica(room.note_id, update)
-        if do_snapshot:
-            assert snapshot is not None
+        if snapshot is not None:
+            state, version = snapshot
             try:
-                persisted = await _persist_snapshot(room.note_id, snapshot)
+                persisted = await _persist_snapshot(room.note_id, state)
             except Exception:
                 logger.exception(
                     "yjs_snapshot_persist_failed", note_id=room.note_id)
             else:
                 if persisted:
                     async with room.lock:
-                        room.mark_snapshotted()
+                        room.mark_snapshotted(version)
                 else:
                     logger.warning(
                         "yjs_persist_snapshot_note_missing",
@@ -423,21 +429,22 @@ class YjsRelay:
             async with room.lock:
                 idle = not room.connections
                 due = room.should_snapshot() or (idle and room._dirty)
-                snapshot = room.encode_state() if due else None
+                snapshot = room.snapshot() if due else None
             if snapshot is not None:
+                state, version = snapshot
                 try:
-                    persisted = await _persist_snapshot(room.note_id, snapshot)
+                    persisted = await _persist_snapshot(room.note_id, state)
                 except Exception:
                     logger.exception(
                         "yjs_snapshot_flush_failed", note_id=room.note_id)
                     continue
                 if persisted:
                     async with room.lock:
-                        room.mark_snapshotted()
+                        room.mark_snapshotted(version)
                     saved += 1
                 elif idle:
                     async with room.lock:
-                        room.mark_snapshotted()
+                        room.mark_snapshotted(version)
             if idle and not room._dirty:
                 await self._evict_if_empty(room)
         return saved
@@ -448,11 +455,11 @@ class YjsRelay:
             async with room.lock:
                 if not room._dirty:
                     continue
-                snapshot = room.encode_state()
+                state, version = room.snapshot()
             try:
-                if await _persist_snapshot(room.note_id, snapshot):
+                if await _persist_snapshot(room.note_id, state):
                     async with room.lock:
-                        room.mark_snapshotted()
+                        room.mark_snapshotted(version)
                     saved += 1
             except Exception:
                 logger.exception(

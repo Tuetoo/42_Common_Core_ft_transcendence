@@ -36,3 +36,18 @@ export async function markAllNotificationsRead(): Promise<void> {
   // The unread badge lives in the shared layout.
   revalidatePath("/", "layout");
 }
+
+// The unread badge re-reads the count whenever its socket (re)opens, since
+// notifications sent while it was down never reached it. null: unknown.
+export async function getUnreadCount(): Promise<number | null> {
+  const accessToken = await getAccessToken();
+  if (!accessToken) return null;
+  try {
+    const res = await backendFetch("/notifications?unread_only=true&page_size=1", accessToken, { cache: "no-store" });
+    if (!res.ok) return null;
+    const { total }: { total: number } = await res.json();
+    return total;
+  } catch {
+    return null;
+  }
+}

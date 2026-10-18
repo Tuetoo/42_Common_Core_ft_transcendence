@@ -187,8 +187,8 @@ and `sentiment_label` (VARCHAR(16): `positive`/`neutral`/`negative`),
 (`POST /internal/sentiment`) has analysed the text once. After an edit
 they keep the previous result until a refresh succeeds, so a failed
 refresh leaves the previous label in place until the next successful
-one. `scripts/backfill_sentiment.py --apply` fills only rows that have no
-label.
+one. `scripts/backfill_sentiment.py --apply` fills rows that have no
+label and also re-analyses rows whose label is older than the last edit.
 
 **research_tags** — `id`, `name` (unique). **note_tags** — plain many-to-many
 join table, `note_id` + `tag_id` (both FK).

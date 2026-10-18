@@ -6,7 +6,7 @@
 #   bash scripts/snapshots.sh --confirm           # write the flagged rows
 #   bash scripts/snapshots.sh --all --from 2026-09-01
 #
-# Without --portfolio/--all the test portfolio (PORTFOLIO_ID) is used.
+# Without --portfolio/--all the portfolio PORTFOLIO_ID (see lib.sh) is used.
 # Refused inside the scheduler's busy windows unless FORCE=1.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -19,5 +19,6 @@ done
 if [ "$target_given" = "1" ]; then
   exec "${COMPOSE[@]}" exec -T core-service python -m scripts.recompute_snapshots "$@"
 fi
+require_portfolio_id
 exec "${COMPOSE[@]}" exec -T core-service python -m scripts.recompute_snapshots \
   --portfolio "$PORTFOLIO_ID" "$@"
