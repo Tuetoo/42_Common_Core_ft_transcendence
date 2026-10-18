@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -60,14 +60,15 @@ class AnalyticsRepository:
         return result.scalar_one()
 
     async def list_recommendations_pending_metric(
-            self, *, min_age_days: int,
+            self, *, min_age_days: int, max_age_days: int,
             limit: int = 200) -> list[Recommendation]:
-        cutoff = datetime.now(UTC).timestamp() - min_age_days * 86400
-        cutoff_dt = datetime.fromtimestamp(cutoff, tz=UTC)
+        now = datetime.now(UTC)
         already_scored = select(RecommendationMetric.recommendation_id)
         stmt = (
             select(Recommendation).where(
-                Recommendation.created_at <= cutoff_dt).where(
+                Recommendation.created_at.between(
+                    now - timedelta(days=max_age_days),
+                    now - timedelta(days=min_age_days))).where(
                     Recommendation.id.not_in(already_scored)).order_by(
                         Recommendation.created_at).limit(limit))
         result = await self.session.execute(stmt)

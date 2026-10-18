@@ -77,7 +77,7 @@ export function LoginForm({ next }: { next: string }) {
         {pending ? "Logging in…" : "Log in"}
       </button>
       <div className="flex flex-wrap justify-between gap-x-4 gap-y-2">
-        <Link href="/register" className="link-btn">
+        <Link href={next ? `/register?next=${encodeURIComponent(next)}` : "/register"} className="link-btn">
           Need an account? Register
         </Link>
         <Link href="/forgot-password" className="link-btn">

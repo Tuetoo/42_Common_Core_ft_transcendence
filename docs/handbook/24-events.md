@@ -138,7 +138,7 @@ field on the wire (section 3.4).
 | `user.deactivated` | auth (admin) | pub/sub | core | same | every open socket of the user closed (4401); notification to the user and the actor |
 | `user.reactivated` | auth (admin) | pub/sub | core | same | notification to the user and the actor |
 | `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same (`username` is the name before the soft delete renamed it) | every open socket of the user closed (4401); logged `user_deleted_received`; notification to the admin who deleted (the purge, where actor = user, notifies nobody) |
-| `user.presence.changed` | auth (`domains/auth/service.py::presence_event`, published after the commit) | pub/sub | core `_handle_user_presence_changed` | `user_id, is_online` | push to `presence:<user_id>` |
+| `user.presence.changed` | auth (`domains/auth/service.py::presence_event`, published after the commit) | pub/sub | core `_handle_user_presence_changed` | `user_id, is_online` | push to `presence:<user_id>` and to `user:<friend_id>` of each accepted friend (friend list from auth `GET /internal/users/{id}/friends`) |
 
 Notes on the table:
 
@@ -670,7 +670,8 @@ core-service's handlers in `event_listener.py` do up to three things:
    WebSocketEnvelope(event=<name>, payload=<payload>))`. Channels:
    `analysis:<analysis_id>` (`_broadcast_analysis`, used by the analysis,
    recommendation, decision and tier events), `document:<document_id>`
-   (document status), `presence:<user_id>` (presence). These broadcasts run
+   (document status), `presence:<user_id>` and each accepted friend's
+   `user:<friend_id>` (presence). These broadcasts run
    on every replica for its own sockets and are not relayed between
    replicas. The browser receives the payload unchanged, including the
    `event_id` field.

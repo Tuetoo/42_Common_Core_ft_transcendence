@@ -142,7 +142,9 @@ give `(None, None)`.
 
 **Outcomes.** The daily review job (02:00 New York, chapter 19) scores
 every recommendation that is at least `AI_ACCURACY_EVALUATION_DAYS` (30)
-days old and not yet scored
+days old and not yet scored, as long as its window ended at most
+`REVIEW_GIVE_UP_AFTER_DAYS` (30) days ago; after that an unscorable
+recommendation is left unscored
 (`ai/workflows/review_workflow.py::_score_one_recommendation`):
 
 - the ticker's return from the analysis date to 30 days later
@@ -1310,7 +1312,7 @@ in retrieval. The archive exists for audits and the backfill.
 | Symptom | Cause | Diagnose |
 |---|---|---|
 | Judge prompt has no track record | first analysis of the ticker, limit 0, or a DB error | log `episodic_memory_node.retrieved` (`count`, `scored`) or `episodic_memory_node.retrieval_failed` |
-| outcomes stay NULL | review job not run, or no price data | `bash scripts/logs.sh scheduler grep review-run`; log `review.no_price_data` |
+| outcomes stay NULL | review job not run, or no price data (retried on each run for up to 30 days after the window ends, then left unscored) | `bash scripts/logs.sh scheduler grep review-run`; log `review.no_price_data` |
 | an agent note was not archived | one of the gates | `bash scripts/logs.sh ai-service grep archival.skipped` |
 | a note is found in search but has no `ai.agent_reports` row | writing the rows failed and the cleanup of its indexed chunks failed too | `bash scripts/logs.sh ai-service grep archival.orphan_chunk_cleanup_failed` (`report_id`) |
 | old note still present next to a new one | supersede failed (logged), or similarity below the threshold | `archival.supersede_failed`, `archival.found_near_duplicate` (`similarity`) |

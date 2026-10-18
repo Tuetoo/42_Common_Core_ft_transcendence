@@ -213,8 +213,11 @@ candidates)` and so `reserve_best_slot_gated` under one lock:
      slept 60-63 s. Keeping the place in the queue is faster.
 
 On top of pacing, the router lets at most
-`LLM_GOOGLE_LITE_MAX_CONCURRENT_REQUESTS = 2` Lite requests be in flight
-at once (`_google_lite_concurrency_semaphore`, `_concurrency_gate`). A
+`LLM_GOOGLE_LITE_MAX_CONCURRENT_REQUESTS = 2` non-streaming Lite requests
+be in flight at once (`_google_lite_concurrency_semaphore`,
+`_concurrency_gate`). Streamed RAG answers (`LLMRouter.stream`) are paced
+by the key pool but do not take a place, because a stream can last up to
+120 s and would block analyses. A
 **semaphore** is a counter of free places: a caller takes one before it
 goes on and gives it back afterwards; when none is free, it waits. The
 gate is a `ConcurrencyGate` (`ai/llm/base.py`); `_concurrency_gate`

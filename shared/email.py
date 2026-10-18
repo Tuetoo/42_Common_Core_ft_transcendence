@@ -33,7 +33,8 @@ async def send_email(
             message, hostname=settings.SMTP_HOST, port=settings.SMTP_PORT,
             username=settings.SMTP_USER or None,
             password=settings.SMTP_PASSWORD or None,
-            start_tls=settings.SMTP_USE_TLS)
+            start_tls=settings.SMTP_USE_TLS,
+            timeout=settings.SMTP_TIMEOUT_SECONDS)
     except Exception as exc:
         logger.error(
             "email_send_failed", to=to, subject=subject, error=str(exc))

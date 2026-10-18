@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -61,15 +61,16 @@ class InvestmentDecisionRepository:
         return list(result.scalars().all()), total
 
     async def list_pending_review(
-            self, *, min_age_days: int,
+            self, *, min_age_days: int, max_age_days: int,
             limit: int = 200) -> list[InvestmentDecision]:
-        cutoff = datetime.now(UTC).timestamp() - min_age_days * 86400
-        cutoff_dt = datetime.fromtimestamp(cutoff, tz=UTC)
+        now = datetime.now(UTC)
         already_evaluated = select(DecisionOutcome.decision_id).where(
             DecisionOutcome.evaluation_days == min_age_days)
         stmt = (
             select(InvestmentDecision).where(
-                InvestmentDecision.created_at <= cutoff_dt).where(
+                InvestmentDecision.created_at.between(
+                    now - timedelta(days=max_age_days),
+                    now - timedelta(days=min_age_days))).where(
                     InvestmentDecision.id.not_in(already_evaluated)).order_by(
                         InvestmentDecision.created_at).limit(limit))
         result = await self.session.execute(stmt)

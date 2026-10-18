@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { formatNumber, isFinished, statusPillClass } from "@/app/lib/format";
 import { getMe } from "@/app/lib/session";
@@ -56,7 +57,12 @@ export default async function BacktestPage({ params }: { params: Promise<{ id: s
     <div className="page">
       {!finished && <RefreshWhileRunning />}
       <div>
-        <p className="page-eyebrow">Backtest</p>
+        <p className="page-eyebrow">
+          <Link href="/backtests" className="link-btn" style={{ padding: 0 }}>
+            Backtests
+          </Link>{" "}
+          / Backtest
+        </p>
         <h1 className="page-title">{subject} vs {b.benchmark_symbol}</h1>
         <p className="page-subtitle">
           {b.start_date} to {b.end_date} · started <LocalTime iso={b.created_at} />{" "}

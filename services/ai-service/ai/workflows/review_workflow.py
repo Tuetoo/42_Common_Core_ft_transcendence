@@ -101,7 +101,10 @@ async def review_ai_accuracy() -> StepCounts:
     async with SessionLocal() as session:
         pending = await AnalyticsRepository(
             session).list_recommendations_pending_metric(
-                min_age_days=settings.AI_ACCURACY_EVALUATION_DAYS)
+                min_age_days=settings.AI_ACCURACY_EVALUATION_DAYS,
+                max_age_days=(
+                    settings.AI_ACCURACY_EVALUATION_DAYS
+                    + settings.REVIEW_GIVE_UP_AFTER_DAYS))
         pending_items = [(rec.id, rec.analysis_id, rec.recommendation)
                          for rec in pending]
 
@@ -165,7 +168,9 @@ async def review_decision_outcomes() -> StepCounts:
     for window_days in _DECISION_EVALUATION_WINDOWS:
         async with SessionLocal() as session:
             pending = await InvestmentDecisionRepository(
-                session).list_pending_review(min_age_days=window_days)
+                session).list_pending_review(
+                    min_age_days=window_days, max_age_days=(
+                        window_days + settings.REVIEW_GIVE_UP_AFTER_DAYS))
             pending_items: list[tuple[UUID, str, date, str | None, UUID,
                                       UUID | None]] = []
             for d in pending:

@@ -1407,6 +1407,49 @@ class TestAskStream:
         assert consumed[-1] == "closed"
         assert "d" not in consumed
 
+    @pytest.mark.asyncio
+    async def test_one_deadline_covers_tokens_and_fallback_not_the_client(
+            self, ask_qdrant, monkeypatch):
+        from config import settings
+        from domains.rag.qa import retrieve_sources, stream_answer
+        from domains.rag.schema import RagAskRequest
+
+        request = RagAskRequest(**QUESTION)
+        chunks = await retrieve_sources(request, VisibilityScope.for_user(_ME))
+
+        async def _collect(router, client_delay=0.0):
+            events = []
+            async for event in stream_answer(
+                    request, chunks, started=0.0, llm_router=router):
+                events.append(event)
+                await asyncio.sleep(client_delay)
+            return events
+
+        monkeypatch.setattr(settings, "RAG_ASK_STREAM_TIMEOUT_SECONDS", 0.1)
+        events = await _collect(
+            FakeRouter(chunks=["a", "b", "c"]), client_delay=0.06)
+        assert [e.event for e in events] == [
+            "sources", "token", "token", "token", "done"
+        ]
+
+        monkeypatch.setattr(settings, "RAG_ASK_STREAM_TIMEOUT_SECONDS", 0.3)
+        events = await _collect(FakeRouter(chunks=["a", "b"], delay=0.2))
+        assert [e.event for e in events] == ["sources", "token", "error"]
+        assert events[-1].data["code"] == "timeout"
+
+        class _SlowFallback(FakeRouter):
+
+            async def complete(self, tier, messages, **kwargs):
+                await asyncio.sleep(5)
+                return await super().complete(tier, messages, **kwargs)
+
+        monkeypatch.setattr(settings, "RAG_ASK_STREAM_TIMEOUT_SECONDS", 0.1)
+        events = await _collect(
+            _SlowFallback(
+                answers=["never"], stream_error=LLMRateLimitError("429")))
+        assert [e.event for e in events] == ["sources", "error"]
+        assert events[-1].data["code"] == "timeout"
+
 
 class _GoogleChunk:
 

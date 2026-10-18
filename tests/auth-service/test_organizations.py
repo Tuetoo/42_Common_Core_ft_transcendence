@@ -339,6 +339,110 @@ class TestInvitations:
             f"{ORGS}/invitations/some-token/accept", headers=headers)
         assert r.status_code in (404, 405, 422)
 
+    async def test_manager_invitations_end_with_the_managers_role(
+            self, client, mock_email, db_session):
+        owner = await make_user(client, mock_email, db_session)
+        org = (
+            await client.post(
+                ORGS, json={"name": "Gone"},
+                headers=owner["headers"])).json()["data"]
+        base = f"{ORGS}/{org['id']}"
+
+        async def admin_invite():
+            admin = await make_user(client, mock_email, db_session)
+            await invite_and_join(
+                client, mock_email, org["id"], owner["headers"], admin,
+                "admin")
+            invitee = await make_user(client, mock_email, db_session)
+            r = await client.post(
+                f"{base}/invitations", headers=admin["headers"], json={
+                    "email": invitee["email"],
+                    "role": "member"
+                })
+            assert r.status_code == 201, r.text
+            body = mock_email[-1]["html_body"].split("token=")[1]
+            token = body.split('"')[0].split("<")[0].split("&")[0]
+            return admin, invitee, token
+
+        async def accept(invitee, token):
+            return await client.post(
+                f"{ORGS}/invitations/accept", json={"token": token},
+                headers=invitee["headers"])
+
+        demoted, demoted_invitee, demoted_token = await admin_invite()
+        removed, removed_invitee, removed_token = await admin_invite()
+        await reset_rate_limits()
+        bypassed, bypassed_invitee, bypassed_token = await admin_invite()
+        kept, kept_invitee, kept_token = await admin_invite()
+        assert len((await client.get(
+            f"{base}/invitations",
+            headers=owner["headers"])).json()["data"]) == 4
+
+        r = await client.patch(
+            f"{base}/members/{demoted['id']}/role", headers=owner["headers"],
+            json={"role": "member"})
+        assert r.status_code == 200, r.text
+        r = await client.post(
+            f"{base}/members/{removed['id']}/remove",
+            headers=owner["headers"])
+        assert r.status_code == 204, r.text
+        listed = await client.get(
+            f"{base}/invitations", headers=owner["headers"])
+        assert sorted(row["email"] for row in listed.json()["data"]) == sorted(
+            [bypassed_invitee["email"], kept_invitee["email"]])
+
+        from domains.organization.repository import OrganizationRepository
+
+        row = await OrganizationRepository(db_session).get_member(
+            UUID(org["id"]), UUID(bypassed["id"]))
+        row.role = "member"
+        await db_session.flush()
+
+        for invitee, token in ((demoted_invitee, demoted_token),
+                               (removed_invitee, removed_token),
+                               (bypassed_invitee, bypassed_token)):
+            assert (await accept(invitee, token)).status_code == 404
+        assert (await accept(kept_invitee, kept_token)).status_code == 200
+
+    async def test_accept_racing_a_revoke_answers_404(
+            self, real_client, mock_email):
+        import asyncio
+        from database import SessionLocal
+        from domains.organization.service import OrganizationService
+        from shared.exceptions import NotFoundError
+
+        tag = uid()
+        owner, _ = await register_and_login(
+            real_client, mock_email, f"rv{tag}@example.com", f"rv{tag}")
+        invitee_headers, _ = await register_and_login(
+            real_client, mock_email, f"ri{tag}@example.com", f"ri{tag}")
+        org = (await real_client.post(
+            ORGS, json={"name": "Race"}, headers=owner)).json()["data"]
+        mock_email.clear()
+        r = await real_client.post(
+            f"{ORGS}/{org['id']}/invitations", headers=owner, json={
+                "email": f"ri{tag}@example.com",
+                "role": "member"
+            })
+        assert r.status_code == 201, r.text
+        invitation_id = UUID(r.json()["data"]["id"])
+        token = mock_email[-1]["html_body"].split("token=")[1]
+        token = token.split('"')[0].split("<")[0].split("&")[0]
+        owner_id = UUID(await current_user_id(real_client, owner))
+        invitee_id = UUID(await current_user_id(real_client, invitee_headers))
+
+        async with SessionLocal() as revoker, SessionLocal() as acceptor:
+            await OrganizationService(revoker).revoke_invitation(
+                UUID(org["id"]), owner_id, invitation_id)
+            accepting = asyncio.create_task(
+                OrganizationService(acceptor).accept_invitation(
+                    token, invitee_id))
+            await asyncio.sleep(0.5)
+            assert not accepting.done()
+            await revoker.commit()
+            with pytest.raises(NotFoundError):
+                await accepting
+
 
 class TestAdminUsers:
 
@@ -590,6 +694,41 @@ class TestAdminUsers:
         assert state is not None and state.role == "moderator"
         assert state.is_active
 
+    async def test_email_change_voids_reset_links_and_reset_verifies(
+            self, client, mock_email, db_session):
+        admin = await make_user(client, mock_email, db_session, role="admin")
+        target = await make_user(client, mock_email, db_session)
+
+        async def reset_link(email):
+            await client.post(
+                "/api/v1/auth/password-reset/request", json={"email": email})
+            body = mock_email[-1]["html_body"].split("token=")[1]
+            return body.split('"')[0].split("<")[0].split("&")[0]
+
+        async def confirm(token, password):
+            return await client.post(
+                "/api/v1/auth/password-reset/confirm", json={
+                    "token": token,
+                    "new_password": password
+                })
+
+        old_link = await reset_link(target["email"])
+        new_email = f"moved{uid()}@example.com"
+        r = await client.patch(
+            f"{ADMIN}/users/{target['id']}", headers=admin["headers"],
+            json={"email": new_email})
+        assert r.status_code == 200, r.text
+        assert r.json()["data"]["is_verified"] is False
+        stolen = await confirm(old_link, "stolen-password-1")
+        assert stolen.status_code != 200
+        assert (await login_response(
+            client, new_email, "stolen-password-1")).status_code == 401
+
+        r = await confirm(await reset_link(new_email), "fresh-password-1")
+        assert r.status_code == 200, r.text
+        assert (await login_response(
+            client, new_email, "fresh-password-1")).status_code == 200
+
     async def test_last_admin_deactivation_and_two_factor_reset(
             self, client, mock_email, db_session, captured_events):
         await demote_all_admins(db_session)
@@ -718,7 +857,7 @@ class TestAdminUsers:
         await db_session.flush()
         user_row = await db_session.get(User, tid)
         reset_token = security.create_password_reset_token(
-            target["id"], user_row.password_hash)
+            target["id"], user_row.password_hash, user_row.email)
         detail = (
             await client.get(
                 f"{ADMIN}/users/{target['id']}",
@@ -1038,6 +1177,112 @@ class TestUserState:
             "role": "user",
             "is_active": True
         }
+
+    async def test_concurrent_admin_writes_mirror_the_merged_row(
+            self, real_client, mock_email):
+        import asyncio
+        from database import SessionLocal
+        from domains.admin.schema import AdminUserUpdate
+        from domains.admin.service import AdminService
+        from shared.security import CurrentUser
+
+        tag = uid()
+        headers, _ = await register_and_login(
+            real_client, mock_email, f"cw{tag}@example.com", f"cw{tag}")
+        user_id = UUID(await current_user_id(real_client, headers))
+        admin = CurrentUser(uuid4(), "admin")
+        moderator = CurrentUser(uuid4(), "moderator")
+
+        async with SessionLocal() as first, SessionLocal() as second:
+            deactivator = AdminService(first)
+            await deactivator._require_live_user(user_id)
+            promoting = asyncio.create_task(
+                AdminService(second).update_user(
+                    admin, user_id,
+                    AdminUserUpdate(role=SystemRole.MODERATOR)))
+            await asyncio.sleep(0.5)
+            assert not promoting.done()
+            await deactivator.set_active(moderator, user_id, False)
+            detail = await promoting
+        assert (detail.system_role, detail.is_active) == ("moderator", False)
+        assert await stored_user_state(user_id) == {
+            "role": "moderator",
+            "is_active": False
+        }
+
+    async def test_two_admins_demoting_two_admins_do_not_deadlock(
+            self, real_client, mock_email):
+        import asyncio
+        from database import SessionLocal
+        from domains.admin.schema import AdminUserUpdate
+        from domains.admin.service import AdminService
+        from shared.security import CurrentUser
+        from sqlalchemy import text
+
+        ids = []
+        for _ in range(3):
+            tag = uid()
+            headers, _ = await register_and_login(
+                real_client, mock_email, f"dl{tag}@example.com", f"dl{tag}")
+            ids.append(UUID(await current_user_id(real_client, headers)))
+        async with SessionLocal() as setup:
+            await setup.execute(
+                text("UPDATE users SET system_role = 'admin' "
+                     "WHERE id = ANY(:ids)"), {"ids": ids})
+            await setup.commit()
+        actor = CurrentUser(uuid4(), "admin")
+        demote = AdminUserUpdate(role=SystemRole.USER)
+        try:
+            async with SessionLocal() as first, SessionLocal() as second:
+                one = AdminService(first)
+                await one._require_live_user(ids[0])
+                other = asyncio.create_task(
+                    AdminService(second).update_user(actor, ids[1], demote))
+                await asyncio.sleep(0.5)
+                assert not other.done()
+                done = await one.update_user(actor, ids[0], demote)
+                assert done.system_role == "user"
+                assert (await other).system_role == "user"
+        finally:
+            async with SessionLocal() as cleanup:
+                await cleanup.execute(
+                    text("UPDATE users SET system_role = 'user' "
+                         "WHERE id = ANY(:ids)"), {"ids": ids})
+                await cleanup.commit()
+
+    async def test_startup_sync_drops_keys_of_unknown_users(
+            self, client, mock_email, db_session):
+        from config import settings
+        from user_state_sync import _drop_unknown, mirror_all_users
+
+        redis = get_events_client(settings)
+        user = await make_user(client, mock_email, db_session)
+        ghost = str(uuid4())
+        stale = json.dumps({"role": "admin", "is_active": True})
+        await redis.set(user_state_key(ghost), stale)
+        await redis.set(user_state_key("not-a-uuid"), stale)
+        await redis.set(user_state_key(user["id"]), stale)
+
+        await mirror_all_users(SessionFactory(db_session), batch_size=2)
+        assert await stored_user_state(ghost) is None
+        assert await stored_user_state(user["id"]) == {
+            "role": "user",
+            "is_active": True
+        }
+        assert await redis.get(user_state_key("not-a-uuid")) == stale
+
+        await redis.set(user_state_key(user["id"]), stale)
+        await redis.set(user_state_key(ghost), stale)
+        removed = await _drop_unknown(
+            redis, db_session,
+            [user_state_key(user["id"]), user_state_key(ghost)])
+        assert removed == 1
+        assert await stored_user_state(user["id"]) == {
+            "role": "user",
+            "is_active": True
+        }
+        assert await stored_user_state(ghost) is None
+        await redis.delete(user_state_key("not-a-uuid"))
 
     async def test_startup_sync_writes_every_user_and_failure_is_not_fatal(
             self, client, mock_email, db_session, monkeypatch, tmp_path):

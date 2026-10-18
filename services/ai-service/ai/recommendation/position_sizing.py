@@ -98,6 +98,7 @@ class _PositionContext(BaseModel):
     total_net_value: Decimal | None
     current_weight_pct: Decimal | None
     unpriced: list[str]
+    room_net_value: Decimal | None = None
 
     def lines(self, ticker: str) -> list[str]:
         lines = [
@@ -141,7 +142,7 @@ async def _position_context(
         portfolio_id: str, ticker: str, price: Decimal,
         cash: Decimal | None) -> _PositionContext:
     priced, _ = await priced_holdings(portfolio_id, get_market_data_provider())
-    held, _, total = _holding_totals(priced, ticker)
+    held, held_value, total = _holding_totals(priced, ticker)
     unpriced = unpriced_tickers(priced)
     position_value = held * price
     total_net: Decimal | None = None
@@ -153,15 +154,23 @@ async def _position_context(
     return _PositionContext(
         held_quantity=held, position_value=position_value,
         total_net_value=total_net, current_weight_pct=weight,
-        unpriced=unpriced)
+        unpriced=unpriced,
+        room_net_value=(
+            total - held_value + position_value + cash
+            if cash is not None else None))
 
 
 def position_weight_room(
         position: _PositionContext | None,
         limit_pct: Decimal) -> Decimal | None:
-    if position is None or position.total_net_value is None:
+    if position is None:
         return None
-    return position.total_net_value * limit_pct / 100 - position.position_value
+    net = (
+        position.total_net_value
+        if position.total_net_value is not None else position.room_net_value)
+    if net is None:
+        return None
+    return net * limit_pct / 100 - position.position_value
 
 
 async def current_position_weight_pct(
@@ -282,18 +291,25 @@ async def generate_position_sizing(
         limit_pct = Decimal(str(settings.MAX_POSITION_WEIGHT_PCT))
         room = position_weight_room(position, limit_pct)
         if room is not None and room < min_notional:
-            assert (
-                position is not None
-                and position.current_weight_pct is not None)
+            assert position is not None
+            weight_pct = position.current_weight_pct
             logger.info(
                 "position_sizing.position_weight_limit", ticker=ticker,
-                weight_pct=str(round(position.current_weight_pct,
-                                     1)), room=str(room))
+                weight_pct=(
+                    str(round(weight_pct, 1))
+                    if weight_pct is not None else None), room=str(room),
+                unpriced=position.unpriced)
+            held_text = (
+                f"{weight_pct:.1f}% of the portfolio's net value"
+                if weight_pct is not None else
+                f"worth {position.position_value:.2f}, measured against the "
+                f"priced holdings plus cash because "
+                f"{', '.join(position.unpriced) or 'a holding'} had no "
+                "live price")
             return None, (
                 "No entry tiers were generated for this recommendation -- "
-                f"{ticker} is already {position.current_weight_pct:.1f}% of "
-                f"the "
-                f"portfolio's net value; the {limit_pct:.0f}% single-position "
+                f"{ticker} is already {held_text}; the {limit_pct:.0f}% "
+                "single-position "
                 f"limit leaves room for {max(room, Decimal(0)):.2f} more, "
                 f"below "
                 f"the minimum tier size of {min_notional:.2f}.")

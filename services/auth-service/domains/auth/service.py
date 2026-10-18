@@ -68,6 +68,8 @@ def _oauth_provider_config(provider: str) -> dict[str, str]:
 
 OAUTH_STATE_TTL_SECONDS = 300
 OAUTH_NONCE_COOKIE = "alphamind_oauth_nonce"
+OAUTH_NEXT_MAX_LENGTH = 512
+_OAUTH_MARKER = re.compile(r"[A-Za-z0-9_-]{16,128}")
 TOTP_UNREADABLE_MESSAGE = (
     "Your 2FA settings cannot be read. Ask an administrator to reset your "
     "2FA, then set it up again.")
@@ -140,12 +142,16 @@ class OAuthFlow:
     provider: str
     nonce_hash: str
     code_verifier: str
+    next_path: str | None = None
+    marker: str | None = None
 
     def to_json(self) -> str:
         return json.dumps({
             "provider": self.provider,
             "nonce_hash": self.nonce_hash,
-            "code_verifier": self.code_verifier
+            "code_verifier": self.code_verifier,
+            "next_path": self.next_path,
+            "marker": self.marker
         })
 
     @classmethod
@@ -164,7 +170,9 @@ class OAuthFlow:
             return None
         return cls(
             provider=str(provider), nonce_hash=str(nonce_hash),
-            code_verifier=str(code_verifier))
+            code_verifier=str(code_verifier),
+            next_path=safe_next_path(body.get("next_path")),
+            marker=safe_oauth_marker(body.get("marker")))
 
 
 @dataclass(frozen=True)
@@ -256,14 +264,34 @@ def pkce_challenge(code_verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
-async def oauth_authorize_url(provider: str) -> OAuthStart:
+def safe_next_path(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > OAUTH_NEXT_MAX_LENGTH:
+        return None
+    if not value.startswith("/") or value.startswith("//"):
+        return None
+    if "\\" in value or any(ord(ch) < 0x20 or ord(ch) == 0x7F
+                            for ch in value):
+        return None
+    return value
+
+
+def safe_oauth_marker(value: object) -> str | None:
+    if isinstance(value, str) and _OAUTH_MARKER.fullmatch(value):
+        return value
+    return None
+
+
+async def oauth_authorize_url(
+        provider: str, *, next_path: str | None = None,
+        marker: str | None = None) -> OAuthStart:
     provider_cfg = _oauth_provider_config(provider)
 
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(32)
     flow = OAuthFlow(
         provider=provider, nonce_hash=_sha256_hex(nonce),
-        code_verifier=secrets.token_urlsafe(48))
+        code_verifier=secrets.token_urlsafe(48),
+        next_path=safe_next_path(next_path), marker=safe_oauth_marker(marker))
     await get_cache_client(settings).set(
         f"oauth:state:{state}", flow.to_json(), ex=OAUTH_STATE_TTL_SECONDS)
     params = httpx.QueryParams({
@@ -318,6 +346,7 @@ class AuthService:
         self._db = session
         self.users = UserRepository(session)
         self.pending_events: list[PendingEvent] = []
+        self.oauth_flow: OAuthFlow | None = None
 
     def _user_updated(self, user: User, changed: list[str]) -> None:
         if changed:
@@ -380,7 +409,7 @@ class AuthService:
             logger.info("password_reset_requested_unknown_email")
             return None
         token = security.create_password_reset_token(
-            str(user.id), user.password_hash)
+            str(user.id), user.password_hash, user.email)
         return EmailDispatch(
             to=user.email,
             link=f"{settings.FRONTEND_BASE_URL}/reset-password?token={token}")
@@ -395,14 +424,18 @@ class AuthService:
         if user.deleted_at is not None:
             raise ValidationAppError("This reset link is no longer valid.")
         if payload.get("pwd") != security.password_fingerprint(
-                user.password_hash):
+                user.password_hash, user.email):
             raise ValidationAppError(
                 "This reset link has already been used "
                 "or is no longer valid.")
         user.password_hash = security.hash_password(new_password)
+        changed = ["password"]
+        if not user.is_verified:
+            user.is_verified = True
+            changed.append("is_verified")
         await self._db.flush()
         await self.users.revoke_all_sessions(user.id)
-        self._user_updated(user, ["password"])
+        self._user_updated(user, changed)
 
     async def login(
             self, *, email: str, password: str, totp_code: str | None,
@@ -608,6 +641,7 @@ class AuthService:
             raise OAuthFailedError(
                 "This sign-in was not started in this browser. Start the "
                 "sign-in again.")
+        self.oauth_flow = flow
 
         identity = await self._fetch_oauth_identity(
             provider, provider_cfg, code, flow.code_verifier)

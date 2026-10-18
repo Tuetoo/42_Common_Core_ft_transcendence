@@ -3,13 +3,12 @@
 This document maps the code to the modules of the ft_transcendence
 subject (v21.1, chapter IV).
 
-Scoring: a Major module is worth 2 points and a Minor module 1 point;
-only fully working modules count at evaluation. Each row names the
-module as the subject lists it and the evidence: the backend code, the
-pages of the frontend (the Next.js app in `frontend/`, served by the
-gateway at `/`; page paths are under `frontend/app/`, and route groups in
-parentheses such as `(protected)` are not part of the URL) and, where a
-requirement has no page, how to show it (Swagger at
+A Major module is worth 2 points and a Minor module 1 point. Each row
+names the module as the subject lists it and the evidence: the backend
+code, the pages of the frontend (the Next.js app in `frontend/`, served
+by the gateway at `/`; page paths are under `frontend/app/`, and route
+groups in parentheses such as `(protected)` are not part of the URL)
+and, where a requirement has no page, how to show it (Swagger at
 `/docs/{auth,core,ai}/`, Grafana, GitHub Actions).
 
 ---
@@ -71,7 +70,7 @@ REST (`services/*/clients/*.py`, service-to-service routes under
 |---|---|---|---|---|
 | W1 | Use a framework for both the frontend and backend | Major | 2 | Next.js 16 (React 19) for the frontend; FastAPI for all three backend services. |
 | W2 | Use an ORM for the database | Minor | 1 | SQLAlchemy 2.0 async models and repositories (`shared/database.py`, `services/*/domains/*/model.py`), Alembic migrations per service. |
-| W3 | Real-time features using WebSockets | Major | 2 | `core-service` WebSockets at `/ws/{channel}` over WSS: per-channel authorization, a Redis relay so every replica delivers each message once per socket, presence heartbeats, close codes for expired sessions and lost access, and client reconnection with backoff. Shown in the app: the live notification feed and unread badge (`(protected)/notifications/live-feed.tsx`, `use-live-unread.ts`), the live status of a running analysis (`(protected)/analyses/[id]/live-status.tsx`) and the live refresh of the analytics page. |
+| W3 | Real-time features using WebSockets | Major | 2 | `core-service` WebSockets at `/ws/{channel}` over WSS: per-channel authorization, a Redis relay so every replica delivers each message once per socket, presence heartbeats, close codes for expired sessions and lost access, and client reconnection with backoff. Shown in the app: the live notification feed and unread badge (`(protected)/notifications/live-feed.tsx`, `use-live-unread.ts`), the live status of a running analysis (`(protected)/analyses/[id]/live-status.tsx`), the live refresh of the analytics page, and friends' online status on `/friends` (pushed over the user's `user:` channel, `friends/friend-forms.tsx`). The clients share one reconnect hook, `app/lib/use-channel.ts`. |
 | W4 | Public API with a secured API key, rate limiting, documentation and at least 5 endpoints | Major | 2 | Five endpoints under `/api/v1/public/*` with GET, POST, PUT and DELETE (`services/core-service/api/public.py`); `X-API-Key` checked on every call, with an "Authorize" field in Swagger at `/docs/core/`; per-key and per-user rate limits (429); the keys of a deactivated owner stop working at once. |
 | W5 | A complete notification system for all creation, update and deletion actions | Minor | 1 | Every create, update and delete action notifies the user who made it, and the users it affects: portfolios and the ledger, notes, comments and documents, organizations, members and invitations, friend requests and blocks (the blocked user is never told), analyses, decisions, trade tiers and backtests. Auth and ai actions reach core-service as events (`shared/events.py`, types in `shared/enums.py`). In-app notifications at `/notifications` with a live unread count, optional email. |
 | W6 | File upload and management system | Minor | 1 | Documents (PDF, text, Markdown) at `/research/documents`: type and size checked in the browser and on the server, where a `.pdf` must really be a PDF; upload progress bar; inline preview; download; delete with search-index clean-up; access control by owner and organization on S3-compatible storage. Images (PNG, JPEG, WebP, GIF) as avatars at `/profile`: type and size checked in the browser and on the server, a default avatar when none is set. |
@@ -177,7 +176,7 @@ filings and news.
 
 ---
 
-## 6. Evaluation demo checklist
+## 6. Demo checklist
 
 - [ ] Fresh clone into an empty folder (not named `alphamind`, so its volumes are separate; `make down` the existing stack first, the ports are the same); copy the saved `.env.docker` into it (or `cp .env.example .env.docker` and fill the secrets); `make up` (creates the certificate and starts everything with one command)
 - [ ] https://localhost:8443/status all green; http://localhost:8000 redirects to HTTPS; Chrome console clean

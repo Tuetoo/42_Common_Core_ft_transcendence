@@ -29,6 +29,12 @@ class UserRepository:
             raise NotFoundError(message)
         return user
 
+    async def lock(self, user_id: UUID) -> User | None:
+        result = await self._db.execute(
+            select(User).where(User.id == user_id).with_for_update()
+            .execution_options(populate_existing=True))
+        return result.scalar_one_or_none()
+
     async def get_by_email(self, email: str) -> User | None:
         result = await self._db.execute(
             select(User).where(func.lower(User.email) == email.lower()))
@@ -164,24 +170,19 @@ class UserRepository:
                             synchronize_session="fetch"))
         return result.scalar_one_or_none()
 
-    async def revoke_session(
-            self, session: UserSession, *,
-            reason: str = SessionRevokeReason.LOGOUT) -> None:
+    async def revoke_session(self, session: UserSession) -> None:
         session.revoked_at = datetime.now(UTC)
-        session.revoked_reason = reason
+        session.revoked_reason = SessionRevokeReason.LOGOUT
         await self._db.flush()
 
-    async def revoke_all_sessions(
-            self, user_id: UUID, *,
-            reason: str = SessionRevokeReason.REVOKED_ALL) -> int:
-        result = await self._db.execute(
+    async def revoke_all_sessions(self, user_id: UUID) -> None:
+        await self._db.execute(
             update(UserSession).where(
                 UserSession.user_id == user_id,
                 UserSession.revoked_at.is_(None)).values(
                     revoked_at=datetime.now(UTC),
-                    revoked_reason=reason).execution_options(
-                        synchronize_session="fetch"))
-        return int(getattr(result, "rowcount", 0) or 0)
+                    revoked_reason=SessionRevokeReason.REVOKED_ALL
+                ).execution_options(synchronize_session="fetch"))
 
     async def revoke_rotation_successors(
             self, rotated: UserSession, *, reason: str) -> int:

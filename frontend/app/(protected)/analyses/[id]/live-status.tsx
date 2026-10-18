@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { closeSocket, wsUrl } from "@/app/lib/ws-url";
+import { parseEnvelope, useChannel } from "@/app/lib/use-channel";
 
 type ConnectionStatus = "connecting" | "live" | "polling";
 
@@ -27,37 +27,36 @@ export function LiveStatus({
   shownStatus: string;
 }) {
   const router = useRouter();
-  const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 
-  useEffect(() => {
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    const ws = new WebSocket(wsUrl(`/analysis:${analysisId}?token=${accessToken}`));
-
-    ws.onopen = () => setConnection("live");
-    ws.onmessage = (event) => {
-      const { event: name, payload } = JSON.parse(event.data);
+  // One connection only: if the socket can't be used (expired token,
+  // untrusted certificate) or drops, fall back to re-fetching the page on
+  // a timer so results still appear. It closes when the page stops
+  // rendering this component (e.g. once the analysis has finished) or the
+  // user navigates away.
+  const { status } = useChannel({
+    path: `/analysis:${analysisId}`,
+    token: accessToken,
+    retry: false,
+    onMessage: (event) => {
+      const envelope = parseEnvelope(event.data);
+      if (!envelope) return;
       // The first message is a snapshot of the current status: the analysis
       // may have started or finished between the page loading and the
       // socket opening, so its events were sent before this subscription.
-      const changedBeforeSubscribe = name === "analysis.status" && payload?.status !== shownStatus;
-      if (REFRESH_EVENTS.has(name) || changedBeforeSubscribe) {
+      const changedBeforeSubscribe =
+        envelope.event === "analysis.status" && envelope.payload.status !== shownStatus;
+      if (REFRESH_EVENTS.has(envelope.event) || changedBeforeSubscribe) {
         router.refresh();
       }
-    };
-    // If the socket can't be used (expired token, untrusted certificate),
-    // fall back to re-fetching the page on a timer so results still appear.
-    ws.onclose = () => {
-      setConnection("polling");
-      if (!pollTimer) pollTimer = setInterval(() => router.refresh(), POLL_INTERVAL_MS);
-    };
+    },
+  });
+  const connection: ConnectionStatus = status === "open" ? "live" : status === "ended" ? "polling" : "connecting";
 
-    // Runs when the page stops rendering this component (e.g. once the
-    // analysis has finished) or the user navigates away.
-    return () => {
-      closeSocket(ws);
-      if (pollTimer) clearInterval(pollTimer);
-    };
-  }, [analysisId, accessToken, shownStatus, router]);
+  useEffect(() => {
+    if (connection !== "polling") return;
+    const pollTimer = setInterval(() => router.refresh(), POLL_INTERVAL_MS);
+    return () => clearInterval(pollTimer);
+  }, [connection, router]);
 
   return (
     <div className="panel flex items-center gap-3" style={{ fontSize: 13 }}>

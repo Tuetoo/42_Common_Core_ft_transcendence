@@ -1414,7 +1414,7 @@ quotes, tool values), never from re-parsed model prose.
 
 **A hand-written loop instead of a framework agent executor.**
 Alternative: LangGraph's prebuilt agent. Reason: explainability; every rule for when an agent may stop is code the team
-owns and can show an evaluator.
+owns and can show a reviewer.
 
 **Structured JSON turns instead of "Thought: ... Action: ..." text.**
 Reason: far less fragile to parse; the tool argument schemas also let

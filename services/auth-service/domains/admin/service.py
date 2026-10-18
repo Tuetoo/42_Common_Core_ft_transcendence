@@ -25,7 +25,8 @@ from domains.auth.service import (EmailDispatch, avatar_or_default,
 from domains.organization.repository import OrganizationRepository
 from shared.enums import OrganizationRole, SystemRole
 from shared.events import EventName
-from shared.exceptions import ConflictError, PermissionDeniedError
+from shared.exceptions import (ConflictError, NotFoundError,
+                               PermissionDeniedError)
 from shared.http_client import get_http_client
 from shared.permissions import Permission, has_permission, sorted_permissions
 from shared.schemas import PaginatedResponse, PaginationParams
@@ -204,6 +205,7 @@ class AdminService:
         for user_id in candidates:
             events_before = len(self.pending_events)
             try:
+                await self.admin.lock_active_admin_ids()
                 user = await self.admin.lock_unverified_account(
                     user_id, cutoff)
                 if user is None:
@@ -254,7 +256,7 @@ class AdminService:
         await self.admin.delete_two_factor_secret(user.id)
         await self.admin.delete_connections(user.id)
         await self._transfer_owned_organizations(user, actor_id)
-        await self.orgs.remove_memberships_of_user(user.id, keep_owner=True)
+        await self.orgs.remove_memberships_of_user(user.id)
         await self.users.revoke_all_sessions(user.id)
         await commit_with_state(self._db, user, previous_state)
         self._user_event(
@@ -331,7 +333,10 @@ class AdminService:
         return await self.get_user(user.id)
 
     async def _require_live_user(self, user_id: UUID) -> User:
-        user = await self.users.require(user_id)
+        await self.admin.lock_active_admin_ids()
+        user = await self.users.lock(user_id)
+        if user is None:
+            raise NotFoundError("User not found.")
         if user.deleted_at is not None:
             raise ConflictError("This user has been deleted.")
         return user

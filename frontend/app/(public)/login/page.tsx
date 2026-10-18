@@ -15,7 +15,7 @@ export default async function LoginPage({
         <h1 className="page-title">Log in to AlphaMind</h1>
       </div>
       <LoginForm next={next ?? ""} />
-      <OAuthButtons />
+      <OAuthButtons next={next ?? ""} />
     </div>
   );
 }

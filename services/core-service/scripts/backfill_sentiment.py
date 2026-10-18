@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 from database import SessionLocal, engine
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.research.model import ResearchComment, ResearchNote
 from domains.research.sentiment import (refresh_comment_sentiment,
@@ -36,7 +36,9 @@ async def build_plan(
         session: AsyncSession, *, kind: str, limit: int | None) -> Plan:
     plan = Plan()
     if kind in ("note", "all"):
-        missing = ResearchNote.sentiment_label.is_(None)
+        missing = or_(
+            ResearchNote.sentiment_label.is_(None),
+            ResearchNote.sentiment_analyzed_at < ResearchNote.updated_at)
         plan.notes_missing = int((
             await session.execute(
                 select(func.count()).select_from(ResearchNote).where(missing)
@@ -48,7 +50,12 @@ async def build_plan(
             stmt = stmt.limit(limit)
         plan.note_ids = list((await session.execute(stmt)).scalars().all())
     if kind in ("comment", "all"):
-        missing_c = ResearchComment.sentiment_label.is_(None)
+        missing_c = or_(
+            ResearchComment.sentiment_label.is_(None),
+            and_(
+                ResearchComment.updated_at.is_not(None),
+                ResearchComment.sentiment_analyzed_at
+                < ResearchComment.updated_at))
         plan.comments_missing = int((
             await session.execute(
                 select(func.count()).select_from(ResearchComment).where(
@@ -91,10 +98,10 @@ async def apply_plan(
 
 def print_plan(plan: Plan) -> None:
     print(
-        f"Notes without sentiment:    {plan.notes_missing}"
+        f"Notes without current sentiment:    {plan.notes_missing}"
         f" (this run: {len(plan.note_ids)})")
     print(
-        f"Comments without sentiment: {plan.comments_missing}"
+        f"Comments without current sentiment: {plan.comments_missing}"
         f" (this run: {len(plan.comment_ids)})")
 
 
@@ -110,7 +117,8 @@ def print_result(result: Result) -> None:
 
 DESCRIPTION = (
     "Operator script: compute the sentiment of existing\n"
-    "research notes and comments that have none yet.")
+    "research notes and comments that have no label or a label\n"
+    "older than the last edit.")
 
 
 def _parser() -> argparse.ArgumentParser:

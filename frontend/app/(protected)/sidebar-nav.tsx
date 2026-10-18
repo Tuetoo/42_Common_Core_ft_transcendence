@@ -10,17 +10,17 @@ import { MobileNav } from "./mobile-nav";
 export function SidebarNav({
   accessToken,
   userId,
-  initialUnread,
+  unread: serverUnread,
   permissions,
   account,
 }: {
   accessToken: string;
   userId: string;
-  initialUnread: number;
+  unread: { count: number };
   permissions: string[];
   account: React.ReactNode;
 }) {
-  const unread = useLiveUnread({ accessToken, userId, initialUnread });
+  const unread = useLiveUnread({ accessToken, userId, serverUnread });
   const groups = navGroups(permissions);
 
   return (

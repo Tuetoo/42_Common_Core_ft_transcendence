@@ -118,6 +118,7 @@ class AIServiceSettings(BaseServiceSettings):
     MIN_USABLE_AGENTS_FOR_DEBATE: int = 4
     EPISODIC_CONTEXT_LIMIT: int = 3
     AI_ACCURACY_EVALUATION_DAYS: int = 30
+    REVIEW_GIVE_UP_AFTER_DAYS: int = 30
 
     RAG_ASK_RATE_LIMIT_PER_MINUTE: int = 10
     RAG_ASK_RATE_LIMIT_PER_DAY: int = 200

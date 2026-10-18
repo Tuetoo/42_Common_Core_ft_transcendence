@@ -109,7 +109,13 @@ On the Mac (host):
      public base URL. Set `FRONTEND_BASE_URL` to the frontend origin
      (`https://localhost:8443` locally): the callback answers 303 to
      `<FRONTEND_BASE_URL>/oauth/complete` with the tokens, a 2FA
-     challenge or `error=oauth_failed` in the URL fragment.
+     challenge or `error=oauth_failed` in the URL fragment. Start the
+     sign-in in a browser on that same origin: the frontend's per-tab
+     marker lives in the `sessionStorage` of the origin where the login
+     page was opened, so a sign-in started on another origin (for example
+     `npm run dev` on `http://localhost:3000`, or `127.0.0.1` instead of
+     `localhost`) ends with "This sign-in was not started in this browser
+     tab". For `npm run dev`, set `FRONTEND_BASE_URL` to its origin.
    - `QDRANT_API_KEY`: leave empty for the local Qdrant; set it only for
      a Qdrant server that requires a key.
    - If you change `POSTGRES_PASSWORD`, change the password inside
@@ -159,13 +165,16 @@ On the Mac (host):
    The script refuses an unknown email, a deleted account, and demoting
    the last active admin (exit code 1). Tokens already issued get the new
    role at once, because every service reads the live role from Redis.
-7. **Point the scripts at your ids.** The default ids in `scripts/lib.sh`
-   (`ADMIN_USER_ID`, `OWNER_USER_ID`, `PORTFOLIO_ID`) belong to the
-   owner's development database and do not exist on a fresh install, so
-   `token.sh admin`, `e2e.sh`, `tiers.sh` and `run_analysis.sh` fail
-   there. Export your own ids in the shell first, for example
-   `export ADMIN_USER_ID=<uuid of the admin>`, and create a test
-   portfolio through the API for `PORTFOLIO_ID` and `OWNER_USER_ID`.
+7. **Point the scripts at your ids.** `scripts/lib.sh` has no built-in
+   ids. It reads `ADMIN_USER_ID`, `OWNER_USER_ID` and `PORTFOLIO_ID` from
+   the environment, or from an optional git-ignored `.env.scripts` file
+   at the repository root (`VAR=value` lines; the environment wins).
+   `ADMIN_USER_ID` falls back to the oldest active admin account, so
+   `token.sh admin` and `e2e.sh` work once step 6 is done.
+   `OWNER_USER_ID` falls back to the owner of `PORTFOLIO_ID`.
+   `PORTFOLIO_ID` has no fallback: create a test portfolio through the
+   API and set its id before you run `tiers.sh`, `snapshots.sh` (without
+   `--portfolio`/`--all`), `run_analysis.sh` or `token.sh owner`.
 8. **Seed the RAG corpus (writes data, uses embedding quota).** The
    repository holds a seed corpus in `rag_seed_documents/` (folders
    `analyst_report`, `earnings_call`, `filing`, `macro_research`,
@@ -284,16 +293,21 @@ the Python scripts inside the services are in section 3.5b):
 
 - `cd` to the repository root, whatever your current folder is.
 - `COMPOSE=(docker compose --env-file .env.docker)`.
-- Default ids of the development data, overridable by environment
-  variables: `ADMIN_USER_ID` (`551b898b-e87c-4872-8bca-70333bc9d00b`),
-  `OWNER_USER_ID` (`5c7a7207-b4a1-4db8-8550-aae19d0a3d65`),
-  `PORTFOLIO_ID` (`d72855ea-2776-41c3-bc77-ce1a4c1435d5`, the test
-  portfolio).
+- The ids `ADMIN_USER_ID`, `OWNER_USER_ID` and `PORTFOLIO_ID` come from
+  the environment or from the optional, git-ignored `.env.scripts` at
+  the repository root (only these three names are read; the environment
+  wins). There are no built-in defaults.
+- `require_admin_id` falls back to the oldest active, non-deleted admin
+  in `auth.users`; `require_owner_id` falls back to the owner of
+  `PORTFOLIO_ID`; `require_portfolio_id` has no fallback. Each one checks
+  the UUID and stops with a message that names the variable.
+- `psql_value`: runs one query with `psql -At` and prints the value.
 - `psql_stdin`: runs SQL from stdin with `psql -U "$POSTGRES_USER" -d
   "$POSTGRES_DB" -v ON_ERROR_STOP=1` inside the postgres container, so the
   user and database come from the container, not from your shell.
 - `make_token USER_ID ROLE [HOURS]`: runs auth-service's own
-  `security._create_token(...)` inside the auth-service container.
+  `security._create_token(...)` inside the auth-service container (the
+  values are passed as arguments, not written into the Python code).
 - `in_busy_window` / `guard_busy_window`: the busy-window check
   (section 3.7). Used by `rebuild.sh`, `e2e.sh` and `snapshots.sh`.
 
@@ -616,7 +630,7 @@ checks the clock.
 |---|---|---|---|---|
 | `set_system_role --email E --role guest\|user\|moderator\|admin [--dry-run]` | auth | yes | Sets a user's system role in the database and in the live Redis mirror, so issued tokens get it at once. How the first admin is made. Refuses an unknown email, a deleted account and demoting the last active admin (exit 1). | 11 |
 | `delete_documents --id U [--id U ...] [--confirm]` | core | with `--confirm` | Deletes documents like the API does, but without the owner check (for documents owned by the ingestion user or the system): the row and a `document.deleted` outbox entry in one commit, the event published at once (or later by the outbox dispatcher), then the S3 object. Each document is committed on its own; ids already gone are reported as not found. | 12, 22 |
-| `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
+| `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none, or whose label is older than the last edit (`sentiment_analyzed_at < updated_at`) (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
 | `recompute_snapshots` (through `scripts/snapshots.sh`) | core | with `--confirm` | Rebuilds NAV snapshots from the ledger and official closes; see section 3.5. | 12 |
 | `e2e_check` (through `scripts/e2e.sh`) | core | test data only, cleaned up | Whole-stack end-to-end check; see section 3.11. | 31 |
 | `analysis_cli create\|status\|get\|committed` | ai | `create` | Internal analysis client used by `run_analysis.sh` (see section 3.9); `committed <portfolio-uuid>` prints the BUY cash held by open tiers, used by `tiers.sh`. | 13 |
@@ -877,8 +891,8 @@ caffeinate -i make analyze T="AAPL MSFT"                       # same, through m
 
 What it does, per ticker, one after another (`scripts/run_analysis.sh`):
 
-1. **Create** a system analysis bound to `PORTFOLIO_ID` (default: the test
-   portfolio) by running
+1. **Create** a system analysis bound to `PORTFOLIO_ID` (required; the
+   script stops at the start when it is not set) by running
    `python -m scripts.analysis_cli create <TICKER> --portfolio <id>`
    inside ai-service. The CLI calls `POST /internal/analyses` on
    `http://localhost:8000` inside the container, with the
@@ -907,7 +921,7 @@ What it does, per ticker, one after another (`scripts/run_analysis.sh`):
 
 One ticker failing or timing out never stops the rest (`set -uo
 pipefail`, without `-e`). The script sources `scripts/lib.sh` (repository
-root, Compose command, `PORTFOLIO_ID` default, `psql_stdin`), so it works
+root, Compose command, `require_portfolio_id`, `psql_stdin`), so it works
 from any folder.
 
 Output folder `runs/run_<timestamp>/` in the repository root (`runs/` is
@@ -1241,9 +1255,9 @@ disappears on a server.
 
 | Setting | Default | Meaning | File |
 |---|---|---|---|
-| `ADMIN_USER_ID` | `551b898b-e87c-4872-8bca-70333bc9d00b` | admin account used by `token.sh admin` and `e2e.sh` | `scripts/lib.sh` |
-| `OWNER_USER_ID` | `5c7a7207-b4a1-4db8-8550-aae19d0a3d65` | test portfolio owner (`token.sh owner`, `tiers.sh decline`) | `scripts/lib.sh` |
-| `PORTFOLIO_ID` | `d72855ea-2776-41c3-bc77-ce1a4c1435d5` | test portfolio for `run_analysis.sh`, `tiers.sh`, `snapshots.sh` | `scripts/lib.sh` |
+| `ADMIN_USER_ID` | the oldest active admin | admin account used by `token.sh admin` and `e2e.sh` | environment or `.env.scripts` |
+| `OWNER_USER_ID` | the owner of `PORTFOLIO_ID` | test portfolio owner (`token.sh owner`, `tiers.sh decline`) | environment or `.env.scripts` |
+| `PORTFOLIO_ID` | none (required) | test portfolio for `run_analysis.sh`, `tiers.sh`, `snapshots.sh` (unless `--portfolio`/`--all`), `token.sh owner` | environment or `.env.scripts` |
 | `FORCE` | `0` | `1` overrides the busy-window refusal | `scripts/lib.sh` |
 | `GATEWAY_URL` | `https://localhost:8443` | public gateway address for scripts that call the public API (`tiers.sh decline`) | `scripts/lib.sh` |
 | `HOURS` | `2` | token lifetime in `token.sh` | `scripts/token.sh` |
@@ -1489,7 +1503,7 @@ command on its own line, from the repository root.
     make smoke
     ```
     They see one `OK`, `SKIP` or `FAIL` line per check and a summary.
-    Run it once before the evaluation: `filing_records` fails while a
+    Run it once before a demo: `filing_records` fails while a
     stored filing has no `ai.filing_records` row (fix it with
     `backfill_filing_records`, section 3.5b). The check itself refreshes
     AAPL's cached prices and creates and deletes one scratch backtest;
@@ -1555,7 +1569,7 @@ one exporter for about two minutes; no data is touched):
 | `Makefile` | Build, test, lint and operator targets (each operator target runs one script from `scripts/`). |
 | `.env.example` | Template for `.env.docker`, with every setting explained. |
 | `docker-compose.yaml`, `docker-compose.override.yml` | The stack and the development override. |
-| `scripts/lib.sh` | Repository root, Compose command, default ids, `psql_stdin`, `make_token`, busy windows. |
+| `scripts/lib.sh` | Repository root, Compose command, id lookup (`.env.scripts`, `require_*`), `psql_stdin`, `make_token`, busy windows. |
 | `scripts/token.sh` | Access tokens. |
 | `scripts/health.sh` | Health overview from Compose and Prometheus. |
 | `scripts/psql.sh`, `scripts/redis-cli.sh`, `scripts/qdrant.sh`, `scripts/objectstore.sh` | Shells and views of the data stores. |

@@ -56,6 +56,18 @@ async def are_users_connected(user_a: str, user_b: str) -> bool:
     return bool(response.json().get("connected"))
 
 
+async def list_friend_ids(user_id: str) -> list[str]:
+    url = f"{settings.AUTH_SERVICE_URL}/internal/users/{user_id}/friends"
+    try:
+        response = await get_http_client(_TIMEOUT).get(url)
+        response.raise_for_status()
+        return [str(friend) for friend in response.json()["friend_ids"]]
+    except Exception:
+        logger.warning(
+            "auth_friend_lookup_failed", user_id=user_id, exc_info=True)
+        return []
+
+
 async def list_user_organization_roles(user_id: str) -> dict[UUID, str]:
     return await organization_roles(
         settings, get_http_client(_TIMEOUT), settings.AUTH_SERVICE_URL,

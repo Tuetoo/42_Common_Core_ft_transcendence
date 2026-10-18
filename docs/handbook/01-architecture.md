@@ -647,7 +647,6 @@ auth-service:
   volumes:
     - ./shared:/app/shared
     - ./services/auth-service:/app
-    - avatar_data:/app/data/avatars
 # core-service: same pattern; ai-service: same pattern plus LOG_LEVEL=DEBUG
 ```
 
@@ -897,7 +896,7 @@ fixed-size Docker disk that holds PostgreSQL and the backups.
 
 ## 7. Demo walkthrough
 
-Goal: show the evaluators the architecture live, from the outside in.
+Goal: show the architecture live, from the outside in.
 Run from the repository root with the stack already up (see
 [chapter 02](02-operations.md) for bringing it up).
 

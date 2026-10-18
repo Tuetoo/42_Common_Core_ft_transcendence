@@ -1,7 +1,7 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
 import { Avatar } from "../avatar";
-import { AddFriendForm, AutoRefresh, ConnectionButton } from "./friend-forms";
+import { AddFriendForm, AutoRefresh, ConnectionButton, LivePresence } from "./friend-forms";
 
 type Connection = {
   id: string;
@@ -56,7 +56,8 @@ export default async function FriendsPage() {
 
   return (
     <div className="page">
-      <AutoRefresh seconds={30} />
+      <LivePresence />
+      <AutoRefresh seconds={60} />
       <div>
         <p className="page-eyebrow">Account</p>
         <h1 className="page-title">Friends</h1>

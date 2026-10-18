@@ -9,14 +9,13 @@
 #                                            # decline the analysis' recommendation
 #                                            # (its pending tiers become declined)
 #
-# PORTFOLIO_ID selects the portfolio (default: the test portfolio). A
-# decision must come from the portfolio owner, so `decline` uses a token
-# of OWNER_USER_ID (default: the test portfolio's owner).
+# PORTFOLIO_ID selects the portfolio (see lib.sh). A decision must come
+# from the portfolio owner, so `decline` uses a token of OWNER_USER_ID
+# (default: the owner of PORTFOLIO_ID).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
-uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-[[ "$PORTFOLIO_ID" =~ $uuid_re ]] || die "PORTFOLIO_ID is not a UUID: $PORTFOLIO_ID"
+require_portfolio_id
 
 cmd="${1:-open}"
 [ "$#" -gt 0 ] && shift
@@ -39,9 +38,10 @@ SQL
     ;;
   decline)
     [ "$#" -ge 1 ] || die "usage: bash scripts/tiers.sh decline <analysis-uuid> [...]"
+    require_owner_id
     token=$(make_token "$OWNER_USER_ID" user 1)
     for analysis_id in "$@"; do
-      [[ "$analysis_id" =~ $uuid_re ]] || die "not a UUID: $analysis_id"
+      [[ "$analysis_id" =~ $UUID_RE ]] || die "not a UUID: $analysis_id"
       echo "== $analysis_id"
       curl -sk -X POST "$GATEWAY_URL/api/v1/analyses/$analysis_id/decisions" \
         -H "Authorization: Bearer $token" -H "Content-Type: application/json" \

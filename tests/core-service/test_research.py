@@ -1145,10 +1145,14 @@ class TestDocumentIngestion:
             document.status = status
             await db_session.flush()
             second = await client.post("/api/v1/research/documents", **kwargs)
+            assert len(published) == (2 if republished else 1), case
+            if not republished:
+                assert second.status_code == 409, case
+                assert second.json()["error"]["code"] == "conflict", case
+                continue
             assert second.status_code == 201, case
             first_id = first.json()["data"]["id"]
             assert second.json()["data"]["id"] == first_id, case
-            assert len(published) == (2 if republished else 1), case
 
     async def test_hide_and_repository_rules(
             self, db_session, mock_cross_service, client, monkeypatch):
@@ -1541,6 +1545,37 @@ class TestSentiment:
         assert note_id in plan.note_ids and comment_id in plan.comment_ids
         assert plan.notes_missing >= 1 and plan.comments_missing >= 1
 
+        from sqlalchemy import update
+        from domains.research.model import ResearchComment, ResearchNote
+
+        labelled_at = datetime.now(UTC)
+        async with SessionLocal() as session:
+            await session.execute(
+                update(ResearchNote).where(ResearchNote.id == note_id).values(
+                    sentiment_label="positive",
+                    sentiment_analyzed_at=labelled_at,
+                    updated_at=labelled_at - timedelta(minutes=1)))
+            await session.execute(
+                update(ResearchComment).where(
+                    ResearchComment.id == comment_id).values(
+                        sentiment_label="positive",
+                        sentiment_analyzed_at=labelled_at, updated_at=None))
+            await session.commit()
+            current = await backfill_sentiment.build_plan(
+                session, kind="all", limit=None)
+            assert note_id not in current.note_ids
+            assert comment_id not in current.comment_ids
+            for model, row_id in ((ResearchNote, note_id),
+                                  (ResearchComment, comment_id)):
+                await session.execute(
+                    update(model).where(model.id == row_id).values(
+                        updated_at=labelled_at + timedelta(minutes=1)))
+            await session.commit()
+            stale = await backfill_sentiment.build_plan(
+                session, kind="all", limit=None)
+            assert note_id in stale.note_ids
+            assert comment_id in stale.comment_ids
+
         only_mine = backfill_sentiment.Plan(
             note_ids=[note_id], comment_ids=[comment_id])
         now = [0.0]
@@ -1582,7 +1617,8 @@ class TestSentiment:
         monkeypatch.setattr(backfill_sentiment, "close_http_clients", _noop)
         assert await backfill_sentiment.main(["--kind", "note"]) == 0
         out = capsys.readouterr().out
-        assert "Preview only" in out and "Notes without sentiment" in out
+        assert "Preview only" in out
+        assert "Notes without current sentiment" in out
         assert await backfill_sentiment.main(["--rate", "0"]) == 2
 
         import clients.ai_client as client_module

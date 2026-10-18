@@ -15,15 +15,28 @@ COMPOSE=(docker compose --env-file .env.docker)
 GATEWAY_URL="${GATEWAY_URL:-https://localhost:8443}"
 GATEWAY_URL="${GATEWAY_URL%/}"
 
-# Default ids of the development data (override with environment variables).
-ADMIN_USER_ID="${ADMIN_USER_ID:-551b898b-e87c-4872-8bca-70333bc9d00b}"
-OWNER_USER_ID="${OWNER_USER_ID:-5c7a7207-b4a1-4db8-8550-aae19d0a3d65}"
-PORTFOLIO_ID="${PORTFOLIO_ID:-d72855ea-2776-41c3-bc77-ce1a4c1435d5}"
-
 die() {
   echo "error: $*" >&2
   exit 1
 }
+
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# Ids of the accounts and portfolio the scripts act on: ADMIN_USER_ID,
+# OWNER_USER_ID and PORTFOLIO_ID. Set them in the environment or as
+# VAR=value lines in .env.scripts at the repository root (git-ignored;
+# the environment wins). When unset, require_admin_id takes the oldest
+# active admin and require_owner_id the owner of PORTFOLIO_ID;
+# PORTFOLIO_ID has no fallback.
+if [ -f .env.scripts ]; then
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      ADMIN_USER_ID|OWNER_USER_ID|PORTFOLIO_ID)
+        [ -n "${!key:-}" ] || printf -v "$key" '%s' "${value%$'\r'}"
+        ;;
+    esac
+  done < .env.scripts
+fi
 
 # Run SQL with psql inside the postgres container, as that container's own
 # POSTGRES_USER on POSTGRES_DB. SQL is read from stdin.
@@ -31,11 +44,44 @@ psql_stdin() {
   "${COMPOSE[@]}" exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1'
 }
 
-# Print a 2-hour access token for USER_ID with ROLE (admin or user).
+# Print the unaligned, header-less result of the SQL in $1.
+psql_value() {
+  "${COMPOSE[@]}" exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -At' <<< "$1"
+}
+
+require_admin_id() {
+  if [ -z "${ADMIN_USER_ID:-}" ]; then
+    ADMIN_USER_ID=$(psql_value "SELECT id FROM auth.users WHERE system_role = 'admin' AND is_active AND deleted_at IS NULL ORDER BY created_at LIMIT 1;") \
+      || die "could not look up the admin account (is postgres up?); set ADMIN_USER_ID in the environment or in .env.scripts"
+    [ -n "$ADMIN_USER_ID" ] \
+      || die "no active admin account exists; give an account the admin role (scripts.set_system_role) or set ADMIN_USER_ID in the environment or in .env.scripts"
+  fi
+  [[ "$ADMIN_USER_ID" =~ $UUID_RE ]] || die "ADMIN_USER_ID is not a UUID: $ADMIN_USER_ID"
+}
+
+require_portfolio_id() {
+  [ -n "${PORTFOLIO_ID:-}" ] \
+    || die "PORTFOLIO_ID is not set; set it to the id of your test portfolio in the environment or in .env.scripts"
+  [[ "$PORTFOLIO_ID" =~ $UUID_RE ]] || die "PORTFOLIO_ID is not a UUID: $PORTFOLIO_ID"
+}
+
+require_owner_id() {
+  if [ -z "${OWNER_USER_ID:-}" ]; then
+    require_portfolio_id
+    OWNER_USER_ID=$(psql_value "SELECT owner_id FROM core.portfolios WHERE id = '$PORTFOLIO_ID';") \
+      || die "could not look up the owner of $PORTFOLIO_ID (is postgres up?); set OWNER_USER_ID in the environment or in .env.scripts"
+    [ -n "$OWNER_USER_ID" ] \
+      || die "portfolio $PORTFOLIO_ID does not exist; set PORTFOLIO_ID or OWNER_USER_ID in the environment or in .env.scripts"
+  fi
+  [[ "$OWNER_USER_ID" =~ $UUID_RE ]] || die "OWNER_USER_ID is not a UUID: $OWNER_USER_ID"
+}
+
+# Print an access token for USER_ID with ROLE (admin or user), valid for
+# HOURS (default 2).
 make_token() {
-  local user_id="$1" role="$2" hours="${3:-2}"
   "${COMPOSE[@]}" exec -T auth-service python -c \
-    "from datetime import timedelta; from security import _create_token; print(_create_token('$user_id', timedelta(hours=$hours), 'access', {'role': '$role'}))"
+    "import sys; from datetime import timedelta; from security import _create_token; print(_create_token(sys.argv[1], timedelta(hours=float(sys.argv[3])), 'access', {'role': sys.argv[2]}))" \
+    "$1" "$2" "${3:-2}"
 }
 
 # Busy windows of the scheduler, in New York time (the crontab's zone):

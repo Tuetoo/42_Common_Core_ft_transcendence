@@ -1,7 +1,7 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { QUESTION_MAX, TICKER_HINT, TICKER_HTML_PATTERN, tickerError } from "../limits";
+import { useEffect, useRef, useState } from "react";
+import { DOCUMENT_CATEGORIES, QUESTION_MAX, TICKER_HINT, TICKER_HTML_PATTERN, tickerError } from "../limits";
 
 type Citation = {
   index: number;
@@ -13,8 +13,6 @@ type Citation = {
 };
 
 type Status = "idle" | "streaming" | "done" | "error";
-
-const CATEGORIES = ["filing", "analyst_report", "earnings_call", "news", "macro_research", "risk_analysis"];
 
 // Server-Sent Events arrive as blocks separated by a blank line:
 //   event: token
@@ -51,6 +49,9 @@ export function AskPanel() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Leaving the page cancels the answer, so the server stops generating it.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   function toggleCategory(category: string) {
     setCategories((prev) => (prev.includes(category) ? prev.filter((c) => c !== category) : [...prev, category]));
@@ -102,6 +103,7 @@ export function AskPanel() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let finished = false;
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -120,6 +122,7 @@ export function AskPanel() {
             // source of truth in case any token was missed.
             setAnswer(payload.answer as string);
             setCitations(payload.citations as Citation[]);
+            finished = true;
           } else if (event === "error") {
             setError(payload.message as string);
             setStatus("error");
@@ -127,7 +130,12 @@ export function AskPanel() {
           }
         }
       }
-      setStatus("done");
+      if (finished) {
+        setStatus("done");
+      } else {
+        setError("The answer was cut off. Please try again.");
+        setStatus("error");
+      }
     } catch {
       // Reading throws when the user pressed Stop; keep what arrived.
       setStatus(controller.signal.aborted ? "done" : "error");
@@ -189,7 +197,7 @@ export function AskPanel() {
           <legend style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 6 }}>
             Only search these document types (optional)
           </legend>
-          {CATEGORIES.map((c) => (
+          {DOCUMENT_CATEGORIES.map((c) => (
             <label key={c} className="flex items-center gap-2" style={{ fontSize: 13 }}>
               <input autoComplete="off" type="checkbox" checked={categories.includes(c)} onChange={() => toggleCategory(c)} />
               {c.replaceAll("_", " ")}

@@ -146,6 +146,7 @@ class OrganizationService:
                 "Only the organization owner can remove an admin.")
         previous_role = member.role
         await self.orgs.remove_member(member)
+        await self.orgs.delete_open_invitations_by(org_id, target_user_id)
         await self._org_event(
             EventName.ORGANIZATION_MEMBER_REMOVED, org, requester_id,
             user_id=target_user_id, role=previous_role)
@@ -158,6 +159,7 @@ class OrganizationService:
                 "The owner cannot leave the organization. Delete it instead.")
         previous_role = member.role
         await self.orgs.remove_member(member)
+        await self.orgs.delete_open_invitations_by(org_id, user_id)
         await self._org_event(
             EventName.ORGANIZATION_MEMBER_LEFT, org, user_id, user_id=user_id,
             role=previous_role)
@@ -181,6 +183,8 @@ class OrganizationService:
         previous_role = member.role
         member.role = data.role
         await self._db.flush()
+        if OrganizationRole(member.role) not in _MANAGER_ROLES:
+            await self.orgs.delete_open_invitations_by(org_id, target_user_id)
         if previous_role != member.role:
             await self._org_event(
                 EventName.ORGANIZATION_ROLE_CHANGED, org, requester_id,
@@ -255,7 +259,7 @@ class OrganizationService:
             invitation_id: UUID) -> None:
         org = await self._require_org(org_id)
         await self._require_role(org_id, requester_id, _MANAGER_ROLES)
-        invitation = await self.orgs.get_invitation_by_id(invitation_id)
+        invitation = await self.orgs.lock_invitation(invitation_id)
         if (invitation is None or invitation.organization_id != org_id
                 or invitation.accepted_at is not None):
             raise NotFoundError("Invitation not found.")
@@ -275,7 +279,7 @@ class OrganizationService:
         payload = security.decode_or_invalid(
             token, security.ORGANIZATION_INVITATION_TOKEN_TYPE)
 
-        invitation = await self.orgs.get_invitation_by_id(UUID(payload["sub"]))
+        invitation = await self.orgs.lock_invitation(UUID(payload["sub"]))
         if invitation is None:
             raise NotFoundError("Invitation no longer exists.")
         if invitation.accepted_at is not None:
@@ -294,6 +298,12 @@ class OrganizationService:
                                       current_user_id):
             raise ConflictError(
                 "You are already a member of this organization.")
+
+        inviter = await self.orgs.get_member(
+            invitation.organization_id, invitation.invited_by)
+        if inviter is None or OrganizationRole(
+                inviter.role) not in _MANAGER_ROLES:
+            raise NotFoundError("Invitation no longer exists.")
 
         try:
             async with self._db.begin_nested():

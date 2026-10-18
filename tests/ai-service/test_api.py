@@ -1330,6 +1330,27 @@ class TestBacktestRoutes:
             await client.get(sys_url,
                              headers=_headers(owner))).status_code == 404
 
+        newer = await BacktestRepository(db_session).create(
+            user_id=owner, strategy_name="t", benchmark_symbol="SPY",
+            start_date=date(2026, 1, 1), end_date=date(2026, 2, 1),
+            initial_capital=1000.0)
+        backtest.created_at = datetime(2026, 3, 1, tzinfo=UTC)
+        newer.created_at = datetime(2026, 3, 2, tzinfo=UTC)
+        await db_session.flush()
+        listed = await client.get("/api/v1/backtests", headers=_headers(owner))
+        assert listed.status_code == 200, listed.text
+        assert [b["id"] for b in listed.json()["data"]
+                ] == [str(newer.id), str(backtest.id)]
+        page = await client.get(
+            "/api/v1/backtests?limit=1&offset=1", headers=_headers(owner))
+        assert [b["id"] for b in page.json()["data"]] == [str(backtest.id)]
+        assert (await client.get("/api/v1/backtests",
+                                 headers=stranger)).json()["data"] == []
+        assert (await client.get("/api/v1/backtests")).status_code == 401
+        assert (
+            await client.get("/api/v1/backtests?limit=0",
+                             headers=_headers(owner))).status_code == 422
+
         for status in ("completed", "failed"):
             me = uuid4()
             backtest_id = await _stored_backtest(db_session, me, status)

@@ -609,6 +609,17 @@ main svg {
   .row-item { padding: 12px 14px; }
   .stat-value { font-size: 22px; }
 
+  /* iOS Safari zooms the page when it focuses a field whose text is
+     smaller than 16px. Unlayered, so it also beats Tailwind text-[13px]. */
+  input,
+  select,
+  textarea,
+  .field input,
+  .field select,
+  .field textarea {
+    font-size: 16px;
+  }
+
   /* Rows of buttons, inputs and headings wrap onto the next line when they
      don't fit. Wrapping only happens on overflow, so short rows look the
      same; add flex-nowrap to a row that must stay on one line. */

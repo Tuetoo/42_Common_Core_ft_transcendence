@@ -133,14 +133,14 @@ The web pages are the Next.js app in `frontend/`
    [31 Testing and quality](31-testing-quality.md),
    [32 CI/CD](32-ci-cd.md).
 
-### Path B: "I have an evaluation tomorrow" (about three hours)
+### Path B: "I am preparing a demo or an interview" (about three hours)
 
 1. Read sections 1 and 3 of [01](01-architecture.md) and section 3 of
    [16](16-ai-analysis-pipeline.md).
 2. Read section 5 ("Design decisions and why") of
    [01](01-architecture.md), [14](14-ai-llm-layer.md),
    [16](16-ai-analysis-pipeline.md), [24](24-events.md) and
-   [29](29-security.md). Evaluators usually ask "why".
+   [29](29-security.md). Reviewers and interviewers usually ask "why".
 3. Rehearse the demo plan in section 5 below once, end to end.
 4. Answer the "Check your understanding" questions of the chapters you
    will demo.
@@ -191,13 +191,13 @@ Reference documents next to this handbook:
 [ERD](../ERD.md) (every table and column),
 [DISASTER_RECOVERY](../DISASTER_RECOVERY.md) (backup and restore),
 [DEPLOYMENT](../DEPLOYMENT.md) (the cloud host and continuous deployment),
-[MODULE_MAPPING](../MODULE_MAPPING.md) (subject modules and where each is
-implemented),
+[MODULE_MAPPING](../MODULE_MAPPING.md) (the 42 subject modules and where
+each is implemented),
 [DESIGN](../DESIGN.md),
 [PROJECT_STRUCTURE](../PROJECT_STRUCTURE.md).
 What is not built yet is listed in section 8.
 
-## 5. A demo plan for an evaluation (about 30 minutes)
+## 5. A 30-minute demo plan
 
 Each step uses the demo walkthrough of one chapter. Rehearse it once the
 day before, outside the busy windows, and run

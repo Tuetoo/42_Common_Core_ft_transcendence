@@ -9,11 +9,31 @@ import {
   type OAuthTwoFactorState,
 } from "@/app/lib/actions/auth";
 import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../../field-rules";
+import { OAUTH_MARKER_KEY } from "../../oauth-buttons";
 
 type Outcome =
-  | { kind: "login"; accessToken: string; refreshToken: string }
-  | { kind: "challenge"; challengeToken: string }
+  | { kind: "login"; accessToken: string; refreshToken: string; next: string }
+  | { kind: "challenge"; challengeToken: string; next: string }
   | { kind: "error"; message: string };
+
+const NOT_THIS_TAB =
+  "This sign-in was not started in this browser tab, so it was not accepted. Start the sign-in again.";
+
+function storedMarker(): string | null {
+  try {
+    return window.sessionStorage.getItem(OAUTH_MARKER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function forgetMarker() {
+  try {
+    window.sessionStorage.removeItem(OAUTH_MARKER_KEY);
+  } catch {
+    // nothing stored
+  }
+}
 
 const initialTwoFactor: OAuthTwoFactorState = {};
 
@@ -38,9 +58,16 @@ function readFragment(): Outcome {
   const refreshToken = params.get("refresh_token");
   const challengeToken = params.get("challenge_token");
   const error = params.get("error");
+  const next = params.get("next") ?? "";
 
-  if (accessToken && refreshToken) return { kind: "login", accessToken, refreshToken };
-  if (challengeToken) return { kind: "challenge", challengeToken };
+  if (accessToken || challengeToken) {
+    const expected = storedMarker();
+    if (!expected || params.get("marker") !== expected) {
+      return { kind: "error", message: NOT_THIS_TAB };
+    }
+  }
+  if (accessToken && refreshToken) return { kind: "login", accessToken, refreshToken, next };
+  if (challengeToken) return { kind: "challenge", challengeToken, next };
   return {
     kind: "error",
     message: params.get("message") ?? (error ? `Sign-in failed (${error}).` : "Sign-in failed."),
@@ -57,13 +84,15 @@ function OAuthResultInBrowser() {
     handled.current = true;
     // Drop the tokens from the address bar and browser history right away.
     window.history.replaceState(null, "", window.location.pathname);
+    // One marker per started sign-in: a second completion needs a new start.
+    forgetMarker();
     if (outcome.kind === "login") {
-      startTransition(() => completeOAuthLogin(outcome.accessToken, outcome.refreshToken));
+      startTransition(() => completeOAuthLogin(outcome.accessToken, outcome.refreshToken, outcome.next));
     }
   }, [outcome]);
 
   if (outcome.kind === "challenge") {
-    return <TwoFactorStep challengeToken={outcome.challengeToken} />;
+    return <TwoFactorStep challengeToken={outcome.challengeToken} next={outcome.next} />;
   }
 
   if (outcome.kind === "error") {
@@ -81,9 +110,9 @@ function OAuthResultInBrowser() {
   return <p style={{ color: "var(--text-secondary)" }}>Completing sign-in…</p>;
 }
 
-function TwoFactorStep({ challengeToken }: { challengeToken: string }) {
+function TwoFactorStep({ challengeToken, next }: { challengeToken: string; next: string }) {
   const [state, formAction, pending] = useActionState(
-    completeOAuthTwoFactor.bind(null, challengeToken),
+    completeOAuthTwoFactor.bind(null, challengeToken, next),
     initialTwoFactor
   );
 

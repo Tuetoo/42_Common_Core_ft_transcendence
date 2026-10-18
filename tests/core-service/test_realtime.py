@@ -999,6 +999,7 @@ class TestNotificationService:
         user_id = uuid4()
         await actions.notify_user(
             user_id=user_id, type="account_updated", title="t", content="c")
+        await asyncio.gather(*actions._email_tasks)
         assert await _rows(user_id) == 0
         assert pushed == []
         assert emailed == ["a@example.com"]
@@ -1006,6 +1007,7 @@ class TestNotificationService:
         preferences["in_app"] = True
         await actions.notify_user(
             user_id=user_id, type="account_updated", title="t", content="c")
+        await asyncio.gather(*actions._email_tasks)
         assert await _rows(user_id) == 1
         assert pushed == [f"user:{user_id}"]
         assert emailed == ["a@example.com", "a@example.com"]
@@ -1037,6 +1039,43 @@ class TestNotificationService:
             "user_id": str(uuid4())
         })
         assert seen == [True]
+
+    async def test_slow_email_does_not_block_delivery(self, monkeypatch):
+        import aiosmtplib
+        from config import settings
+        from domains.notification import service as actions
+        from domains.notification.schema import NotificationRead
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        timeouts: list[float | None] = []
+
+        async def _smtp(message, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            started.set()
+            await release.wait()
+
+        async def _broadcast(channel, envelope, **kwargs):
+            return None
+
+        monkeypatch.setattr(aiosmtplib, "send", _smtp)
+        monkeypatch.setattr(settings, "SMTP_TIMEOUT_SECONDS", 3.5)
+        monkeypatch.setattr(actions.manager, "broadcast", _broadcast)
+        note = NotificationRead(
+            id=uuid4(), user_id=uuid4(), type="account_updated", title="t",
+            content=None, created_at=datetime.now(UTC))
+        await asyncio.wait_for(
+            actions.NotificationService.deliver_notification(
+                note,
+                actions.DeliveryPreferences(
+                    email=True, email_address="a@example.com")),
+            timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert len(actions._email_tasks) == 1
+        release.set()
+        await asyncio.gather(*actions._email_tasks)
+        assert timeouts == [3.5]
+        assert not actions._email_tasks
 
 
 @pytest.mark.usefixtures("no_sentiment_analysis")
@@ -1532,6 +1571,51 @@ class TestNotificationEvents:
 
 
 class TestEventListener:
+
+    async def test_presence_change_reaches_friends_user_channels(
+            self, monkeypatch):
+        import clients.auth_client as auth_client
+        import event_listener as event_listener_module
+
+        sent: list[tuple[str, str, dict]] = []
+        friends = {"me": ["f1", "f2"]}
+
+        async def _broadcast(channel, envelope, **kwargs):
+            sent.append((channel, envelope.event, envelope.payload))
+
+        async def _friends(user_id):
+            return friends.get(user_id, [])
+
+        monkeypatch.setattr(
+            event_listener_module.manager, "broadcast", _broadcast)
+        monkeypatch.setattr(auth_client, "list_friend_ids", _friends)
+        payload = {"user_id": "me", "is_online": True}
+        await event_listener_module._handle_user_presence_changed(payload)
+        assert [channel for channel, _, _ in sent] == ["presence:me"]
+        await asyncio.gather(*event_listener_module._presence_tasks)
+        assert sent == [
+            (channel, "user.presence.changed", payload)
+            for channel in ("presence:me", "user:f1", "user:f2")
+        ]
+
+        sent.clear()
+        await event_listener_module._handle_user_presence_changed(
+            {"is_online": False})
+        assert sent == []
+
+        class _Broken:
+
+            async def get(self, url):
+                raise RuntimeError("auth down")
+
+        monkeypatch.undo()
+        monkeypatch.setattr(
+            event_listener_module.manager, "broadcast", _broadcast)
+        monkeypatch.setattr(
+            auth_client, "get_http_client", lambda timeout: _Broken())
+        await event_listener_module._handle_user_presence_changed(payload)
+        await asyncio.gather(*event_listener_module._presence_tasks)
+        assert [channel for channel, _, _ in sent] == ["presence:me"]
 
     async def test_document_status_persistence_and_recommendation_notice(
             self, mock_cross_service, monkeypatch):
@@ -2162,6 +2246,51 @@ class TestYjsCollaboration:
         assert sender.sent == [] and not sender.closed
         assert broken.closed and broken_twice.closed
         assert room.connections == {good, sender}
+
+    async def test_rejoin_during_disconnect_save_keeps_new_edit(
+            self, monkeypatch):
+        saves: list[str] = []
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def _gated(note_id, state):
+            if not saves:
+                entered.set()
+                await gate.wait()
+            saves.append(yjs_relay.extract_text(state))
+            return True
+
+        async def _noop(note_id):
+            return None
+
+        monkeypatch.setattr(yjs_relay, "_persist_snapshot", _gated)
+        monkeypatch.setattr(yjs_relay, "_mark_room_active", _noop)
+        monkeypatch.setattr(yjs_relay, "_mark_room_inactive", _noop)
+        relay = yjs_relay.YjsRelay()
+        base = yjs_relay.seed_state("A")
+        room = yjs_relay.YjsRoom("n-race", None)
+        room.apply(base, counts_toward_snapshot=True)
+        relay._rooms = {"n-race": room}
+        first, second = _BroadcastSocket(), _BroadcastSocket()
+        room.connections.add(first)  # type: ignore[arg-type]
+
+        leaving = asyncio.create_task(
+            relay.disconnect(first, room))  # type: ignore[arg-type]
+        await entered.wait()
+        assert await relay.connect(
+            second, "n-race") is room  # type: ignore[arg-type]
+        async with room.lock:
+            room.apply(
+                yjs_relay.replace_text(base, "AC"),
+                counts_toward_snapshot=True)
+        gate.set()
+        await leaving
+
+        assert saves == ["A"]
+        assert room._dirty and relay._rooms.get("n-race") is room
+        await relay.disconnect(second, room)  # type: ignore[arg-type]
+        assert saves == ["A", "AC"]
+        assert "n-race" not in relay._rooms
 
     async def test_close_note_sessions_on_hide_and_delete(
             self, _clean_rooms, monkeypatch):

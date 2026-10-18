@@ -108,7 +108,8 @@ whom are the one exception).
 | `site:stats` | site statistics, analytics `scope=all` | - | - | - | yes |
 
 A guest is read-only: they can still read everything shared with them,
-manage their own account (profile, password, 2FA), remove connections,
+manage their own account (profile, 2FA, and the password through the
+emailed reset link), remove connections,
 leave organizations and accept an organization invitation. An unknown role has no permissions (fail closed).
 The first admin is created on the command line (see Administration below).
 
@@ -183,7 +184,12 @@ OAuth link) is deleted by a nightly job 7 days after registration
 registration (see Internal below).
 
 OAuth browser binding: `/auth/oauth/{provider}/authorize` must be opened as
-a browser navigation. It sets the cookie `alphamind_oauth_nonce` (HttpOnly,
+a browser navigation. It takes two optional query parameters: `next`, a
+same-site path to open after the sign-in (it must start with one `/`,
+not `//`, contain no backslash or control characters, and be at most 512
+characters), and `marker`, a random value of 16 to 128 characters from
+`A-Za-z0-9_-`. An invalid value is dropped silently, not refused. It sets
+the cookie `alphamind_oauth_nonce` (HttpOnly,
 Secure, SameSite=Lax, Path `/api/v1/auth/oauth`, 5 minutes) and redirects to
 the provider with a single-use `state` and a PKCE challenge (S256). The
 callback requires that cookie: a missing or foreign nonce burns the state
@@ -201,6 +207,10 @@ nonce cookie on every outcome. The fragment is URL-encoded
 | the account has 2FA | `challenge_token=...&expires_in=300`; then call `POST /auth/oauth/2fa` with `{challenge_token, code}` |
 | any failure | `error=oauth_failed&message=<error message>` |
 
+When the browser-binding check passed, the fragment also carries the
+`next` and `marker` values given at the authorize step (for every
+outcome above, including a failure after that check).
+
 "Any failure" covers every error of the sign-in: the provider reported an
 error or the user said no, a missing `code` or `state`, an invalid,
 expired, replayed or other-provider state, a missing or foreign nonce
@@ -213,7 +223,14 @@ A fragment (the part after `#`) is never sent by the browser to any
 server and never appears in the `Referer` header. The frontend page
 `/oauth/complete` reads `window.location.hash`, removes it from the
 address bar with `history.replaceState`, and then stores the tokens,
-asks for the 2FA code, or shows the message. `FRONTEND_BASE_URL` must be
+asks for the 2FA code, or shows the message. Before the authorize
+navigation, the frontend stores a random marker for the tab in
+`sessionStorage`; `/oauth/complete` accepts tokens or a 2FA challenge
+only when the fragment's `marker` equals that stored value, otherwise it
+shows an error and stores nothing (protection against login CSRF). After
+the sign-in, including the 2FA step, the user lands on `next` (checked
+again by the frontend) instead of `/portfolios`, so an invitation link
+survives a Google or GitHub sign-in. `FRONTEND_BASE_URL` must be
 the frontend origin (for example `https://localhost:8443` locally, the
 cloud URL on the server).
 
@@ -409,6 +426,7 @@ GET    /internal/users/{user_id}/state          {"role", "is_active"}
 GET    /internal/users/{user_id}/organizations
 GET    /internal/users/{user_id}/notification-settings
 GET    /internal/connections/check
+GET    /internal/users/{user_id}/friends        {"friend_ids": [uuid, ...]}, accepted connections only
 POST   /internal/users/{user_id}/presence      body {"online": bool} (called by core-service WebSockets)
 POST   /internal/scheduler/purge-unverified     (scheduler, daily 04:10 New York)
 ```
@@ -599,10 +617,13 @@ services. The row delete and the outbox entry commit together; the
 stored object is deleted only after the commit (background task), so a failed
 file delete leaves at most an orphan object, never a row without its file.
 
-Re-uploading a duplicate document returns the existing row (201)
-without uploading or publishing anything (a `failed` duplicate is re-ingested
-in place when the caller owns it; another organization member gets 409
-`conflict`); download sends an RFC 5987 `filename*` so non-ASCII names work;
+Re-uploading a document with the same name (same ticker, category and
+filename) returns 409 `conflict` "A document with this name already
+exists. Delete it or rename the file before uploading again." Two cases
+differ: a `failed` duplicate is re-ingested in place when the caller owns
+it (another organization member gets 409), and a duplicate that looks
+stuck in processing is published again and its existing row is returned
+(201); download sends an RFC 5987 `filename*` so non-ASCII names work;
 `sort` on the notes list is validated (422 on unknown values); another
 user's document or notification returns 404. Comments can be listed by
 anyone who can read the note and deleted by the comment or note author; a
@@ -657,8 +678,9 @@ buried under the shared corpus); `is_system` is true on those rows.
   per note or comment runs at a time; saves made meanwhile queue one
   follow-up that reads the latest text. A failed refresh keeps the
   previous label until the next successful refresh (a new row stays
-  null); `scripts/backfill_sentiment.py` (preview, `--apply`) fills only
-  rows that have no label.
+  null); `scripts/backfill_sentiment.py` (preview, `--apply`) fills rows
+  that have no label and also re-analyses rows whose label is older than
+  the last edit.
 - `GET /sentiment/summary`: the analysed notes and comments the caller may
   read, optionally about `ticker` (tagged with it or mentioning it, plus
   their comments) and created within `from`..`to` (UTC days, 422 when
@@ -810,6 +832,9 @@ Over the limit is **429**
 `rate_limited` with `Retry-After` (seconds to the next window); if Redis
 is unavailable the limiter lets the request through (logged), the same
 shared implementation as auth-service's limits (`shared/redis.py`).
+In front of that, the gateway limits `/api/v1/public` to 5 requests per
+second per client address (burst 20); beyond that nginx answers 429 with
+its own HTML body, not the JSON error envelope.
 
 `PUT .../holdings/{holding_id}` records `adjustment`
 transactions like the JWT route and returns `HoldingAdjustmentRead`
@@ -831,9 +856,13 @@ WS     /ws/yjs/{note_id}      Yjs CRDT binary relay for collaborative note editi
 `/ws/{channel}` is a generic relay — the channel string itself carries the
 real meaning, not a fixed enum of endpoints. Real channel names currently in
 use: `analysis:{analysis_id}` (completion / recommendation-ready events for
-one analysis), `user:{user_id}` (a user's own notification stream: each new
-in-app notification), `presence:{user_id}` (online/offline status changes for
-a user's connections), `document:{document_id}` (ingestion status).
+one analysis), `user:{user_id}` (a user's own stream: each new in-app
+notification, and `user.presence.changed` when one of the user's accepted
+friends comes online or goes offline), `presence:{user_id}` (online/offline
+status changes for a user's connections), `document:{document_id}`
+(ingestion status). The web app opens `user:` and `analysis:` sockets;
+`presence:` and `document:` are used only by API clients (the web app
+gets presence over `user:` and polls the documents table).
 
 Only these four prefixes are accepted (others close with 4400).
 `user:` must be the caller; `presence:` needs an accepted connection;
@@ -1108,10 +1137,15 @@ write; a guest gets 403).
 POST   /api/v1/backtests
 POST   /api/v1/backtests/recommendation-replay
 POST   /api/v1/backtests/portfolio
+GET    /api/v1/backtests?limit=20&offset=0
 GET    /api/v1/backtests/{backtest_id}
 GET    /api/v1/backtests/{backtest_id}/metrics
 DELETE /api/v1/backtests/{backtest_id}
 ```
+
+`GET /api/v1/backtests` lists the caller's own backtests, newest first
+(`limit` 1-100, default 20; `offset` 0-10000), as `data: [BacktestRead]`.
+System backtests are never listed. The web app shows it at `/backtests`.
 
 `DELETE /api/v1/backtests/{backtest_id}` (needs `analysis:create`)
 removes the caller's own finished backtest (`completed` or `failed`) with all
@@ -1237,9 +1271,12 @@ document_id, title, category, ticker, content_date, snippet}], "model",
 
 If the LLM stream fails before its first token, the answer is produced once
 with the non-streaming path (router retries and fallback model) and sent as
-a single `token`. The stream is cut after `RAG_ASK_STREAM_TIMEOUT_SECONDS`
-(120) with an `error` event, and stops without a final event when the
-client disconnects.
+a single `token`. One deadline, `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120 s
+from the start of the stream), covers the whole answer after `sources`,
+including that fallback; when it passes, the stream ends with an `error`
+event, code `timeout`. Every stream ends with exactly one `done` or
+`error`, except when the client disconnects: then it stops without a
+final event.
 
 Errors before any output: 422 (body), 403 (permission), **429** with
 `Retry-After` (at most `RAG_ASK_RATE_LIMIT_PER_MINUTE` = 10 questions per
@@ -1328,7 +1365,8 @@ note or comment is saved, and `scripts/backfill_sentiment.py`): body
 empty text; 503 (`Retry-After: 60`) when the LLM is unavailable or gives no
 usable answer, or after `SENTIMENT_TIMEOUT_SECONDS` (240) in total (the
 caller keeps the stored sentiment, empty for a new row, and tries again on
-the next save; the backfill fills rows that have no label). core-service
+the next save; the backfill fills rows that have no label or a label
+older than the last edit). core-service
 waits up to 270 s for the answer. One cheap (Lite) tier call with strict
 JSON, asked again once when the answer is not the requested JSON; only
 the score is taken from the model (clamped), and the label is derived from
@@ -1511,7 +1549,7 @@ of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pu
 | `user.role.changed` | auth-service | pub/sub | core-service | `account_role_changed` to the user, and to the actor |
 | `user.deactivated` / `user.reactivated` | auth-service | pub/sub | core-service | `account_updated` ("deactivated" / "reactivated") to the user, and to the actor |
 | `user.deleted` | auth-service | pub/sub | core-service | `account_updated` to the admin who deleted; the unverified-account purge (actor = user) is only logged; access is already blocked by the live user state |
-| `user.presence.changed` | auth-service | pub/sub | core-service | WebSocket relay to `presence:{user_id}` |
+| `user.presence.changed` | auth-service | pub/sub | core-service | WebSocket relay to `presence:{user_id}` and to `user:{friend_id}` of each accepted friend |
 
 Payloads (built by `services/auth-service/events_out.py`,
 `services/ai-service/ai_events.py` and core's event code):

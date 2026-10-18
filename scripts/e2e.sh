@@ -17,6 +17,7 @@ part="${1:-all}"
 [ "$#" -gt 0 ] && shift
 guard_busy_window "end-to-end run"
 
+require_admin_id
 token=$(make_token "$ADMIN_USER_ID" admin 2)
 [ -n "$token" ] || die "could not create an admin token (is auth-service up?)"
 

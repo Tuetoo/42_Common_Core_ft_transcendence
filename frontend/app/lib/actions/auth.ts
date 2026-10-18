@@ -137,13 +137,14 @@ export async function logout() {
 
 // Called by /oauth/complete once it has read the tokens from the URL
 // fragment. Setting the session cookies has to happen on the server
-// (httpOnly cookies can't be written from browser JavaScript).
-export async function completeOAuthLogin(accessToken: string, refreshToken: string) {
+// (httpOnly cookies can't be written from browser JavaScript). `next` comes
+// from the fragment too, so it goes through safeNext like a form value.
+export async function completeOAuthLogin(accessToken: string, refreshToken: string, next: string) {
   if (!accessToken || !refreshToken) {
     redirect("/login");
   }
   await setSession(accessToken, refreshToken);
-  redirect("/portfolios");
+  redirect(safeNext(next));
 }
 
 export type OAuthTwoFactorState = {
@@ -152,6 +153,7 @@ export type OAuthTwoFactorState = {
 
 export async function completeOAuthTwoFactor(
   challengeToken: string,
+  next: string,
   _prevState: OAuthTwoFactorState,
   formData: FormData
 ): Promise<OAuthTwoFactorState> {
@@ -177,5 +179,5 @@ export async function completeOAuthTwoFactor(
 
   const { data } = await res.json();
   await setSession(data.access_token, data.refresh_token);
-  redirect("/portfolios");
+  redirect(safeNext(next));
 }
