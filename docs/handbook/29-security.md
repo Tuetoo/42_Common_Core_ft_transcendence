@@ -129,8 +129,9 @@ private Docker network.
   (FastAPI slash redirects, Grafana's origin check) carry `:8443`.
 
 Behind the gateway the services speak plain HTTP on the Docker network.
-uvicorn runs with `--proxy-headers --forwarded-allow-ips=*` (each
-service's `Dockerfile` and `docker-compose.override.yml`), so
+uvicorn runs with `--proxy-headers --forwarded-allow-ips=*` (the `CMD`
+of both stages in each service's `Dockerfile`; the development override
+sets no `command`), so
 `request.client.host` is the address the gateway reports
 (`services/auth-service/security.py::client_ip` reads it). The gateway
 **replaces** `X-Forwarded-For` with `$remote_addr` instead of appending.
@@ -309,10 +310,11 @@ arrives with the new refresh token, then for 30 seconds more, and for at
 most 15 minutes. A 401 with `refresh_token_superseded` keeps both
 cookies (like a 5xx or 429: try later). Known trade-off:
 the browser's WebSocket needs the token in `?token=`, so the server
-passes the access token to the client components that open sockets
-(live notifications, unread count, analysis status, analytics refresh,
-and the note editor, which also fetches a fresh one from
-`/research/collab-token`). So page JavaScript can see the access token,
+passes the access token to the client components that open sockets:
+the sidebar's unread badge, which holds the one `user:` socket of the tab
+(the live notifications, the analytics refresh and the friends page
+listen on it), the analysis status, and the note editor, which also
+fetches a fresh one from `/research/collab-token`. So page JavaScript can see the access token,
 but not the refresh token. An XSS bug could steal an access token valid
 for at most 15 minutes.
 
@@ -381,8 +383,8 @@ At rest, `two_factor_secrets.secret` is encrypted with Fernet
 The key is `TOTP_ENCRYPTION_KEY`, or, when it is empty, a key derived
 from `JWT_SECRET`; reading tries both. Outside development/test the
 service refuses to start without a valid `TOTP_ENCRYPTION_KEY`. A
-plain-text secret (no `fernet:` prefix) is accepted and is encrypted
-after the user's next successful 2FA check. A stored value that no key can read (both keys changed)
+stored value that no key can read (both keys changed, or no `fernet:`
+prefix)
 gives a 409 asking the user to have an admin reset 2FA
 (`DELETE /api/v1/admin/users/{id}/2fa`, `user:manage`); an admin cannot
 reset their own 2FA this way (403), only disable it with a code.
@@ -616,8 +618,8 @@ answers 401 `Internal token not configured` (fail closed).
 
 | Where | Key | Limit | On failure of the store | Code |
 |---|---|---|---|---|
-| Gateway, `/api/v1/auth` | client address | 10 requests/s, burst 20, `nodelay` -> 429 | - | `infra/gateway/nginx.conf` (`auth_zone`) |
-| Gateway, `/api/v1/public` | client address | 5 requests/s, burst 20, `nodelay` -> 429; limits guessing of API keys before the key lookup | - | `infra/gateway/nginx.conf` (`public_zone`) |
+| Gateway, `/api/v1/auth` | client address | 10 requests/s, burst 20, `nodelay` -> 429 | - | `infra/gateway/nginx.conf` (zone `auth_zone`), `api_locations.conf` (`limit_req`) |
+| Gateway, `/api/v1/public` | client address | 5 requests/s, burst 20, `nodelay` -> 429; limits guessing of API keys before the key lookup | - | `infra/gateway/nginx.conf` (zone `public_zone`), `api_locations.conf` (`limit_req`) |
 | Login | per address / per email | 30 / 10 per 15 min | fail open | `services/auth-service/domains/auth/api.py`, `security.py` |
 | Registration | per address | 10 per hour | fail open | same |
 | Password reset request | per address / per email | 10 / 3 per hour | fail open | same |
@@ -626,6 +628,7 @@ answers 401 `Internal token not configured` (fail closed).
 | 2FA failures | per user | 5 failures in 5 min -> 15 min lock | fail open | `security.two_factor_*` |
 | Public API (`/api/v1/public`) | per key and per key owner | key: its `rate_limit_per_minute` (at most 60); owner: 60 per minute across all keys | fail open | `services/core-service/apikeys.py` |
 | RAG assistant (`/api/v1/rag/ask`, `/ask/stream`) | per user | 10 per clock minute, 200 per UTC day | fail open | `services/ai-service/domains/rag/qa.py`, `check_rate_limit` |
+| Decision review (`POST /api/v1/decisions/{id}/review`) | per user | 3 per clock minute, 20 per UTC day | fail open | `services/ai-service/rate_limit.py`, `check_user_rate_limit` |
 | Backtests (all three create routes) | per user | at most `BACKTEST_MAX_ACTIVE_PER_USER` (2) pending or running backtests -> 429 `rate_limit_exceeded` (log `backtest_rejected_limit`) | counted in PostgreSQL under a per-user advisory lock, so two concurrent creates cannot both pass | `services/ai-service/domains/backtest/api.py`, `repository.py::count_active_for_user` |
 
 auth-service and the public API share one counter, `fixed_window_hits` in
@@ -640,16 +643,17 @@ in Redis. Counters live in Redis database 1 (`REDIS_DB_RATE_LIMIT`).
 Every Redis-based limit **fails open**: if Redis is down, requests are
 allowed and a warning is logged (`rate_limit_unavailable` for auth-service
 and the public API, `rag_ask.rate_limit_unavailable` for the RAG
-assistant). An outage of the limiter must not lock users out. The 2FA
+assistant, `decision_review.rate_limit_unavailable` for decision reviews). An outage of the limiter must not lock users out. The 2FA
 lockout is built from two keys: a failure counter
 (`auth:rl:2fa:fail:<hash>`, the shared fixed window, deleted by every
 correct code) and, after the fifth
 failure, a lock key with the lock time as its expiry (the counter is then
 deleted). `two_factor_guard` refuses while the lock key has a positive
 TTL, with `Retry-After` = that TTL. The RAG
-limit is the one exception to the shared counter: `check_rate_limit` in
-`services/ai-service/domains/rag/qa.py` keeps its own per-minute and
-per-day keys (`ai:rag_ask:rate:...`) in the rate-limit database (1). The
+and decision review limits use `check_user_rate_limit` in
+`services/ai-service/rate_limit.py`, which keeps per-minute and per-day
+keys (`ai:rag_ask:rate:...`, `ai:decision_review:rate:...`) in the
+rate-limit database (1). The
 gateway limit lives in nginx memory and needs no store.
 
 ### 3.12 API keys (the public API)
@@ -804,8 +808,7 @@ directory. But the database dump itself is sensitive:
   hashes, `core.api_keys.key_hash` (SHA-256): hashes, not usable directly;
 - `auth.two_factor_secrets.secret`: the TOTP secrets are encrypted
   (Fernet). A backup alone does not reveal them, but a backup together
-  with `.env.docker` (`TOTP_ENCRYPTION_KEY`, `JWT_SECRET`) does. Rows not
-  yet converted (see 3.6) are still plain text;
+  with `.env.docker` (`TOTP_ENCRYPTION_KEY`, `JWT_SECRET`) does;
 - every user's email and personal data.
 
 Treat `./backups` like a secret. It is gitignored and dockerignored; keep
@@ -846,6 +849,7 @@ off-machine copies encrypted. See `../DISASTER_RECOVERY.md`.
 | `MAX_UPLOAD_SIZE_BYTES` | `20971520` (20 MB) | Research document size. | same |
 | `YJS_MAX_UPDATE_BYTES` | `1048576` | Largest collaborative-edit frame. | same |
 | `RAG_ASK_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `10` / `200` | RAG assistant limits. | `services/ai-service/config.py` |
+| `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `3` / `20` | Decision review limits. | `services/ai-service/config.py` |
 | `AVATAR_MAX_SIZE_MB` | `5` | Avatar size. | `services/auth-service/config.py` |
 | gateway `auth_zone` | `10r/s`, burst 20 | Gateway limit on `/api/v1/auth`. | `infra/gateway/nginx.conf` |
 | gateway `public_zone` | `5r/s`, burst 20 | Gateway limit on `/api/v1/public`. | `infra/gateway/nginx.conf` |
@@ -999,8 +1003,8 @@ needed because the development certificate is self-signed.
    `permission_denied` "Only the portfolio owner can perform this action."
    Say: "Admin is a role for managing users, not a key to every portfolio;
    and a stranger cannot even learn that the portfolio exists. Permission
-   and ownership are separate checks." (The id is the default
-   `PORTFOLIO_ID` in `scripts/lib.sh`.)
+   and ownership are separate checks." (The id is an example; use your
+   test `PORTFOLIO_ID`, chapter 02, section 3.2 step 7.)
 
 5. **The internal route refused through the gateway, and by the token.**
 
@@ -1222,7 +1226,7 @@ or if any container could be compromised, you would add `requirepass`.
 | `services/core-service/apikeys.py`, `api/public.py` | API keys and their `/api/v1/api-keys` routes, the public API and its guard. |
 | `services/core-service/domains/portfolio/service.py` | `_require_readable`, `_require_owner`. |
 | `services/ai-service/deps.py` | `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
-| `services/ai-service/domains/rag/qa.py` | RAG ask rate limit. |
+| `services/ai-service/rate_limit.py`, `domains/rag/qa.py`, `domains/decision/api.py` | `check_user_rate_limit` (per-user minute and day counters) and its two callers, the RAG ask and decision review limits. |
 | `docker-compose.yaml` | Port bindings, SeaweedFS loopback flags. |
 | `.gitignore`, `.dockerignore` | Keep `.env.docker`, backups and logs out of git and images. |
 

@@ -1465,8 +1465,3 @@ async def latest_quarter_payload(ticker: str) -> dict[str, Any] | None:
 def forget_filing_caches(ticker: str) -> None:
     _submissions_cache.pop(ticker.upper(), None)
     _quarter_cache.pop(ticker.upper(), None)
-
-
-def _reset_caches_for_tests() -> None:
-    _submissions_cache.clear()
-    _quarter_cache.clear()

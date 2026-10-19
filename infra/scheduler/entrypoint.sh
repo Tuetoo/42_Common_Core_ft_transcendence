@@ -44,6 +44,14 @@ if [ -z "${INTERNAL_API_TOKEN:-}" ]; then
     echo "[$(date)] scheduler: WARNING INTERNAL_API_TOKEN is empty; jobs only work while the services run with APP_ENV=development/test" >&2
 fi
 
+# With arguments, run that one command (for example
+# `docker compose run --rm --no-deps scheduler /scripts/call-job.sh
+# deleted-user-sweep-core`) instead of cron, so a single job can be run by
+# hand where the scheduler stays stopped (the cloud host).
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
 # Job output is written to /proc/1/fd/1 and
 # /proc/1/fd/2 (see crontab), i.e. the stdout/stderr of this script, which
 # stays PID 1, so `docker compose logs scheduler` and the `vector`

@@ -34,6 +34,7 @@ class DeliveryPreferences:
     websocket: bool = True
     email: bool = False
     email_address: str | None = None
+    user_deleted: bool = False
 
 
 async def delivery_preferences(user_id: str) -> DeliveryPreferences:
@@ -48,7 +49,8 @@ async def delivery_preferences(user_id: str) -> DeliveryPreferences:
         websocket=bool(
             channels.get(NotificationChannel.WEBSOCKET.value, True)),
         email=bool(channels.get(NotificationChannel.EMAIL.value, False)),
-        email_address=info.get("email") or None)
+        email_address=info.get("email") or None,
+        user_deleted=bool(info.get("deleted")))
 
 
 _email_tasks: set[asyncio.Task[None]] = set()
@@ -172,6 +174,11 @@ async def notify_user(
             type=str(type))
         return
     preferences = await delivery_preferences(str(uid))
+    if preferences.user_deleted:
+        logger.info(
+            "notification.skipped_deleted_user", user_id=str(uid),
+            type=str(type))
+        return
     if not preferences.in_app:
         send_email_if_enabled(
             str(uid), preferences, title=title, content=content)

@@ -57,6 +57,14 @@ class LLMInvalidRequestError(LLMRequestError):
     pass
 
 
+class LLMCreditExhaustedError(LLMInvalidRequestError):
+    pass
+
+
+class LLMOutputExhaustedError(LLMRequestError):
+    pass
+
+
 class LLMRateLimitError(LLMRequestError):
 
     def __init__(
@@ -303,15 +311,66 @@ def strip_json_code_fence(raw: str) -> str:
     return match.group(1).strip() if match else text
 
 
+_RAW_LOG_HEAD_CHARS = 500
+_RAW_LOG_TAIL_CHARS = 300
+
+
+def log_unparseable(event: str, raw: str, **fields: object) -> None:
+    logger.warning(
+        event, raw=raw[:_RAW_LOG_HEAD_CHARS],
+        raw_tail=raw[-_RAW_LOG_TAIL_CHARS:], raw_chars=len(raw), **fields)
+
+
+def recover_wrapped_json(
+        raw: str, shape: type[dict[Any, Any]] | type[list[Any]]) -> Any:
+    fenced = strip_json_code_fence(raw)
+    opener, closer = ("{", "}") if shape is dict else ("[", "]")
+    for text in dict.fromkeys((fenced, raw.strip())):
+        start, end = text.find(opener), text.rfind(closer)
+        if not 0 <= start < end:
+            continue
+        try:
+            data = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, shape):
+            logger.info(
+                "llm_json.recovered_from_wrapped_text", shape=shape.__name__,
+                chars_dropped=len(raw) - (end + 1 - start))
+            return data
+    return None
+
+
 def parse_json_dict(raw: str, *,
                     log_event: str | None = None) -> dict[str, Any] | None:
     try:
         data = json.loads(strip_json_code_fence(raw))
     except json.JSONDecodeError:
-        if log_event:
-            logger.warning(log_event, raw=raw[:500])
-        return None
+        data = recover_wrapped_json(raw, dict)
+        if data is None:
+            data = _repaired_trailing_commas(raw)
+        if data is None:
+            if log_event:
+                log_unparseable(log_event, raw)
+            return None
     return data if isinstance(data, dict) else None
+
+
+def _repaired_trailing_commas(raw: str) -> dict[str, Any] | None:
+    text = strip_json_code_fence(raw)
+    repaired = _without_trailing_commas(text)
+    if repaired == text:
+        return None
+    try:
+        data = json.loads(repaired)
+    except json.JSONDecodeError:
+        data = recover_wrapped_json(repaired, dict)
+    if not isinstance(data, dict):
+        return None
+    logger.info(
+        "llm_json.repaired_trailing_comma", chars=len(raw),
+        chars_removed=len(text) - len(repaired))
+    return data
 
 
 _LIST_KEYS = ("relevant", "results", "items")
@@ -321,7 +380,7 @@ def parse_json_list(raw: str, *, log_event: str) -> list[object] | None:
     try:
         data = json.loads(strip_json_code_fence(raw))
     except json.JSONDecodeError:
-        logger.warning(log_event, raw=raw[:500])
+        log_unparseable(log_event, raw)
         return None
     if isinstance(data, dict):
         for key in _LIST_KEYS:

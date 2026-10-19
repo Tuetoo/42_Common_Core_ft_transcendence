@@ -1,10 +1,11 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
-import { Pager, pageParam } from "../../pager";
+import { Pager, firstParam, pageParam } from "../../pager";
 import { UploadDocumentForm } from "./upload-document-form";
 import { DocumentTable } from "./document-table";
-import { DOCUMENT_CATEGORIES, DOCUMENT_STATUSES, TICKER_HINT, TICKER_HTML_PATTERN, TICKER_RE } from "../limits";
+import { TICKER_PATTERN, TICKER_RE, TICKER_TITLE } from "@/app/lib/format";
+import { DOCUMENT_CATEGORIES, DOCUMENT_STATUSES } from "../limits";
 import { loadOrganizations } from "../organizations";
 import type { Paginated, ResearchDocument } from "../types";
 
@@ -23,20 +24,16 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
-function one(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value)?.trim() ?? "";
-}
-
 // Keeps only values the backend accepts (GET /research/documents in
 // services/core-service/domains/research/api.py), so a hand-edited URL
 // shows an unfiltered list instead of a 422 error page.
 function readFilters(sp: SearchParams) {
-  const ticker = one(sp.ticker).toUpperCase();
-  const category = one(sp.category);
-  const status = one(sp.status);
-  const sort = one(sp.sort);
-  const from = one(sp.created_from);
-  const to = one(sp.created_to);
+  const ticker = firstParam(sp.ticker).toUpperCase();
+  const category = firstParam(sp.category);
+  const status = firstParam(sp.status);
+  const sort = firstParam(sp.sort);
+  const from = firstParam(sp.created_from);
+  const to = firstParam(sp.created_to);
   const filters = {
     ticker: TICKER_RE.test(ticker) ? ticker : "",
     category: (DOCUMENT_CATEGORIES as readonly string[]).includes(category) ? category : "",
@@ -44,7 +41,7 @@ function readFilters(sp: SearchParams) {
     sort: SORTS.some(([value]) => value === sort) ? sort : "-created_at",
     created_from: DATE_RE.test(from) ? from : "",
     created_to: DATE_RE.test(to) ? to : "",
-    include_system: one(sp.include_system) === "true" ? "true" : "",
+    include_system: firstParam(sp.include_system) === "true" ? "true" : "",
   };
   // The backend rejects a reversed range; swap it instead.
   if (filters.created_from && filters.created_to && filters.created_from > filters.created_to) {
@@ -105,8 +102,8 @@ export default async function DocumentsPage({ searchParams }: { searchParams: Pr
               autoComplete="off"
               type="text"
               maxLength={10}
-              pattern={TICKER_HTML_PATTERN}
-              title={TICKER_HINT}
+              pattern={TICKER_PATTERN}
+              title={TICKER_TITLE}
               defaultValue={filters.ticker}
               placeholder="All"
               className="uppercase"

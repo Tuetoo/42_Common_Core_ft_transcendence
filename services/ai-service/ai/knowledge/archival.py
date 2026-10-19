@@ -6,6 +6,7 @@ import structlog
 from ai.agents.evidence_grounding import non_english_reason
 from ai.knowledge.kg_context import core_company_name, resolve_ticker_name
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier,
+                         log_unparseable, recover_wrapped_json,
                          strip_json_code_fence)
 from ai.llm.router import LLMRouter
 from ai.rag.chunking import Chunk, chunk_document
@@ -20,6 +21,7 @@ from database import SessionLocal
 from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
                       field_validator)
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.model import Analysis
 from domains.knowledge.model import AgentReport
 from domains.knowledge.repository import (AgentReportRepository,
@@ -39,14 +41,6 @@ _CATEGORY_BY_ROLE: dict[AgentRole, DocumentCategory] = {
 _MIN_WORDS_TO_ARCHIVE = 40
 
 _NEAR_DUPLICATE_DEDUP_LOOKBACK = 3
-_NEAR_DUPLICATE_SEMANTIC_THRESHOLD = 0.90
-
-
-def near_duplicate_threshold() -> float:
-    configured = settings.ARCHIVAL_NEAR_DUPLICATE_THRESHOLD
-    return (
-        configured
-        if configured is not None else _NEAR_DUPLICATE_SEMANTIC_THRESHOLD)
 
 
 def is_archivable_role(role: AgentRole) -> bool:
@@ -93,12 +87,12 @@ def _archive_visibility(owner: object) -> ChunkVisibility:
 
 async def _find_near_duplicate_of_recent_report(
         *, category: DocumentCategory, content: str, ticker: str | None,
-        owner: object = _UNKNOWN_OWNER) -> AgentReport | None:
+        owner: object) -> AgentReport | None:
     async with SessionLocal() as session:
         recent = await AgentReportRepository(session).list_recent_by_category(
             category.value, ticker=ticker,
             limit=_NEAR_DUPLICATE_DEDUP_LOOKBACK)
-    if recent and owner is not _UNKNOWN_OWNER:
+    if recent:
         report_owners = await _analysis_owners(
             [report.analysis_id for report in recent])
         recent = [
@@ -114,7 +108,7 @@ async def _find_near_duplicate_of_recent_report(
 
     for report, recent_vector in zip(recent, recent_vectors, strict=True):
         similarity = cosine_similarity(new_vector, recent_vector)
-        if similarity >= near_duplicate_threshold():
+        if similarity >= settings.ARCHIVAL_NEAR_DUPLICATE_THRESHOLD:
             logger.info(
                 "archival.found_near_duplicate", category=category.value,
                 similarity=round(similarity,
@@ -123,19 +117,24 @@ async def _find_near_duplicate_of_recent_report(
     return None
 
 
+async def delete_archived_report(
+        session: AsyncSession, report_id: UUID) -> tuple[int, int]:
+    deletion = await delete_document_completely(str(report_id), session)
+    relations_removed = await KnowledgeGraphRepository(
+        session).delete_relations_for_report(report_id)
+    await AgentReportRepository(session).delete(report_id)
+    return deletion.qdrant_bm25_chunks_removed, relations_removed
+
+
 async def _supersede_report(old_report: AgentReport) -> None:
     async with SessionLocal() as session:
-        deletion = await delete_document_completely(
-            str(old_report.id), session)
-        relations_removed = await KnowledgeGraphRepository(
-            session).delete_relations_for_report(old_report.id)
-        await AgentReportRepository(session).delete(old_report.id)
+        chunks_removed, relations_removed = await delete_archived_report(
+            session, old_report.id)
         await session.commit()
 
     logger.info(
         "archival.superseded_near_duplicate", old_report_id=str(old_report.id),
-        category=old_report.category,
-        rag_chunks_removed=deletion.qdrant_bm25_chunks_removed,
+        category=old_report.category, rag_chunks_removed=chunks_removed,
         kg_relations_removed=relations_removed)
 
 
@@ -401,8 +400,10 @@ def _parse_response(raw: str) -> list[KgTriple]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("kg_extraction.unparseable_response", raw=raw[:500])
-        return []
+        data = recover_wrapped_json(raw, list)
+        if data is None:
+            log_unparseable("kg_extraction.unparseable_response", raw)
+            return []
 
     if not isinstance(data, list):
         logger.warning("kg_extraction.response_not_a_list", raw=raw[:500])

@@ -189,9 +189,9 @@ async def run_tier_monitoring_workflow() -> dict[str, Any]:
                     await session.commit()
                     continue
                 outcome = await _check_one_tier(tier, today=today)
-                counts[outcome] += 1
                 event = _tier_outcome_event(tier, outcome)
                 await session.commit()
+                counts[outcome] += 1
                 if event is not None:
                     await publish_event(*event)
             except Exception:

@@ -41,7 +41,10 @@ YJS_SNAPSHOT_DEBOUNCE_SECONDS = 30.0
 SECTIONS: tuple[str, ...] = (
     "platform", "auth", "roles", "org", "portfolio", "apikey", "documents",
     "research", "realtime", "yjs", "analytics", "backtest", "analysis",
-    "admin", "cleanup")
+    "admin", "deletion", "cleanup")
+OPT_IN_SECTIONS: frozenset[str] = frozenset({"deletion"})
+DELETION_TIMEOUT = 60.0
+SWEEP_TIMEOUT = 300.0
 SECTION_DEPS: dict[str, tuple[str, ...]] = {
     "platform": (),
     "auth": (),
@@ -57,6 +60,7 @@ SECTION_DEPS: dict[str, tuple[str, ...]] = {
     "backtest": ("auth", "portfolio"),
     "analysis": ("auth", "portfolio"),
     "admin": ("auth", ),
+    "deletion": (),
     "cleanup": ()
 }
 
@@ -76,7 +80,9 @@ Then run inside the core-service container:
     core-service python -m scripts.e2e_check [--with-analysis] [--keep] \\
     [--only SECTION[,SECTION]] [--verbose]
 
-Sections: """ + ", ".join(SECTIONS)
+Sections: """ + ", ".join(SECTIONS) + """
+(deletion runs only when named in --only: it deletes a throwaway account
+and calls the two nightly deleted-user sweeps)"""
 
 T = TypeVar("T")
 
@@ -113,7 +119,7 @@ def one_line(text: str, limit: int = 300) -> str:
 def resolve_sections(
         only: Sequence[str] | None) -> tuple[list[str], list[str]]:
     if not only:
-        return list(SECTIONS), []
+        return [n for n in SECTIONS if n not in OPT_IN_SECTIONS], []
     unknown = [name for name in only if name not in SECTIONS]
     if unknown:
         raise ValueError(
@@ -384,7 +390,7 @@ class E2E:
     def __init__(self, args: argparse.Namespace, out: TextIO) -> None:
         self.args = args
         self.out = out
-        self.run_id = args.run_id or secrets.token_hex(3)
+        self.run_id = secrets.token_hex(3)
         self.prefix = f"E2E {self.run_id}"
         self.admin_token: str = os.environ.get("E2E_ADMIN_TOKEN", "").strip()
         self.results: dict[str, Result] = {}
@@ -411,19 +417,14 @@ class E2E:
         self.backtest_id: str | None = None
         self._db_used = False
         self._renew_lock = asyncio.Lock()
-        base = args.base_url.rstrip("/")
-        self.base_url = base
-        self.ws_base = (
-            "wss" + base[5:] if base.startswith("https") else
-            ("ws" + base[4:]))
-        headers = ({
-            "Host": args.insecure_host_header
-        } if (args.insecure_host_header) else {})
+        self.base_url = DEFAULT_BASE_URL
+        self.ws_base = "wss" + DEFAULT_BASE_URL.removeprefix("https")
         self.api = httpx.AsyncClient(
-            base_url=base, verify=False, headers=headers, timeout=30.0,
+            base_url=DEFAULT_BASE_URL, verify=False,
+            headers={"Host": DEFAULT_HOST_HEADER}, timeout=30.0,
             follow_redirects=False)
         self.mail = httpx.AsyncClient(
-            base_url=args.mailhog_url.rstrip("/"), timeout=10.0)
+            base_url=DEFAULT_MAILHOG_URL, timeout=10.0)
 
     def _print(self, line: str) -> None:
         print(redact(line, self.secrets), file=self.out, flush=True)
@@ -671,6 +672,65 @@ class E2E:
             c for c in self.created if not (c.kind == kind and c.id == obj_id)
         ]
 
+    async def check_signup(self, section: str, actor: Actor) -> bool:
+
+        async def register() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/auth/register", json_body={
+                    "email": actor.email,
+                    "username": actor.username,
+                    "password": actor.password
+                })
+            if resp.status_code == 429:
+                raise CheckFailed(
+                    "429 rate limited (auth allows 10 registrations per "
+                    "address per hour; wait and re-run)")
+            self.expect(resp, 201)
+            self.track("user", actor.name, actor.email, actor.username)
+            return actor.email
+
+        async def verify() -> str:
+            started = time.monotonic()
+            token = await self.mail_token(actor.email, "/verify-email")
+            resp = await self.req(
+                "POST", "/api/v1/auth/verify-email",
+                json_body={"token": token})
+            self.expect(resp, 200)
+            return f"link from MailHog after {time.monotonic() - started:.1f}s"
+
+        async def login() -> str:
+            await self.login_ok(actor)
+            resp = await self.req("GET", "/api/v1/auth/me", who=actor)
+            self.expect(resp, 200)
+            me = _data(resp)
+            actor.user_id = str(me["id"])
+            for created in self.created:
+                if created.kind == "user" and created.owner == actor.name:
+                    created.extra["user_id"] = actor.user_id
+            return f"{actor.username} id={actor.user_id}"
+
+        name = actor.name
+        await self.check(f"{section}.register_{name}", register)
+        await self.check(
+            f"{section}.verify_{name}", verify,
+            requires=(f"{section}.register_{name}", ))
+        return await self.check(
+            f"{section}.login_{name}", login,
+            requires=(f"{section}.verify_{name}", ))
+
+    async def internal_post(
+            self, url: str, body: Any = None,
+            timeout: float = 10.0) -> httpx.Response:
+        from shared.http_client import get_http_client
+
+        started = time.monotonic()
+        resp = await get_http_client(timeout).post(url, json=body)
+        if self.args.verbose:
+            self._print(
+                f"     POST {url} -> {resp.status_code} "
+                f"({time.monotonic() - started:.2f}s)")
+        return resp
+
     async def core_internal_get(self, path: str) -> httpx.Response:
         from config import settings
         from shared.http_client import get_http_client
@@ -770,54 +830,8 @@ class E2E:
             "auth.admin_stats", stats_baseline,
             requires=("auth.admin_token", ))
 
-        for actor in self.users.values():
-
-            async def register(actor: Actor = actor) -> str:
-                resp = await self.req(
-                    "POST", "/api/v1/auth/register", json_body={
-                        "email": actor.email,
-                        "username": actor.username,
-                        "password": actor.password
-                    })
-                if resp.status_code == 429:
-                    raise CheckFailed(
-                        "429 rate limited (auth allows 10 registrations per "
-                        "address per hour; wait and re-run)")
-                self.expect(resp, 201)
-                self.track("user", actor.name, actor.email, actor.username)
-                return actor.email
-
-            await self.check(f"auth.register_{actor.name}", register)
-
-            async def verify(actor: Actor = actor) -> str:
-                started = time.monotonic()
-                token = await self.mail_token(actor.email, "/verify-email")
-                resp = await self.req(
-                    "POST", "/api/v1/auth/verify-email",
-                    json_body={"token": token})
-                self.expect(resp, 200)
-                return (
-                    f"link from MailHog after "
-                    f"{time.monotonic() - started:.1f}s")
-
-            await self.check(
-                f"auth.verify_{actor.name}", verify,
-                requires=(f"auth.register_{actor.name}", ))
-
-            async def login(actor: Actor = actor) -> str:
-                await self.login_ok(actor)
-                resp = await self.req("GET", "/api/v1/auth/me", who=actor)
-                self.expect(resp, 200)
-                me = _data(resp)
-                actor.user_id = str(me["id"])
-                for created in self.created:
-                    if created.kind == "user" and created.owner == actor.name:
-                        created.extra["user_id"] = actor.user_id
-                return f"{actor.username} id={actor.user_id}"
-
-            await self.check(
-                f"auth.login_{actor.name}", login,
-                requires=(f"auth.verify_{actor.name}", ))
+        for actor in list(self.users.values()):
+            await self.check_signup("auth", actor)
 
         async def me_permissions() -> str:
             expected = sorted_permissions("user")
@@ -2755,6 +2769,441 @@ class E2E:
             "admin.deleted_login_fails", gina_login,
             requires=("admin.soft_delete_gina", ))
 
+    async def core_rows_of_user(
+            self, user_id: str,
+            watchlist_id: str | None = None) -> dict[str, int]:
+        from apikeys import ApiKey
+        from database import SessionLocal
+        from domains.notification.model import Notification
+        from domains.portfolio.model import (Portfolio, Watchlist,
+                                             WatchlistItem)
+        from domains.research.model import (Document, ResearchComment,
+                                            ResearchNote)
+        from sqlalchemy import func, select
+
+        self._db_used = True
+        uid = UUID(user_id)
+        queries: dict[str, Any] = {
+            "documents": select(func.count()).select_from(Document).where(
+                Document.owner_id == uid),
+            "notes": select(func.count()).select_from(ResearchNote).where(
+                ResearchNote.author_id == uid),
+            "comments": select(func.count()).select_from(
+                ResearchComment).where(ResearchComment.author_id == uid),
+            "portfolios": select(func.count()).select_from(Portfolio).where(
+                Portfolio.owner_id == uid),
+            "watchlists": select(func.count()).select_from(Watchlist).where(
+                Watchlist.owner_id == uid),
+            "api_keys": select(func.count()).select_from(ApiKey).where(
+                ApiKey.owner_user_id == uid),
+            "notifications": select(func.count()).select_from(
+                Notification).where(Notification.user_id == uid)
+        }
+        if watchlist_id is not None:
+            queries["watchlist_items"] = select(func.count()).select_from(
+                WatchlistItem).where(
+                    WatchlistItem.watchlist_id == UUID(watchlist_id))
+        counts: dict[str, int] = {}
+        async with SessionLocal() as session:
+            for name, query in queries.items():
+                counts[name] = int((await session.execute(query)).scalar_one())
+        return counts
+
+    async def s_deletion(self) -> None:
+        from config import settings
+
+        password = secrets.token_urlsafe(18)
+        self.secrets.append(password)
+        dora = Actor(
+            name="dora", email=f"e2e-{self.run_id}-dora@example.com",
+            username=f"e2e_{self.run_id}_dora", password=password)
+        self.users[dora.name] = dora
+        invitee = f"e2e-{self.run_id}-dora-invitee@example.com"
+        made: dict[str, Any] = {}
+        self.info(
+            "deletion: only the throwaway account "
+            f"{dora.email} and its own data are created and deleted")
+        if not await self.check_signup("deletion", dora):
+            self.record(
+                "deletion.all", SKIP, "needs a registered, verified and "
+                "logged-in throwaway user")
+            return
+        alive = ("deletion.login_dora", )
+
+        async def upload() -> str:
+            body = (
+                f"{self.prefix} private memo of a throwaway account.\n"
+                "It exists only to test account deletion.\n").encode()
+            resp = await self.req(
+                "POST", "/api/v1/research/documents", who=dora, files={
+                    "file": (f"e2e-{self.run_id}-dora.txt", body, "text/plain")
+                }, data={
+                    "category": "analyst_report",
+                    "ticker": TICKER,
+                    "title": f"{self.prefix} dora memo"
+                }, timeout=60.0)
+            self.expect(resp, 201)
+            doc = _data(resp)
+            made["document"] = doc
+            self.track("document", dora.name, str(doc["id"]))
+            if not await asyncio.to_thread(self.storage_head,
+                                           doc["storage_url"]):
+                raise CheckFailed(f"object {doc['storage_url']} missing")
+            return f"private document {doc['id']} ({len(body)} bytes, in S3)"
+
+        await self.check("deletion.document_upload", upload, requires=alive)
+
+        async def settled() -> str:
+            doc_id = made["document"]["id"]
+
+            async def attempt() -> str | None:
+                resp = await self.req(
+                    "GET", f"/api/v1/research/documents/{doc_id}", who=dora)
+                self.expect(resp, 200)
+                status = str(_data(resp)["status"])
+                return status if status in ("ready", "failed") else None
+
+            status = await poll(attempt, 90.0, 3.0)
+            if status is None:
+                raise SkipCheck(
+                    "ingestion still running after 90s; the deletion runs "
+                    "anyway")
+            return f"ingestion finished (status={status})"
+
+        await self.check(
+            "deletion.document_settled", settled,
+            requires=("deletion.document_upload", ), timeout=120.0)
+
+        async def note() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/research/notes", who=dora, json_body={
+                    "title": f"{self.prefix} dora private note",
+                    "content": "Private note of a throwaway account.",
+                    "tags": [TICKER]
+                })
+            self.expect(resp, 201)
+            note_id = str(_data(resp)["id"])
+            made["note"] = note_id
+            self.track("note", dora.name, note_id)
+            resp = await self.req(
+                "POST", f"/api/v1/research/notes/{note_id}/comments",
+                who=dora, json_body={"content": "Comment on my own note."})
+            self.expect(resp, 201)
+            made["comment"] = str(_data(resp)["id"])
+            return f"private note {note_id} with comment {made['comment']}"
+
+        await self.check("deletion.note_with_comment", note, requires=alive)
+
+        async def portfolio() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/portfolios", who=dora, json_body={
+                    "name": f"{self.prefix} dora portfolio",
+                    "currency": "USD"
+                })
+            self.expect(resp, 201)
+            pid = str(_data(resp)["id"])
+            made["portfolio"] = pid
+            self.track("portfolio", dora.name, pid)
+            resp = await self.req(
+                "POST", f"/api/v1/portfolios/{pid}/transactions", who=dora,
+                json_body={
+                    "ticker": "CASH",
+                    "transaction_type": "deposit",
+                    "quantity": "1000",
+                    "transaction_date": datetime.now(UTC).isoformat()
+                })
+            self.expect(resp, 201)
+            return f"private portfolio {pid} with a 1000 deposit"
+
+        await self.check("deletion.portfolio", portfolio, requires=alive)
+
+        async def watchlist() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/watchlists", who=dora,
+                json_body={"name": f"{self.prefix} dora watchlist"})
+            self.expect(resp, 201)
+            wid = str(_data(resp)["id"])
+            made["watchlist"] = wid
+            self.track("watchlist", dora.name, wid)
+            resp = await self.req(
+                "POST", f"/api/v1/watchlists/{wid}/items", who=dora,
+                json_body={"ticker": TICKER})
+            if resp.status_code != 201:
+                self.info(
+                    f"deletion: watchlist item {TICKER} not added "
+                    f"(HTTP {resp.status_code}); the watchlist stays empty")
+                return f"watchlist {wid} (no item)"
+            return f"watchlist {wid} with {TICKER}"
+
+        await self.check("deletion.watchlist", watchlist, requires=alive)
+
+        async def api_key() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/api-keys", who=dora,
+                json_body={"name": f"{self.prefix} dora key"})
+            self.expect(resp, 201)
+            body = _data(resp)
+            made["api_key"] = {"id": str(body["id"]), "key": str(body["key"])}
+            self.secrets.append(made["api_key"]["key"])
+            self.track("api_key", dora.name, made["api_key"]["id"])
+            return f"key {made['api_key']['id']}"
+
+        await self.check("deletion.api_key", api_key, requires=alive)
+
+        async def organization() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/organizations", who=dora,
+                json_body={"name": f"{self.prefix} dora org"})
+            self.expect(resp, 201)
+            org_id = str(_data(resp)["id"])
+            made["organization"] = org_id
+            self.track("organization", dora.name, org_id)
+            return f"org {org_id} (dora is the only member)"
+
+        await self.check(
+            "deletion.organization", organization, requires=alive)
+
+        async def accept_as_admin() -> httpx.Response:
+            return await self.req(
+                "POST", "/api/v1/organizations/invitations/accept", who=ADMIN,
+                json_body={"token": made["invitation_token"]})
+
+        async def invitation() -> str:
+            resp = await self.req(
+                "POST",
+                f"/api/v1/organizations/{made['organization']}/invitations",
+                who=dora, json_body={
+                    "email": invitee,
+                    "role": "viewer"
+                })
+            self.expect(resp, 201)
+            made["invitation_token"] = await self.mail_token(
+                invitee, "/invitations/accept")
+            resp = await accept_as_admin()
+            self.expect(resp, 403)
+            return (
+                f"open invitation to {invitee}; probe with the admin token "
+                "-> 403 (exists, other address)")
+
+        await self.check(
+            "deletion.invitation", invitation,
+            requires=("deletion.organization", ))
+
+        async def org_portfolio() -> str:
+            resp = await self.req(
+                "POST", "/api/v1/portfolios", who=dora, json_body={
+                    "name": f"{self.prefix} dora org portfolio",
+                    "currency": "USD",
+                    "organization_id": made["organization"],
+                    "visibility": "organization"
+                })
+            if resp.status_code != 201:
+                self.info(
+                    f"deletion: organization portfolio not created "
+                    f"(HTTP {resp.status_code}); skipped")
+                raise SkipCheck(f"HTTP {resp.status_code}")
+            pid = str(_data(resp)["id"])
+            made["org_portfolio"] = pid
+            self.track("portfolio", dora.name, pid)
+            return f"portfolio {pid} shared with the organization"
+
+        await self.check(
+            "deletion.org_portfolio", org_portfolio,
+            requires=("deletion.organization", ))
+
+        async def rows_before() -> str:
+            counts = await self.core_rows_of_user(
+                _need(dora.user_id, "dora"), made.get("watchlist"))
+            wanted = {
+                "documents": "document",
+                "notes": "note",
+                "comments": "comment",
+                "portfolios": "portfolio",
+                "watchlists": "watchlist",
+                "api_keys": "api_key"
+            }
+            missing = [
+                name for name, key in wanted.items()
+                if key in made and counts[name] < 1
+            ]
+            if missing:
+                raise CheckFailed(f"not in the core database: {missing}")
+            return " ".join(f"{k}={v}" for k, v in counts.items())
+
+        await self.check("deletion.core_rows_before", rows_before,
+                         requires=alive)
+
+        async def delete() -> str:
+            resp = await self.req(
+                "DELETE", f"/api/v1/admin/users/{_need(dora.user_id, 'dora')}",
+                who=ADMIN)
+            self.expect(resp, 204)
+            dora.deleted = True
+            for created in [c for c in self.created
+                            if c.owner == dora.name and c.kind != "user"]:
+                self.untrack(created.kind, created.id)
+            return "204 (the same admin route the web app uses)"
+
+        if not await self.check("deletion.admin_delete", delete,
+                                requires=alive):
+            self.info(
+                "deletion: the account was not deleted; cleanup removes its "
+                "data the normal way")
+        gone = ("deletion.admin_delete", )
+
+        async def login_fails() -> str:
+            resp = await self.login(dora)
+            self.expect(resp, 401)
+            return "login -> 401"
+
+        await self.check("deletion.login_fails", login_fails, requires=gone)
+
+        async def old_token() -> str:
+            out = []
+            for service, path in (("core", "/api/v1/portfolios"),
+                                  ("ai", "/api/v1/analyses")):
+                resp = await self.req("GET", path, token=dora.access)
+                self.expect(resp, 401)
+                out.append(f"{service} 401")
+            return "old access token: " + ", ".join(out)
+
+        await self.check(
+            "deletion.old_token_refused", old_token, requires=gone)
+
+        async def key_refused() -> str:
+            resp = await self.req(
+                "GET", f"/api/v1/public/portfolios/{uuid4()}",
+                api_key=made["api_key"]["key"])
+            self.expect(resp, 401)
+            return "X-API-Key -> 401"
+
+        await self.check(
+            "deletion.api_key_refused", key_refused,
+            requires=(*gone, "deletion.api_key"))
+
+        async def auth_deleted() -> str:
+            resp = await self.internal_post(
+                f"{settings.AUTH_SERVICE_URL}/internal/users/deleted",
+                {"user_ids": [dora.user_id]})
+            self.expect(resp, 200)
+            ids = [str(i) for i in (_json(resp) or {}).get("deleted_ids", [])]
+            if ids != [dora.user_id]:
+                raise CheckFailed(f"deleted_ids={ids}")
+            return "auth /internal/users/deleted lists the id"
+
+        await self.check(
+            "deletion.auth_marks_deleted", auth_deleted, requires=gone)
+
+        async def org_gone() -> str:
+            resp = await self.internal_post(
+                f"{settings.AUTH_SERVICE_URL}/internal/organizations/missing",
+                {"organization_ids": [made["organization"]]})
+            self.expect(resp, 200)
+            ids = [str(i) for i in (_json(resp) or {}).get("missing_ids", [])]
+            if ids != [made["organization"]]:
+                raise CheckFailed(
+                    f"organization still exists in auth (missing_ids={ids})")
+            return "auth /internal/organizations/missing lists it"
+
+        await self.check(
+            "deletion.organization_gone", org_gone,
+            requires=(*gone, "deletion.organization"))
+
+        async def invitation_gone() -> str:
+            resp = await accept_as_admin()
+            self.expect(resp, 404)
+            return "admin probe -> 404 (invitation no longer exists)"
+
+        await self.check(
+            "deletion.invitation_gone", invitation_gone,
+            requires=(*gone, "deletion.invitation"))
+
+        async def core_gone() -> str:
+            started = time.monotonic()
+            last: dict[str, int] = {}
+
+            async def attempt() -> bool | None:
+                last.clear()
+                last.update(
+                    await self.core_rows_of_user(
+                        _need(dora.user_id, "dora"), made.get("watchlist")))
+                return True if not any(last.values()) else None
+
+            if await poll(attempt, DELETION_TIMEOUT, 2.0) is None:
+                left = {k: v for k, v in last.items() if v}
+                raise CheckFailed(
+                    f"still in core after {DELETION_TIMEOUT:g}s: {left}")
+            return (
+                f"no {', '.join(last)} rows left after "
+                f"{time.monotonic() - started:.0f}s")
+
+        await self.check(
+            "deletion.core_data_gone", core_gone, requires=gone,
+            timeout=DELETION_TIMEOUT + 30)
+
+        async def object_gone() -> str:
+            key = made["document"]["storage_url"]
+
+            async def attempt() -> bool | None:
+                exists = await asyncio.to_thread(self.storage_head, key)
+                return None if exists else True
+
+            if await poll(attempt, DELETION_TIMEOUT, 2.0) is None:
+                raise CheckFailed(
+                    f"object {key} still in storage after "
+                    f"{DELETION_TIMEOUT:g}s")
+            return "document object removed from storage"
+
+        await self.check(
+            "deletion.document_object_gone", object_gone,
+            requires=(*gone, "deletion.document_upload"),
+            timeout=DELETION_TIMEOUT + 30)
+
+        self.info(
+            "deletion: ai holds no data of the throwaway account (an "
+            "analysis or backtest would need the LLM or seeded snapshots); "
+            "ai is checked through the refused token and the ai sweep. Its "
+            "per-user cleanup is covered by tests/ai-service "
+            "(TestUserDeletion)")
+
+        async def sweep(url: str, nested: Sequence[str]) -> str:
+            resp = await self.internal_post(url, timeout=SWEEP_TIMEOUT)
+            self.expect(resp, 200)
+            body = _json(resp)
+            parts = [("users", body)]
+            parts += [(key, (body or {}).get(key)) for key in nested]
+            out = []
+            for label, result in parts:
+                problem = sweep_problem(result)
+                if problem is not None:
+                    raise CheckFailed(f"{label}: {problem}")
+                out.append(f"{label}: {sweep_summary(result)}")
+            return "; ".join(out)
+
+        await self.check(
+            "deletion.sweep_core",
+            lambda: sweep(
+                f"{settings.CORE_SERVICE_URL}/internal/scheduler/"
+                "deleted-user-sweep", ("organizations", )),
+            timeout=SWEEP_TIMEOUT + 30)
+        await self.check(
+            "deletion.sweep_ai",
+            lambda: sweep(
+                f"{settings.AI_SERVICE_URL}/internal/scheduler/"
+                "deleted-user-sweep", ()), timeout=SWEEP_TIMEOUT + 30)
+
+        async def still_gone() -> str:
+            counts = await self.core_rows_of_user(
+                _need(dora.user_id, "dora"), made.get("watchlist"))
+            left = {k: v for k, v in counts.items() if v}
+            if left:
+                raise CheckFailed(f"rows came back: {left}")
+            return "still no core rows of the deleted account"
+
+        await self.check(
+            "deletion.nothing_left_after_sweeps", still_gone,
+            requires=("deletion.core_data_gone", ))
+
     async def s_cleanup(self) -> None:
         if self.args.keep:
             kept = (
@@ -2785,8 +3234,12 @@ class E2E:
             items = [c for c in self.created if c.kind == kind]
             if not items:
                 raise SkipCheck(f"no {kind} left to remove")
-            done, errors = 0, []
+            done, gone, errors = 0, 0, []
             for item in items:
+                if self.users[item.owner].deleted:
+                    self.untrack(kind, item.id)
+                    gone += 1
+                    continue
                 try:
                     await ensure_active(item.owner)
                     resp = await self.req(
@@ -2799,7 +3252,10 @@ class E2E:
             if errors:
                 raise CheckFailed(
                     f"{done} removed; failed: {'; '.join(errors)}")
-            return f"{done} {kind}(s) removed"
+            extra = (
+                f" ({gone} already removed with a deleted account)"
+                if gone else "")
+            return f"{done} {kind}(s) removed{extra}"
 
         steps: list[tuple[str, str, Callable[[Created], str]]] = [
             (
@@ -2842,7 +3298,7 @@ class E2E:
                 if not actor.deleted:
                     resp = await self.req(
                         "DELETE", f"/api/v1/admin/users/{user_id}", who=ADMIN)
-                    if resp.status_code not in (204, 409):
+                    if resp.status_code not in (204, 404, 409):
                         errors.append(f"{actor.name}: HTTP {resp.status_code}")
                         continue
                     actor.deleted = True
@@ -2902,6 +3358,39 @@ def stat_value(stats: Mapping[str, Any], part: str, key: str) -> int | None:
     return None if value is None else int(value)
 
 
+SWEEP_COUNT_KEYS = ("candidates", "deleted", "cleaned", "failed")
+
+
+def sweep_problem(result: Any) -> str | None:
+    if not isinstance(result, Mapping):
+        return f"not a sweep result: {result!r}"
+    counts: dict[str, int] = {}
+    for key in SWEEP_COUNT_KEYS:
+        value = result.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{key}={value!r} is not a count"
+        counts[key] = value
+    if result.get("lookup_failed") is not False:
+        return f"lookup_failed={result.get('lookup_failed')!r}"
+    if result.get("refused") is not False:
+        return f"refused={result.get('refused')!r} (safety brake)"
+    if counts["failed"]:
+        return f"failed={counts['failed']}"
+    if counts["cleaned"] + counts["failed"] != counts["deleted"]:
+        return (
+            f"cleaned {counts['cleaned']} + failed {counts['failed']} != "
+            f"deleted {counts['deleted']}")
+    if counts["deleted"] > counts["candidates"]:
+        return (
+            f"deleted {counts['deleted']} > candidates "
+            f"{counts['candidates']}")
+    return None
+
+
+def sweep_summary(result: Mapping[str, Any]) -> str:
+    return " ".join(f"{key}={result.get(key)}" for key in SWEEP_COUNT_KEYS)
+
+
 async def poll(
         fn: Callable[[], Awaitable[T | None]], timeout: float,
         interval: float) -> T | None:
@@ -2939,14 +3428,6 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--break-lock", action="store_true",
         help="remove the lock of an earlier run that was killed "
         "(only one e2e_check / e2e_tier_check runs at a time)")
-    parser.add_argument(
-        "--base-url", default=DEFAULT_BASE_URL, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--mailhog-url", default=DEFAULT_MAILHOG_URL, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--insecure-host-header", default=DEFAULT_HOST_HEADER,
-        help=argparse.SUPPRESS)
-    parser.add_argument("--run-id", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.only:
         args.only = [

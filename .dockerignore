@@ -16,5 +16,6 @@
 **/*.pyc
 **/.mypy_cache
 **/.pytest_cache
+**/dump.rdb
 **/.vscode
 services/*/shared

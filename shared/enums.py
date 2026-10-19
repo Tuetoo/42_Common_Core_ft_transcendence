@@ -25,6 +25,7 @@ class AnalysisFailureReason(StrEnum):
     NO_EVIDENCE = "no_evidence"
     DEBATE_UNAVAILABLE = "debate_unavailable"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    LLM_CREDIT_EXHAUSTED = "llm_credit_exhausted"
 
 
 class ConnectionStatus(StrEnum):

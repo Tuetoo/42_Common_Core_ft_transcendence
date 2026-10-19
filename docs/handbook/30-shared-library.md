@@ -46,6 +46,7 @@ almost everything else depends on.
      ^
      |    <- redis.py <- events.py, user_state.py
      |    <- http_client.py <- user_state.py, security.py
+     |    <- deleted_users.py (also imports http_client.py)
      |    <- security.py (uses permissions.py, user_state.py,
      |                    INTERNAL_TOKEN_HEADER from http_client.py)
      |    <- logging.py <- schemas.py (current_request_id)
@@ -210,7 +211,7 @@ One `redis.asyncio` pool per (URL, database number), `decode_responses=True`,
 | Function | Database setting | Default | Holds |
 |---|---|---|---|
 | `get_cache_client` | `REDIS_DB_CACHE` | 0 | caches, OAuth state and 2FA-challenge markers, membership cache, job heartbeats, NewsAPI usage log and source catalog, API key validation cache, e2e lock |
-| `get_rate_limit_client` | `REDIS_DB_RATE_LIMIT` | 1 | rate-limit counters (auth, public API, RAG assistant) and the API key `last_used_at` gate |
+| `get_rate_limit_client` | `REDIS_DB_RATE_LIMIT` | 1 | rate-limit counters (auth, public API, RAG assistant, decision reviews) and the API key `last_used_at` gate |
 | `get_events_client` | `REDIS_DB_EVENTS` | 2 | pub/sub events, the live user state |
 | `get_queue_client` | `REDIS_DB_QUEUE` | 3 | durable event streams |
 
@@ -273,7 +274,8 @@ section 3.1.
   `durable_event_subscriber_started` is logged each time the groups are
   (re)created. Durable events are used where
   losing an event is a real bug: document uploaded or deleted, document
-  status changed, portfolio deleted. core-service does not call
+  status changed, portfolio deleted, and the stream copy of user deleted
+  (auth-service publishes it on both transports). core-service does not call
   `publish_durable_event` straight from its routes: it first stores the
   event in its outbox table and publishes it from there
   (`services/core-service/outbox.py`, chapter 24).
@@ -412,9 +414,10 @@ Redis transaction (`SET NX EX`, `INCR`, `TTL`) and returns
 `(count, seconds_left)` per key, or `None` when Redis fails (the caller
 allows the request; logged `rate_limit_unavailable`). The window starts
 at the first hit. A non-positive TTL is reported as the full window. `rate_limited_response` builds the 429 with
-`Retry-After` through `shared.exceptions.error_response`. Used by auth-service (`security.py`) and core-service
-(`apikeys.py`). ai-service's RAG limit has its own per-minute and
-per-day counters in `domains/rag/qa.py`.
+`Retry-After` through `shared.exceptions.error_response`. Used by auth-service (`security.py`), core-service
+(`apikeys.py`) and ai-service (`rate_limit.py::check_user_rate_limit`,
+which builds its own per-minute and per-UTC-day keys for the RAG
+assistant and decision reviews and answers with its own 429).
 
 #### `storage.py` -- object storage (S3 API)
 
@@ -433,8 +436,10 @@ That import sits under `if TYPE_CHECKING:`, so it only runs during type
 checking, never at run time (the stubs are a dev dependency, see
 chapter 31). Functions:
 `ensure_bucket`, `upload_bytes`, `download_bytes`, `delete_object`,
-`check_storage_connection`, `close_storage_clients`. Used by core-service
-(upload and delete of research documents, `main.py` bucket check) and
+`list_object_keys` (every key under a prefix), `check_storage_connection`,
+`close_storage_clients`. Used by core-service
+(upload and delete of research documents, `main.py` bucket check, the
+deleted-user sweep's file cleanup) and
 ai-service (reading documents for RAG, SEC filing ingestion), plus a few
 scripts (chapter 22).
 
@@ -588,9 +593,34 @@ failed (`all_units_failed(units, failed)`; logged as the error
 scheduler's scripts send a heartbeat only on a 2xx answer, so a run in
 which everything failed is not counted as a success. Used by
 core-service's market-open and notification-retention routes,
-ai-service's tier-monitoring, review-run and rag-ingest routes, and
+ai-service's tier-monitoring, review-run and rag-ingest routes, the
+deleted-user sweeps of core and ai, and
 auth-service's purge-unverified route ([26-scheduler-jobs.md](26-scheduler-jobs.md) section
 3.4).
+
+#### `deleted_users.py` -- cleanup of deleted accounts
+
+Used by core-service and ai-service. `run_cleanup_steps(session_factory,
+scope, scope_id, steps, *, strict)` runs each cleanup step in its own
+session, logs `<scope>_data_cleanup_failed` for a failed step and
+`<scope>_data_cleaned` with the counts; with `strict=True` it raises
+when a step failed. `deleted_user_ids(settings, ids)` asks auth-service
+`POST /internal/users/deleted` in batches of
+`DELETED_USERS_BATCH_SIZE` (500) and returns the deleted ones;
+`missing_organization_ids` does the same with `POST
+/internal/organizations/missing`. Both raise on any HTTP error, so a
+caller never mistakes a failed answer for "deleted". `clean_each` and
+`log_sweep` are the per-id loop and the summary log.
+`run_deleted_user_sweep(settings, candidates, cleanup)` asks auth which
+candidates are deleted and runs `cleanup` for each one; one failure is
+logged (`deleted_user_sweep_item_failed`) and the rest still run. A
+failed lookup returns `lookup_failed=True` without deleting. It returns
+a `SweepResult(candidates, deleted, cleaned, failed, lookup_failed,
+refused)`; only core's organization sweep sets `refused` (chapter 26).
+`sweep_steps(prefix, result, *, brake=False)` turns a `SweepResult`
+into the `job_response` steps `<prefix>` and `<prefix>_lookup`, plus
+`<prefix>_safety_brake` (`refused`) with `brake=True`, which only the
+organization sweep passes.
 
 #### `enums.py` -- shared vocabularies
 
@@ -619,7 +649,7 @@ What the values mean, where the code does not say it by name:
   analysis is skipped because its owner was deactivated), `service_restart`,
   `worker_error`, `workflow_error`. "No verdict" endings:
   `judge_unavailable`, `no_evidence`,
-  `debate_unavailable`, `insufficient_evidence`.
+  `debate_unavailable`, `insufficient_evidence`, `llm_credit_exhausted`.
 - `DocumentCategory`: retrieval and chunking key off the category, not
   the file format (a PDF and a text transcript of an earnings call chunk
   the same way; a 10-K and an analyst report do not). `risk_analysis`
@@ -835,7 +865,7 @@ All read-only.
 
 6. **Type-check the shared package** (on the host, needs `uv sync`):
    `make mypy-shared`. Expected: `Success: no issues found in <N> source
-   files` (16 modules today; the number changes when modules are added
+   files` (17 modules today; the number changes when modules are added
    or removed).
 
 ---
@@ -872,10 +902,13 @@ database 0 and the durable stream ended up in the wrong place.
 </details>
 
 <details>
-<summary>5. Why is the RAG assistant's limit not in <code>shared/redis.py</code>?</summary>
+<summary>5. Why are the RAG assistant's minute and day limits not in <code>shared/redis.py</code>?</summary>
 
-It is used by one service only and has a different shape (per clock
-minute plus per UTC day). Shared code is for rules several services need.
+Only ai-service uses that shape (per clock minute plus per UTC day). So
+`shared/redis.py` keeps the counter all services share
+(`fixed_window_hits`), and ai-service's `rate_limit.py` holds the key
+names and limits on top of it. Shared code is for rules several services
+need.
 </details>
 
 <details>
@@ -912,6 +945,7 @@ service-specific (settings come in as parameters).
 | `shared/market_calendar.py` | `MARKET_TZ`, `market_today`, NYSE holidays |
 | `shared/user_state.py` | Live role/active state; organization roles cache and invalidation |
 | `shared/scheduled_jobs.py` | `job_response`, `all_units_failed` |
+| `shared/deleted_users.py` | `run_cleanup_steps`, `deleted_user_ids`, `missing_organization_ids`, `clean_each`, `run_deleted_user_sweep`, `sweep_steps`, `SweepResult` |
 | `shared/enums.py` | Shared `StrEnum` vocabularies |
 | `shared/schemas.py` | Response envelopes, cross-service refs; `TICKER_RE`, `normalize_ticker` |
 

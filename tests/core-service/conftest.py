@@ -167,6 +167,13 @@ def mock_cross_service(monkeypatch):
     monkeypatch.setattr(ai_client, "request_analysis", _fake_request_analysis)
     monkeypatch.setattr(ai_client, "get_fx_rate", _fake_get_fx_rate)
 
+    import event_listener
+
+    async def _no_document_files(settings, *, bucket, prefix):
+        return []
+
+    monkeypatch.setattr(event_listener, "list_object_keys", _no_document_files)
+
 
 @pytest.fixture
 def organization_roles(monkeypatch):

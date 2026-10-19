@@ -25,7 +25,7 @@
    |                    user/recommendation lookups, OAuth state, job heartbeats,     |
    |                    NewsAPI usage log and source catalog, end-to-end lock         |
    | DB 1  rate limit   auth login/register/reset/2FA counters, public API counters,  |
-   |                    RAG-assistant counters                                        |
+   |                    RAG-assistant and decision-review counters                    |
    | DB 2  events       auth:user_state:* mirror, event claims, Yjs active rooms      |
    |                    (+ PUBLISH on channels events:*, ws:fanout, yjs:note:*)       |
    | DB 3  queue        Redis Streams stream:<event>  (consumer group "workers")      |
@@ -84,7 +84,8 @@ There is no host port and no password: only containers on the Docker
 network can reach Redis.
 
 **Why AOF.** The durable event streams (`document.uploaded`,
-`document.deleted`, `portfolio.deleted`, `document.status_changed`) must
+`document.deleted`, `portfolio.deleted`, `document.status_changed`,
+`user.deleted`) must
 survive a crash. Redis's default RDB snapshots are written only every so
 often, so with them alone a crash can lose up to an hour of stream
 entries: an uploaded document would then never be indexed, a deleted
@@ -178,7 +179,9 @@ authenticated request (`USER_STATE_CHECK_ENABLED`, default true).
   `{"role": "...", "is_active": true|false}`, in the **events** database.
 - auth-service is the only writer (`services/auth-service/user_state_sync.py`).
   It writes every user at startup (`mirror_all_users_safely`, batches of
-  500) and after each change of role, active flag or deletion. Its own
+  500), then deletes keys whose user id no longer exists in the database
+  (log `user_state.startup_sync_removed`), and it writes again after each
+  change of role, active flag or deletion. Its own
   writes have **no TTL**. A deleted user is stored as inactive, never
   removed, so their old tokens stay blocked. `commit_with_state` mirrors
   first and commits second, so a mirror failure rolls the change back.
@@ -240,7 +243,7 @@ database, unlike the `apikey:valid:*` cache in DB 0): at most one
 PostgreSQL update of `last_used_at` per key per minute; skipped when
 Redis is down.
 
-**ai-service research assistant** (`services/ai-service/domains/rag/qa.py::check_rate_limit`):
+**ai-service research assistant** (`services/ai-service/domains/rag/qa.py::check_rate_limit`, which calls the shared `rate_limit.py::check_user_rate_limit`):
 keys `ai:rag_ask:rate:<user>:m:<YYYYMMDDHHMM>` (TTL 120 s) and
 `ai:rag_ask:rate:<user>:d:<YYYYMMDD>` (TTL 2 days) in the **rate-limit**
 database (DB 1, `get_rate_limit_client`), with
@@ -251,6 +254,13 @@ the day). The window is also part of the key name (the minute or the
 UTC day), and the day limit's `Retry-After` is computed from the next UTC
 midnight. Fails open too: a Redis error logs
 `rag_ask.rate_limit_unavailable` and the question is allowed.
+
+**ai-service decision reviews** (`POST /api/v1/decisions/{id}/review`)
+use the same helper (`services/ai-service/rate_limit.py::check_user_rate_limit`)
+with keys `ai:decision_review:rate:<user>:m:...` and `...:d:...`, limits
+`DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` (3) and
+`DECISION_REVIEW_RATE_LIMIT_PER_DAY` (20); a Redis error logs
+`decision_review.rate_limit_unavailable` and the request is allowed.
 
 ### 3.6 One-time markers and locks
 
@@ -320,6 +330,7 @@ a restarted service finds its own pending entries.
 | `stream:document.uploaded` | `ai-service` | RAG ingestion |
 | `stream:document.deleted` | `ai-service` | remove chunks |
 | `stream:portfolio.deleted` | `ai-service` | close the portfolio's open tiers |
+| `stream:user.deleted` | `ai-service` | delete the user's ai data (auth also publishes it on pub/sub for core) |
 | `stream:document.status_changed` | `core-service` | persist `core.documents.status` |
 
 ### 3.8 What is not in Redis
@@ -342,7 +353,7 @@ Prefixes say who owns a key:
 | `auth:` (`auth:rl:*`, `auth:user_state:*`) | auth-service (user state read by all) |
 | `auth_client:` | cache of auth-service answers, shared by core and ai |
 | `core:` | core-service (`core:auth_client:*`, `core:ai_client:*`, `core:event_claim:*`, `core:job_last_success`, `core:job_tracked_since`, `core:market_close_skipped`) |
-| `ai:` | ai-service (`ai:core_client:*`, `ai:internal:*`, `ai:rag_ask:*` in DB 1, `ai:newsapi:*`) |
+| `ai:` | ai-service (`ai:core_client:*`, `ai:internal:*`, `ai:rag_ask:*` and `ai:decision_review:*` in DB 1, `ai:newsapi:*`) |
 | `apikey:`, `ratelimit:` | core-service public API (`apikey:valid:*` in DB 0; `apikey:last_used_gate:*` and `ratelimit:*` in DB 1) |
 | `oauth:` | auth-service OAuth flow |
 | `yjs:`, `ws:` | core-service real-time (`yjs:active:*` keys; `yjs:note:*` and `ws:fanout` channels) |
@@ -355,7 +366,8 @@ Prefixes say who owns a key:
 `core:job_last_success` is a hash with one field per scheduled job
 (`market-open`, `market-close`, `tier-monitoring`, `review-run`,
 `rag-ingest`, `logs-cleanup`, `backup`, `purge-unverified`,
-`notification-retention`) holding the Unix time of its last
+`notification-retention`, `deleted-user-sweep-core`,
+`deleted-user-sweep-ai`) holding the Unix time of its last
 success (`services/core-service/job_health.py`). Each job script reports
 to `POST /internal/scheduler/heartbeat/{job}`. core-service exports it as
 the gauge `alphamind_job_last_success_timestamp_seconds{scheduled_job}`,
@@ -401,6 +413,7 @@ on port 9121.
 | `RATE_LIMIT_ENABLED` and `RATE_LIMIT_*` | see section 3.5 | auth-service rate limits | `services/auth-service/config.py` |
 | `PUBLIC_API_RATE_LIMIT_PER_MINUTE` | `60` | public API cap per key and per owner | `services/core-service/config.py` |
 | `RAG_ASK_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `10` / `200` | research assistant limits | `services/ai-service/config.py` |
+| `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | `3` / `20` | decision review limits | `services/ai-service/config.py` |
 | `MEMBERSHIP_CACHE_TTL_SECONDS` | `60` (constant) | org-role cache lifetime | `shared/user_state.py` |
 | pool | `max_connections=20`, `socket_timeout=15` | per (URL, DB) pool | `shared/redis.py` |
 | stream cap | `MAXLEN ~ 10000` (constant) | approximate length limit per stream | `shared/events.py` |
@@ -456,7 +469,7 @@ the system usable when both Redis and auth-service are down.
 
 | Symptom | Likely cause | What the system does | How to diagnose |
 |---|---|---|---|
-| `/health` shows `"redis": false`; alert `RedisDown` | Redis down | caches miss, rate limits allow, user state falls back to token claims, publishes fail (core-service's durable events wait in `core.event_outbox` and are published when Redis is back; alert `OutboxBacklog` after 15 minutes) | `docker compose --env-file .env.docker ps redis`; `bash scripts/redis-cli.sh PING` |
+| `/health` shows `"redis": false`; alert `RedisDown` | Redis down | caches miss, rate limits allow, user state falls back to token claims, publishes fail (core-service's durable events wait in `core.event_outbox` and are published when Redis is back; alert `OutboxBacklog` after 15 minutes; auth has no outbox, so a lost `user.deleted` is repaired by the nightly deleted-user sweeps) | `docker compose --env-file .env.docker ps redis`; `bash scripts/redis-cli.sh PING` |
 | Uploaded documents stay `uploaded` | stream not consumed (ai-service down), or Redis was down when core-service tried to publish | entries wait in the stream; events core-service could not publish wait in `core.event_outbox` and the outbox dispatcher publishes them when Redis is back; a re-upload re-publishes once the status has not changed for 10 minutes (`uploaded`) or 60 minutes (processing statuses) | `bash scripts/redis-cli.sh -n 3 XINFO GROUPS stream:document.uploaded` (look at `lag` and `pending`) |
 | Log `durable_event_dead_lettered` | a handler failed 5 times | the entry is acknowledged and needs a human | the preceding `durable_event_handler_failed` log lines; [24-events.md](24-events.md) |
 | Log `durable_event_subscriber_loop_error` repeating | Redis unreachable from the subscriber | loop retries with backoff (1, 2, 5, 10, 30 s; field `retry_in_seconds`) | Redis health; network |
@@ -635,7 +648,7 @@ counted from `ai.analyses` in PostgreSQL.
 | `services/ai-service/ai/providers/newsapi.py` | NewsAPI usage log and source catalog keys |
 | `services/auth-service/security.py` | auth scopes, 2FA lock |
 | `services/core-service/apikeys.py` | public API counters, key validation cache |
-| `services/ai-service/domains/rag/qa.py` | research assistant counters |
+| `services/ai-service/rate_limit.py` | per-user minute and day counters (`check_user_rate_limit`) for the research assistant (`domains/rag/qa.py`) and decision reviews (`domains/decision/api.py`) |
 | `shared/events.py` | pub/sub publish/subscribe, streams, consumer group |
 | `shared/http_client.py` | `gather_bounded` (in-process semaphore, not Redis) |
 | `services/core-service/event_listener.py` | event claims |

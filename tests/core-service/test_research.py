@@ -326,6 +326,7 @@ class TestNotesAndDocumentUploads:
         doc_id = UUID(first.json()["data"]["id"])
         row = await db_session.get(Document, doc_id)
         row.status = "failed"
+        first_upload = row.uploaded_at
         await db_session.flush()
 
         kwargs["files"] = {
@@ -334,6 +335,8 @@ class TestNotesAndDocumentUploads:
         second = await client.post("/api/v1/research/documents", **kwargs)
         assert second.status_code == 201
         assert second.json()["data"]["status"] == "uploaded"
+        await db_session.refresh(row)
+        assert row.uploaded_at == first_upload
         assert storage_recorder.uploaded == [row.storage_url, row.storage_url]
         assert _STORAGE[row.storage_url] == b"%PDF-1.4 v2"
         assert len(published_events) == 2 and published_events[1][1][
@@ -988,7 +991,7 @@ class TestResearchContent:
         event_name, payload = research_doubles["published"][-1]
         assert event_name == "document.uploaded"
         assert payload["owner_id"] == str(SYSTEM_DOCUMENT_OWNER_ID)
-        assert payload["is_system"] is True and payload["ticker"] == "AMD"
+        assert "is_system" not in payload and payload["ticker"] == "AMD"
         assert payload["content_date"].startswith("2026-08-05")
 
         again = await client.post(
@@ -1153,6 +1156,10 @@ class TestDocumentIngestion:
             assert second.status_code == 201, case
             first_id = first.json()["data"]["id"]
             assert second.json()["data"]["id"] == first_id, case
+            assert second.json()["data"]["status"] == "uploaded", case
+            await db_session.refresh(document)
+            assert document.status == "uploaded", case
+            assert not research_service._looks_stuck(document), case
 
     async def test_hide_and_repository_rules(
             self, db_session, mock_cross_service, client, monkeypatch):
@@ -1202,7 +1209,8 @@ class TestDocumentIngestion:
             category="filing", ticker="MSFT", storage_url="documents/x/3.txt")
         await db_session.commit()
 
-        filenames = await repo.list_filenames(ticker=ticker, category="filing")
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
         assert filenames == [f"{ticker}_10-K_2026-01-01.txt"]
         stuck = await repo.create(
             owner_id=uuid4(), organization_id=None,
@@ -1214,17 +1222,35 @@ class TestDocumentIngestion:
         assert applied and changed is stuck
         assert datetime.now(UTC) - stuck.status_changed_at < timedelta(
             minutes=1)
-        filenames = await repo.list_filenames(ticker=ticker, category="filing")
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
         assert sorted(filenames) == [
             f"{ticker}_10-K_2026-01-01.txt", f"{ticker}_10-Q_2026-01-01.txt"
         ]
         stuck.status_changed_at = datetime.now(UTC) - timedelta(hours=2)
         await db_session.flush()
-        filenames = await repo.list_filenames(ticker=ticker, category="filing")
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
         assert filenames == [f"{ticker}_10-K_2026-01-01.txt"]
         stuck.status = "ready"
         await db_session.flush()
-        filenames = await repo.list_filenames(ticker=ticker, category="filing")
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
+        assert sorted(filenames) == [
+            f"{ticker}_10-K_2026-01-01.txt", f"{ticker}_10-Q_2026-01-01.txt"
+        ]
+        stuck.status = "failed"
+        await db_session.flush()
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
+        assert filenames == [f"{ticker}_10-K_2026-01-01.txt"]
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=0)
+        assert len(filenames) == 2
+        stuck.uploaded_at = datetime.now(UTC) - timedelta(days=8)
+        await db_session.flush()
+        filenames = await repo.list_filenames(
+            ticker=ticker, category="filing", failed_retry_days=7)
         assert sorted(filenames) == [
             f"{ticker}_10-K_2026-01-01.txt", f"{ticker}_10-Q_2026-01-01.txt"
         ]

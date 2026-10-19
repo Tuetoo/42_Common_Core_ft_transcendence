@@ -947,9 +947,6 @@ class TestMarketAndAnalyticsAuth:
             async def get_recent_price_history(self, ticker, **kwargs):
                 return []
 
-            async def get_instrument_metadata(self, ticker):
-                raise AssertionError("no metadata call for an unknown ticker")
-
         with pytest.raises(NoPriceDataError):
             await MarketService(db_session).refresh_from_external_provider(
                 "ZZQQ", provider=_Provider())  # type: ignore[arg-type]
@@ -1258,7 +1255,8 @@ class TestAsk:
     async def test_minute_and_daily_rate_limits(
             self, client, ask_qdrant, fake_router, monkeypatch, _schema_ready):
         from config import settings
-        from domains.rag.qa import RagAskRateLimitedError, check_rate_limit
+        from domains.rag.qa import check_rate_limit
+        from rate_limit import UserRateLimitedError
 
         monkeypatch.setattr(settings, "RAG_ASK_RATE_LIMIT_PER_MINUTE", 2)
         import domains.rag.api as rag_api
@@ -1287,7 +1285,7 @@ class TestAsk:
         user = str(uuid4())
         now = datetime(2026, 9, 29, 23, 0, 0, tzinfo=UTC)
         await check_rate_limit(user, now=now)
-        with pytest.raises(RagAskRateLimitedError) as exc:
+        with pytest.raises(UserRateLimitedError) as exc:
             await check_rate_limit(user, now=now + timedelta(minutes=1))
         assert exc.value.retry_after == 59 * 60
 
@@ -1501,11 +1499,10 @@ class TestStreamPlumbing:
         out = []
         with pytest.raises(LLMRequestError):
             async for chunk in router.stream(
-                    LLMTier.CHEAP, [LLMMessage(role="user", content="q")],
-                    provider="google"):
+                    LLMTier.CHEAP, [LLMMessage(role="user", content="q")]):
                 out.append(chunk)
         assert out == ["x"]
-        assert router.resolve_model(LLMTier.CHEAP, "google")
+        assert router.resolve_model(LLMTier.CHEAP)
 
         async def _reserve(model, candidates, **kw):
             return _GoogleReservation()

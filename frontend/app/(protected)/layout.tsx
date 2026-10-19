@@ -1,6 +1,5 @@
 import { redirect } from "next/navigation";
-import { getAccessToken, getMe } from "@/app/lib/session";
-import { backendFetch } from "@/app/lib/backend";
+import { getAccessToken, getMe, getUnreadTotal } from "@/app/lib/session";
 import { logout } from "@/app/lib/actions/auth";
 import { SiteFooter } from "@/app/site-footer";
 import { Avatar } from "./avatar";
@@ -14,12 +13,9 @@ export default async function ProtectedLayout({ children }: { children: React.Re
 
   // getMe() is cached per request, so pages that call it again don't
   // trigger a second /auth/me.
-  const [{ me }, unreadRes] = await Promise.all([
-    getMe(),
-    backendFetch("/notifications?unread_only=true&page_size=1", accessToken, { cache: "no-store" }),
-  ]);
+  const [{ me }, unreadCount] = await Promise.all([getMe(), getUnreadTotal(accessToken)]);
   // The badge is a nicety: if the count can't be loaded, show none.
-  const unread: number = unreadRes.ok ? (await unreadRes.json()).total : 0;
+  const unread = unreadCount ?? 0;
 
   const account = (
     <div className="flex items-center gap-2 px-3">

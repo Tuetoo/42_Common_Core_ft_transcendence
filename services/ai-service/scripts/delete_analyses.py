@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from uuid import UUID
+from ai.knowledge.archival import delete_archived_report
 from ai.rag.indexing import delete_document_completely
 from config import settings
 from database import SessionLocal
@@ -806,12 +807,7 @@ async def _apply_target(session: AsyncSession, target: AnalysisTarget) -> str:
                 {"id": aid})).all()
     ]
     for report_id in report_ids:
-        await delete_document_completely(str(report_id), session)
-        await _exec(
-            session, "DELETE FROM ai.kg_relations WHERE source_report_id = :r",
-            r=report_id)
-        await _exec(
-            session, "DELETE FROM ai.agent_reports WHERE id = :r", r=report_id)
+        await delete_archived_report(session, report_id)
     await _exec(
         session,
         "DELETE FROM ai.recommendation_tiers WHERE recommendation_id IN "
@@ -844,12 +840,7 @@ async def _apply_report(session: AsyncSession, report_id: UUID) -> str:
         r=report_id)
     if exists is None:
         return "already gone"
-    await delete_document_completely(str(report_id), session)
-    await _exec(
-        session, "DELETE FROM ai.kg_relations WHERE source_report_id = :r",
-        r=report_id)
-    await _exec(
-        session, "DELETE FROM ai.agent_reports WHERE id = :r", r=report_id)
+    await delete_archived_report(session, report_id)
     return "deleted"
 
 

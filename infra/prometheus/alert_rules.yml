@@ -169,7 +169,7 @@ groups:
     rules:
       - alert: DailyJobStale
         expr: |
-          time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup|review-run|rag-ingest|logs-cleanup|purge-unverified|notification-retention"}
+          time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup|review-run|rag-ingest|logs-cleanup|purge-unverified|notification-retention|deleted-user-sweep-core|deleted-user-sweep-ai"}
             > 26 * 3600
         for: 10m
         labels:
@@ -210,7 +210,7 @@ groups:
             A holding had no close for the session, so no snapshot was
             written for {{ $value }} portfolio(s) (see the
             market_close_snapshot_skipped log lines). Fill the day later
-            with scripts/recompute_snapshots.py --to <date>.
+            with bash scripts/snapshots.sh --all --to <date> (then --confirm).
 
   # Durable events (core-service outbox.py): an event written to
   # core.event_outbox that has not reached Redis. The dispatcher retries

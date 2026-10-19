@@ -29,6 +29,12 @@ class UserRepository:
             raise NotFoundError(message)
         return user
 
+    async def list_deleted_ids(self, user_ids: list[UUID]) -> list[UUID]:
+        result = await self._db.execute(
+            select(User.id).where(
+                User.id.in_(user_ids), User.deleted_at.is_not(None)))
+        return list(result.scalars().all())
+
     async def lock(self, user_id: UUID) -> User | None:
         result = await self._db.execute(
             select(User).where(User.id == user_id).with_for_update()
@@ -183,6 +189,12 @@ class UserRepository:
                     revoked_at=datetime.now(UTC),
                     revoked_reason=SessionRevokeReason.REVOKED_ALL
                 ).execution_options(synchronize_session="fetch"))
+
+    async def delete_sessions(self, user_id: UUID) -> None:
+        await self._db.execute(
+            delete(UserSession).where(
+                UserSession.user_id == user_id).execution_options(
+                    synchronize_session="fetch"))
 
     async def revoke_rotation_successors(
             self, rotated: UserSession, *, reason: str) -> int:

@@ -52,7 +52,8 @@ def merge_debate_state(
                 new.superseded_through_round))
 
 
-FailureKind = Literal["rate_limit", "server_overload", "non_english", "other"]
+FailureKind = Literal["rate_limit", "server_overload", "non_english",
+                      "credit_exhausted", "other"]
 AVAILABILITY_FAILURE_KINDS: frozenset[str] = frozenset(
     {"rate_limit", "server_overload"})
 DebateSide = Literal["bull", "bear"]
@@ -66,8 +67,6 @@ def node_name(role: AgentRole) -> str:
 
 
 class AgentOutput(BaseModel):
-    model_config = ConfigDict(frozen=False)
-
     role: AgentRole
     status: AgentStatus = AgentStatus.COMPLETED
     summary: str
@@ -124,6 +123,7 @@ class DebateArgument(BaseModel):
     citations: list[str] = Field(default_factory=list)
     available: bool = True
     unavailable_kind: FailureKind | None = None
+    fallback_calls: int = 0
 
 
 def _is_superseded(
@@ -167,6 +167,7 @@ FAILURE_KIND_TEXT: dict[str, str] = {
     "server_overload": "LLM provider overloaded (503)",
     "rate_limit": "LLM rate limit / quota exhausted (429)",
     "non_english": "model output rejected as non-English",
+    "credit_exhausted": "LLM provider API credit used up",
     "other": "error unrelated to provider capacity"
 }
 
@@ -265,6 +266,8 @@ class JudgeVerdict(BaseModel):
     judge_failed: bool = False
     failure_reason: AnalysisFailureReason | None = None
     retry_round: bool = False
+    model: str | None = None
+    fallback_calls: int = 0
 
 
 class DebateState(BaseModel):
@@ -279,6 +282,11 @@ class DebateState(BaseModel):
     @property
     def latest_verdict(self) -> JudgeVerdict | None:
         return self.verdicts[-1] if self.verdicts else None
+
+    @property
+    def latest_valid_verdict(self) -> JudgeVerdict | None:
+        return next((v for v in reversed(self.verdicts) if not v.judge_failed),
+                    None)
 
     def latest_argument(self, side: DebateSide) -> DebateArgument | None:
         return next((a for a in reversed(self.arguments) if a.side == side),
@@ -333,6 +341,7 @@ class ReflectionVerdict(BaseModel):
     usable_agent_count: int = 0
     agent_count: int = 0
     issue_details: list[ReflectionIssue] = Field(default_factory=list)
+    fallback_calls: int = 0
 
     @model_validator(mode="after")
     def _sync_issue_details(self) -> "ReflectionVerdict":
@@ -392,14 +401,12 @@ class EpisodicMemoryHit(BaseModel):
 
 
 class PriorRecommendation(BaseModel):
-    recommendation_id: str
     analysis_id: str
     action: RecommendationAction
     confidence: float
     issued_at: datetime
     accepted: bool
     well_supported_count: int | None = None
-    agent_count: int | None = None
     judge_leaning: RecommendationAction | None = None
     judge_confidence: float | None = None
 
@@ -593,13 +600,14 @@ class AnalysisState(BaseModel):
                     f"{when} "
                     f"({issue_count} unresolved issue"
                     f"{'s' if issue_count != 1 else ''} in the final review "
-                    f"pass, e.g. {'; '.join(causes)}); confidence reflects "
-                    f"that.")
+                    f"pass, e.g. {'; '.join(causes)}); confidence is not "
+                    "reduced for this.")
             else:
                 notes.append(
                     f"Reflection could not fully verify the debate content "
                     f"{when}: "
-                    f"{'; '.join(causes)}; confidence reflects that.")
+                    f"{'; '.join(causes)}; confidence is not reduced for "
+                    "this.")
 
         elif self.reflection_history and any(
                 not v.verified for v in self.reflection_history[:-1]):
@@ -613,8 +621,7 @@ class AnalysisState(BaseModel):
                 f"{len(earlier_issues)} issue"
                 f"{'s' if len(earlier_issues) != 1 else ''} (e.g. "
                 f"{'; '.join(causes)}); ")
-            last = self.reflection_history[-1]
-            if ratio == 1.0 and last.llm_review_ran:
+            if ratio == 1.0:
                 notes.append(
                     prefix + "the system retried and the final evidence has "
                     "since been verified. Confidence is not reduced for this.")

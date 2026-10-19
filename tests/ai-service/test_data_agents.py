@@ -1,15 +1,12 @@
 import ast
-import importlib.util
 import inspect
 import json
+from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 import ai.agents.loop as loop_module
-import ai.knowledge.archival as archival_module
-import ai.knowledge.kg_context as kg_context_module
 import ai.providers.news_relevance as relevance_module
-import ai.recommendation.position_sizing as sizing_module
 import ai.tools.filing_tool as filing_tool_module
 import ai.tools.fundamentals_tool as fundamentals_tool_module
 import ai.tools.macro_tool as macro_tool_module
@@ -35,19 +32,22 @@ from ai.agents.news import _NewsFinishValidator
 from ai.agents.portfolio import _portfolio_finish_validator
 from ai.agents.reflection import ReflectionAgent
 from ai.agents.risk import (RECORD_NAME_MESSAGE, _event_line,
-                            _record_names_entity, _risk_answer_issue,
-                            _risk_events_line, _sourced_risk_events)
+                            _log_empty_events_after_correction,
+                            _names_match, _record_names_entity,
+                            _risk_answer_issue, _risk_events_line,
+                            _sourced_risk_events, _text_names)
 from ai.graph.state import (ISSUE_LLM_REVIEW, ISSUE_NOT_RETRIED,
                             ISSUE_RETRY_NO_PROGRESS, AgentOutput,
                             AnalysisState, DebateArgument, DebateState,
                             EpisodicMemoryHit, JudgeVerdict, ReflectionIssue,
                             ReflectionVerdict, _classify_reflection_causes)
 from ai.knowledge import filing_records as frec
+from ai.knowledge import recycled_content
 from ai.llm.base import LLMResponse, LLMUsage
-from ai.providers.base import (FundamentalsSnapshot, InstrumentMetadata,
+from ai.providers.base import (FundamentalsSnapshot,
                                MacroDataPoint, NewsArticle, PriceBar,
-                               PriceQuote, ProviderRequestError,
-                               WebSearchResult)
+                               PriceQuote, ProviderQuotaError,
+                               ProviderRequestError, WebSearchResult)
 from ai.rag.retriever import RetrievedChunk
 from ai.tools.base import Tool
 from ai.tools.filing_tool import SearchFilingsTool
@@ -184,10 +184,6 @@ class _RisingMarketProvider:
     async def get_recent_price_history(
             self, ticker, *, interval="1d", lookback_days=90):
         return _rising_bars(ticker, interval, self.count, self.step)
-
-    async def get_instrument_metadata(self, ticker):
-        return InstrumentMetadata(
-            name=f"{ticker} Inc.", sector=None, exchange=None)
 
 
 def _news_with_evidence(
@@ -354,50 +350,6 @@ _PROMPT_CASES = {
             "do not state this company's own financials", "catalog=no"
         ], _NO_CATALOG_PHRASES),
     "news": (lambda: news._SYSTEM_PROMPT, ["catalog=no"], _NO_CATALOG_PHRASES)
-}
-_REMOVED_NAMES = {
-    "filing-phrase-checks": (
-        filing, [
-            "one_off_items_issue", "relabeled_net_income_issue",
-            "filing_recency_issue", "filing_answer_issue",
-            "strip_period_prefixes"
-        ]),
-    "risk-phrase-checks": (
-        risk, [
-            "_superseded_status_issue", "_completed_deal_issue",
-            "_event_status_note"
-        ]),
-    "source-credibility-tool": (
-        news_tool_module, ["AssessSourceCredibilityTool"]),
-    "kg-context-legal-filter": (
-        kg_context_module, ["drop_resolved_legal_relations"]),
-    "extraction-legal-filter": (
-        archival_module, ["drop_resolved_legal_triples"]),
-    "debate-common-word-lists": (
-        dc, [
-            "profit_changes_in_passage", "newest_quarter_changes",
-            "profit_decline_line", "period_label_findings", "percent_mentions",
-            "split_clauses", "annual_figures_as_current",
-            "unstated_profit_declines", "_SIDE_RE_CACHE", "_CONFIRMED_OK_RE",
-            "self_verify_argument", "extract_flagged_figures",
-            "repeats_flagged_figures", "structured_facts_lines",
-            "agent_derived_only_figures"
-        ]),
-    "reflection-word-lists": (
-        reflection, [
-            "_UNGROUNDED_CLAIM_RE", "_SIDE_NAME_RES",
-            "_is_debate_ungrounded_claim", "_debate_period_mismatches"
-        ]),
-    "judge-figure-logging": (
-        judge, ["_log_cited_figures", "_log_agent_derived_figures"]),
-    "sizing-buy-cap": (
-        sizing_module,
-        ["BuyCap", "buy_cap_for", "buy_cap_pct", "_scale_tiers_to_cap"]),
-    "buy-cap-settings": (
-        config.settings, [
-            "TIER_BUY_CAP_PCT_MIN", "TIER_BUY_CAP_PCT_MAX",
-            "TIER_BUY_CAP_CONF_LOW", "TIER_BUY_CAP_CONF_HIGH"
-        ])
 }
 
 
@@ -1086,11 +1038,6 @@ class TestPromptsAndSettings:
             for text in absent:
                 assert text not in prompt, (case_id, text)
 
-        for case_id, (owner, names) in _REMOVED_NAMES.items():
-            for name in names:
-                assert not hasattr(owner, name), (case_id, name)
-        assert importlib.util.find_spec("ai.knowledge.filing_recency") is None
-        assert importlib.util.find_spec("ai.agents.source_credibility") is None
         settings = config.settings
         assert settings.MIN_BUY_TIER_CONFIDENCE == 0.5
         assert settings.JUDGE_RETRY_BUDGET_SECONDS == 240.0
@@ -1190,10 +1137,6 @@ class TestMarketAgent:
                                            tzinfo=UTC), open=100.0, high=106.0,
                         low=99.0, close=105.5, volume=1200, source="fake")
                 ]
-
-            async def get_instrument_metadata(self, ticker):
-                return InstrumentMetadata(
-                    name=f"{ticker} Inc.", sector=None, exchange=None)
 
         monkeypatch.setattr(
             market_tool_module, "get_market_data_provider",
@@ -1438,6 +1381,26 @@ class TestSentimentAgent:
         assert output.raw_output["sentiment_label"] == "positive"
         assert "cautiously optimistic" in (
             classification_router.calls[0][-1].content)
+
+        class _QuotaNews:
+
+            async def search_news(self, query, **kw):
+                raise ProviderQuotaError("request limit reached")
+
+        monkeypatch.setattr(
+            news_tool_module, "get_news_provider", lambda: _QuotaNews())
+        router = _Router([
+            _action("search_news", {"query": "latest news"}),
+            _finish("No sentiment reading is possible this run.")
+        ])
+        monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
+        output = await sentiment.SentimentAgent(
+            role=AgentRole.SENTIMENT, llm_router=_NoCallRouter()).run(
+                _state(agent_outputs={AgentRole.NEWS: _news_with_evidence()}))
+        assert output.raw_output["sentiment_label"] is None
+        assert output.raw_output["no_evidence"] is False
+        assert "proceed with the evidence you have" in (
+            router.calls[1][-1].content)
 
     @pytest.mark.asyncio
     async def test_no_news_and_no_own_results_is_no_evidence(
@@ -1837,6 +1800,36 @@ class TestFundamentalAgent:
         assert output.raw_output["finish_meta"] is not None
         assert output.is_well_supported is True
 
+    @pytest.mark.asyncio
+    async def test_earlier_run_kg_figures_are_not_own_evidence(
+            self, monkeypatch):
+        monkeypatch.setattr(fundamental, "GetFundamentalsTool", _FakeFundTool)
+        kg = (
+            "- GOOGL --[guided_adjusted_eps_2026_of]--> $19.50 to $20.00 "
+            "(dated 2026-10-18) [source: analyst_report] [agent-derived, not "
+            "independently sourced]")
+        stale = "GOOGL trades at P/E 22.00; EPS guidance is $19.50 to $20.00."
+        for fresh, calls in ((None, 3), ("10-Q guides $19.50 to $20.00.", 2)):
+            router = _Router([
+                _action("get_fundamentals", {"ticker": "GOOGL"}),
+                _finish(stale, {"trailing_pe": 22.0}),
+                _finish("GOOGL trades at P/E 22.00.", {"trailing_pe": 22.0})
+            ], finish_reason="STOP")
+            monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
+            output = await fundamental.FundamentalAgent(
+                role=AgentRole.FUNDAMENTAL).run(
+                    _state(
+                        "GOOGL", kg_context=kg, fresh_filing_context=fresh))
+            assert len(router.calls) == calls, fresh
+            rejected = [
+                str(e.get("observation") or "")
+                for e in output.raw_output["scratchpad"]
+                if "Figure check" in str(e.get("observation") or "")
+            ]
+            assert bool(rejected) is (fresh is None), fresh
+            if rejected:
+                assert '"$19.50 to $20.00"' in rejected[0]
+
 
 class TestTechnicalAgent:
 
@@ -2129,6 +2122,39 @@ class TestRiskAgent:
         assert output.raw_output["risk_events"] == []
         assert output.summary.startswith("[VERIFICATION WARNING:")
 
+    def test_empty_events_after_correction_log_their_reason(self):
+        pad = _steps(("search_prior_risk_notes", _UNH_PRIOR_NOTES),
+                     ("search_filings", _UNH_FILINGS))
+        metrics = {
+            "risk_events": [{
+                "entity": "Department of Justice",
+                "evidence_tool": "search_prior_risk_notes",
+                "status": "not_applicable"
+            }, {
+                "entity": "x"
+            }]
+        }
+        dropped: Counter[str] = Counter()
+        assert _sourced_risk_events(metrics, pad, dropped=dropped) == []
+        assert dropped == {"malformed": 1, "unsourced": 1}
+        cases = {
+            "no-finish": (False, None, "no_accepted_finish", 0),
+            "null-metrics": (True, None, "model_omitted_list", 0),
+            "omitted": (True, {}, "model_omitted_list", 0),
+            "empty": (True, {"risk_events": []}, "model_returned_empty", 0),
+            "dropped": (True, metrics, "all_events_dropped", 2)
+        }
+        for case_id, (accepted, got, reason, received) in cases.items():
+            with capture_logs() as logs:
+                _log_empty_events_after_correction(
+                    "UNH", accepted, got, dropped)
+            event = next(
+                e for e in logs
+                if e["event"] == "risk.events_empty_after_correction")
+            assert (event["reason"], event["received"]) == (
+                reason, received), case_id
+            assert event["dropped"] == {"malformed": 1, "unsourced": 1}
+
     def test_sourced_events_and_their_plain_words_line(self):
         pad = _steps(("search_prior_risk_notes", _UNH_PRIOR_NOTES),
                      ("search_filings", _UNH_FILINGS))
@@ -2151,8 +2177,12 @@ class TestRiskAgent:
         assert kept == ["DOJ", "CMS"]
 
         pad = _pad(_TSLA_TWO_FILINGS)
+        assert _sourced_risk_events(
+            _TSLA_DRAFT, pad, rows=_TSLA_TWO_ROWS, shown=True) == []
         events = _sourced_risk_events(
-            _TSLA_DRAFT, pad, rows=_TSLA_TWO_ROWS, shown=True)
+            _events(("NHTSA", "pending", "F1"),
+                    ("Benavides v. Tesla", "appeal", "F1")), pad,
+            rows=_TSLA_TWO_ROWS, shown=True)
         line = _risk_events_line(events, _TSLA_TWO_ROWS, True)
         assert line == (
             "Named risk events (sourced): NHTSA (status pending; "
@@ -2190,11 +2220,10 @@ class TestRiskAgent:
         assert [e["source_id"] for e in events
                 ] == ["F1.L1", "F1.T1", "KO_10-Q_2026-07-29.txt"]
         assert _risk_events_line(events, rows, True) == (
-            "Named risk events (sourced): City of Baltimore plastic "
-            "packaging lawsuit (status pending; source: 10-Q filed "
-            "2026-07-29, legal matter: Baltimore plastic packaging "
-            "lawsuit); Africa bottling sale (status pending; source: "
-            "10-Q filed 2026-07-29); IRS (status appeal; source: 10-Q filed "
+            "Named risk events (sourced): Baltimore plastic packaging "
+            "lawsuit (status pending; source: 10-Q filed 2026-07-29); "
+            "Africa bottling sale (status pending; source: 10-Q filed "
+            "2026-07-29); IRS (status appeal; source: 10-Q filed "
             "2026-07-29)")
 
         event = {
@@ -2298,6 +2327,192 @@ class TestRiskAgent:
             validator.records.shown = shown
             validator("Risk remains.", metrics, _pad("search_filings result"))
             assert "empty_risk_events" not in validator.fired, case_id
+
+    def test_paraphrased_or_record_cited_events_are_sourced(self):
+        name = (
+            "Reyes v. Costco Wholesale Corporation (California wage-and-hour "
+            "class action and related PAGA action)")
+        rows = [
+            _Row(
+                "COST_10-K_2026-10-07.txt", "10-K", date(2026, 10, 7),
+                date(2026, 8, 30), {
+                    "legal_matters": [{
+                        "name": name,
+                        "status": "pending",
+                        "quote": ""
+                    }, {
+                        "name": "United States ex rel. Poehling",
+                        "status": "pending",
+                        "quote": ""
+                    }]
+                })
+        ]
+        pad = _pad(
+            frec.render_filing_records(rows) +
+            "\n- (COST) [COST_10-K_2026-10-07]: **China Antitrust**: "
+            "Preliminary finding (Sept 2025).")
+        cases = {
+            "drops-the-end-of-a-parenthetical": (
+                "Reyes v. Costco Wholesale Corporation (California "
+                "wage-and-hour class action)", "COST_10-K_2026-10-07.txt"),
+            "punctuation-differs": (
+                "China antitrust preliminary finding", "COST_10-K_2026-10-07"),
+            "shorter-caption-with-record-id": (
+                "Reyes v. Costco (California wage-and-hour class action)",
+                "F1.L1")
+        }
+        for case_id, (entity, source) in cases.items():
+            metrics = _events((entity, "pending", source))
+            assert _risk_answer_issue(
+                "x", metrics, pad, rows=rows, shown=True) == (None,
+                                                              False), case_id
+        events = _sourced_risk_events(
+            _events(("Reyes v. Costco (California wage-and-hour class "
+                     "action)", "pending", "F1.L1"),
+                    (name, "pending", "F1.L1")), pad, rows=rows, shown=True)
+        assert [(e["entity"], e["source_id"]) for e in events
+                ] == [(name, "F1.L1")]
+
+        paraphrase = _events((
+            "DOJ whistleblower suit over Medicare coding", "pending", "F1.L2"))
+        issue, record_name = _risk_answer_issue(
+            "x", paraphrase, pad, rows=rows, shown=True,
+            allow_record_name_mismatch=False)
+        assert issue is not None and issue.startswith("Record check:")
+        assert record_name is True
+        assert "does not appear" not in issue
+        assert _sourced_risk_events(paraphrase, pad, rows=rows,
+                                    shown=True) == []
+        reworded = _events(("U.S. export controls on AI chips shipped to "
+                            "China", "not_applicable", ""))
+        assert _risk_answer_issue(
+            "x", reworded, pad, rows=rows, shown=True) == (None, False)
+        assert _sourced_risk_events(reworded, pad, rows=rows,
+                                    shown=True) == []
+
+    def test_empty_list_renders_the_shown_legal_records(self):
+        line = _risk_events_line([], _TSLA_ROWS, True)
+        assert line == (
+            "Named risk events (sourced): none confirmed by the risk agent "
+            "this run; taken from the filing records shown this run: Certain "
+            "Derivative Lawsuits in Delaware (status appeal as "
+            "of 2026-05; source: 10-Q filed 2026-07-23); Benavides v. Tesla, "
+            "Inc. (status appeal as of 2026-03-16; source: 10-Q "
+            "filed 2026-04-23).")
+        assert recycled_content._CODE_LINE_RE.sub(
+            "", "Risk is moderate.\n\n" + line) == "Risk is moderate."
+        assert _risk_events_line([], _TSLA_ROWS, False) == (
+            "Named risk events (sourced): none reported with a tool source "
+            "this run.")
+        assert _risk_events_line([], [], True).endswith("none reported with "
+                                                        "a tool source this "
+                                                        "run.")
+        many = [
+            _Row(
+                "X_10-Q_2026-07-01.txt", "10-Q", date(2026, 7, 1), None, {
+                    "legal_matters": [{
+                        "name": f"Matter {chr(65 + i)} litigation",
+                        "status": "pending"
+                    } for i in range(10)]
+                })
+        ]
+        line = _risk_events_line([], many, True)
+        assert line.count(" (status pending; source: 10-Q") == 8
+        assert line.endswith("; and 2 more legal matter(s) in those records.")
+
+    def test_names_tolerate_trailing_generic_words_only(self):
+        assert _text_names(
+            "Verzenio Hatch-Waxman: Cipla ANDA notice April 2026; Lilly sued "
+            "in Delaware June 2026", "Verzenio Hatch-Waxman suit")
+        assert _text_names(
+            "China's antitrust regulators (Sept 2025) found",
+            "China antitrust regulators finding")
+        assert _names_match("China antitrust", "China antitrust investigation")
+        assert _names_match(
+            "Verzenio Hatch-Waxman suit",
+            "Verzenio Hatch-Waxman patent litigation")
+        assert not _text_names(
+            "the Utah antitrust suit was filed", "Texas antitrust suit")
+        assert not _text_names("texas privacy suit", "texas antitrust suit")
+        assert not _names_match("Texas antitrust suit", "Texas privacy suit")
+        assert not _names_match(
+            "In Re NVIDIA Corporation Securities Litigation",
+            "In re NVIDIA Corporation Consolidated Derivative Litigation")
+        assert not _text_names(
+            "China SAMR antitrust review", "China antitrust review")
+        for one, other in (
+                ("Federal Trade Commission antitrust lawsuit",
+                 "Federal Trade Commission Prime enrollment lawsuit"),
+                ("European Commission antitrust investigation",
+                 "European Commission DMA investigation"),
+                ("Department of Justice antitrust lawsuit",
+                 "Department of Justice criminal investigation"),
+                ("Texas AG antitrust suit", "Texas AG privacy suit")):
+            assert not _names_match(one, other)
+            assert not _text_names(other, one)
+
+    def test_events_line_keeps_newest_records_and_lists_closed_last(self):
+
+        def matter(name: str, status: str, **kw: Any) -> dict[str, Any]:
+            return {"name": name, "status": status, "quote": "", **kw}
+
+        rows = [
+            _Row(
+                "X_10-Q_2026-07-28.txt", "10-Q", date(2026, 7, 28), None, {
+                    "legal_matters": [
+                        matter("Coastal erosion lawsuits", "settled",
+                               status_date="2026-07-31"),
+                        matter("Securities class action", "pending"),
+                        matter("Verzenio Hatch-Waxman litigation", "pending")
+                    ]
+                }),
+            _Row(
+                "X_10-K_2026-01-30.txt", "10-K", date(2026, 1, 30), None, {
+                    "legal_matters": [
+                        matter("Securities class action suit", "appeal"),
+                        matter("Derivative suit", "dismissed")
+                    ]
+                }),
+            _Row(
+                "X_10-Q_2025-07-29.txt", "10-Q", date(2025, 7, 29), None, {
+                    "legal_matters": [matter("Cell Phone Litigation",
+                                             "pending")]
+                })
+        ]
+        line = _risk_events_line(
+            [], rows, True, "The Verzenio Hatch-Waxman suit is pending.")
+        assert line == (
+            "Named risk events (sourced): none confirmed by the risk agent "
+            "this run; taken from the filing records shown this run: "
+            "Verzenio Hatch-Waxman litigation (status pending; source: 10-Q "
+            "filed 2026-07-28); Securities class action (status pending; "
+            "source: 10-Q filed 2026-07-28). Closed in those records "
+            "(settled, dismissed or decided): Coastal "
+            "erosion lawsuits (status settled as of 2026-07-31; source: 10-Q "
+            "filed 2026-07-28); Derivative suit (status dismissed; source: "
+            "10-K filed 2026-01-30).")
+        assert "Cell Phone" in _risk_events_line([], rows[2:], True)
+        closed_only = [
+            _Row(
+                "X_10-K_2026-01-30.txt", "10-K", date(2026, 1, 30), None,
+                {"legal_matters": [matter("Derivative suit", "dismissed")]})
+        ]
+        assert _risk_events_line([], closed_only, True).startswith(
+            "Named risk events (sourced): none confirmed by the risk agent "
+            "this run; taken from the filing records shown this run: no open "
+            "matter. Closed in those records")
+        many_closed = [
+            _Row(
+                "X_10-K_2026-01-30.txt", "10-K", date(2026, 1, 30), None, {
+                    "legal_matters": [
+                        matter(f"Matter {chr(65 + i)} litigation",
+                               "dismissed") for i in range(10)
+                    ]
+                })
+        ]
+        line = _risk_events_line([], many_closed, True)
+        assert "shown this run: no open matter. Closed" in line
+        assert line.endswith("; and 2 more legal matter(s) in those records.")
 
     def test_record_of_another_matter_and_record_naming(self, capsys):
         validator = _validator(_TSLA_TWO_ROWS)
@@ -2667,13 +2882,6 @@ class TestDebateSides:
         assert final and final[0]["ungrounded_figures"] == ["26%"]
 
     def test_evidence_text_for_failed_quarters_and_one_off_items(self):
-        all_failed = _failed_outputs(
-            [AgentRole.MARKET, AgentRole.NEWS, AgentRole.FILING])
-        result = dc.format_evidence(_state(agent_outputs=all_failed))
-        assert "no real evidence available" in result
-        assert "402 error" not in result
-        assert "- market:" not in result
-
         cases = {
             "absent": (None),
             "empty-text": ({
@@ -2712,25 +2920,25 @@ class TestDebateSides:
 class TestJudgeAgent:
 
     @pytest.mark.asyncio
-    async def test_leaning_fallback_no_evidence_skip_and_prior_clause(
+    async def test_leaning_fallback_and_prior_clause(
             self, monkeypatch):
         router = _Router([_judge_json(True, leaning="strong_buy")])
         monkeypatch.setattr(judge, "LLMRouter", lambda: router)
         verdict = await JudgeAgent().assess_round(_state())
         assert verdict.leaning == RecommendationAction.HOLD
 
-        router = _Router([_judge_json(True, "buy", 0.75)])
-        monkeypatch.setattr(judge, "LLMRouter", lambda: router)
-
-        verdict = await JudgeAgent().assess_round(
-            _state(agent_outputs=_failed_outputs(_ALL_DATA_ROLES)))
-
-        assert verdict.leaning == RecommendationAction.HOLD
-        assert verdict.confidence == 0.0
-        assert verdict.judge_failed is True
-        assert verdict.failure_reason == "no_evidence"
-        assert verdict.converged is False
-        assert len(router.calls) == 0
+        for case_id, confidence in (
+                ("nan", float("nan")), ("infinity", float("inf")),
+                ("nan-string", "nan"), ("list", [0.9]), ("above-one", 1.7)):
+            router = _Router([
+                json.dumps({
+                    "converged": True, "leaning": "buy",
+                    "confidence": confidence, "rationale": "test rationale"})
+            ])
+            monkeypatch.setattr(judge, "LLMRouter", lambda r=router: r)
+            verdict = await JudgeAgent().assess_round(_state())
+            expected = 1.0 if case_id == "above-one" else 0.0
+            assert verdict.confidence == expected, case_id
 
         cases = {
             "no-pending-recommendation": (None, False),
@@ -2939,3 +3147,9 @@ class TestReflectionAgent:
             ]))
         assert "no agent's actual evidence supports" in causes
         assert "(429)" in causes and "same feedback" in causes
+
+
+def test_technical_schema_requires_categorical_claims() -> None:
+    schema = technical._TECHNICAL_REPORTED_SCHEMA
+    assert schema["required"] == list(technical._CATEGORICAL_CLAIMS)
+    assert set(schema["required"]) <= set(schema["properties"])

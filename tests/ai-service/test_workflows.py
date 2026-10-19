@@ -1245,6 +1245,9 @@ class TestReviewAiAccuracy:
             assert rows[0][0] in rec_ids and rows[1][0] not in rec_ids
             assert (rows[0][1] in decision_ids
                     and rows[1][1] not in decision_ids)
+            mine = next(d for d in decisions if d.id == rows[0][1])
+            assert (mine.action, mine.analysis_id) == (
+                RecommendationAction.BUY.value, analysis.id)
 
             await session.execute(
                 delete(InvestmentDecision).where(
@@ -1406,7 +1409,7 @@ class TestReviewStepCounts:
         decisions = [
             SimpleNamespace(
                 id=uuid4(), ticker="AMD", created_at=datetime.now(UTC),
-                user_id=uuid4(), recommendation_id=uuid4())
+                user_id=uuid4(), action="buy", analysis_id=uuid4())
             for _ in range(count)
         ]
 
@@ -1457,7 +1460,7 @@ class TestReviewStepCounts:
         async def _score(recommendation_id, analysis_id, action):
             if recommendation_id == recs[0].id:
                 raise RuntimeError("provider 503")
-            return None if recommendation_id == recs[1].id else True
+            return recommendation_id != recs[1].id
 
         async def _evaluate(decision_id, *args, **kwargs):
             if decision_id == decisions[0].id:
@@ -1672,6 +1675,45 @@ class TestTierMonitoringGating:
 
 
 class TestTierMonitoringRun:
+
+    @pytest.mark.asyncio
+    async def test_failed_commit_counts_the_tier_once(
+            self, monkeypatch, _schema_ready):
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        async with SessionLocal() as session:
+            analysis, rec = await _analysis_with_tiers(
+                session, user_id=uuid4(),
+                prices=[(Decimal("100"), Decimal("1"))])
+            await session.commit()
+            analysis_id, rec_id = analysis.id, rec.id
+
+        async def _triggered(tier, *, today):
+            return "triggered"
+
+        async def _commit_fails(self):
+            raise RuntimeError("database blip")
+
+        monkeypatch.setattr(tier_workflow, "_check_one_tier", _triggered)
+        monkeypatch.setattr(
+            tier_workflow, "_tier_outcome_event", lambda tier, outcome: None)
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(AsyncSession, "commit", _commit_fails)
+                counts = await tier_workflow.run_tier_monitoring_workflow()
+        finally:
+            async with SessionLocal() as session:
+                for sql in ("DELETE FROM ai.recommendation_tiers "
+                            "WHERE recommendation_id = :r",
+                            "DELETE FROM ai.recommendations WHERE id = :r"):
+                    await session.execute(text(sql), {"r": rec_id})
+                await session.execute(
+                    text("DELETE FROM ai.analyses WHERE id = :a"),
+                    {"a": analysis_id})
+                await session.commit()
+        assert counts["checked"] >= 1
+        assert counts["triggered"] == 0
+        assert counts["execution_failed"] == counts["checked"]
 
     @pytest.mark.asyncio
     async def test_rejected_is_terminal_and_5xx_is_retried(

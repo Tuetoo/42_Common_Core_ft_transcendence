@@ -77,10 +77,23 @@ async def _handle_portfolio_deleted(payload: dict[str, Any]) -> None:
             user_id_fallback=payload.get("user_id") or None))
 
 
+async def _handle_user_deleted(payload: dict[str, Any]) -> None:
+    try:
+        user_id = UUID(str(payload.get("user_id")))
+    except ValueError:
+        logger.warning("user_deleted_bad_user_id", payload=payload)
+        return
+    logger.info("user_deleted_received", user_id=str(user_id))
+    from user_cleanup import delete_user_data
+
+    await delete_user_data(user_id, strict=True)
+
+
 def build_durable_subscriber() -> DurableEventSubscriber:
     subscriber = DurableEventSubscriber(
         settings, consumer_name=settings.SERVICE_NAME)
     subscriber.on(EventName.DOCUMENT_UPLOADED, _handle_document_uploaded)
     subscriber.on(EventName.DOCUMENT_DELETED, _handle_document_deleted)
     subscriber.on(EventName.PORTFOLIO_DELETED, _handle_portfolio_deleted)
+    subscriber.on(EventName.USER_DELETED, _handle_user_deleted)
     return subscriber

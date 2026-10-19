@@ -103,8 +103,6 @@ class Position:
 class Shortfall:
     ticker: str
     missing: Decimal
-    at: datetime
-    price_hint: Decimal | None
 
 
 @dataclass
@@ -181,9 +179,7 @@ def replay_positions(rows: Iterable[LedgerRow]) -> ReplayResult:
             out = abs(quantity or Decimal(0))
             if out > pos.quantity and not amounts_equal(out, pos.quantity):
                 shortfalls.append(
-                    Shortfall(
-                        ticker=row.ticker, missing=out - pos.quantity,
-                        at=_utc(row.transaction_date), price_hint=row.price))
+                    Shortfall(ticker=row.ticker, missing=out - pos.quantity))
                 pos.quantity = Decimal(0)
             elif amounts_equal(out, pos.quantity):
                 pos.quantity = Decimal(0)

@@ -29,19 +29,7 @@ collaborative editing, uploaded research documents that become searchable
 in real time, a public API, analytics, monitoring and backups.
 
 A running copy is deployed at https://alphamind-research.duckdns.org:8443
-(status page: https://alphamind-research.duckdns.org:8443/status). The
-demo address works only while the AWS instance is running. On the demo
-site, Google sign-in works only for registered test users (the Google
-OAuth app is in testing mode); GitHub sign-in works for everyone.
-
-### Project history
-
-AlphaMind started as ft_transcendence, the final project of the 42
-Common Core, built by a team of three and evaluated at 42 London in
-October 2026. The evaluated version is tagged
-[`v1.0-42-evaluated`](https://github.com/Tuetoo/42_Common_Core_ft_transcendence/tree/v1.0-42-evaluated).
-Since the evaluation, jiezhang continues to develop it alone as a
-portfolio project; all changes after that tag are hers.
+(status page: https://alphamind-research.duckdns.org:8443/status).
 
 ### Key features
 
@@ -58,8 +46,8 @@ portfolio project; all changes after that tag are hers.
 - **Users and teams**: registration with email verification, 2FA,
   Google and GitHub login, profile and avatar, friends and online
   status, organizations with member roles, admin and moderator pages.
-- **Real time**: notifications, unread counts, analysis status,
-  analytics refresh and friends' online status over WebSockets.
+- **Real time**: notifications, unread counts, analysis status and
+  analytics refresh over WebSockets.
 - **Analytics**: interactive charts, date ranges and filters, CSV export
   and a print view for PDF.
 - **Public API**: five endpoints with API keys, rate limits and Swagger
@@ -93,9 +81,9 @@ Around it: scheduler (cron jobs, backups) Â· Prometheus, Alertmanager, Grafana Â
   rate limits and live user state; Qdrant for the vector index of the
   research library; S3-compatible object storage for uploaded files.
 - **Gateway.** nginx terminates TLS, sends pages to the frontend and API
-  calls to the services, applies rate limits on login routes and the
-  public API, serves the status page and Grafana, and blocks internal
-  routes and metrics from outside.
+  calls to the services, applies rate limits on login routes, serves the
+  status page and Grafana, and blocks internal routes and metrics from
+  outside.
 
 AlphaMind is a research and learning tool. It does not trade real money
 and its output is not financial advice.
@@ -137,11 +125,7 @@ Then fill in at least:
 - optionally `GOOGLE_CLIENT_ID`/`_SECRET` and `GITHUB_CLIENT_ID`/`_SECRET`
   for OAuth login, with the callback
   `https://localhost:8443/api/v1/auth/oauth/<google|github>/callback`
-  registered at each provider. Start an OAuth sign-in from the origin set
-  in `FRONTEND_BASE_URL` (`https://localhost:8443` by default): the
-  sign-in finishes on that origin, and from any other origin (for example
-  `npm run dev` on port 3000, or `127.0.0.1` instead of `localhost`) the
-  page shows "This sign-in was not started in this browser tab".
+  registered at each provider.
 
 ### Run
 
@@ -278,8 +262,7 @@ sidebar beside the content on screens 768 px and wider, and
 `hidden md:flex` in `sidebar-nav.tsx` hides the sidebar on phones, where
 a Menu button takes its place. Elements that repeat everywhere, such as
 buttons and form fields, share a few component classes (`btn`, `field`)
-defined in `globals.css`. Below 768 px, form fields use a 16 px font, so
-iOS Safari does not zoom into a field when it gets focus.
+defined in `globals.css`.
 
 ## Technical Decisions
 
@@ -408,9 +391,6 @@ The known security trade-offs are listed in
   every update and saves the merged text.
 - Changes reach other users at once over WebSockets: notifications,
   unread counts, online status, analysis status and analytics refresh.
-  A friend's online status is pushed over the user's own `user:`
-  channel; the friends page also refreshes every 60 seconds as a
-  fallback.
 
 ## Frontend Quality
 
@@ -603,7 +583,7 @@ Papers behind the retrieval and the agents:
 
 ### Use of AI
 
-AI tools were used throughout the project. The
+AI tools were used throughout the project, as the subject allows. The
 team decided what to build, made the design decisions, and ran, tested
 and reviewed every change before it was merged.
 
@@ -687,12 +667,13 @@ and reviewed every change before it was merged.
   quotas), so the cloud host runs no scheduled jobs and makes no
   backups; backups are made on the local stack, nightly or with
   `make backup`.
-- **Dependency advisories.** Next.js is pinned at 16.3.8, and
-  `npm audit --omit=dev` reports no vulnerabilities in the runtime
-  dependencies. A full `npm audit` still reports a high-severity
-  advisory for `braces`, which reaches the project only through the
-  lint tooling (`eslint-config-next`); it is not part of the production
-  server.
+- **Dependency advisories.** `npm audit` reports published advisories
+  for the pinned Next.js 16.3.3 (fixed in 16.4.0) and for two indirect
+  dependencies (`sharp`, `source-map-js`). The application does not use
+  most of the affected features: no `next/og` image responses, no
+  `use cache` or Draft Mode, no metadata image routes, no `next/image`,
+  and it runs the production server, not the development server. The
+  versions stay pinned until the upgrade can be tested end to end.
 - **Security trade-offs.** The services share one signing secret for
   tokens, Redis and Qdrant rely on the private Docker network instead of
   passwords, and a few sockets end only at token expiry when access
@@ -717,7 +698,7 @@ and reviewed every change before it was merged.
 - Backups copied off the host, a managed database and more than one
   replica per service.
 - Asymmetric token signing (RS256), so only auth-service can issue tokens.
-- Replace or update the lint dependencies once `eslint-config-next`
-  no longer pulls in the `braces` version flagged by `npm audit`.
+- Upgrade Next.js to 16.4.0 or later and refresh the other dependencies
+  flagged by `npm audit`, with a full rebuild and end-to-end test.
 
 The analysis output is for research and learning, not investment advice.

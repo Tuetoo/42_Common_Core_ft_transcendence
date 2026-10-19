@@ -34,7 +34,7 @@ Think of AlphaMind as a small company building:
 - The **scheduler** is the alarm clock. At fixed New York times it calls
   internal routes (market open, tier monitoring, market close, nightly
   review, RAG ingestion, purge of unverified accounts, notification
-  retention) and makes the nightly backup.
+  retention, the deleted-user sweeps) and makes the nightly backup.
 - **Prometheus, Alertmanager, Grafana, the exporters and vector** are the
   security cameras and log books.
 
@@ -223,8 +223,8 @@ and other services ask the owner through its internal API.
 | Redis | shared, with fixed logical databases | see below |
 
 **One database, three schemas.** `infra/postgres/init-schemas.sql` runs
-once, when the `postgres_data` volume is empty. It creates the extension
-`pgcrypto` and the schemas `auth`, `core` and `ai`. Each service then puts
+once, when the `postgres_data` volume is empty. It creates the schemas
+`auth`, `core` and `ai`. Each service then puts
 its own schema first on the PostgreSQL `search_path` for every connection
 (`shared/database.py`, `"search_path": f"{settings.POSTGRES_SCHEMA},public"`;
 `POSTGRES_SCHEMA` is `auth`, `core` or `ai` in each service's
@@ -253,7 +253,7 @@ explains the refusal cases.
 | DB | Setting | Used for |
 |---|---|---|
 | 0 | `REDIS_DB_CACHE` | caches (API key validation, organization membership, OAuth state, the FX rate, a few internal lookups), the scheduled-job health times `core:job_last_success` and `core:job_tracked_since` (when core began tracking a job that has no success yet), the NewsAPI usage log |
-| 1 | `REDIS_DB_RATE_LIMIT` | rate-limit counters (auth, public API, RAG assistant) |
+| 1 | `REDIS_DB_RATE_LIMIT` | rate-limit counters (auth, public API, RAG assistant, decision reviews) |
 | 2 | `REDIS_DB_EVENTS` | pub/sub events and the live user state `auth:user_state:<id>` |
 | 3 | `REDIS_DB_QUEUE` | durable event streams `stream:<event>` |
 
@@ -306,11 +306,12 @@ The pieces:
 |---|---|---|
 | core-service | `clients/auth_client.py` | `/internal/users/{id}`, `/internal/connections/check`, `/internal/users/{id}/notification-settings`, `/internal/users/{id}/presence` |
 | core-service, ai-service | `clients/auth_client.py` -> `shared/user_state.py` | auth `/internal/users/{id}/organizations` (organization membership and role, cached 60 s in Redis) |
+| core-service, ai-service | `shared/deleted_users.py` | auth `POST /internal/users/deleted` (the nightly deleted-user sweeps) and, core only, `POST /internal/organizations/missing` (the organization sweep and `scripts.clean_organizations`); batches of 500 |
 | all three services | `shared/user_state.py` | auth `/internal/users/{id}/state` (live role and active flag, only when the Redis key is missing) |
 | core-service | `clients/ai_client.py` | `/internal/recommendations/latest`, `/internal/analyses/{id}`, `/internal/market/instruments/{ticker}/prices`, `/internal/fx-rate`, `/internal/analyses` (create), `/internal/sentiment` |
 | ai-service | `clients/core_client.py` | `/internal/portfolios/{id}/holdings`, `/owner`, `/cash-balance`, `/snapshots`, `/cash-flows`, `POST /internal/portfolios/{id}/transactions` (tier execution), `/internal/tracked-tickers`, `/internal/documents/filenames`, `/internal/documents` |
 | auth-service | `domains/admin/service.py::_fetch_service_stats` | `/internal/stats` of core and ai (admin statistics page; auth's own numbers are read from its database, it has no `/internal/stats` route) |
-| scheduler | `infra/scheduler/*.sh` (curl) | core `/internal/scheduler/market-open`, `/market-close`, `/notification-retention`, `/heartbeat/{job}`; ai `/internal/scheduler/tier-monitoring`, `/internal/scheduler/rag-ingest`, `/internal/review/run`; auth `/internal/scheduler/purge-unverified` |
+| scheduler | `infra/scheduler/*.sh` (curl) | core `/internal/scheduler/market-open`, `/market-close`, `/notification-retention`, `/deleted-user-sweep`, `/heartbeat/{job}`; ai `/internal/scheduler/tier-monitoring`, `/internal/scheduler/rag-ingest`, `/internal/scheduler/deleted-user-sweep`, `/internal/review/run`; auth `/internal/scheduler/purge-unverified` |
 
 Because the gateway never forwards `/internal/`, operator tools that need
 an internal route run **inside** a container. For example
@@ -330,7 +331,7 @@ for, or even know, the listeners. Two transports exist
 | Transport | Function | Redis | Guarantee | Used for |
 |---|---|---|---|---|
 | Pub/sub | `publish_cross_service` / `CrossServiceSubscriber` | channel `events:<name>` | at most once: lost if no listener is connected | notifications and live updates: `analysis.*`, `recommendation.ready`, `tier.*`, `decision.*`, `backtest.*`, organization, friend, block and user events, presence |
-| Durable stream | `publish_durable_event` / `DurableEventSubscriber` | stream `stream:<name>` in DB 3, consumer group `workers` | at least once: kept until acknowledged, retried, capped at about 10,000 entries | `document.uploaded`, `document.deleted`, `portfolio.deleted` (core -> ai, written first to the outbox table `core.event_outbox` in the same transaction as the change, then published), and the database update of `document.status_changed` (ai -> core) |
+| Durable stream | `publish_durable_event` / `DurableEventSubscriber` | stream `stream:<name>` in DB 3, consumer group `workers` | at least once: kept until acknowledged, retried, capped at about 10,000 entries | `document.uploaded`, `document.deleted`, `portfolio.deleted` (core -> ai, written first to the outbox table `core.event_outbox` in the same transaction as the change, then published), the database update of `document.status_changed` (ai -> core), and `user.deleted` (auth -> ai; also sent on pub/sub for core) |
 
 Who listens:
 
@@ -341,9 +342,12 @@ Who listens:
   WebSocket connections.
 - **ai-service** (`event_listener.py`) consumes the durable streams
   `document.uploaded`, `document.deleted` (index or remove a document in
-  RAG) and `portfolio.deleted` (cancel the portfolio's open tiers).
+  RAG), `portfolio.deleted` (cancel the portfolio's open tiers) and
+  `user.deleted` (delete all ai data of the user). core-service consumes
+  the durable stream `document.status_changed` and gets `user.deleted`
+  over pub/sub.
 
-Why durable streams for those four: with pub/sub, an uploaded document
+Why durable streams for those five: with pub/sub, an uploaded document
 stays at status `uploaded` with zero chunks forever when its message is
 published while ai-service's listener happens to be disconnected, and
 nothing logs an error. A missed live update only costs a
@@ -944,7 +948,7 @@ Run from the repository root with the stack already up (see
 8. **Show the events transport.**
    `bash scripts/redis-cli.sh -n 3 --scan --pattern 'stream:*'`
    They see the durable streams (`stream:document.uploaded`, ...). Say:
-   "These four events must never be lost; everything else is pub/sub."
+   "These five events must never be lost; everything else is pub/sub."
 9. **Show the Swagger pages.** Open `https://localhost:8443/docs/core/`
    and scroll through the routes. Point out there are no `/internal`
    routes in the gateway paths.
@@ -975,9 +979,10 @@ Run from the repository root with the stack already up (see
    ai-service process. A restart ends queued and running analyses; the
    next startup marks them `failed` / `service_restart`.
 7. **Which events use Redis streams, and why?** `document.uploaded`,
-   `document.deleted`, `portfolio.deleted`, and the database part of
-   `document.status_changed`. Losing one would leave wrong state (an
-   unindexed document, tiers trading in a deleted portfolio).
+   `document.deleted`, `portfolio.deleted`, `user.deleted` (for ai), and
+   the database part of `document.status_changed`. Losing one would leave
+   wrong state (an unindexed document, tiers trading in a deleted
+   portfolio, ai data of a deleted user).
 8. **Why does nginx re-resolve service names every 10 seconds?** A
    restarted container can get a new IP address, and Docker may give the
    old one to another container. A cached address would send requests to
@@ -1009,7 +1014,7 @@ Run from the repository root with the stack already up (see
 | `shared/security.py` | JWT decoding, live user state check, `require_internal_token`. |
 | `shared/events.py` | Pub/sub and durable stream transports; event names and owners. |
 | `infra/gateway/nginx.conf` | Routing, TLS, headers, rate limit, resolver. |
-| `infra/postgres/init-schemas.sql` | Creates `pgcrypto` and the three schemas on first initialisation. |
+| `infra/postgres/init-schemas.sql` | Creates the three schemas on first initialisation. |
 | `infra/scheduler/` | Scheduler image, crontab, job scripts, backup and restore. |
 | `infra/objectstore/` | SeaweedFS entrypoint (writes the S3 identity) and health check. |
 | `infra/prometheus/`, `infra/alertmanager/`, `infra/grafana/`, `infra/vector/` | Monitoring and logging configuration. |

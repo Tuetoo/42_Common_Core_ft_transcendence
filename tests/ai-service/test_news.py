@@ -9,7 +9,6 @@ import ai.agents.loop as loop_module
 import ai.agents.news as news_module
 import ai.agents.reflection as reflection_module
 import ai.agents.sentiment as sentiment_module
-import ai.graph.nodes as nodes_module
 import ai.ingestion.digests as macro_ingestion
 import ai.ingestion.digests as news_ingestion
 import ai.llm.google_provider as google_provider
@@ -29,8 +28,10 @@ from ai.agents.finish_checks import INTERNAL_TOKEN_MESSAGE
 from ai.agents.loop import ScratchpadEntry
 from ai.agents.news import (FALLBACK_UNVERIFIED_REASON,
                             PRIOR_NOTE_CLAIMS_MESSAGE, NewsAgent,
-                            _NewsFinishValidator, prefetch_web_fallback,
-                            prior_news_note_similarity,
+                            _NewsFinishValidator,
+                            _reject_finish_before_live_search,
+                            fallback_sources_unverified,
+                            prefetch_web_fallback, prior_news_note_similarity,
                             weekday_date_mismatches)
 from ai.agents.reflection import ReflectionAgent
 from ai.graph.state import AgentOutput, AnalysisState
@@ -39,7 +40,8 @@ from ai.llm.base import (AGENT_LLM_CALL_RETRIES, GatedReservation, LLMError,
                          LLMServerOverloadedError, LLMTier, LLMUsage)
 from ai.providers import tavily
 from ai.providers.base import (MacroDataPoint, NewsArticle, PriceQuote,
-                               ProviderError, ProviderRequestError,
+                               ProviderError, ProviderQuotaError,
+                               ProviderRequestError, ProviderUnavailableError,
                                WebSearchResult)
 from ai.providers.fred import _PERCENT_SERIES_IDS, _SERIES_ALIASES
 from ai.providers.news_relevance import (COMPANY_BUSINESS, ClassifiedArticle,
@@ -621,6 +623,74 @@ class TestSearchNewsTool:
             self._lines_from_catalog_outlets_are_marked,
             setup=_install_known_companies)
 
+    async def test_quota_hint_names_only_a_tool_the_caller_has(self):
+
+        class _Quota:
+
+            async def search_news(self, query: str,
+                                  **kw: Any) -> list[NewsArticle]:
+                raise ProviderQuotaError("request limit reached")
+
+        class _Down:
+
+            async def search_news(self, query: str,
+                                  **kw: Any) -> list[NewsArticle]:
+                raise ProviderRequestError("HTTP 500")
+
+        with_web = await SearchNewsTool(
+            provider=_Quota(), fallback_tool="web_search").run("chips")
+        assert with_web.endswith("-- use web_search for news instead")
+        alone = await SearchNewsTool(provider=_Quota()).run("chips")
+        assert "web_search" not in alone
+        assert alone.endswith(
+            "NewsAPI is unavailable this run; do not call search_news "
+            "again, proceed with the evidence you have")
+        other = await SearchNewsTool(
+            provider=_Down(), fallback_tool="web_search").run("chips")
+        assert other == "News search failed for 'chips': HTTP 500"
+
+    async def test_unconfigured_news_provider_stops_retries(self):
+
+        class _NoKey:
+
+            async def search_news(self, query: str,
+                                  **kw: Any) -> list[NewsArticle]:
+                raise ProviderUnavailableError("NEWSAPI_API_KEY is not set")
+
+        with_web = await SearchNewsTool(
+            provider=_NoKey(), fallback_tool="web_search").run("chips")
+        assert with_web == (
+            "News search failed for 'chips': the news provider is not "
+            "configured for this run; do not call search_news again, use "
+            "web_search for news instead")
+        alone = await SearchNewsTool(provider=_NoKey()).run("chips")
+        assert alone.endswith(
+            "do not call search_news again, proceed with the evidence you "
+            "have")
+
+        failed = ScratchpadEntry(
+            thought="t", action="search_news", action_input={},
+            observation=with_web, tool_error=True, prefetched=True)
+
+        def web(header_detail: str) -> ScratchpadEntry:
+            return ScratchpadEntry(
+                thought="t", action="web_search", action_input={},
+                observation=(
+                    "Web search results for 'x' (2 results: 2 company "
+                    "business, 0 stock market, 0 opinion/listicle, 0 consumer "
+                    f"product, 0 unclassified{header_detail}):\n"
+                    "[2026-10-01] a (https://a.example/x): text"))
+
+        no_catalog = web("")
+        assert fallback_sources_unverified([failed, no_catalog]) is False
+        assert fallback_sources_unverified(
+            [failed, web("; 0 from catalog outlets")]) is True
+        assert fallback_sources_unverified(
+            [failed, web("; 1 from catalog outlets")]) is False
+        assert _reject_finish_before_live_search(
+            "", None, [failed, no_catalog]) is None
+        assert _reject_finish_before_live_search("", None, [failed]) is None
+
 
 class _QueuedHttpClient:
 
@@ -773,7 +843,7 @@ class TestNewsApiProvider:
             await provider.search_news("AAPL")
         assert "request limit reached (HTTP 429 rateLimited)" in str(
             first.value)
-        assert "use web_search" in str(first.value)
+        assert "web_search" not in str(first.value)
 
         with pytest.raises(ProviderRequestError) as second:
             await provider.search_news("MSFT")
@@ -2304,41 +2374,7 @@ class TestAnalysisPlumbing:
         assert event["max_wait_seconds"] == 30.0
 
 
-_REMOVED = [(settings, "NEWS_BLOCKED_DOMAINS"),
-            (settings, "NEWS_DOWNWEIGHT_DOMAINS"),
-            (settings, "NEWS_DOWNWEIGHT_MAX_ITEMS"),
-            (settings, "NEWS_HOMONYM_TICKER_MAX_LEN"),
-            (nodes_module.settings, "DATA_AGENT_RATE_LIMIT_RETRY_SECONDS"),
-            (relevance_module, "is_blocked_domain"),
-            (relevance_module, "is_ticker_homonym"),
-            (relevance_module, "non_news_reason"),
-            (relevance_module, "cap_downweighted"),
-            (relevance_module, "_GENERIC_NAME_WORDS"),
-            (relevance_module, "_SHOPPING_TITLE"),
-            (relevance_module, "_FORECAST_TITLE"),
-            (relevance_module, "_BOILERPLATE_TEXT"),
-            (relevance_module, "headline_mentions_company"),
-            (relevance_module, "_reasoning_contradicts_relevant"),
-            (relevance_module, "_reasoning_affirms_company"),
-            (relevance_module, "_keyword_prefilter"),
-            (web_tool_module, "_BLOCKED_DOMAINS"),
-            (news_tool_module, "_REPUTABLE_DOMAINS"),
-            (news_tool_module, "DOWNWEIGHTED_HEADER")]
-
-
-def test_removed_names_defaults_and_shared_objects():
-    for owner, name in _REMOVED:
-        assert not hasattr(owner, name), name
-    defaults = {
-        "consumer-items-cap": (settings, "NEWS_CONSUMER_MAX_ITEMS", 2),
-        "newsapi-searches-titles-and-descriptions": (
-            settings, "NEWSAPI_SEARCH_IN", "title,description"),
-        "newsapi-sorts-by-relevancy": (
-            settings, "NEWSAPI_SORT_BY", "relevancy"),
-        "react-output-cap": (loop_module, "_REACT_LOOP_MAX_TOKENS", 4096)
-    }
-    for case_id, (owner, name, expected) in defaults.items():
-        assert getattr(owner, name) == expected, case_id
+def test_link_unavailable_is_one_shared_object():
     assert web_tool_module.LINK_UNAVAILABLE is (
         news_tool_module.LINK_UNAVAILABLE)
 

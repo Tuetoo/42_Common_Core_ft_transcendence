@@ -24,10 +24,12 @@
  17:30 Mon-Fri     market-close -> core-service            (portfolio NAV snapshots)
  02:00 daily       review-run                        ----> run_review_workflow
  02:30 daily       backup.sh                               (backups, chapter 2)
- 03:00 daily       rag-ingest                        ----> auto-ingestion      ch. 17
+ 03:05 daily       rag-ingest                        ----> auto-ingestion      ch. 17
  04:00 daily       logs-cleanup.sh
  04:10 daily       purge-unverified -> auth-service        (unverified accounts)
  04:20 daily       notification-retention -> core-service  (old read notifications)
+ 04:30 daily       deleted-user-sweep-core -> core-service (deleted users' data, chapter 26)
+ 04:40 daily       deleted-user-sweep-ai -> ai-service     (deleted users' AI data, chapter 26)
 
  on demand (API, background task)
    POST /api/v1/analyses                     ----> run_analysis_workflow
@@ -39,7 +41,7 @@
 ```
 
 London is 5 hours ahead of New York most of the year, so 17:00 New York is
-22:00 in London, 02:00 is 07:00, and 03:00 is 08:00. The scheduler runs in
+22:00 in London, 02:00 is 07:00, and 03:05 is 08:05. The scheduler runs in
 `America/New_York` (the container's `TZ`), so the jobs follow daylight
 saving time automatically.
 
@@ -155,6 +157,8 @@ service start, `fail_stale_analyses_on_startup` fails any analysis left
    the tier's event.
 4. Any exception: roll back only this tier, count `execution_failed`, log
    `tier_monitoring.tier_processing_failed`, continue with the next tier.
+   The tier's outcome is counted only after its commit succeeds, so a
+   tier whose commit fails is counted once, as `execution_failed`.
 
 The result (also logged as `tier_monitoring.run_complete`) is a count per
 outcome: `checked`, `triggered`, `expired`, `no_fresh_data`,
@@ -248,7 +252,11 @@ The outcome decides the tier's status:
 
 Why the idempotency key: if core-service committed the trade but the
 answer timed out, the next day's retry with the same `tier:<id>` key gets
-the existing transaction back instead of buying twice. Why
+the existing transaction back instead of buying twice. Known limit: in
+that case ai stores the retry day's fill price and time as
+`triggered_price` / `triggered_at`, while the ledger keeps the first day's
+trade, because core's internal transaction answer carries only `id` and
+`ticker` (no price or date) for ai to copy. Why
 `execution_failed` is terminal: a refusal for insufficient cash will be
 refused again every day until the window ends.
 
@@ -301,7 +309,11 @@ followed ones would hide exactly the calls nobody trusted.
 `InvestmentDecision` at each window of 7, 30 and 90 days
 (`_DECISION_EVALUATION_WINDOWS`) that has no outcome for that window yet
 (up to 200 per window and run, oldest first, and only while the window
-ended at most `REVIEW_GIVE_UP_AFTER_DAYS` (30) days ago):
+ended at most `REVIEW_GIVE_UP_AFTER_DAYS` (30) days ago). One query
+(`InvestmentDecisionRepository.list_pending_review`) loads the decisions
+together with their recommendation's action and analysis id; a decision
+always has its recommendation (`recommendation_id` is `NOT NULL` with a
+foreign key), so there is no "recommendation missing" case:
 
 - `strategy_return` = the ticker's return over the window, negated for a
   SELL recommendation (`_directional_return`). The direction is the
@@ -347,7 +359,7 @@ heartbeat.
 
 ### 3.6 Auto-ingestion (summary)
 
-03:00 New York (08:00 London), every day: `call-job.sh rag-ingest` ->
+03:05 New York (08:05 London), every day: `call-job.sh rag-ingest` ->
 `POST /internal/scheduler/rag-ingest` (curl limit 3600 s, the slowest
 job). For every tracked ticker (portfolio holdings and watchlists) it
 adds new SEC filings and one news digest per day, then one macro report
@@ -363,7 +375,7 @@ Cost and failure rules (`ai/workflows/auto_ingestion_workflow.py`):
 - Each new filing costs two HIGHEST-tier calls: the summary and the
   separate records-only call (chapter 18, sections 3.10-3.11). A ticker
   with several new filings therefore spends several of the day's HIGHEST
-  requests at 03:00. A records failure does not stop the filing: the
+  requests at 03:05. A records failure does not stop the filing: the
   document is stored and the records can be added later with
   `scripts/backfill_filing_records.py`.
 - Filings, news and macro are separate steps. If storing any new filing
@@ -597,6 +609,15 @@ with `reviews_removed`), because a review describes the old action.
   string; otherwise it is empty.
 - Only the decision's own user may generate or read it (another user's
   decision is a 404); generating needs `analysis:create`.
+- Generating is limited per user with the same fixed-window counter as
+  the RAG assistant (`rate_limit.py::check_user_rate_limit`, keys
+  `ai:decision_review:rate:<user>:m:...` and `...:d:...`):
+  `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` (3) and
+  `DECISION_REVIEW_RATE_LIMIT_PER_DAY` (20, UTC day). Over the limit the
+  answer is 429 with `Retry-After`, before any LLM call; if Redis is down
+  the request is let through. Why: each call spends one shared CHEAP-tier
+  call and adds a notification, so an unlimited loop could use up the
+  quota that analyses need.
 - A stored review publishes `decision.reviewed` (same payload as
   `decision.recorded`) after the response; core-service turns it into a
   `decision_reviewed` notification for the user ("A new review of your
@@ -695,13 +716,14 @@ layers on synthetic price series from a fake market-data provider.
 |---|---|---|---|
 | crontab: tier monitoring | `0 17 * * 1-5` | `infra/scheduler/crontab` | 17:00 New York, weekdays |
 | crontab: review | `0 2 * * *` | same | 02:00 New York, daily |
-| crontab: rag-ingest | `0 3 * * *` | same | 03:00 New York, daily |
+| crontab: rag-ingest | `5 3 * * *` | same | 03:05 New York, daily (five minutes after Google's daily quota reset at midnight Pacific) |
 | crontab: market-close | `30 17 * * 1-5` | same | snapshots after tier monitoring |
 | curl limit tier monitoring | 900 s | `infra/scheduler/call-job.sh` | |
 | curl limit review | 1800 s | same | |
 | curl limit rag-ingest | 3600 s | same | |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | `services/ai-service/config.py` | accuracy checkpoint |
 | `REVIEW_GIVE_UP_AFTER_DAYS` | 30 | `services/ai-service/config.py` | days after its window ends that an unscored item stays in the review |
+| `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` / `_PER_DAY` | 3 / 20 | `services/ai-service/config.py` | decision reviews a user may generate per clock minute / UTC day (3.9) |
 | `ANALYSIS_TIMEOUT_SECONDS` | 2700.0 | same | per analysis |
 | `SYSTEM_TIER_ACCEPTANCE_HOURS` | 72 | same | pending tier of a system analysis waits this long for acceptance (3.3) |
 | `SENTIMENT_MAX_INPUT_CHARS` | 6000 | same | text cut for sentiment |

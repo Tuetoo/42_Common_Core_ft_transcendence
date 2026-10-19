@@ -245,6 +245,15 @@ controls the commit boundary; it returns a `DeletionResult` with what
 was removed. `ai.filing_records` is keyed by filename, not by document
 id, and is not deleted here.
 
+**Deleted accounts.** A deleted user's private documents leave Qdrant
+through the same `document.deleted` event, which core publishes when it
+cleans that user's data. ai-service removes the user's archived agent
+notes itself (`user_cleanup.py`, on `user.deleted` and in the nightly
+`deleted-user-sweep-ai` job): each note of the user's analyses goes
+through `archival.delete_archived_report`, which calls
+`delete_document_completely` with the `ai.agent_reports` id (chapter 13,
+section 3.8).
+
 ### 3.4 How points are read (`ai/rag/retriever.py`)
 
 `BaseRetriever.retrieve()` (subclasses such as `FilingRetriever` set the
@@ -453,7 +462,7 @@ interval: 10s, timeout: 5s, retries: 10, start_period: 20s
 |---|---|---|---|
 | `QDRANT_HOST` | `qdrant` | host name of Qdrant | `services/ai-service/config.py` |
 | `QDRANT_PORT` | `6333` | REST port | `services/ai-service/config.py` |
-| `QDRANT_URL` | unset (`.env.example`: `http://qdrant:6333`) | full URL; wins over host/port | `services/ai-service/config.py` |
+| `QDRANT_URL` | unset (`.env.example` sets only `QDRANT_HOST` and `QDRANT_PORT`) | full URL; wins over host/port | `services/ai-service/config.py` |
 | `QDRANT_COLLECTION_RESEARCH` | `research_documents_gemini` | the one RAG collection | `services/ai-service/config.py` |
 | `QDRANT_VECTOR_SIZE` | `1536` | vector size; must equal the provider's dimension | `services/ai-service/config.py` |
 | `EMBEDDING_PROVIDER` | `google` | `google` or `mistral` | `services/ai-service/config.py` |
@@ -461,7 +470,7 @@ interval: 10s, timeout: 5s, retries: 10, start_period: 20s
 | `GOOGLE_EMBEDDING_DIMENSIONS` | `1536` | requested output size | `services/ai-service/config.py` |
 | `EMBEDDING_REQUEST_TIMEOUT_SECONDS` | `30.0` | time limit of one Gemini embedding request | `services/ai-service/config.py` |
 | `RAG_TOP_K_RESULTS` | `5` | default results per retriever (vector query fetches 3x) | `services/ai-service/config.py` |
-| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | `.env.example`, and therefore the running stack: `0.85` (calibrated for `gemini-embedding-2`). If the variable is unset (code default `None`) the code falls back to `0.90` (`_NEAR_DUPLICATE_SEMANTIC_THRESHOLD` in `ai/knowledge/archival.py`), the value chosen for `mistral-embed` | cosine threshold at or above which a new agent note supersedes a near-duplicate one (compared with the latest 3 notes of the same category and ticker) | `services/ai-service/config.py`, `.env.example` |
+| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | `0.85`, the code default and `.env.example` value (calibrated for `gemini-embedding-2`); use `0.90` with `mistral-embed` | cosine threshold at or above which a new agent note supersedes a near-duplicate one (compared with the latest 3 notes of the same category and ticker) | `services/ai-service/config.py`, `.env.example` |
 | `QDRANT_API_KEY` | empty | sent as the `api-key` header by ai-service's client and by `backup.sh`/`restore.sh`, only when set | `services/ai-service/config.py`, `.env.example` |
 | `QDRANT_LOCAL_URL` | `http://127.0.0.1:6333` | URL for `scripts/qdrant.sh` | `scripts/qdrant.sh` |
 | image / port | `qdrant/qdrant:v1.18.3`, `127.0.0.1:6333:6333` | server version, host binding | `docker-compose.yaml` |

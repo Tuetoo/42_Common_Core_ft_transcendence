@@ -1,6 +1,6 @@
 from datetime import datetime
 from uuid import UUID
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.auth.model import User, UserProfile
 from domains.organization.model import (Organization, OrganizationInvitation,
@@ -11,6 +11,14 @@ class OrganizationRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
+
+    async def list_missing_ids(self, org_ids: list[UUID]) -> list[UUID]:
+        existing = set((
+            await self._db.execute(
+                select(Organization.id).where(Organization.id.in_(org_ids)))
+        ).scalars().all())
+        return [org_id for org_id in dict.fromkeys(org_ids)
+                if org_id not in existing]
 
     async def get_by_id(self, org_id: UUID) -> Organization | None:
         result = await self._db.execute(
@@ -90,19 +98,43 @@ class OrganizationRepository:
             self, organization_id: UUID, *,
             excluding: UUID) -> OrganizationMember | None:
         result = await self._db.execute(
-            select(OrganizationMember).where(
-                OrganizationMember.organization_id == organization_id,
-                OrganizationMember.user_id
-                != excluding).order_by((OrganizationMember.role != "admin"),
-                                       OrganizationMember.joined_at,
-                                       OrganizationMember.id).limit(1))
+            select(OrganizationMember).join(
+                User, User.id == OrganizationMember.user_id).where(
+                    OrganizationMember.organization_id == organization_id,
+                    OrganizationMember.user_id != excluding).order_by(
+                        User.is_active.desc(),
+                        OrganizationMember.role != "admin",
+                        OrganizationMember.joined_at,
+                        OrganizationMember.id).limit(1))
         return result.scalar_one_or_none()
 
     async def remove_memberships_of_user(self, user_id: UUID) -> None:
         await self._db.execute(
             delete(OrganizationMember).where(
-                OrganizationMember.user_id == user_id,
-                OrganizationMember.role != "owner").execution_options(
+                OrganizationMember.user_id == user_id).execution_options(
+                    synchronize_session="fetch"))
+
+    async def list_open_invitations_sent_by(
+            self, user_id: UUID,
+            now: datetime) -> list[OrganizationInvitation]:
+        result = await self._db.execute(
+            select(OrganizationInvitation).where(
+                OrganizationInvitation.invited_by == user_id,
+                OrganizationInvitation.accepted_at.is_(None),
+                OrganizationInvitation.expires_at > now))
+        return list(result.scalars().all())
+
+    async def delete_invitations_of_user(
+            self, user_id: UUID, email: str | None) -> None:
+        sent_open = and_(
+            OrganizationInvitation.invited_by == user_id,
+            OrganizationInvitation.accepted_at.is_(None))
+        addressed = (
+            func.lower(OrganizationInvitation.email) == email.lower()
+            if email is not None else false())
+        await self._db.execute(
+            delete(OrganizationInvitation).where(or_(
+                sent_open, addressed)).execution_options(
                     synchronize_session="fetch"))
 
     async def count_for_user(self, user_id: UUID) -> int:

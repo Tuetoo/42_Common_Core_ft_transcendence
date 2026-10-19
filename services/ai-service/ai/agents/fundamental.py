@@ -379,8 +379,7 @@ class FundamentalAgent(BaseAgent):
                 self.role.value, fundamental_answer_issue, once_checks=[(
                     OWN_EVIDENCE_CHECK,
                     own_evidence_figure_check(
-                        combine_context(
-                            state.fresh_filing_context, kg_context) or ""))]),
+                        state.fresh_filing_context or ""))]),
             reported_metrics_schema=_REPORTED_METRICS_SCHEMA)
         result = await loop.run(
             f"Assess {state.ticker}'s valuation: P/E, P/B, revenue growth, "

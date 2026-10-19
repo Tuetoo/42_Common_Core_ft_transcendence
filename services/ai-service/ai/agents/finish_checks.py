@@ -3,7 +3,8 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Any
 import structlog
-from ai.agents.debate_common import find_ungrounded_figures
+from ai.agents.debate_common import (find_ungrounded_figures,
+                                     scaled_figures_matching_plain_dollars)
 from ai.agents.loop import (MAX_FINISH_VALIDATION_RETRIES,
                             NUMBER_MATCH_REL_TOLERANCE, ScratchpadEntry,
                             evidence_reference_text)
@@ -40,11 +41,17 @@ def internal_token_message(tokens: Sequence[str]) -> str:
         tokens=", ".join(f'"{token}"' for token in tokens))
 
 
-class RejectOnceBudget:
+class InternalTokenValidator:
 
-    def __init__(self, role: str) -> None:
+    def __init__(
+        self, role: str, base: FinishCheck | None = None,
+        once_checks: Sequence[tuple[str, FinishCheck]] = ()
+    ) -> None:
         self.role = role
         self.rejections = 0
+        self.base = base
+        self.once_checks = list(once_checks)
+        self.fired: set[str] = set()
 
     def reject(self, issue: str) -> str:
         self.rejections += 1
@@ -61,18 +68,6 @@ class RejectOnceBudget:
             "finish_checks.once_check_logged_only", role=self.role,
             check=check, **fields)
         return False
-
-
-class InternalTokenValidator(RejectOnceBudget):
-
-    def __init__(
-        self, role: str, base: FinishCheck | None = None,
-        once_checks: Sequence[tuple[str, FinishCheck]] = ()
-    ) -> None:
-        super().__init__(role)
-        self.base = base
-        self.once_checks = list(once_checks)
-        self.fired: set[str] = set()
 
     def _token_issue(
             self, final_answer: str, reported_metrics: dict[str, Any] | None,
@@ -164,6 +159,7 @@ def own_evidence_ungrounded_figures(
     if extra_reference:
         evidence += "\n" + extra_reference
     found = set(find_ungrounded_figures(final_answer, evidence))
+    found -= scaled_figures_matching_plain_dollars(found, evidence)
     found.update(ungrounded_counts(final_answer, evidence))
     return sorted(found)
 

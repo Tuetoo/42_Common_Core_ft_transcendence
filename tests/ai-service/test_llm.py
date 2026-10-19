@@ -11,28 +11,38 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
+import ai.llm.anthropic_provider as anthropic_module
 import ai.llm.google_provider as google_module
 import ai.llm.router as router_module
 import ai.rag.embedding as embedding_module
 import ai.rag.retriever as retriever_module
 import ai.recommendation.position_sizing as sizing_module
 import ai.tools.portfolio_tool as portfolio_tool_module
+import anthropic
 import config
+import httpx
 import observability
 import pytest
 import pytest_asyncio
 import structlog
+from ai.agents import debate_common as dc
+from ai.agents.judge import JudgeAgent
 from ai.agents.reflection import review_skip_reason_for
 from ai.graph.state import ReflectionVerdict
-from ai.llm.anthropic_provider import _split_system_and_turns
+from ai.llm.anthropic_provider import (_split_system_and_turns,
+                                       anthropic_output_schema,
+                                       reduced_output_schema)
 from ai.llm.base import (ConcurrencyGate, LLMConfigError,
+                         LLMCreditExhaustedError, LLMError,
                          LLMInvalidRequestError, LLMMessage,
-                         LLMNonEnglishOutputError, LLMProviderAdapter,
+                         LLMNonEnglishOutputError, LLMOutputExhaustedError,
+                         LLMProviderAdapter,
                          LLMProviderTimeoutError, LLMRateLimitError,
                          LLMRequestError, LLMRequestTimeoutError, LLMResponse,
                          LLMServerOverloadedError, LLMTier, LLMUsage,
                          RequestPacer, released_while_waiting, request_pacer)
-from ai.llm.router import LLMRouter, router_retry_limit
+from ai.llm.router import (LLMRouter, fallback_call_count,
+                           recording_served_models, router_retry_limit)
 from ai.providers.base import PriceQuote
 from ai.recommendation.position_sizing import (BudgetBlockedNote,
                                                _validated_sizing,
@@ -45,6 +55,7 @@ from helpers import (_chain, _FakeEmbedModels, _FakeGeminiResponse,
                      _scripted_pool, _server_503, _single_client_pool, _state)
 from mistralai.client.errors.sdkerror import SDKError
 from prometheus_client import REGISTRY
+from pydantic import ValidationError
 from structlog.testing import capture_logs
 from shared.enums import AnalysisType, RecommendationAction
 
@@ -96,6 +107,7 @@ def no_thinking_budget_rejections():
 
 def _reset_llm_state() -> None:
     request_pacer.reset()
+    anthropic_module._schema_levels.clear()
     google_module._THINKING_BUDGET_REJECTED_MODELS.clear()
 
 
@@ -347,17 +359,17 @@ async def _complete_lite(max_tokens: int = 4096) -> LLMResponse:
 class TestRouterBasics:
 
     async def _unknown_provider_raises_config_error(self, monkeypatch):
+        monkeypatch.setattr(
+            config.settings, "LLM_DEFAULT_PROVIDER", "not_a_provider")
         router = _router_with(anthropic=_FakeAdapter("anthropic"))
         with pytest.raises(LLMConfigError):
-            await router.complete(
-                LLMTier.CHEAP, _msgs(), provider="not_a_provider")
+            await router.complete(LLMTier.CHEAP, _msgs())
 
     async def _stream_yields_chunks_from_resolved_adapter(self, monkeypatch):
         monkeypatch.setattr(config.settings, "LLM_MISTRAL_MODEL_CHEAP", "m")
         router = _router_with(mistral=_FakeAdapter("mistral"))
         chunks = [
-            chunk async for chunk in router.stream(
-                LLMTier.CHEAP, _msgs(), provider="mistral")
+            chunk async for chunk in router.stream(LLMTier.CHEAP, _msgs())
         ]
         assert chunks == ["chunk from mistral/m"]
 
@@ -370,8 +382,8 @@ class TestRouterBasics:
         recorder = _RecordingSleep()
         monkeypatch.setattr("ai.llm.router.asyncio.sleep", recorder)
         router = _router_with(mistral=_FakeAdapter("mistral"))
-        await router.complete(LLMTier.CHEAP, _msgs(), provider="mistral")
-        await router.complete(LLMTier.CHEAP, _msgs(), provider="mistral")
+        await router.complete(LLMTier.CHEAP, _msgs())
+        await router.complete(LLMTier.CHEAP, _msgs())
         assert recorder.delays and recorder.delays[-1] > 0
 
     async def _rate_limit_falls_back_to_the_alternate_model(self, monkeypatch):
@@ -384,7 +396,7 @@ class TestRouterBasics:
         adapter = _FakeAdapter(
             "mistral", fail_times=2, fail_with=LLMRateLimitError)
         resp = await _router_with(mistral=adapter).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="mistral", retries=1)
+            LLMTier.HIGHEST_ACCURACY, _msgs(), retries=1)
         assert resp.content == "response from mistral/large"
         assert adapter.calls == 3
 
@@ -411,7 +423,7 @@ class TestRouterBasics:
                 "mistral", fail_times=5, fail_with=fail_with)
             with pytest.raises(fail_with):
                 await _router_with(mistral=adapter).complete(
-                    tier, _msgs(), provider="mistral", retries=1)
+                    tier, _msgs(), retries=1)
             assert adapter.calls == 2, case_id
 
     async def test_router_basics(self):
@@ -421,6 +433,8 @@ class TestRouterBasics:
             self._concurrent_cheap_calls_get_paced_when_interval_set,
             self._rate_limit_falls_back_to_the_alternate_model,
             self._failure_without_a_fallback_is_raised,
+            setup=lambda mp: mp.setattr(
+                config.settings, "LLM_DEFAULT_PROVIDER", "mistral"),
             reset=_reset_llm_state)
 
 
@@ -441,9 +455,7 @@ async def test_anthropic_message_order_and_caller_timeouts(monkeypatch):
         "content": "Let me check."
     }]
 
-    import ai.llm.anthropic_provider as anthropic_module
     import ai.llm.openai_provider as openai_module
-    from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
     from openai import NOT_GIVEN as OPENAI_NOT_GIVEN
 
     openai_create = _RecordingCreate(
@@ -453,24 +465,859 @@ async def test_anthropic_message_order_and_caller_timeouts(monkeypatch):
                     finish_reason="stop",
                     message=SimpleNamespace(content="ok"))
             ]))
-    anthropic_create = _RecordingCreate(
-        SimpleNamespace(
-            model="claude", stop_reason="end_turn",
-            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
-            content=[SimpleNamespace(type="text", text="ok")]))
+    anthropic_create = _RecordingCreate(_anthropic_message("ok"))
     monkeypatch.setattr(
         openai_module, "_client",
         SimpleNamespace(chat=SimpleNamespace(completions=openai_create)))
     monkeypatch.setattr(
         anthropic_module, "_client",
         SimpleNamespace(messages=anthropic_create))
-    for adapter, create, not_given in (
+    for adapter, create, default_timeout in (
             (openai_module.OpenAIAdapter(), openai_create, OPENAI_NOT_GIVEN),
             (anthropic_module.AnthropicAdapter(), anthropic_create,
-             ANTHROPIC_NOT_GIVEN)):
+             config.settings.LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS)):
         await adapter.complete(_msgs(), model="m")
         await adapter.complete(_msgs(), model="m", timeout_seconds=300)
-        assert [k["timeout"] for k in create.kwargs] == [not_given, 300]
+        assert [k["timeout"] for k in create.kwargs] == [default_timeout, 300]
+
+
+async def test_openai_errors_map_like_the_anthropic_adapter(monkeypatch):
+    import ai.llm.openai_provider as openai_module
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat")
+
+    def status(
+            cls: type[openai.APIStatusError], code: int,
+            body: dict[str, str] | None = None) -> Exception:
+        return cls(
+            f"Error code: {code}", response=httpx.Response(
+                code, request=request), body=body)
+
+    class _Raising:
+
+        def __init__(self, exc: Exception) -> None:
+            self.exc = exc
+
+        async def create(self, **kwargs: Any) -> Any:
+            raise self.exc
+
+    cases = [
+        (status(openai.RateLimitError, 429), LLMRateLimitError),
+        (status(openai.RateLimitError, 429, {"code": "insufficient_quota"}),
+         LLMCreditExhaustedError),
+        (status(openai.InternalServerError, 503), LLMServerOverloadedError),
+        (openai.APITimeoutError(request=request), LLMProviderTimeoutError),
+        (status(openai.BadRequestError, 400), LLMInvalidRequestError),
+        (status(openai.AuthenticationError, 401), LLMInvalidRequestError),
+        (RuntimeError("boom"), LLMRequestError),
+    ]
+    for exc, expected in cases:
+        monkeypatch.setattr(
+            openai_module, "_client",
+            SimpleNamespace(chat=SimpleNamespace(completions=_Raising(exc))))
+        with pytest.raises(LLMRequestError) as caught:
+            await openai_module.OpenAIAdapter().complete(_msgs(), model="m")
+        assert type(caught.value) is expected, type(exc).__name__
+        assert caught.value.__cause__ is exc
+
+
+def _anthropic_message(
+        text: str, *, thinking_tokens: int | None = None,
+        stop_reason: str = "end_turn") -> SimpleNamespace:
+    details = (
+        None if thinking_tokens is None else
+        SimpleNamespace(thinking_tokens=thinking_tokens))
+    return SimpleNamespace(
+        model="claude-haiku-5-5", stop_reason=stop_reason,
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=40,
+            output_tokens_details=details, cache_read_input_tokens=7,
+            cache_creation_input_tokens=None),
+        content=[
+            SimpleNamespace(type="thinking"),
+            SimpleNamespace(type="text", text=text)
+        ])
+
+
+def _anthropic_status_error(
+        error_cls: type[anthropic.APIStatusError], status: int,
+        error_type: str, message: str) -> anthropic.APIStatusError:
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(status, request=request)
+    body = {"type": "error", "error": {"type": error_type, "message": message}}
+    return error_cls(
+        f"Error code: {status} - {body}", response=response, body=body)
+
+
+def _anthropic_timeout() -> anthropic.APITimeoutError:
+    return anthropic.APITimeoutError(
+        request=httpx.Request("POST", "https://api.anthropic.com"))
+
+
+class _AnthropicCreate:
+
+    def __init__(self, outcome: Any) -> None:
+        self.outcome = outcome
+        self.kwargs: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.kwargs.append(kwargs)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+class _AnthropicSequence:
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self.outcomes = list(outcomes)
+        self.kwargs: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.kwargs.append(kwargs)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _AnthropicStream:
+
+    def __init__(
+            self, chunks: list[str], final: Any,
+            fail_after: Exception | None = None) -> None:
+        self.chunks = chunks
+        self.final = final
+        self.fail_after = fail_after
+
+    async def texts(self) -> Any:
+        for chunk in self.chunks:
+            yield chunk
+        if self.fail_after is not None:
+            raise self.fail_after
+
+    async def get_final_message(self) -> Any:
+        return self.final
+
+
+class _AnthropicStreamMessages:
+
+    def __init__(self, outcome: Any) -> None:
+        self.outcome = outcome
+        self.kwargs: list[dict[str, Any]] = []
+
+    def stream(self, **kwargs: Any) -> Any:
+        self.kwargs.append(kwargs)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return _StreamContext(self.outcome)
+
+
+class _StreamContext:
+
+    def __init__(self, stream: _AnthropicStream) -> None:
+        self.stream = stream
+
+    async def __aenter__(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            text_stream=self.stream.texts(),
+            get_final_message=self.stream.get_final_message)
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+def _too_complex() -> anthropic.APIStatusError:
+    return _anthropic_status_error(
+        anthropic.BadRequestError, 400, "invalid_request_error",
+        "Schema is too complex.")
+
+
+_TOOL_UNION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "thought": {
+            "type": "string"
+        },
+        "action_input": {
+            "anyOf": [{
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string"
+                    }
+                },
+                "required": ["ticker"]
+            }, {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string"
+                    },
+                    "ticker": {
+                        "type": "integer"
+                    }
+                }
+            }, {
+                "type": "null"
+            }]
+        },
+        "reported_metrics": {
+            "anyOf": [{
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "number"
+                    }
+                },
+                "required": ["x"]
+            }, {
+                "type": "null"
+            }]
+        }
+    },
+    "required": ["thought"]
+}
+
+
+def _install_anthropic(monkeypatch, messages: Any) -> None:
+    monkeypatch.setattr(
+        anthropic_module, "_client", SimpleNamespace(messages=messages))
+
+
+_REACT_LIKE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "thought": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+        },
+        "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "multipleOf": 0.01
+        },
+        "email": {
+            "type": "string",
+            "format": "email"
+        },
+        "code": {
+            "type": "string",
+            "format": "isin",
+            "pattern": "^(?=[A-Z])"
+        },
+        "tags": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 9,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "nonempty": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "string"
+            }
+        },
+        "metrics": {
+            "anyOf": [{
+                "type": "object"
+            }, {
+                "type": "null"
+            }]
+        }
+    },
+    "required": ["thought"]
+}
+
+
+@pytest.mark.usefixtures("unpaced_llm")
+class TestAnthropicAdapter:
+
+    async def _success_sends_schema_and_logs_usage(self, monkeypatch):
+        create = _AnthropicCreate(
+            _anthropic_message('{"a": 1}', thinking_tokens=10))
+        _install_anthropic(monkeypatch, create)
+        messages = [
+            LLMMessage(role="system", content="Be brief."),
+            LLMMessage(role="user", content="hi")
+        ]
+        with capture_logs() as logs:
+            resp = await anthropic_module.AnthropicAdapter().complete(
+                messages, model="claude-haiku-5-5", temperature=0.0,
+                response_format="json_object",
+                response_schema=_REACT_LIKE_SCHEMA)
+        assert resp.content == '{"a": 1}'
+        assert resp.provider == "anthropic"
+        assert resp.usage == LLMUsage(
+            prompt_tokens=107, completion_tokens=30, thinking_tokens=10)
+        assert resp.finish_reason == "end_turn"
+        sent = create.kwargs[0]
+        assert sent["system"] == [{
+            "type": "text",
+            "text": "Be brief.",
+            "cache_control": {
+                "type": "ephemeral"
+            }
+        }]
+        assert sent["temperature"] is anthropic.omit
+        assert sent["thinking"] == {"type": "adaptive"}
+        assert sent["max_tokens"] == 1024 + 2048
+        assert sent["output_config"]["effort"] == "low"
+        output_format = sent["output_config"]["format"]
+        assert output_format["type"] == "json_schema"
+        assert output_format["schema"]["additionalProperties"] is False
+        success = [e for e in logs
+                   if e["event"] == "anthropic.completion_succeeded"]
+        assert len(success) == 1
+        assert {
+            k: success[0][k]
+            for k in ("model", "prompt_tokens", "completion_tokens",
+                      "thinking_tokens", "finish_reason", "cache_read_tokens",
+                      "cache_creation_tokens", "uncached_prompt_tokens",
+                      "schema_sent")
+        } == {
+            "model": "claude-haiku-5-5",
+            "prompt_tokens": 107,
+            "cache_creation_tokens": 0,
+            "uncached_prompt_tokens": 100,
+            "schema_sent": True,
+            "completion_tokens": 30,
+            "thinking_tokens": 10,
+            "finish_reason": "end_turn",
+            "cache_read_tokens": 7
+        }
+        assert isinstance(success[0]["latency_ms"], int)
+
+    async def _plain_call_sends_no_format_or_temperature(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("plain"))
+        _install_anthropic(monkeypatch, create)
+        resp = await anthropic_module.AnthropicAdapter().complete(
+            _msgs(), model="m", response_schema=_REACT_LIKE_SCHEMA)
+        sent = create.kwargs[0]
+        assert sent["system"] is anthropic.omit
+        assert sent["output_config"] == {"effort": "low"}
+        assert resp.usage.thinking_tokens is None
+        assert resp.usage.completion_tokens == 40
+        _set_settings(
+            monkeypatch, {
+                "LLM_ANTHROPIC_EFFORT": "",
+                "LLM_ANTHROPIC_SEND_TEMPERATURE": True
+            })
+        await anthropic_module.AnthropicAdapter().complete(
+            _msgs(), model="m", temperature=0.3, response_format="json_object")
+        assert create.kwargs[1]["output_config"] is anthropic.omit
+        assert create.kwargs[1]["temperature"] == 0.3
+
+    async def _schema_conversion(self, monkeypatch):
+        converted = anthropic_output_schema(_REACT_LIKE_SCHEMA)
+        assert converted is not None
+        props = converted["properties"]
+        assert props["thought"] == {"type": "string"}
+        assert props["score"] == {"type": "number"}
+        assert props["email"] == {"type": "string", "format": "email"}
+        assert props["code"] == {"type": "string"}
+        assert props["tags"] == {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    }
+                },
+                "additionalProperties": False
+            }
+        }
+        assert props["nonempty"]["minItems"] == 1
+        assert props["metrics"]["anyOf"][0] == {
+            "type": "object",
+            "additionalProperties": False
+        }
+        assert converted["additionalProperties"] is False
+        assert converted["required"] == ["thought"]
+        assert "minLength" in _REACT_LIKE_SCHEMA["properties"]["thought"]
+
+        recursive = {
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "child": {
+                            "$ref": "#/$defs/node"
+                        }
+                    }
+                }
+            },
+            "$ref": "#/$defs/node"
+        }
+        assert anthropic_output_schema(recursive) is None
+        too_many_optional = {
+            "type": "object",
+            "properties": {f"p{i}": {"type": "string"} for i in range(25)}
+        }
+        assert anthropic_output_schema(too_many_optional) is None
+        too_many_unions = {
+            "type": "object",
+            "properties": {
+                f"p{i}": {"type": ["string", "null"]}
+                for i in range(17)
+            },
+            "required": [f"p{i}" for i in range(17)]
+        }
+        assert anthropic_output_schema(too_many_unions) is None
+
+        create = _AnthropicCreate(_anthropic_message("{}"))
+        _install_anthropic(monkeypatch, create)
+        with capture_logs() as logs:
+            await anthropic_module.AnthropicAdapter().complete(
+                _msgs(), model="m", response_format="json_object",
+                response_schema=too_many_optional)
+        assert create.kwargs[0]["output_config"] == {"effort": "low"}
+        assert any(
+            e["event"] == "anthropic.response_schema_not_sent" for e in logs)
+
+    async def _errors_are_mapped(self, monkeypatch):
+        credit_message = (
+            "Your credit balance is too low to access the Anthropic API. "
+            "Please go to Plans & Billing to upgrade or purchase credits.")
+        cases = [
+            ("rate-limit",
+             _anthropic_status_error(
+                 anthropic.RateLimitError, 429, "rate_limit_error", "slow"),
+             LLMRateLimitError),
+            ("overloaded",
+             _anthropic_status_error(
+                 anthropic.OverloadedError, 529, "overloaded_error",
+                 "Overloaded"), LLMServerOverloadedError),
+            ("server-error",
+             _anthropic_status_error(
+                 anthropic.InternalServerError, 500, "api_error", "boom"),
+             LLMServerOverloadedError),
+            ("timeout", _anthropic_timeout(), LLMProviderTimeoutError),
+            ("bad-request",
+             _anthropic_status_error(
+                 anthropic.BadRequestError, 400, "invalid_request_error",
+                 "max_tokens: too large"), LLMInvalidRequestError),
+            ("credit-invalid-request",
+             _anthropic_status_error(
+                 anthropic.BadRequestError, 400, "invalid_request_error",
+                 credit_message), LLMCreditExhaustedError),
+            ("credit-billing-error",
+             _anthropic_status_error(
+                 anthropic.BadRequestError, 400, "billing_error",
+                 credit_message), LLMCreditExhaustedError),
+            ("auth",
+             _anthropic_status_error(
+                 anthropic.AuthenticationError, 401, "authentication_error",
+                 "invalid x-api-key"), LLMConfigError),
+            ("connection", RuntimeError("socket closed"), LLMRequestError)
+        ]
+        for case_id, raised, expected in cases:
+            _install_anthropic(monkeypatch, _AnthropicCreate(raised))
+            with pytest.raises(LLMError) as info:
+                await anthropic_module.AnthropicAdapter().complete(
+                    _msgs(), model="claude-haiku-5-5")
+            assert type(info.value) is expected, case_id
+            assert info.value.__cause__ is raised, case_id
+        _install_anthropic(
+            monkeypatch,
+            _AnthropicCreate(
+                _anthropic_status_error(
+                    anthropic.BadRequestError, 400, "invalid_request_error",
+                    credit_message)))
+        with pytest.raises(LLMCreditExhaustedError) as info:
+            await anthropic_module.AnthropicAdapter().complete(
+                _msgs(), model="claude-haiku-5-5")
+        assert isinstance(info.value, LLMInvalidRequestError)
+        assert "Anthropic API credit is used up" in str(info.value)
+        assert router_retry_limit(
+            info.value, provider_name="anthropic", model="claude-haiku-5-5",
+            retries=4) == 0
+
+    async def _stream_success_logs_usage(self, monkeypatch):
+        messages = _AnthropicStreamMessages(
+            _AnthropicStream(["Hel", "lo"],
+                             _anthropic_message("Hello", thinking_tokens=4)))
+        _install_anthropic(monkeypatch, messages)
+        with capture_logs() as logs:
+            chunks = [
+                c async for c in anthropic_module.AnthropicAdapter().stream(
+                    _msgs(), model="claude-haiku-5-5", temperature=0.1,
+                    max_tokens=64)
+            ]
+        assert chunks == ["Hel", "lo"]
+        sent = messages.kwargs[0]
+        assert sent["max_tokens"] == 64 + 2048
+        assert sent["temperature"] is anthropic.omit
+        assert sent["output_config"] == {"effort": "low"}
+        done = [e for e in logs if e["event"] == "anthropic.stream_completed"]
+        assert len(done) == 1
+        assert done[0]["prompt_tokens"] == 107
+        assert done[0]["completion_tokens"] == 36
+        assert done[0]["thinking_tokens"] == 4
+
+    async def _stream_errors_are_mapped(self, monkeypatch):
+        overloaded = _anthropic_status_error(
+            anthropic.OverloadedError, 529, "overloaded_error", "Overloaded")
+        _install_anthropic(monkeypatch, _AnthropicStreamMessages(overloaded))
+        with pytest.raises(LLMServerOverloadedError):
+            async for _ in anthropic_module.AnthropicAdapter().stream(
+                    _msgs(), model="m"):
+                pass
+        mid_stream = anthropic.APIStatusError(
+            "overloaded", response=httpx.Response(
+                200, request=httpx.Request("POST", "https://x")), body={
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "Overloaded"
+                    }
+                })
+        _install_anthropic(
+            monkeypatch,
+            _AnthropicStreamMessages(
+                _AnthropicStream(["partial"], None, fail_after=mid_stream)))
+        received: list[str] = []
+        with pytest.raises(LLMServerOverloadedError):
+            async for chunk in anthropic_module.AnthropicAdapter().stream(
+                    _msgs(), model="m"):
+                received.append(chunk)
+        assert received == ["partial"]
+
+    async def _router_never_retries_credit_exhaustion(self, monkeypatch):
+        _set_settings(
+            monkeypatch, {
+                "LLM_ANTHROPIC_MODEL_CHEAP": "haiku",
+                "LLM_DEFAULT_PROVIDER": "anthropic"
+            })
+        monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
+        adapter = _FakeAdapter(
+            "anthropic", fail_times=5, fail_with=LLMCreditExhaustedError)
+        with pytest.raises(LLMCreditExhaustedError):
+            await _router_with(anthropic=adapter).complete(
+                LLMTier.CHEAP, _msgs(), retries=4)
+        assert adapter.calls == 1
+        limited = _FakeAdapter(
+            "anthropic", fail_times=2, fail_with=LLMServerOverloadedError)
+        resp = await _router_with(anthropic=limited).complete(
+            LLMTier.CHEAP, _msgs(), retries=4)
+        assert resp.content == "response from anthropic/haiku"
+        assert limited.calls == 3
+
+    async def _thinking_mode_follows_the_tier_model(self, monkeypatch):
+        _set_settings(
+            monkeypatch, {
+                "LLM_ANTHROPIC_MODEL_CHEAP": "haiku",
+                "LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY": "sonnet"
+            })
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        adapter = anthropic_module.AnthropicAdapter()
+        for model in ("haiku", "sonnet", "other"):
+            await adapter.complete(_msgs(), model=model, max_tokens=128)
+        assert [(k["thinking"]["type"], k["max_tokens"])
+                for k in create.kwargs] == [("adaptive", 128 + 2048),
+                                            ("between_tools", 128),
+                                            ("adaptive", 128 + 2048)]
+        _set_settings(
+            monkeypatch, {
+                "LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY": "adaptive",
+                "LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS": 0
+            })
+        await adapter.complete(_msgs(), model="sonnet", max_tokens=128)
+        assert create.kwargs[-1]["thinking"] == {"type": "adaptive"}
+        assert create.kwargs[-1]["max_tokens"] == 128
+
+    async def _rejected_between_tools_is_explained(self, monkeypatch):
+        _set_settings(
+            monkeypatch, {"LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY": "sonnet"})
+        rejection = _anthropic_status_error(
+            anthropic.BadRequestError, 400, "invalid_request_error",
+            "thinking.type: between_tools is not supported for this model")
+        create = _AnthropicCreate(rejection)
+        _install_anthropic(monkeypatch, create)
+        with pytest.raises(LLMInvalidRequestError) as info:
+            await anthropic_module.AnthropicAdapter().complete(
+                _msgs(), model="sonnet")
+        assert "'between_tools'" in str(info.value)
+        assert "LLM_ANTHROPIC_THINKING_" in str(info.value)
+        assert len(create.kwargs) == 1
+
+    async def _thinking_that_uses_every_token_is_an_error(self, monkeypatch):
+        exhausted = _anthropic_message(
+            "", thinking_tokens=40, stop_reason="max_tokens")
+        _install_anthropic(monkeypatch, _AnthropicCreate(exhausted))
+        with capture_logs() as logs, pytest.raises(
+                LLMOutputExhaustedError) as info:
+            await anthropic_module.AnthropicAdapter().complete(
+                _msgs(), model="m", max_tokens=128)
+        assert "before writing any text" in str(info.value)
+        assert [
+            router_retry_limit(
+                info.value, provider_name="anthropic", model="m",
+                retries=retries) for retries in (0, 1, 4)
+        ] == [0, 1, 1]
+        logged = [
+            e for e in logs
+            if e["event"] == "anthropic.thinking_exhausted_max_tokens"
+        ]
+        assert logged and logged[0]["thinking_tokens"] == 40
+        assert logged[0]["output_tokens"] == 40
+        assert logged[0]["max_tokens"] == 128 + 2048
+        cut_text = _anthropic_message("partial", stop_reason="max_tokens")
+        _install_anthropic(monkeypatch, _AnthropicCreate(cut_text))
+        resp = await anthropic_module.AnthropicAdapter().complete(
+            _msgs(), model="m", max_tokens=128)
+        assert resp.content == "partial"
+        _install_anthropic(
+            monkeypatch,
+            _AnthropicStreamMessages(_AnthropicStream([], exhausted)))
+        with pytest.raises(LLMOutputExhaustedError):
+            async for _ in anthropic_module.AnthropicAdapter().stream(
+                    _msgs(), model="m"):
+                pass
+        monkeypatch.setattr("ai.llm.router.asyncio.sleep", _no_sleep)
+        _set_settings(
+            monkeypatch, {
+                "LLM_ANTHROPIC_MODEL_CHEAP": "haiku",
+                "LLM_DEFAULT_PROVIDER": "anthropic"
+            })
+        adapter = _FakeAdapter(
+            "anthropic", fail_times=5, fail_with=LLMOutputExhaustedError)
+        with pytest.raises(LLMOutputExhaustedError):
+            await _router_with(anthropic=adapter).complete(
+                LLMTier.CHEAP, _msgs(), retries=4)
+        assert adapter.calls == 2
+
+    async def _json_answers_are_normalized(self, monkeypatch):
+        cases = [
+            ("fenced", '```json\n{"a": 1}\n```', '{"a": 1}'),
+            ("preamble", 'Here is the JSON:\n{"a": {"b": 2}}',
+             '{"a": {"b": 2}}'),
+            ("trailing", '{"a": 1}\nHope this helps.', '{"a": 1}'),
+            ("list", 'Result: [{"a": 1}, {"b": 2}] done',
+             '[{"a": 1}, {"b": 2}]'),
+            ("valid", '{"a": 1}', '{"a": 1}'),
+            ("invalid", 'Sorry, {"a": 1,', 'Sorry, {"a": 1,'),
+            ("no-json", "I cannot answer.", "I cannot answer.")
+        ]
+        adapter = anthropic_module.AnthropicAdapter()
+        for case_id, raw, expected in cases:
+            _install_anthropic(
+                monkeypatch, _AnthropicCreate(_anthropic_message(raw)))
+            with capture_logs() as logs:
+                resp = await adapter.complete(
+                    _msgs(), model="m", response_format="json_object")
+            assert resp.content == expected, case_id
+            normalized = [
+                e for e in logs if e["event"] == "anthropic.json_normalized"
+            ]
+            if expected == raw:
+                assert not normalized, case_id
+            else:
+                assert normalized[0]["chars_dropped"] == (
+                    len(raw) - len(expected)), case_id
+        fenced = '```json\n{"a": 1}\n```'
+        _install_anthropic(
+            monkeypatch, _AnthropicCreate(_anthropic_message(fenced)))
+        plain = await adapter.complete(_msgs(), model="m")
+        assert plain.content == fenced
+        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+        with_schema = await adapter.complete(
+            _msgs(), model="m", response_format="json_object",
+            response_schema=schema)
+        assert with_schema.content == fenced
+
+    async def _too_complex_schema_falls_back_to_plain_json(
+            self, monkeypatch):
+        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+        fenced = '```json\n{"a": 1}\n```'
+        create = _AnthropicSequence([
+            _too_complex(),
+            _anthropic_message(fenced),
+            _anthropic_message('{"a": 2}')
+        ])
+        _install_anthropic(monkeypatch, create)
+        adapter = anthropic_module.AnthropicAdapter()
+
+        async def call(response_schema: Any = schema) -> LLMResponse:
+            return await adapter.complete(
+                _msgs(), model="m", response_format="json_object",
+                response_schema=response_schema)
+
+        with capture_logs() as logs:
+            first = await call()
+            second = await call()
+        assert first.content == '{"a": 1}'
+        assert second.content == '{"a": 2}'
+        assert "format" in create.kwargs[0]["output_config"]
+        assert [k["output_config"] for k in create.kwargs[1:]] == [{
+            "effort": "low"
+        }] * 2
+        assert all(
+            k["thinking"] == {"type": "adaptive"} for k in create.kwargs)
+        fallbacks = [
+            e for e in logs
+            if e["event"] == "anthropic.schema_too_complex_fallback"
+        ]
+        assert len(fallbacks) == 1
+        assert fallbacks[0]["model"] == "m"
+        assert len(fallbacks[0]["schema_hash"]) == 16
+        assert (fallbacks[0]["rejected_level"],
+                fallbacks[0]["next_level"]) == ("full", "none")
+        skipped = [
+            e for e in logs
+            if e["event"] == "anthropic.response_schema_skipped"
+        ]
+        assert [e["schema_hash"] for e in skipped] == [
+            fallbacks[0]["schema_hash"]
+        ] * 2
+        assert [
+            e["schema_sent"]
+            for e in logs if e["event"] == "anthropic.completion_succeeded"
+        ] == [False, False]
+
+        other_schema = {"type": "object", "properties": {"b": {}}}
+        cases: list[tuple[Any, Exception]] = [
+            (other_schema,
+             _anthropic_status_error(
+                 anthropic.BadRequestError, 400, "invalid_request_error",
+                 "max_tokens: too large")), (None, _too_complex())
+        ]
+        for response_schema, raised in cases:
+            create = _AnthropicSequence([raised, _anthropic_message("{}")])
+            _install_anthropic(monkeypatch, create)
+            with pytest.raises(LLMInvalidRequestError):
+                await call(response_schema)
+            assert len(create.kwargs) == 1
+
+    async def _too_complex_schema_tries_the_reduced_schema(self, monkeypatch):
+        full = anthropic_output_schema(_TOOL_UNION_SCHEMA)
+        assert full is not None
+        reduced = reduced_output_schema(full)
+        assert reduced["properties"]["action_input"] == {
+            "anyOf": [{
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "anyOf": [{
+                            "type": "string"
+                        }, {
+                            "type": "integer"
+                        }]
+                    },
+                    "query": {
+                        "type": "string"
+                    }
+                },
+                "additionalProperties": False
+            }, {
+                "type": "null"
+            }]
+        }
+        assert reduced["properties"]["reported_metrics"] == (
+            full["properties"]["reported_metrics"])
+        assert reduced_output_schema(reduced) == reduced
+
+        create = _AnthropicSequence([
+            _too_complex(),
+            _anthropic_message('{"thought": "a"}'),
+            _anthropic_message('{"thought": "b"}')
+        ])
+        _install_anthropic(monkeypatch, create)
+        adapter = anthropic_module.AnthropicAdapter()
+        with capture_logs() as logs:
+            for _ in range(2):
+                await adapter.complete(
+                    _msgs(), model="m", response_format="json_object",
+                    response_schema=_TOOL_UNION_SCHEMA)
+        sent = [k["output_config"]["format"]["schema"] for k in create.kwargs]
+        assert sent == [full, reduced, reduced]
+        assert [(e["rejected_level"], e["next_level"]) for e in logs
+                if e["event"] == "anthropic.schema_too_complex_fallback"
+                ] == [("full", "reduced")]
+        assert not any(
+            e["event"] == "anthropic.response_schema_skipped" for e in logs)
+
+        anthropic_module._schema_levels.clear()
+        create = _AnthropicSequence(
+            [_too_complex(),
+             _too_complex(),
+             _anthropic_message("{}")])
+        _install_anthropic(monkeypatch, create)
+        with capture_logs() as logs:
+            await adapter.complete(
+                _msgs(), model="m", response_format="json_object",
+                response_schema=_TOOL_UNION_SCHEMA)
+        assert [
+            k["output_config"].get("format", {}).get("schema")
+            for k in create.kwargs
+        ] == [full, reduced, None]
+        assert [e["event"] for e in logs if e["event"].startswith(
+            "anthropic.") and e["event"] != "anthropic.completion_succeeded"
+                ] == [
+                    "anthropic.schema_too_complex_fallback",
+                    "anthropic.schema_too_complex_fallback",
+                    "anthropic.response_schema_skipped"
+                ]
+
+    async def _prompt_caching_can_be_turned_off(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        _set_settings(monkeypatch, {"LLM_ANTHROPIC_PROMPT_CACHING": False})
+        await anthropic_module.AnthropicAdapter().complete(
+            [LLMMessage(role="system", content="Be brief."), *_msgs()],
+            model="m")
+        assert create.kwargs[0]["system"] == "Be brief."
+        assert "cache_control" not in create.kwargs[0]
+
+    async def test_anthropic_adapter(self):
+        await _run_steps(
+            self._too_complex_schema_falls_back_to_plain_json,
+            self._too_complex_schema_tries_the_reduced_schema,
+            self._prompt_caching_can_be_turned_off,
+            self._json_answers_are_normalized,
+            self._thinking_mode_follows_the_tier_model,
+            self._rejected_between_tools_is_explained,
+            self._thinking_that_uses_every_token_is_an_error,
+            self._success_sends_schema_and_logs_usage,
+            self._plain_call_sends_no_format_or_temperature,
+            self._schema_conversion, self._errors_are_mapped,
+            self._stream_success_logs_usage, self._stream_errors_are_mapped,
+            self._router_never_retries_credit_exhaustion,
+            reset=_reset_llm_state)
+
+
+def test_credit_exhaustion_becomes_the_analysis_failure_reason():
+    from ai.graph.nodes import _failure_kind_of
+    from ai.graph.state import AgentOutput
+    from ai.recommendation.engine import no_verdict_reason
+    from shared.enums import AgentRole, AgentStatus, AnalysisFailureReason
+
+    assert _failure_kind_of(LLMCreditExhaustedError("x")) == "credit_exhausted"
+    failed = {
+        role: AgentOutput(
+            role=role, status=AgentStatus.FAILED, summary="failed",
+            score=0.0, is_well_supported=False, failure_kind=kind)
+        for role, kind in ((AgentRole.MARKET, "credit_exhausted"),
+                           (AgentRole.NEWS, "other"))
+    }
+    assert no_verdict_reason(_state(agent_outputs=failed)) == (
+        AnalysisFailureReason.LLM_CREDIT_EXHAUSTED)
+    failed[AgentRole.MARKET].failure_kind = "other"
+    assert no_verdict_reason(_state(agent_outputs=failed)) == (
+        AnalysisFailureReason.NO_EVIDENCE)
 
 
 @pytest.mark.usefixtures("unpaced_llm")
@@ -602,8 +1449,6 @@ class TestGoogleKeys:
         monkeypatch.setattr(config.settings, "GOOGLE_API_KEY_2", "key-B")
         monkeypatch.setattr(config.settings, "GOOGLE_API_KEY_3", "key-C")
         pool = _GoogleKeyPool()
-        assert not hasattr(pool, "mark_rate_limited")
-        assert not hasattr(pool, "_cooldown_until")
         assert set(pool.available_labels_excluding(
             set())) == {"primary", "key_2", "key_3"}
         assert set(pool.available_labels_excluding({"primary"
@@ -1146,8 +1991,7 @@ class TestRouterFallback:
                     ("google", model, "primary"), far_future)
             adapter = _FakeAdapter("google")
             resp = await _router_with(google=adapter).complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=1)
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=1)
             assert resp.content == "response from google/gemini-3.6-flash"
             assert adapter.calls == 1
 
@@ -1162,8 +2006,7 @@ class TestRouterFallback:
             failing={"gemini-3.6-flash": LLMRateLimitError})
         with pytest.raises(LLMRateLimitError) as exc_info:
             await _router_with(google=adapter).complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=1)
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=1)
         assert adapter.calls == ["gemini-3.6-flash"]
         assert isinstance(exc_info.value.__cause__, LLMServerOverloadedError)
         assert "skipped 'gemini-3.8-flash'" in str(exc_info.value.__cause__)
@@ -1176,7 +2019,7 @@ class TestRouterFallback:
             content=_CHINESE)
         with pytest.raises(LLMNonEnglishOutputError):
             await _router_with(google=adapter).complete(
-                LLMTier.CHEAP, _msgs(), provider="google", retries=0)
+                LLMTier.CHEAP, _msgs(), retries=0)
         assert adapter.calls == [
             "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"
         ]
@@ -1188,20 +2031,38 @@ class TestRouterFallback:
         adapter = _FailingModelsAdapter(content=content)
         with pytest.raises(LLMNonEnglishOutputError):
             await _router_with(google=adapter).complete(
-                LLMTier.CHEAP, _msgs(), provider="google",
-                response_format="json_object")
+                LLMTier.CHEAP, _msgs(), response_format="json_object")
 
     async def _fallback_call_has_the_flag_and_no_schema(self, monkeypatch):
         _chain(monkeypatch)
-        adapter = _PerModelAdapter({"m1": ["503"], "m2": ["ok"]})
+        adapter = _PerModelAdapter({"m1": ["503", "ok"], "m2": ["ok"]})
         schema = {"type": "object"}
-        resp = await LLMRouter(providers={
-            "google": adapter
-        }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=0,
-            response_format="json_object", response_schema=schema)
+        router = LLMRouter(providers={"google": adapter})
+        with recording_served_models() as served:
+            resp = await router.complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=0,
+                response_format="json_object", response_schema=schema)
+            await router.complete(
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=0)
+        await router.complete(
+            LLMTier.HIGHEST_ACCURACY, _msgs(), retries=0)
         assert resp.content == "answer from m2"
-        assert adapter.calls == [("m1", {}), ("m2", {"fallback": True})]
+        assert adapter.calls[:2] == [("m1", {}), ("m2", {"fallback": True})]
+        assert served == [("m2", True), ("m1", False)]
+        assert fallback_call_count(served) == 1
+
+    async def _debate_stage_calls_count_fallback_answers(self, monkeypatch):
+        _chain(monkeypatch)
+        monkeypatch.setattr(config.settings, "LLM_DEFAULT_PROVIDER", "google")
+        router = LLMRouter(providers={
+            "google": _PerModelAdapter({"m1": ["503"], "m2": ["ok"]})
+        })
+        verdict = await JudgeAgent(llm_router=router).assess_round(_state())
+        assert verdict.fallback_calls == 2
+        argument = await dc.generate_debate_argument(
+            side="bull", state=_state(), llm_router=router,
+            llm_tier=LLMTier.HIGHEST_ACCURACY, system_prompt="s")
+        assert argument.fallback_calls == 1
 
     async def _thinking_budget_goes_to_both_google_calls(self, monkeypatch):
         _set_google_cheap_chain(monkeypatch)
@@ -1213,7 +2074,7 @@ class TestRouterFallback:
         await LLMRouter(providers={
             "google": adapter
         }).complete(
-            LLMTier.CHEAP, _msgs(), provider="google", retries=0,
+            LLMTier.CHEAP, _msgs(), retries=0,
             thinking_budget=512)
         assert [extra.get("thinking_budget")
                 for _, extra in adapter.calls] == [512, 512]
@@ -1226,8 +2087,7 @@ class TestRouterFallback:
             await LLMRouter(providers={
                 "google": adapter
             }).complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=0)
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=0)
         assert [m for m, _ in adapter.calls] == ["m1", "m2"]
 
     async def _day_exhausted_fallback_is_skipped(self, monkeypatch):
@@ -1243,8 +2103,7 @@ class TestRouterFallback:
             await LLMRouter(providers={
                 "google": adapter
             }).complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=0)
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=0)
         assert adapter.models == ["m1"]
         assert "skipped 'm2'" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, LLMServerOverloadedError)
@@ -1259,6 +2118,7 @@ class TestRouterFallback:
 
         await _run_steps(
             self._fallback_call_has_the_flag_and_no_schema,
+            self._debate_stage_calls_count_fallback_answers,
             self._thinking_budget_goes_to_both_google_calls,
             self._a_failed_fallback_is_raised_without_more_calls,
             self._day_exhausted_fallback_is_skipped,
@@ -1271,9 +2131,9 @@ class TestRouterFallback:
         adapter = _PerModelAdapter({"m1": ["timeout"], "m2": ["ok"]})
         router = LLMRouter(providers={"google": adapter})
         first = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+            LLMTier.HIGHEST_ACCURACY, _msgs(), retries=4)
         second = await router.complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+            LLMTier.HIGHEST_ACCURACY, _msgs(), retries=4)
         assert first.content == second.content == "answer from m2"
         assert adapter.models == ["m1", "m2", "m2"]
 
@@ -1284,7 +2144,7 @@ class TestRouterFallback:
         await LLMRouter(providers={
             "google": adapter
         }).complete(
-            LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google", retries=4)
+            LLMTier.HIGHEST_ACCURACY, _msgs(), retries=4)
         assert adapter.models == ["m1", "m2"]
 
     async def _caller_timeout_retries_once_without_fallback(
@@ -1295,8 +2155,8 @@ class TestRouterFallback:
             await LLMRouter(providers={
                 "google": adapter
             }).complete(
-                LLMTier.HIGHEST_ACCURACY, _msgs(), provider="google",
-                retries=4, timeout_seconds=300)
+                LLMTier.HIGHEST_ACCURACY, _msgs(), retries=4,
+                timeout_seconds=300)
         assert adapter.models == ["m1", "m1"]
         assert all(
             extra["timeout_seconds"] == 300 for _, extra in adapter.calls)
@@ -1349,8 +2209,9 @@ def test_router_retry_limit():
                  "mistral-overloaded", LLMServerOverloadedError("503"),
                  "mistral", "mistral-small-lite", 4, 4),
              (
-                 "anthropic-provider-timeout", LLMProviderTimeoutError("t"),
-                 "anthropic", "claude-lite", 4, 4)]
+                 "anthropic-provider-timeout-one-retry",
+                 LLMProviderTimeoutError("t"), "anthropic", "claude-lite", 4,
+                 1)]
     for case_id, exc, provider, model, retries, expected in cases:
         got = router_retry_limit(
             exc, provider_name=provider, model=model, retries=retries)
@@ -1381,7 +2242,7 @@ class TestRouterLiteCooldownRetry:
 
     async def _run(self, adapter, *, retries: int = 4):
         return await _router_with(google=adapter).complete(
-            LLMTier.CHEAP, _msgs(), provider="google", retries=retries)
+            LLMTier.CHEAP, _msgs(), retries=retries)
 
     async def _no_recorded_cooldown_waits_one_quota_window(self, monkeypatch):
         _set_google_cheap_chain(monkeypatch)
@@ -1872,6 +2733,34 @@ class TestEmbeddingConfiguration:
                 embedding_module.check_embedding_configuration()
             assert match in str(exc_info.value), case_id
 
+    def test_llm_tier_and_provider_typos_fail_at_startup(self, monkeypatch):
+        for name, value in (("LLM_DEFAULT_PROVIDER", "gogle"),
+                            ("FILING_LLM_TIER", "highest"),
+                            ("LLM_ANTHROPIC_THINKING_CHEAP", "adaptve"),
+                            ("LLM_ANTHROPIC_EFFORT", "lowest")):
+            with pytest.raises(ValidationError, match=name):
+                config.AIServiceSettings(**{name: value})
+
+        defaults = config.AIServiceSettings()
+        for name in (*config._BLANK_IS_DEFAULT, "LLM_ANTHROPIC_EFFORT"):
+            with monkeypatch.context() as mp:
+                mp.setenv(name, "")
+                loaded = getattr(config.AIServiceSettings(), name)
+            expected = ("" if name == "LLM_ANTHROPIC_EFFORT" else getattr(
+                defaults, name))
+            assert loaded == expected, name
+
+        example = Path(__file__).resolve().parents[2] / ".env.example"
+        checked = set()
+        for line in example.read_text().splitlines():
+            name, _, value = line.lstrip("# ").partition("=")
+            if name in (*config._BLANK_IS_DEFAULT, "LLM_ANTHROPIC_EFFORT"):
+                with monkeypatch.context() as mp:
+                    mp.setenv(name, value)
+                    assert getattr(config.AIServiceSettings(), name) == value
+                checked.add(name)
+        assert {"LLM_DEFAULT_PROVIDER", "RAG_ASK_LLM_TIER"} <= checked
+
 
 class _BM25:
 
@@ -2265,3 +3154,113 @@ class TestServiceSetup:
         filters = data["tool"]["pytest"]["ini_options"]["filterwarnings"]
         assert any("Failed to obtain server version" in f for f in filters)
         assert "ignore::UserWarning" not in filters
+
+
+_SIZING_PROSE = (
+    "Sizing rationale: the budget is $7,698.95, so I scale in.\n\n"
+    "- Tier 1: 343.00 x 6 = 2,058.00\n\n"
+    '{"window_days": 5, "tiers": [{"target_price": 343.0, '
+    '"quantity": 6.0}]}\n\nTotal is within the budget.')
+
+
+class TestWrappedJsonRecovery:
+
+    def test_object_wrapped_in_prose_is_recovered_and_logged(self):
+        from ai.agents.loop import ReActAgentLoop
+        from ai.llm.base import parse_json_dict
+
+        with capture_logs() as logs:
+            assert parse_json_dict('{"a": 1}') == {"a": 1}
+            assert parse_json_dict('```json\n{"a": 2}\n```') == {"a": 2}
+        assert not logs
+        with capture_logs() as logs:
+            parsed = parse_json_dict(_SIZING_PROSE, log_event="x.unparseable")
+        assert parsed is not None and parsed["window_days"] == 5
+        recovered = [
+            e for e in logs
+            if e["event"] == "llm_json.recovered_from_wrapped_text"
+        ]
+        assert recovered[0]["shape"] == "dict"
+        assert recovered[0]["chars_dropped"] == (
+            len(_SIZING_PROSE) - len(_SIZING_PROSE[_SIZING_PROSE.index("{"):
+                                                   _SIZING_PROSE.rindex("}")
+                                                   + 1]))
+        assert not any(e["event"] == "x.unparseable" for e in logs)
+        assert parse_json_dict("[1, 2]") is None
+        assert parse_json_dict('Two: {"a": 1} and {"b": 2}') is None
+        step = ReActAgentLoop._parse_response(
+            '{"thought": "done", "finish_answer": "ok"}\nextra words')
+        assert step is not None and step.finish_answer == "ok"
+
+        result, note = _validate(_SIZING_PROSE, "7698.95")
+        assert result is not None and note is not None
+        assert "could not be parsed" not in note
+        assert [(t.target_price, t.quantity) for t in result.tiers] == [
+            (Decimal("343.0"), Decimal("6.0"))
+        ]
+
+    def test_trailing_comma_is_repaired_only_after_other_recovery(self):
+        from ai.agents.loop import ReActAgentLoop
+        from ai.llm.base import parse_json_dict
+
+        with capture_logs() as logs:
+            assert parse_json_dict('{"a": [1, 2]}') == {"a": [1, 2]}
+        assert not logs
+        raw = (
+            '{"thought": "t", "finish_answer": "no external analyst '
+            'commentary is included.",}')
+        with capture_logs() as logs:
+            step = ReActAgentLoop._parse_response(raw)
+        assert step is not None and step.finish_answer == (
+            "no external analyst commentary is included.")
+        repaired = [
+            e for e in logs if e["event"] == "llm_json.repaired_trailing_comma"
+        ]
+        assert repaired[0]["chars_removed"] == 1
+        assert not any(
+            e["event"] == "react_loop.unparseable_response" for e in logs)
+        assert parse_json_dict('{"a": "x,}", "b": [1, 2, ], }') == {
+            "a": "x,}",
+            "b": [1, 2]
+        }
+        assert parse_json_dict('Reply: {"a": 1,} done') == {"a": 1}
+        with capture_logs() as logs:
+            assert parse_json_dict('{"a": 1,, }', log_event="x.bad") is None
+        assert [e["event"] for e in logs] == ["x.bad"]
+
+    def test_unparseable_text_logs_head_and_tail(self):
+        from ai.llm.base import parse_json_dict
+
+        raw = "Tiers: {not json} " + "x" * 900 + " end of answer"
+        with capture_logs() as logs:
+            assert parse_json_dict(raw, log_event="x.unparseable") is None
+        failed = [e for e in logs if e["event"] == "x.unparseable"]
+        assert failed[0]["raw"] == raw[:500]
+        assert failed[0]["raw_tail"] == raw[-300:]
+        assert failed[0]["raw_chars"] == len(raw)
+
+    def test_kg_list_wrapped_in_prose_is_recovered(self):
+        from ai.knowledge.archival import _parse_response
+
+        triple = {
+            "source": "AMZN",
+            "source_type": "company",
+            "relation": "reported_revenue_of",
+            "target": "$200.61B",
+            "target_type": "economic_indicator",
+            "confidence": 0.9
+        }
+        raw = json.dumps([triple]) + "\n\nNote: figures are from Q2."
+        with capture_logs() as logs:
+            triples = _parse_response(raw)
+        assert [t.target for t in triples] == ["$200.61B"]
+        assert any(
+            e["event"] == "llm_json.recovered_from_wrapped_text"
+            and e["shape"] == "list" for e in logs)
+        with capture_logs() as logs:
+            assert _parse_response("[cut off " + "y" * 600) == []
+        failed = [
+            e for e in logs
+            if e["event"] == "kg_extraction.unparseable_response"
+        ]
+        assert failed[0]["raw_tail"].endswith("y" * 10)

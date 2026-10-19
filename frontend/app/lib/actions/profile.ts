@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, extractErrorMessage, readApiError } from "@/app/lib/backend";
-import { avatarFileError } from "@/app/(public)/field-rules";
+import { USERNAME_RE, avatarFileError, isTimezone } from "@/app/(public)/field-rules";
 
 export type ProfileValues = {
   username: string;
@@ -19,18 +19,6 @@ export type UpdateProfileState = {
   success?: boolean;
   values?: ProfileValues;
 };
-
-// Same limits as MeUpdate in services/auth-service/domains/auth/schema.py.
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
-
-function isTimezone(value: string): boolean {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: value });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function validateProfile(v: ProfileValues): string | null {
   if (!USERNAME_RE.test(v.username)) {

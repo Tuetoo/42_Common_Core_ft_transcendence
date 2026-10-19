@@ -12,7 +12,8 @@ logger = structlog.get_logger(__name__)
 SCHEDULED_JOBS = frozenset({
     "market-open", "market-close", "tier-monitoring", "review-run",
     "rag-ingest", "logs-cleanup", "backup", "purge-unverified",
-    "notification-retention"
+    "notification-retention", "deleted-user-sweep-core",
+    "deleted-user-sweep-ai"
 })
 _REDIS_KEY = "core:job_last_success"
 _SKIPPED_KEY = "core:market_close_skipped"

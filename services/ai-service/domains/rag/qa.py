@@ -5,7 +5,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 import structlog
 from ai.agents.evidence_grounding import non_english_reason
@@ -16,8 +16,8 @@ from ai.rag.retriever import (BaseRetriever, FilingRetriever, RetrievedChunk,
 from ai.rag.visibility import VisibilityScope
 from config import settings
 from domains.rag.schema import RagAnswer, RagAskRequest, RagCitation
+from rate_limit import check_user_rate_limit
 from shared.enums import DocumentCategory
-from shared.redis import fixed_window_hits
 
 logger = structlog.get_logger(__name__)
 
@@ -61,13 +61,6 @@ _ENGLISH_RETRY_INSTRUCTION = (
     "English. Answer again, in English only.")
 
 
-class RagAskRateLimitedError(Exception):
-
-    def __init__(self, message: str, retry_after: int) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
 class RagAnswerUnavailableError(Exception):
 
     def __init__(self, message: str, code: str = "llm_unavailable") -> None:
@@ -75,37 +68,11 @@ class RagAnswerUnavailableError(Exception):
         self.code = code
 
 
-async def _count(key: str, ttl_seconds: int) -> int | None:
-    hits = await fixed_window_hits(settings, [key], ttl_seconds)
-    if hits is None:
-        logger.warning("rag_ask.rate_limit_unavailable", key=key)
-        return None
-    return hits[0][0]
-
-
 async def check_rate_limit(
         user_id: str, *, now: datetime | None = None) -> None:
-    now = now or datetime.now(UTC)
-    minute_key = f"ai:rag_ask:rate:{user_id}:m:{now.strftime('%Y%m%d%H%M')}"
-    day_key = f"ai:rag_ask:rate:{user_id}:d:{now.strftime('%Y%m%d')}"
-    minute_count = await _count(minute_key, 120)
-    if minute_count is None:
-        return
-    if minute_count > settings.RAG_ASK_RATE_LIMIT_PER_MINUTE:
-        raise RagAskRateLimitedError(
-            "Too many questions this minute "
-            f"(limit {settings.RAG_ASK_RATE_LIMIT_PER_MINUTE}).",
-            retry_after=max(1, 60 - now.second))
-    day_count = await _count(day_key, 2 * 86400)
-    if day_count is None:
-        return
-    if day_count > settings.RAG_ASK_RATE_LIMIT_PER_DAY:
-        next_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        raise RagAskRateLimitedError(
-            "Daily question limit reached "
-            f"(limit {settings.RAG_ASK_RATE_LIMIT_PER_DAY}).",
-            retry_after=max(1, int((next_midnight - now).total_seconds())))
+    await check_user_rate_limit(
+        "rag_ask", user_id, per_minute=settings.RAG_ASK_RATE_LIMIT_PER_MINUTE,
+        per_day=settings.RAG_ASK_RATE_LIMIT_PER_DAY, noun="question", now=now)
 
 
 async def retrieve_sources(request: RagAskRequest,
@@ -218,10 +185,7 @@ def build_messages(
 
 
 def _tier() -> LLMTier:
-    try:
-        return LLMTier(settings.RAG_ASK_LLM_TIER)
-    except ValueError:
-        return LLMTier.CHEAP
+    return LLMTier(settings.RAG_ASK_LLM_TIER)
 
 
 def no_sources_answer(request: RagAskRequest, started: float) -> RagAnswer:

@@ -4,7 +4,10 @@ from uuid import UUID
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.admin.schema import AdminUserSort, SortOrder
-from domains.auth.model import OAuthAccount, TwoFactorSecret, User, UserProfile
+from domains.auth.model import (OAuthAccount, TwoFactorSecret, User,
+                                UserProfile, UserSession)
+from domains.organization.model import (Organization, OrganizationInvitation,
+                                        OrganizationMember)
 from domains.social.model import Connection
 from shared.database import count_query
 from shared.enums import SystemRole
@@ -95,6 +98,22 @@ class AdminRepository:
                 User.id == user_id,
                 *self._unverified_before(created_before)).with_for_update())
         return result.scalar_one_or_none()
+
+    async def deleted_ids_with_leftovers(self) -> list[UUID]:
+        leftovers = (
+            select(UserSession.id).where(UserSession.user_id == User.id),
+            select(OrganizationInvitation.id).where(
+                OrganizationInvitation.invited_by == User.id,
+                OrganizationInvitation.accepted_at.is_(None)),
+            select(OrganizationMember.id).where(
+                OrganizationMember.user_id == User.id),
+            select(Organization.id).where(Organization.owner_id == User.id))
+        result = await self._db.execute(
+            select(User.id).where(
+                User.deleted_at.is_not(None),
+                or_(*(query.exists() for query in leftovers))).order_by(
+                    User.id))
+        return list(result.scalars().all())
 
     async def oauth_providers(self, user_id: UUID) -> list[str]:
         result = await self._db.execute(

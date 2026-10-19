@@ -2,11 +2,12 @@ import { LocalTime } from "@/app/(protected)/local-time";
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
-import { Pager, pageParam } from "../pager";
+import { Pager, firstParam, pageParam } from "../pager";
 import { CreateNoteForm } from "./create-note-form";
 import { SentimentPill } from "./sentiment-pill";
 import { loadOrganizations } from "./organizations";
-import { SEARCH_TEXT_MAX, TAG_MAX_CHARS, UUID_RE } from "./limits";
+import { UUID_RE } from "@/app/lib/format";
+import { SEARCH_TEXT_MAX, TAG_MAX_CHARS } from "./limits";
 import type { Note, Paginated } from "./types";
 
 const PAGE_SIZE = 20;
@@ -19,21 +20,17 @@ const SORTS = [
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
-function one(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value)?.trim() ?? "";
-}
-
 // Only the parameters GET /research/notes supports
 // (services/core-service/domains/research/api.py search_notes): q (full-text
 // search over title and content), tag (exact tag name), author_id,
 // organization_id, sort, page, page_size. Invalid values are dropped so a
 // hand-edited URL never turns into a 422 error page.
 function readFilters(sp: SearchParams) {
-  const q = one(sp.q).slice(0, SEARCH_TEXT_MAX);
-  const tag = one(sp.tag).slice(0, TAG_MAX_CHARS);
-  const authorId = one(sp.author_id);
-  const organizationId = one(sp.organization_id);
-  const sort = one(sp.sort);
+  const q = firstParam(sp.q).slice(0, SEARCH_TEXT_MAX);
+  const tag = firstParam(sp.tag).slice(0, TAG_MAX_CHARS);
+  const authorId = firstParam(sp.author_id);
+  const organizationId = firstParam(sp.organization_id);
+  const sort = firstParam(sp.sort);
   return {
     q,
     tag,

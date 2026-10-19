@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
@@ -5,6 +6,7 @@ import structlog
 from config import settings
 from database import get_db
 from deps import day_start
+from event_listener import sweep_deleted_organizations, sweep_deleted_users
 from fastapi import (APIRouter, BackgroundTasks, Depends, Form, Query,
                      UploadFile, status)
 from fastapi.responses import JSONResponse
@@ -25,6 +27,7 @@ from domains.research.model import Document, ResearchComment, ResearchNote
 from domains.research.repository import DocumentRepository
 from domains.research.schema import SystemDocumentCreate
 from domains.research.service import ResearchService
+from shared.deleted_users import sweep_steps
 from shared.enums import DocumentCategory
 from shared.exceptions import NotFoundError, PermissionDeniedError
 from shared.market_calendar import is_trading_day, market_today
@@ -66,7 +69,7 @@ async def market_close(db: AsyncSession = Depends(
     today = market_today()
     reason = _non_trading_reason(today)
     if reason is not None:
-        return _skipped("market_close", today, reason, portfolios_processed=0)
+        return _skipped("market-close", today, reason, portfolios_processed=0)
     result = await PortfolioService(db).run_market_close_job(today)
     await record_market_close_skipped(result.skipped)
     return {
@@ -211,7 +214,7 @@ async def market_open(db: AsyncSession = Depends(
     today = market_today()
     reason = _non_trading_reason(today)
     if reason is not None:
-        return _skipped("market_open", today, reason, analyses_requested=0)
+        return _skipped("market-open", today, reason, analyses_requested=0)
     result = await PortfolioService(db).run_market_open_job()
     return job_response(
         "market-open", {
@@ -233,6 +236,19 @@ async def notification_retention(
             "batches": result.batches,
             "failed_batches": result.failed_batches
         }, steps={"batches": (result.batches, result.failed_batches)})
+
+
+@router.post("/scheduler/deleted-user-sweep", response_model=None)
+async def deleted_user_sweep() -> JSONResponse:
+    users = await sweep_deleted_users()
+    organizations = await sweep_deleted_organizations()
+    return job_response(
+        "deleted-user-sweep-core", {
+            **asdict(users), "organizations": asdict(organizations)
+        }, steps={
+            **sweep_steps("users", users),
+            **sweep_steps("organizations", organizations, brake=True)
+        })
 
 
 @router.get("/stats")
@@ -278,7 +294,8 @@ async def get_document_filenames(
         ticker: str | None = Query(default=None), category: str = Query(...),
         db: AsyncSession = Depends(get_db, scope="function")) -> list[str]:
     return await DocumentRepository(db).list_filenames(
-        ticker=ticker, category=category)
+        ticker=ticker, category=category,
+        failed_retry_days=settings.FAILED_DOCUMENT_RETRY_DAYS)
 
 
 @router.post("/documents")

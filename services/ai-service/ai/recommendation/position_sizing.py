@@ -46,20 +46,10 @@ _SYSTEM_PROMPT = (
     '"tiers": [{"target_price": <float>, "quantity": <float>}, ...]}')
 
 
-class KeepEarlierTiersNote(str):
+class BudgetBlockedNote(str):
     __slots__ = ()
 
     reason_text = "for a budget reason"
-
-
-class BudgetBlockedNote(KeepEarlierTiersNote):
-    __slots__ = ()
-
-
-class LowConfidenceNote(KeepEarlierTiersNote):
-    __slots__ = ()
-
-    reason_text = "because its confidence is below the minimum for tiers"
 
 
 _BUDGET_OVERSHOOT_TOLERANCE = Decimal("0.005")
@@ -214,7 +204,7 @@ async def generate_position_sizing(
         logger.info(
             "position_sizing.buy_confidence_below_minimum", ticker=ticker,
             confidence=confidence, minimum=min_confidence)
-        return None, LowConfidenceNote(
+        return None, (
             "No entry tiers were generated for this recommendation -- its "
             f"confidence {confidence:.2f} is below the minimum of "
             f"{min_confidence:.2f} for BUY tiers, so no cash is reserved "
@@ -443,7 +433,9 @@ def _validated_sizing(
                 quantity=Decimal(str(tier["quantity"])))
         except (KeyError, TypeError, ValueError, InvalidOperation):
             continue
-        if not (suggestion.target_price > 0 and suggestion.quantity > 0):
+        if not (suggestion.target_price.is_finite()
+                and suggestion.quantity.is_finite()
+                and suggestion.target_price > 0 and suggestion.quantity > 0):
             continue
         tiers.append(suggestion)
 

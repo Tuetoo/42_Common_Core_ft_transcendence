@@ -107,14 +107,17 @@ reaches domain code. The gateway never proxies `/internal`.
 - pub/sub for notifications and live updates (a missed one loses only a
   message a user can still find by refreshing);
 - durable streams with consumer groups for the events that must not be
-  lost (`document.uploaded`, `document.deleted`, `portfolio.deleted`, and
-  the database half of `document.status_changed`): redelivered until
-  acknowledged, dead-lettered after repeated failures. core-service's
-  three durable events are first written to the outbox table
-  `core.event_outbox` in the same transaction as the change, then
-  published after the response; a background dispatcher republishes any
-  row that is still unpublished (at-least-once delivery, idempotent
-  handlers).
+  lost (`document.uploaded`, `document.deleted`, `portfolio.deleted`, the
+  database half of `document.status_changed`, and auth-service's
+  `user.deleted`, which ai-service reads from a stream while core-service
+  reads it over pub/sub): redelivered until acknowledged, dead-lettered
+  after repeated failures. core-service's three durable events are first
+  written to the outbox table `core.event_outbox` in the same transaction
+  as the change, then published after the response; a background
+  dispatcher republishes any row that is still unpublished (at-least-once
+  delivery, idempotent handlers). A nightly sweep in core and in ai
+  repeats the `user.deleted` cleanup for every deleted account that still
+  owns data, so a lost deletion event is caught the next night.
 Every publisher publishes after its own transaction committed (including
 auth-service's `user.presence.changed`); every event has a consumer (the
 table is `API_SPEC.md` §6).
@@ -176,8 +179,10 @@ load off the database the other services use.
   viewer) are checked per resource; guests are read-only.
 - **Public API.** `X-API-Key`; keys are stored hashed; per-key and
   per-owner limits (fixed one-minute windows, 429 with `Retry-After`).
-  Rate limits of auth and core share one implementation
-  (`shared/redis.py`) that lets requests through when Redis is down.
+  Rate limits of auth, core and ai (the RAG assistant and decision
+  reviews, per user) share one fixed-window counter
+  (`shared/redis.py::fixed_window_hits`) that lets requests through when
+  Redis is down.
 - **Transport and secrets.** TLS at the gateway; plain HTTP only inside
   the Docker network; `/internal` needs the shared internal token and is
   never exposed; secrets come from `.env.docker` (never committed;
@@ -195,9 +200,10 @@ load off the database the other services use.
   memory) as calibration only; Reflection checks citations and can send
   an agent back once with targeted feedback. Details:
   `handbook/15-ai-agents.md` and `handbook/16-ai-analysis-pipeline.md`.
-- **LLM router.** One interface over Google (Gemini, the default),
-  Mistral, OpenAI and Anthropic, with tiers per task, per-key pacing,
-  cooldowns after rate limits and fallbacks between models.
+- **LLM router.** One interface over Google (Gemini, the code default),
+  Mistral, OpenAI and Anthropic (Claude, the recommended provider,
+  `MODEL_COMPARISON.md`), with tiers per task, per-key pacing, cooldowns
+  after rate limits and fallbacks between models of one provider.
 - **RAG.** Category-aware chunking, hybrid BM25 + vector retrieval fused
   with RRF, per-category weights, and visibility per document (owner,
   organization, system). Filings, news and macro research are ingested
@@ -212,8 +218,10 @@ load off the database the other services use.
 - **Scheduling.** A `scheduler` container runs cron: market open and
   close (weekdays, NYSE holidays skipped by the services), tier
   monitoring, the nightly review, RAG ingestion, the purge of unverified
-  accounts, the deletion of old read notifications, log cleanup and the
-  nightly backup.
+  accounts, the deletion of old read notifications, the deleted-user
+  sweeps of core and ai, log cleanup and the nightly backup. One job can
+  also be run by hand with `docker compose --env-file .env.docker run
+  --rm --no-deps scheduler /scripts/call-job.sh <job>` (`DEPLOYMENT.md`).
 - **Observability.** Structured JSON logs (every HTTP request
   gets a request id, taken from a valid `X-Request-ID` or newly made; it is
   on every log line of the request, in error bodies and in the

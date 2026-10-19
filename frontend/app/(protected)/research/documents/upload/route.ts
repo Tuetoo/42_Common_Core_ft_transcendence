@@ -4,11 +4,11 @@ import {
   DOCUMENT_CATEGORIES,
   DOCUMENT_MAX_BYTES,
   DOCUMENT_TITLE_MAX,
-  UUID_RE,
   documentFileError,
   formatBytes,
   tickerError,
 } from "../../limits";
+import { UUID_RE } from "@/app/lib/format";
 
 // Room for the multipart boundaries and the small text fields.
 const MULTIPART_OVERHEAD = 64 * 1024;

@@ -77,9 +77,10 @@
 
 The rules below apply to all Python code in the repository.
 
-- **No comments or docstrings.** The only comments are tool pragmas
+- **No docstrings, few comments.** Most comments are tool pragmas
   (`# type: ignore[...]`, `# noqa: <code>`, `# pragma: no cover`, and the
-  `# pyright: ...` header of the two shared test modules). The handbook is the
+  `# pyright: ...` header of the two shared test modules); a handful of
+  short comments give a reason the code cannot show. The handbook is the
   explanation of the code. Text the program needs at run
   time is an explicit string: error messages (for example `default_message` on each `AppError` subclass, see
   [30-shared-library.md](30-shared-library.md)), a script's `--help`
@@ -153,26 +154,26 @@ what a service covers. Where things live:
 | Topic | File |
 |---|---|
 | Registration, login, tokens, sessions, 2FA, OAuth, profile, connections, emails | `tests/auth-service/test_accounts.py` |
-| Organizations, admin users, system roles, user state, auth events | `tests/auth-service/test_organizations.py` |
+| Organizations, admin users, account deletion and the purge job, system roles, user state, auth events | `tests/auth-service/test_organizations.py` |
 | Internal token, HTTP surface, rate limits, migrations | `tests/auth-service/test_platform.py` |
 | Health, internal access, service clients, job health, user state, ownership rules, API keys, `e2e_check` helpers, migrations, gateway config (`X-Forwarded-For` replaced, never appended, in 4 places: http level, `/ws`, `/grafana/`, internal listener) | `tests/core-service/test_platform.py` |
 | Notes, documents, research content, document ingestion, sentiment | `tests/core-service/test_research.py` |
 | Portfolio access, transactions, ledger adjustments, snapshots, scheduled jobs, exports | `tests/core-service/test_portfolio.py` |
-| Connection manager, WebSockets, notifications, event listener, cross-service events, Yjs collaboration | `tests/core-service/test_realtime.py` |
+| Connection manager, WebSockets, notifications, event listener (including the cleanup of deleted users and organizations and the nightly sweep), cross-service events, Yjs collaboration | `tests/core-service/test_realtime.py` |
 | Judge, debate, reflection, position sizing, tier replacement, decision review | `tests/ai-service/test_debate_judge.py` |
 | Analysis workflow, backtests, review jobs, tier monitoring | `tests/ai-service/test_workflows.py` |
 | Smoke and `e2e_tier_check` scripts, operator scripts | `tests/ai-service/test_scripts.py` |
-| Analysis repository, service and queue, create and read routes, backtest routes, analytics, internal routes, events, migrations | `tests/ai-service/test_api.py` |
+| Analysis repository, service and queue, create and read routes, backtest routes, analytics, internal routes, events, user deletion and the nightly sweep, migrations | `tests/ai-service/test_api.py` |
 
-Size (collected tests, which count each parametrized case; 489 test
-functions in the 21 unit-test files, plus the 4 `alembic_contract.py`
-checks that every suite collects):
+Size (collected tests: 558 test functions in the 21 unit-test files,
+plus the 4 `alembic_contract.py` checks that every suite collects; no
+test is parametrized):
 
 | Suite | Test files | Collected tests | Statement coverage |
 |---|---|---|---|
-| `tests/auth-service` | 3 | 42 | 75% |
-| `tests/core-service` | 4 | 84 | 66% |
-| `tests/ai-service` | 14 | 375 | 90% |
+| `tests/auth-service` | 3 | 54 | 75% |
+| `tests/core-service` | 4 | 102 | 66% |
+| `tests/ai-service` | 14 | 414 | 90% |
 | `tests/integration` | 1 | 1 | not measured |
 
 The suite was reduced by removing tests that covered no code line or
@@ -270,9 +271,11 @@ with fakes. core also has `organization_roles` and `published_events`;
 ai has `owners`, `rows`, `workflow_env` and `_portfolio_backend`
 (section 7.3). Each service's `helpers.py` holds the shared builders,
 fakes and functions its test files use. ai-service also has an autouse `_no_agent_prefetch` that sets
-`AGENT_PREFETCH_ENABLED=False`, so no test reaches Yahoo, SEC or FRED
-through the agents' prefetch tools (otherwise a test could pass offline
-and fail with network access, or the other way round).
+`AGENT_PREFETCH_ENABLED=False`, so the optional prefetch calls to Yahoo,
+SEC and FRED do not run (otherwise a test could pass offline and fail
+with network access, or the other way round). Macro's DFF/DGS10 prefetch
+ignores that switch (chapter 15), so a test that runs the Macro agent
+must fake its FRED tool itself.
 
 There is no switch to use an existing local PostgreSQL instead: every
 suite starts its own containers, so **Docker must be running** on the
@@ -349,7 +352,29 @@ in order:
 
 `platform`, `auth`, `roles`, `org`, `portfolio`, `apikey`, `documents`,
 `research`, `realtime`, `yjs`, `analytics`, `backtest`, `analysis` (only
-with `--with-analysis`), `admin`, `cleanup`.
+with `--with-analysis`), `admin`, `deletion` (opt-in: only with
+`--only deletion`), `cleanup`.
+
+`deletion` checks account deletion on the real stack
+(`bash scripts/e2e.sh core --only deletion --verbose`). It registers one
+throwaway user (`e2e-<runid>-dora@example.com`), gives it a private
+document, a private note with a comment, a private portfolio with a
+deposit, a watchlist (with an item when the ticker is accepted), an API
+key, and an organization where it is the only member, with an open
+invitation to another throwaway address and a portfolio shared with it.
+Then the admin route deletes the user, and the section checks: login and
+the old token fail (core and ai), the API key is refused, auth lists the
+id as deleted and the organization as missing, the invitation is gone
+(an admin probe of its token gives 404 instead of 403), no core row of the
+user is left (polled up to 60 s) and the S3 object is gone. Finally it calls
+the two nightly jobs `deleted-user-sweep-core` and `deleted-user-sweep-ai`
+the way the scheduler does (no heartbeat is sent) and checks a 200 answer
+with `failed=0`, no `lookup_failed` and no `refused`. The sweeps act only
+on deleted accounts and missing organizations, as they do every night.
+The note and the comment each cost one short sentiment call (CHEAP tier),
+and the document one embedding; nothing else uses the LLM. ai has no
+cheap per-user data to create, so ai's own cleanup is left to
+`tests/ai-service` (`TestUserDeletion`).
 
 `--only a,b` adds the sections they depend on (`SECTION_DEPS`; for
 example `yjs` needs `auth` and `org`). It creates its own users
@@ -374,13 +399,15 @@ fresh admin token:
 ```bash
 make e2e                    # both
 make e2e PART=core ARGS="--only auth,portfolio --verbose"
+make e2e PART=core ARGS="--only deletion --verbose"   # opt-in
 make e2e PART=tier
 ```
 
 `scripts/e2e.sh` refuses to run inside the scheduler's busy windows
 (09:00-10:30 and 16:55-17:50 New York, 14:00-15:30 and 21:55-22:50
 London) unless `FORCE=1`. Remember the auth limits: 10 registrations per
-address per hour, and each core run registers three users.
+address per hour, and each core run registers three users (one more with
+`deletion`).
 
 ### 3.8 Smoke check
 
@@ -506,7 +533,6 @@ lint:
 | `integration-ci.yml` ("stack smoke CI"), job `config-checks` | pull request touching `infra/**`, `scripts/**`, the compose files, `.dockerignore`, `frontend/Dockerfile`, `Makefile`, `.env.example` or the workflow; push to `main` | `uv run flake8 infra`; `csp_hashes.py --check`; `docker compose config -q` of the stack and of the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` |
 | `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` and the frontend's `/healthz` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404, `/login` = 200, `/healthz` = 200; `down -v` (always, also after a failure) |
 | `frontend-ci.yml` ("frontend CI") | pull request touching `frontend/**` or the workflow; push to `main` touching the same | in `frontend/`, Node 24: `npm ci`; `npm run lint` (ESLint); `npx next typegen && npx tsc --noEmit`; `npm run build` |
-
 | `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand; it then waits for every other workflow run of the same commit and deploys only if all succeeded or were skipped (the per-service checks run only for the services the commit touches; chapter [32](32-ci-cd.md) section 3.4) | SSH to the cloud host with a key that may only run `scripts/deploy.sh`, sending the checked commit sha (fast-forward to that commit, `docker compose up -d --build --wait`; the scheduler keeps its state: a stopped scheduler stays stopped); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 
 The stack smoke job does not run `tests/integration` (no seeded corpus or
@@ -611,8 +637,8 @@ never change behaviour.
   (core, ai).
 - Shared builders go in the service's `helpers.py` (or a fixture in its
   `conftest.py`). A test file never imports another test file.
-- Several inputs for one behaviour: `pytest.mark.parametrize` with
-  readable ids, `pytest.param(..., id="sell-not-held")`.
+- Several inputs for one behaviour: a loop over named cases inside one
+  test, with the case id in each assert message (`assert ..., case_id`).
 
 ### 7.2 Example: a reset link works once
 
@@ -744,7 +770,7 @@ Run on your machine (host), from the repository root, with `uv` installed
 
    It starts the Postgres and Redis containers (a few seconds), then runs
    the pure tests of the end-to-end script's helpers (MailHog parsing, link
-   extraction, PDF building): 3 test functions, each looping over
+   extraction, PDF building): 4 test functions, each looping over
    named cases. Point at the startup: "Even this class gets a real
    database, because the suite's `conftest.py` sets it up once per run."
    Expected last line: `N passed` with no failures.

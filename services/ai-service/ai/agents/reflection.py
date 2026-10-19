@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Sequence
 from typing import Any
 import structlog
 from ai.agents.debate_common import (_FIGURE_RE, CODE_BUILT_LINES_ARE_EVIDENCE,
@@ -12,14 +13,17 @@ from ai.graph.state import (AVAILABILITY_FAILURE_KINDS, FAILURE_KIND_TEXT,
                             ISSUE_ITERATION_CAP, ISSUE_KINDS, ISSUE_LLM_REVIEW,
                             ISSUE_NO_EVIDENCE_NOT_RETRIED, ISSUE_NOT_RETRIED,
                             ISSUE_NOT_WELL_SUPPORTED, ISSUE_ZERO_EVIDENCE,
-                            AgentOutput, AnalysisState, DebateSide,
-                            FailureKind, IssueKind, ReflectionIssue,
-                            ReflectionVerdict, is_usable_evidence,
+                            AgentOutput, AnalysisState, DebateArgument,
+                            DebateSide, FailureKind, IssueKind,
+                            ReflectionIssue, ReflectionVerdict,
+                            is_usable_evidence,
                             lacks_successful_tool_evidence)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
                          LLMRateLimitError, LLMRequestTimeoutError,
-                         LLMServerOverloadedError, LLMTier, parse_json_dict)
-from ai.llm.router import LLMRouter, capacity_aware_delay
+                         LLMServerOverloadedError, LLMTier, log_unparseable,
+                         parse_json_dict)
+from ai.llm.router import (LLMRouter, capacity_aware_delay,
+                           fallback_call_count, recording_served_models)
 from config import settings
 from shared.enums import AgentRole, AgentStatus
 
@@ -146,7 +150,9 @@ _REVIEW_MAX_TOKENS = 2048
 _DEBATE_SIDE_ROLES: tuple[tuple[AgentRole, DebateSide], ...] = (
     (AgentRole.BULL, "bull"), (AgentRole.BEAR, "bear"))
 
-_NOT_RETRIABLE_FAILURE_KINDS = AVAILABILITY_FAILURE_KINDS | {"non_english"}
+_NOT_RETRIABLE_FAILURE_KINDS = AVAILABILITY_FAILURE_KINDS | {
+    "non_english", "credit_exhausted"
+}
 
 
 def _not_retriable_failure_kind(out: AgentOutput) -> FailureKind | None:
@@ -199,6 +205,19 @@ def _issue_text(
     return f"{text} [{'; '.join(details)}]" if details else text
 
 
+def _earlier_other_side_text(
+        arguments: Sequence[DebateArgument], side: str | None) -> str:
+    own_rounds = [
+        a.round_number for a in arguments if a.side == side and a.available
+    ]
+    if side not in ("bull", "bear") or not own_rounds:
+        return ""
+    latest = max(own_rounds)
+    return "\n".join(
+        a.argument for a in arguments
+        if a.side != side and a.available and a.round_number < latest)
+
+
 def review_skip_reason_for(exc: LLMError) -> str:
     name = type(exc).__name__
     if isinstance(exc, LLMRequestTimeoutError):
@@ -219,6 +238,12 @@ class ReflectionAgent:
         self.llm_tier = llm_tier
 
     async def check(self, state: AnalysisState) -> ReflectionVerdict:
+        with recording_served_models() as served:
+            verdict = await self._check(state)
+        return verdict.model_copy(
+            update={"fallback_calls": fallback_call_count(served)})
+
+    async def _check(self, state: AnalysisState) -> ReflectionVerdict:
         round_number = len(state.reflection_history) + 1
 
         not_retried_issues: list[ReflectionIssue] = []
@@ -396,6 +421,12 @@ class ReflectionAgent:
 
         parsed = parse_json_dict(
             response.content, log_event="reflection.unparseable_response")
+        if parsed is not None and not {"checked_claims", "issues"} & set(
+                parsed):
+            log_unparseable(
+                "reflection.unparseable_response", response.content,
+                reason="no checked_claims or issues key")
+            parsed = None
         if parsed is None:
             return [], {}, "the review response could not be parsed"
 
@@ -426,13 +457,14 @@ class ReflectionAgent:
             valid_roles.add(AgentRole.BEAR)
 
         evidence_text = format_evidence(state)
-        debate_text = self._debate_transcript(state)
+        debate_arguments = self._reviewed_arguments(state)
         reference_text = format_grounding_reference(state)
         issues: list[ReflectionIssue] = []
         reasons: dict[AgentRole, list[str]] = {}
         for item in raw_issues:
             issue = self._structured_issue(
-                item, valid_roles, evidence_text, debate_text, reference_text)
+                item, valid_roles, evidence_text, debate_arguments,
+                reference_text)
             if issue is None:
                 continue
             issues.append(issue)
@@ -448,7 +480,8 @@ class ReflectionAgent:
     @staticmethod
     def _structured_issue(
             item: Any, valid_roles: set[AgentRole], evidence_text: str,
-            debate_text: str, reference_text: str) -> ReflectionIssue | None:
+            debate_arguments: Sequence[DebateArgument],
+            reference_text: str) -> ReflectionIssue | None:
         if not isinstance(item, dict):
             logger.warning("reflection.issue_bad_shape", item=str(item)[:300])
             return None
@@ -477,7 +510,9 @@ class ReflectionAgent:
                     "reflection.issue_role_not_routable", role=raw_role[:40],
                     description=description[:300])
         quote = _optional_text(item.get("evidence_quote")) or ""
-        quote_source = debate_text if kind == "not_engaged" else evidence_text
+        quote_source = (
+            _earlier_other_side_text(debate_arguments, role)
+            if kind == "not_engaged" else evidence_text)
         if not quote or not _quote_is_grounded(quote, quote_source):
             logger.warning(
                 "reflection.issue_quote_not_grounded", kind=kind, role=role,
@@ -500,11 +535,15 @@ class ReflectionAgent:
                 claimed_period=claimed_period, evidence_quote=quote))
 
     @staticmethod
-    def _debate_transcript(state: AnalysisState) -> str:
-        arguments = [
+    def _reviewed_arguments(state: AnalysisState) -> list[DebateArgument]:
+        return [
             a for a in state.debate.transcript_arguments()
             if not state.debate.is_argument_superseded(a)
         ]
+
+    @staticmethod
+    def _debate_transcript(state: AnalysisState) -> str:
+        arguments = ReflectionAgent._reviewed_arguments(state)
         latest_round_by_side: dict[str, int] = {}
         for a in arguments:
             latest_round_by_side[a.side] = max(

@@ -56,3 +56,8 @@ export function pageParam(value: string | string[] | undefined): number {
   const n = Number(Array.isArray(value) ? value[0] : value);
   return Number.isInteger(n) && n > 0 ? n : 1;
 }
+
+// Reads one search param as trimmed text (the first value when repeated).
+export function firstParam(value: string | string[] | undefined): string {
+  return (Array.isArray(value) ? value[0] : value)?.trim() ?? "";
+}

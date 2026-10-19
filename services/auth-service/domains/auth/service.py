@@ -307,8 +307,7 @@ async def oauth_authorize_url(
         url=f"{provider_cfg['authorize_url']}?{params}", nonce=nonce)
 
 
-SETTINGS_FIELDS = (
-    "preferred_currency", "theme", "default_model", "notification_preferences")
+SETTINGS_FIELDS = ("notification_preferences", )
 
 
 async def change_username(
@@ -573,9 +572,6 @@ class AuthService:
             await security.two_factor_failed(str(user_id))
             raise error
         await security.two_factor_succeeded(str(user_id))
-        if not security.is_encrypted(row.secret):
-            row.secret = security.encrypt_secret(secret)
-            await self._db.flush()
 
     async def setup_two_factor(self, user_id: UUID) -> TwoFactorSetupResponse:
         existing = await self.users.get_two_factor_secret(user_id)

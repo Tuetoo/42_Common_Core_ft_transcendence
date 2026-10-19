@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 import structlog
@@ -231,8 +232,8 @@ def _normalize_risk_event(item: Any) -> dict[str, str] | str:
 
 
 def _risk_event_issue(
-        event: dict[str, str],
-        scratchpad: Sequence[ScratchpadEntry]) -> str | None:
+        event: dict[str, str], scratchpad: Sequence[ScratchpadEntry],
+        rows: Sequence[Any] = (), shown: bool = False) -> str | None:
     entity, tool = event["entity"], event["evidence_tool"]
     if tool in NON_EVIDENTIAL_TOOLS:
         return (
@@ -241,6 +242,9 @@ def _risk_event_issue(
             "earlier agent reports, not an independent source -- confirm it "
             "with web_search, search_filings or another tool this run, or "
             "drop it from your answer.")
+    if (_cited_record(event, rows, shown) is not None
+            or (shown and _records_naming(entity, rows, 1)[0])):
+        return None
     observations = [
         e.observation or "" for e in scratchpad
         if is_successful_tool_entry(e, tool)
@@ -248,23 +252,15 @@ def _risk_event_issue(
     if not observations:
         return (
             f"risk event {entity!r} cites {tool}, but {tool} has no "
-            f"successful "
-            "result this run (background context does not count) -- call a "
-            "tool that returns it, or drop that event from your answer.")
-    needle = entity.lower()
-    if not any(needle in obs.lower() for obs in observations):
-        return (
-            f"risk event {entity!r} does not appear in any {tool} result this "
-            "run -- name it exactly as the tool output does, cite the tool "
-            "that actually returned it, or drop it from your answer.")
-    if not any(needle in _independent_text(obs).lower()
-               for obs in observations):
-        return (
-            f"risk event {entity!r} appears in {tool} only inside an earlier "
-            "agent note ([agent:...] passage), which is not an independent "
-            "source -- confirm it with search_filings or web_search this run "
-            "(and describe it as that source does), or drop it from your "
+            "successful result this run (background context does not count) "
+            "-- call a tool that returns it, or drop that event from your "
             "answer.")
+    if not any(_independent_text(obs).strip() for obs in observations):
+        return (
+            f"risk event {entity!r} cites {tool}, whose results this run are "
+            "only earlier agent notes ([agent:...] passages), not an "
+            "independent source -- confirm it with search_filings or "
+            "web_search this run, or drop it from your answer.")
     return None
 
 
@@ -300,18 +296,83 @@ def _name_forms(text: str) -> set[str]:
     return {f for f in forms if f}
 
 
+def _in_order(short: list[str], long: list[str]) -> bool:
+    remaining = iter(long)
+    return all(token in remaining for token in short)
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_ANY_CASE_INNER_PUNCT_RE = re.compile(
+    "(?<=[A-Za-z0-9])[.'\u2019&-]+(?=[A-Za-z0-9])")
+_LOOSE_TOKENS_MAX = 2
+
+
+def _token_forms(text: str) -> list[list[str]]:
+    forms: list[list[str]] = []
+    for variant in (text, _ANY_CASE_INNER_PUNCT_RE.sub("", text)):
+        tokens = _TOKEN_RE.findall(variant)
+        if tokens and tokens not in forms:
+            forms.append(tokens)
+    return forms
+
+
+def _generic(token: str) -> bool:
+    return token.isalpha() and token.islower()
+
+
+def _trimmed_names(tokens: list[str]) -> list[list[str]]:
+    if len(tokens) >= 3 and _generic(tokens[-1]):
+        return [[t.lower() for t in tokens[:-1]]]
+    return []
+
+
+def _in_window(name: list[str], tokens: list[str]) -> bool:
+    lowered = [t.lower() for t in tokens]
+    for start, token in enumerate(lowered):
+        if token != name[0]:
+            continue
+        position, extras = start + 1, 0
+        for wanted in name[1:]:
+            while (position < len(lowered) and lowered[position] != wanted
+                   and extras < _LOOSE_TOKENS_MAX
+                   and _generic(tokens[position])):
+                position, extras = position + 1, extras + 1
+            if position >= len(lowered) or lowered[position] != wanted:
+                break
+            position += 1
+        else:
+            return True
+    return False
+
+
 def _names_match(entity: str, record_name: str) -> bool:
     for a in _name_forms(entity):
         for b in _name_forms(record_name):
             if f" {a} " in f" {b} " or f" {b} " in f" {a} ":
                 return True
+            short, long = sorted((a.split(), b.split()), key=len)
+            if len(short) >= 2 and _in_order(short, long):
+                return True
+    for x in _token_forms(entity):
+        for y in _token_forms(record_name):
+            for small, big in ((x, y), (y, x)):
+                lowered = [t.lower() for t in big]
+                if any(_in_order(name, lowered)
+                       for name in _trimmed_names(small)):
+                    return True
     return False
 
 
 def _text_names(text: str, entity: str) -> bool:
+    if any(f" {a} " in f" {b} " for a in _name_forms(entity)
+           for b in _name_forms(text)):
+        return True
     return any(
-        f" {a} " in f" {b} " for a in _name_forms(entity)
-        for b in _name_forms(text))
+        _in_window(name, tokens) for entity_tokens in _token_forms(entity)
+        for name in (
+            [[t.lower() for t in entity_tokens]] +
+            _trimmed_names(entity_tokens)) if len(name) >= 2
+        for tokens in _token_forms(text))
 
 
 def _record_names_entity(entity: str, record: dict[str, Any]) -> bool:
@@ -347,6 +408,28 @@ def _record_is_of_entity(
                     and _names_match(name, str(other.get("name") or ""))):
                 return True
     return False
+
+
+def _cited_record(
+        event: dict[str, str], rows: Sequence[Any],
+        shown: bool) -> dict[str, Any] | None:
+    if not shown or not _RECORD_ID_RE.match(event["source_id"]):
+        return None
+    record = record_by_id(rows, event["source_id"])
+    return (
+        record if record is not None
+        and record["category"] in _STATUS_CATEGORIES else None)
+
+
+def _canonical_event(
+        event: dict[str, str], rows: Sequence[Any],
+        shown: bool) -> dict[str, str]:
+    record = _cited_record(event, rows, shown)
+    name = str((record or {}).get("name") or "")
+    if (record is None or not name
+            or not _record_is_of_entity(event["entity"], record, rows)):
+        return event
+    return {**event, "entity": name, "source_id": record["id"]}
 
 
 _CAPTION_SEPARATOR = " v. "
@@ -520,14 +603,14 @@ def _event_source_issue(
 
 
 def _risk_events_unsourced(
-        final_answer: str, reported_metrics: dict[str, Any] | None,
-        scratchpad: list[ScratchpadEntry]) -> str | None:
-    del final_answer
+        reported_metrics: dict[str, Any] | None,
+        scratchpad: list[ScratchpadEntry], rows: Sequence[Any],
+        shown: bool) -> str | None:
     events = _reported_risk_events(reported_metrics)
     if isinstance(events, str):
         return events
     for event in events:
-        issue = _risk_event_issue(event, scratchpad)
+        issue = _risk_event_issue(event, scratchpad, rows, shown)
         if issue is not None:
             return issue
     return None
@@ -538,7 +621,8 @@ def _risk_answer_issue(
         scratchpad: list[ScratchpadEntry], *, rows: Sequence[Any] = (),
         shown: bool = False, allow_record_name_mismatch: bool = True,
         log: bool = True) -> tuple[str | None, bool]:
-    issue = _risk_events_unsourced(final_answer, reported_metrics, scratchpad)
+    del final_answer
+    issue = _risk_events_unsourced(reported_metrics, scratchpad, rows, shown)
     if issue is not None:
         return issue, False
     events = _reported_risk_events(reported_metrics)
@@ -581,18 +665,58 @@ def _prior_note_copy_ratio(
 def _sourced_risk_events(
         reported_metrics: dict[str, Any] | None,
         scratchpad: Sequence[ScratchpadEntry], *, rows: Sequence[Any] = (),
-        shown: bool = False) -> list[dict[str, str]]:
+        shown: bool = False,
+        dropped: Counter[str] | None = None) -> list[dict[str, str]]:
     raw = (reported_metrics or {}).get("risk_events")
     if not isinstance(raw, list):
         return []
-    events = [
-        e for e in (_normalize_risk_event(item) for item in raw)
-        if not isinstance(e, str)
-    ]
-    return [
-        e for e in events if _risk_event_issue(e, scratchpad) is None
-        and _cited_filing(e, rows, shown, scratchpad, log=False)[0] is None
-    ]
+    dropped = Counter() if dropped is None else dropped
+    events: list[dict[str, str]] = []
+    for item in raw:
+        normalized = _normalize_risk_event(item)
+        if isinstance(normalized, str):
+            dropped["malformed"] += 1
+        else:
+            events.append(normalized)
+    sourced: dict[str, dict[str, str]] = {}
+    for event in events:
+        record = _cited_record(event, rows, shown)
+        named = (
+            record is not None
+            or (shown and bool(_records_naming(event["entity"], rows, 1)[0]))
+            or any(
+                _text_names(_independent_text(e.observation or ""),
+                            event["entity"]) for e in scratchpad
+                if is_successful_tool_entry(e, event["evidence_tool"])))
+        if not named or (record is not None and not _record_is_of_entity(
+                event["entity"], record, rows)) or _risk_event_issue(
+                    event, scratchpad, rows, shown) is not None:
+            dropped["unsourced"] += 1
+        elif _cited_filing(event, rows, shown, scratchpad,
+                           log=False)[0] is not None:
+            dropped["filing_citation"] += 1
+        else:
+            canonical = _canonical_event(event, rows, shown)
+            sourced.setdefault(canonical["entity"].lower(), canonical)
+    return list(sourced.values())
+
+
+def _log_empty_events_after_correction(
+        ticker: str, accepted: bool, accepted_metrics: dict[str, Any] | None,
+        dropped: Counter[str]) -> None:
+    raw = (accepted_metrics or {}).get("risk_events")
+    if not accepted:
+        reason = "no_accepted_finish"
+    elif not isinstance(raw, list):
+        reason = "model_omitted_list"
+    elif not raw:
+        reason = "model_returned_empty"
+    else:
+        reason = "all_events_dropped"
+    logger.warning(
+        "risk.events_empty_after_correction", ticker=ticker, reason=reason,
+        received=len(raw) if isinstance(raw, list) else 0,
+        dropped=dict(dropped))
 
 
 class _CapturingRiskEventsValidator(InternalTokenValidator):
@@ -700,9 +824,78 @@ def _event_line(
         if parts else event["entity"])
 
 
+_RECORD_EVENTS_SHOWN_MAX = 8
+
+
+_CLOSED_LEGAL_STATUSES = frozenset({"settled", "dismissed", "judgment"})
+
+
+def _legal_records(rows: Sequence[Any], index: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    while (record := record_by_id(rows, f"F{index}.L{len(records) + 1}")):
+        records.append(record)
+    return records
+
+
+def _shown_legal_records(rows: Sequence[Any]) -> list[dict[str, Any]]:
+    by_filing = [_legal_records(rows, i) for i in range(1, len(rows) + 1)]
+    annual_date = next(
+        (records[0]["filing_date"]
+         for records in by_filing if records and records[0]["form"] == "10-K"),
+        "")
+    found: list[dict[str, Any]] = []
+    for record in (r for records in by_filing for r in records):
+        name = str(record.get("name") or "")
+        if (name and record["filing_date"] >= annual_date
+                and not any(_names_match(name, str(r["name"]))
+                            for r in found)):
+            found.append(record)
+    return found
+
+
+def _record_part(record: dict[str, Any]) -> str:
+    return (
+        f"{record['name']} (status {record['status']}"
+        + (f" as of {record['status_date']}"
+           if record.get("status_date") else "")
+        + f"; source: {record['form']} filed {record['filing_date']})")
+
+
+def _record_events_line(rows: Sequence[Any], prose: str = "") -> str:
+    records = sorted(
+        _shown_legal_records(rows),
+        key=lambda r: (
+            r.get("status") in _CLOSED_LEGAL_STATUSES,
+            not _text_names(prose, str(r["name"]))))
+    listed = records[:_RECORD_EVENTS_SHOWN_MAX]
+    open_parts = [
+        _record_part(r) for r in listed
+        if r.get("status") not in _CLOSED_LEGAL_STATUSES
+    ]
+    closed_parts = [
+        _record_part(r) for r in listed
+        if r.get("status") in _CLOSED_LEGAL_STATUSES
+    ]
+    more = len(records) - len(listed)
+    if more > 0:
+        (closed_parts or open_parts).append(
+            f"and {more} more legal matter(s) in those records")
+    line = (
+        "Named risk events (sourced): none confirmed by the risk agent this "
+        "run; taken from the filing records shown this run: "
+        + ("; ".join(open_parts) or "no open matter") + ".")
+    if closed_parts:
+        line += (
+            " Closed in those records (settled, dismissed or decided): "
+            + "; ".join(closed_parts) + ".")
+    return line
+
+
 def _risk_events_line(
         events: list[dict[str, str]], rows: Sequence[Any] = (),
-        shown: bool = False) -> str:
+        shown: bool = False, prose: str = "") -> str:
+    if not events and shown and _shown_legal_records(rows):
+        return _record_events_line(rows, prose)
     if not events:
         return (
             "Named risk events (sourced): none reported with a tool source "
@@ -721,7 +914,7 @@ class RiskAgent(BaseAgent):
         injected_context = combine_context(
             state.fresh_filing_context, kg_context)
         validator = _CapturingRiskEventsValidator(
-            records, extra_reference=injected_context or "")
+            records, extra_reference=state.fresh_filing_context or "")
         volatility_tool = GetVolatilityAndDrawdownTool(
             analysis_ticker=state.ticker)
         prior_notes_tool = SearchResearchArchiveTool(
@@ -790,16 +983,21 @@ class RiskAgent(BaseAgent):
                 feedback, state.procedural_hints.get(self.role),
                 state.fresh_filing_context, kg_context),
             prefetched_evidence=prefetched)
+        accepted = (
+            result.finish_meta is not None and not result.hit_iteration_cap)
         accepted_metrics = (
-            validator.last_reported_metrics if result.finish_meta is not None
-            and not result.hit_iteration_cap else None)
+            validator.last_reported_metrics if accepted else None)
         rows = records.rows or []
+        dropped: Counter[str] = Counter()
         sourced_events = _sourced_risk_events(
             accepted_metrics, result.scratchpad, rows=rows,
-            shown=records.shown)
-        summary = (
-            f"{result.final_answer}\n\n"
-            f"{_risk_events_line(sourced_events, rows, records.shown)}")
+            shown=records.shown, dropped=dropped)
+        if not sourced_events and _EMPTY_EVENTS_CHECK in validator.fired:
+            _log_empty_events_after_correction(
+                state.ticker, accepted, accepted_metrics, dropped)
+        events_line = _risk_events_line(
+            sourced_events, rows, records.shown, result.final_answer)
+        summary = f"{result.final_answer}\n\n{events_line}"
         verification_warnings: list[str] = []
         if result.unresolved_finish_validation_issue is not None:
             logger.warning(

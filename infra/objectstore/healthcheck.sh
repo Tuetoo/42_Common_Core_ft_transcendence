@@ -9,14 +9,13 @@
 # (-K -), never on its command line.
 #
 # Environment: S3_ACCESS_KEY, S3_SECRET_KEY (required), S3_REGION
-# (default us-east-1), OBJECTSTORE_S3_PORT (default 9000).
+# (default us-east-1). The S3 port is 9000.
 
 set -eu
 
 : "${S3_ACCESS_KEY:?S3_ACCESS_KEY is not set}"
 : "${S3_SECRET_KEY:?S3_SECRET_KEY is not set}"
 REGION="${S3_REGION:-us-east-1}"
-PORT="${OBJECTSTORE_S3_PORT:-9000}"
 
 # curl config-file string escaping (backslash and double quote).
 curl_escape() {
@@ -26,4 +25,4 @@ curl_escape() {
 printf 'user = "%s:%s"\n' "$(curl_escape "$S3_ACCESS_KEY")" "$(curl_escape "$S3_SECRET_KEY")" \
     | curl -K - -sS -f -o /dev/null --max-time 4 \
         --aws-sigv4 "aws:amz:${REGION}:s3" \
-        "http://127.0.0.1:${PORT}/"
+        "http://127.0.0.1:9000/"

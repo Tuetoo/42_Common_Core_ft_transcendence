@@ -5,7 +5,6 @@
   "scripts": {
     "dev": "cross-env NODE_EXTRA_CA_CERTS=../infra/gateway/certs/server.crt next dev",
     "build": "next build",
-    "start": "cross-env NODE_EXTRA_CA_CERTS=../infra/gateway/certs/server.crt next start",
     "lint": "eslint"
   },
   "dependencies": {
@@ -17,7 +16,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^24.19.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "cross-env": "^10.1.0",

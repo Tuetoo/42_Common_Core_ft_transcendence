@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 from datetime import date
 from typing import Any
 from uuid import UUID
@@ -18,6 +19,7 @@ from domains.analysis.schema import (AnalysisCreate, AnalysisDetailRead,
 from domains.analysis.service import AnalysisService
 from domains.market.repository import MAX_PRICE_LOOKBACK_DAYS
 from domains.market.schema import PriceBarRead
+from shared.deleted_users import sweep_steps
 from shared.enums import RecommendationAction, WorkflowStatus
 from shared.exceptions import NotFoundError
 from shared.market_calendar import is_trading_day, market_today
@@ -143,6 +145,16 @@ async def trigger_tier_monitoring() -> JSONResponse:
     failed = sum(int(counts.get(key, 0)) for key in _TIER_FAILED_OUTCOMES)
     return job_response(
         "tier-monitoring", counts, steps={"tiers": (units, failed)})
+
+
+@router.post("/scheduler/deleted-user-sweep")
+async def trigger_deleted_user_sweep() -> JSONResponse:
+    from user_cleanup import sweep_deleted_users
+
+    result = await sweep_deleted_users()
+    return job_response(
+        "deleted-user-sweep-ai", asdict(result),
+        steps=sweep_steps("users", result))
 
 
 @router.get("/stats")

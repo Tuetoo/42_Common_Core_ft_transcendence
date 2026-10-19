@@ -55,7 +55,7 @@ class PriceBarRepository:
     async def upsert_bar(
             self, instrument_id: UUID, *, interval: str, timestamp: datetime,
             open: Decimal, high: Decimal, low: Decimal, close: Decimal,
-            volume: float) -> PriceBar:
+            volume: float) -> None:
         values = {
             "instrument_id": instrument_id,
             "interval": interval,
@@ -78,10 +78,3 @@ class PriceBarRepository:
                 "fetched_at": values["fetched_at"]
             })
         await self.session.execute(stmt)
-        await self.session.flush()
-        result = await self.session.execute(
-            select(PriceBar).where(
-                PriceBar.instrument_id == instrument_id,
-                PriceBar.interval == interval,
-                PriceBar.timestamp == timestamp))
-        return result.scalar_one()

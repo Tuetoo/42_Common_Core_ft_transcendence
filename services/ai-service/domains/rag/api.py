@@ -6,9 +6,9 @@ from ai.rag.visibility import resolve_visibility_scope
 from deps import get_rag_user
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from domains.rag.qa import (RagAnswerUnavailableError, RagAskRateLimitedError,
-                            answer_question, check_rate_limit,
-                            retrieve_sources, stream_answer)
+from rate_limit import UserRateLimitedError
+from domains.rag.qa import (RagAnswerUnavailableError, answer_question,
+                            check_rate_limit, retrieve_sources, stream_answer)
 from domains.rag.schema import RagAnswer, RagAskRequest
 from shared.schemas import APIResponse
 from shared.security import CurrentUser
@@ -22,10 +22,8 @@ async def _prepare(payload: RagAskRequest, user: CurrentUser, *,
                    stream: bool) -> list[RetrievedChunk]:
     try:
         await check_rate_limit(str(user.user_id))
-    except RagAskRateLimitedError as exc:
-        raise HTTPException(
-            status_code=429, detail=str(exc),
-            headers={"Retry-After": str(exc.retry_after)}) from exc
+    except UserRateLimitedError as exc:
+        raise exc.http_error() from exc
     logger.info(
         "rag_ask.request", user_id=str(user.user_id), mode=payload.mode,
         question_length=len(payload.question), ticker=payload.ticker,

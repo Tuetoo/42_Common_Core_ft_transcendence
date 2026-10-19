@@ -126,6 +126,18 @@ def _amendment_listing(company: Any, *, full_history: bool) -> list[Any]:
     return list(listing or [])
 
 
+def filing_text(filing: Any) -> str:
+    try:
+        text = filing.sgml().text()
+    except Exception as exc:
+        logger.info(
+            "sec_edgar_filings.sgml_text_failed",
+            accession_no=str(getattr(filing, "accession_no", "")),
+            error=repr(exc))
+        text = None
+    return str(text) if text else str(filing.text())
+
+
 def _merged_amendment_text(
         company: Any, filing: Any, *, full_history: bool, ticker: str,
         filing_date: str) -> str | None:
@@ -140,16 +152,16 @@ def _merged_amendment_text(
         for amendment in amendment_filings:
             if str(amendment.period_of_report) != period_of_report:
                 continue
-            text = str(amendment.text())
+            text = filing_text(amendment)
             logger.info(
                 "sec_edgar_filings.real_amendment_found", ticker=ticker,
                 filing_date=filing_date,
                 amendment_filing_date=str(amendment.filing_date))
             return text
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "sec_edgar_filings.amendment_check_failed", ticker=ticker,
-            filing_date=filing_date)
+            filing_date=filing_date, error=repr(exc))
     return None
 
 
@@ -199,11 +211,12 @@ def _fetch_real_filings_sync(
                 continue
             filing = candidate_filings[filename]
             try:
-                raw_text = filing.text()
-            except Exception:
+                raw_text = filing_text(filing)
+            except Exception as exc:
                 logger.warning(
                     "sec_edgar_filings.filing_text_fetch_failed",
-                    ticker=ticker, form=form, filing_date=filing_date)
+                    ticker=ticker, form=form, filing_date=filing_date,
+                    error=repr(exc))
                 report_source_failure("sec_edgar")
                 continue
             if len(raw_text.split()) < 100:
@@ -255,7 +268,7 @@ def fetch_filing_text_sync(
         _merged_amendment_text(
             company, filing, full_history=older_pages_read > 0, ticker=ticker,
             filing_date=filing_date) if form == "10-K" else None)
-    return str(filing.text()), amendment_text, _period_of_report(filing)
+    return filing_text(filing), amendment_text, _period_of_report(filing)
 
 
 def _period_of_report(filing: Any) -> str | None:
@@ -290,8 +303,8 @@ async def list_new_filings(
     raw_results = sorted(raw_results, key=lambda r: (r[2], r[0]))
     new_filings: list[NewFiling] = []
     for row in raw_results:
-        filename, form, filing_date, raw_text, amendment_text = row[:5]
-        period_of_report = row[5] if len(row) > 5 else None
+        (filename, form, filing_date, raw_text, amendment_text,
+         period_of_report) = row
         if period_of_report is None:
             found = await filing_period(ticker, form, filing_date)
             period_of_report = found.report_date if found else None
@@ -332,7 +345,7 @@ async def list_new_filings(
                     raw_text, form=form, ticker=ticker,
                     filing_date=filing_date, amendment_text=amendment_text,
                     report_date=period_of_report,
-                    tier=LLMTier.HIGHEST_ACCURACY)
+                    tier=LLMTier(settings.FILING_LLM_TIER))
             except Exception as exc:
                 logger.warning(
                     "sec_edgar_filings.records_failed", ticker=ticker,

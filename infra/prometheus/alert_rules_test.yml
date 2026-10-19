@@ -130,13 +130,16 @@ tests:
               summary: "Analysis queue is backed up"
               description: "3 analyses are waiting in ai-service's serial queue and the queue is not draining."
 
-  # A daily job that stopped reporting, a trading-day job within its
-  # window, and a market-close that skipped portfolios. The series carry
+  # Daily jobs that stopped reporting (backup and one of the sweeps), a
+  # trading-day job within its window, and a market-close that skipped
+  # portfolios. The series carry
   # the labels a real scrape stores (job="core-service" from the scrape
   # job, the job name in scheduled_job).
   - interval: 1m
     input_series:
       - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="backup", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "0x1900"
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="deleted-user-sweep-ai", job="core-service", instance="core-service:8000", service="core-service"}'
         values: "0x1900"
       - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="market-close", job="core-service", instance="core-service:8000", service="core-service"}'
         values: "0x1900"
@@ -158,6 +161,15 @@ tests:
             exp_annotations:
               summary: "Scheduled job backup has not succeeded for over 26 hours"
               description: "The daily job backup last succeeded 1d 6h 0m 0s ago. Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time)."
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: deleted-user-sweep-ai
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job deleted-user-sweep-ai has not succeeded for over 26 hours"
+              description: "The daily job deleted-user-sweep-ai last succeeded 1d 6h 0m 0s ago. Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time)."
       - eval_time: 30h
         alertname: TradingDayJobStale
         exp_alerts: []
@@ -171,7 +183,7 @@ tests:
               instance: core-service:8000
             exp_annotations:
               summary: "The last market-close skipped 2 portfolio(s)"
-              description: "A holding had no close for the session, so no snapshot was written for 2 portfolio(s) (see the market_close_snapshot_skipped log lines). Fill the day later with scripts/recompute_snapshots.py --to <date>."
+              description: "A holding had no close for the session, so no snapshot was written for 2 portfolio(s) (see the market_close_snapshot_skipped log lines). Fill the day later with bash scripts/snapshots.sh --all --to <date> (then --confirm)."
 
   # Outbox backlog: fires only when unpublished events stay for 15 minutes.
   - interval: 1m

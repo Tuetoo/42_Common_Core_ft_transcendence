@@ -70,6 +70,13 @@ class CommentChange:
     state_changed: bool = True
 
 
+DOCUMENT_KEY_ROOT = "documents/"
+
+
+def document_key_prefix(owner_id: UUID) -> str:
+    return f"{DOCUMENT_KEY_ROOT}{owner_id}/"
+
+
 def can_moderate(user: CurrentUser) -> bool:
     return has_permission(user.role, Permission.CONTENT_MODERATE)
 
@@ -121,9 +128,7 @@ def _body_state(note_id: UUID, state: bytes | None, text: str) -> bytes:
 
 
 def _looks_stuck(document: Document) -> bool:
-    changed_at = document.status_changed_at or document.uploaded_at
-    if changed_at is None:
-        return True
+    changed_at = document.status_changed_at
     if changed_at.tzinfo is None:
         changed_at = changed_at.replace(tzinfo=UTC)
     return datetime.now(UTC) - changed_at > stuck_after(document.status)
@@ -173,9 +178,18 @@ class ResearchService:
             stuck = existing.status not in FINAL_DOCUMENT_STATUSES and (
                 _looks_stuck(existing))
             if stuck:
+                # Lock and re-read: a status update from ai-service or a
+                # parallel republish may have moved the row on meanwhile.
+                await self._db.refresh(existing, with_for_update=True)
+                stuck = existing.status not in FINAL_DOCUMENT_STATUSES and (
+                    _looks_stuck(existing))
+            if stuck:
                 logger.warning(
                     "document_upload_republished",
-                    document_id=str(existing.id))
+                    document_id=str(existing.id), status=existing.status)
+                existing.status = "uploaded"
+                existing.status_changed_at = datetime.now(UTC)
+                await self._db.flush()
                 await self._publish_uploaded(background_tasks, existing)
             if existing.status != "failed":
                 return UploadOutcome(
@@ -190,8 +204,7 @@ class ResearchService:
                 key=existing.storage_url, content=content,
                 content_type=content_type)
             existing.status = "uploaded"
-            existing.uploaded_at = datetime.now(UTC)
-            existing.status_changed_at = existing.uploaded_at
+            existing.status_changed_at = datetime.now(UTC)
             existing.content_date = content_date or existing.content_date
             existing.title = title or existing.title
             existing.source_url = source_url or existing.source_url
@@ -200,7 +213,8 @@ class ResearchService:
             return UploadOutcome(
                 DocumentRead.model_validate(existing), retried=True)
 
-        object_key = f"documents/{owner_id}/{uuid4().hex}{extension}"
+        object_key = (
+            f"{document_key_prefix(owner_id)}{uuid4().hex}{extension}")
         await upload_bytes(
             settings, bucket=settings.S3_BUCKET_DOCUMENTS, key=object_key,
             content=content, content_type=content_type)
@@ -241,8 +255,7 @@ class ResearchService:
                 "content_date": (
                     document.content_date.isoformat()
                     if document.content_date else None),
-                "filename": document.filename,
-                "is_system": document.owner_id == SYSTEM_DOCUMENT_OWNER_ID
+                "filename": document.filename
             })
         background_tasks.add_task(publish_now, [entry])
 

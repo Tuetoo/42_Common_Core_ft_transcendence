@@ -107,8 +107,8 @@ class DocumentRepository:
         await self._db.delete(document)
         await self._db.flush()
 
-    async def list_filenames(self, *, ticker: str | None,
-                             category: str) -> list[str]:
+    async def list_filenames(self, *, ticker: str | None, category: str,
+                             failed_retry_days: int) -> list[str]:
         ticker_condition = (
             Document.ticker.is_(None)
             if ticker is None else Document.ticker == ticker.upper())
@@ -116,16 +116,20 @@ class DocumentRepository:
         result = await self._db.execute(
             select(Document.filename).where(
                 ticker_condition, Document.category == category,
-                Document.status != DocumentStatus.FAILED,
                 or_(
                     Document.status == DocumentStatus.READY,
+                    and_(
+                        Document.status == DocumentStatus.FAILED,
+                        Document.uploaded_at
+                        < now - timedelta(days=failed_retry_days)),
                     and_(
                         Document.status == DocumentStatus.UPLOADED,
                         Document.status_changed_at
                         >= now - STUCK_DOCUMENT_AFTER),
                     and_(
                         Document.status.not_in([
-                            DocumentStatus.READY, DocumentStatus.UPLOADED
+                            DocumentStatus.READY, DocumentStatus.UPLOADED,
+                            DocumentStatus.FAILED
                         ]), Document.status_changed_at
                         >= now - STUCK_PROCESSING_AFTER))))
         return list(result.scalars().all())

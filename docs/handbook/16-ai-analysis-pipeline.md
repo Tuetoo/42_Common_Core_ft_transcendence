@@ -327,9 +327,10 @@ What a side receives:
   the key records and the year-to-date / year-ago unusual-item lists from
   the filing records (chapter 15, section 3.17). If some agents carry a
   verification warning, a first line "UNVERIFIED CLAIMS FLAGGED this run
-  by: ..." points at them. If every agent failed, the evidence is a single
-  "(every real research agent failed ...)" line, never nine failure
-  strings dressed up as evidence.
+  by: ..." points at them. The debate never starts when every agent
+  failed (`should_continue_to_debate` sends that state to Reflection, and
+  the run ends with `no_evidence`), so at least one agent in the evidence
+  did not fail.
 - The other side's latest completed argument from an earlier round
   (`DebateState.previous_round_argument`: the newest non-superseded one
   with a round number up to the current one, so a side still sees its
@@ -517,14 +518,16 @@ it or remove it; the second answer is accepted whatever it says, and a
 remaining problem is only logged. A failed or unusable rewrite keeps the
 first answer (chapter 15, section 3.18).
 
-Parsing rules: confidence is clamped to 0..1, an unknown leaning becomes
+Parsing rules: confidence is clamped to 0..1 (a non-number, `NaN` or
+`Infinity` becomes 0.0, never 1.0), an unknown leaning becomes
 HOLD, and `converged` counts only a real `true` or the string `"true"`
 (`_parse_converged`; a plain truthiness test would count the string
 `"false"` as true).
 
-The Judge is skipped (no LLM call) in two cases, each an explicit failed
-verdict: every agent failed (`failure_reason="no_evidence"`), or both
-latest sides are unavailable (`"debate_unavailable"`). An answer that is
+The Judge is skipped (no LLM call) when both latest sides are
+unavailable: an explicit failed verdict with `"debate_unavailable"`. It
+never runs when every agent failed (that state goes to Reflection and ends
+with `no_evidence`). An answer that is
 unreadable even after the JSON re-ask gives `judge_failed=True,
 retry_round=True`: the one Judge failure where another round may help. A non-English rationale is a failed Judge.
 The rationale is stored as written: a regex that removes debate-process
@@ -623,11 +626,18 @@ and the current (non-superseded) debate transcript and returns
 figure, claimed_period, evidence_quote, description}`, `kind` one of
 `unsupported`, `wrong_period`, `stale`, `not_engaged`, `inconsistent`).
 Each issue is routed to its `role` (a data agent, Bull or Bear). Code
-checks: the quote must be in the agent evidence (the debate transcript
-for `not_engaged`), otherwise the issue is dropped and logged
+checks: the quote must be in the agent evidence (for `not_engaged`, in
+the other side's arguments from rounds earlier than the criticised
+side's latest round; chapter 15), otherwise the issue is dropped and logged
 (`reflection.issue_quote_not_grounded`); an `unsupported` Bull/Bear issue
 whose figure *is* in the trusted evidence is dropped (a known false
-positive, `reflection.mechanical_false_positive_discarded`). Routing
+positive, `reflection.mechanical_false_positive_discarded`). This
+filter also drops some real reasoning errors built on a real figure (KO,
+BA, GOOGL on 2026-10-19). It stays: every dropped issue in three replayed
+batches had kind `unsupported`, so no structural field tells "figure not
+found" from "wrong reasoning", and keeping all of them would have added
+4 debate rounds and up to 5 penalties in one batch, with most of the
+re-admitted issues in another batch invalid (FIX_IMPL4). Routing
 reads only the structured `role`, never words in the text. A wrongly
 shaped answer is treated as "review did not run"; a single malformed
 issue is dropped on its own. Every issue (mechanical ones too) is kept as a
@@ -667,7 +677,11 @@ usable_agents=N/M` (`ReflectionVerdict.review_meta_line`).
 3. `_drop_no_progress_retries`: an agent whose current output already came
    from a retry with the same feedback is not retried again (a KO run once
    retried News three rounds for the same issue).
-4. `_rate_limit_gate_for_retry` (Google only) looks at the whole model
+4. A single-side Bull/Bear correction is allowed once per mutual round
+   (`correction_used_for_round`).
+   This cap is applied before the capacity gate, so a side retry that the
+   cap drops never waits for capacity or gets a capacity note.
+5. `_rate_limit_gate_for_retry` (Google only) looks at the whole model
    chain the retry would use (`router.tier_model_chain`: the CHEAP chain
    for data agents, the HIGHEST chain for Bull/Bear), not only the
    primary model:
@@ -684,8 +698,6 @@ usable_agents=N/M` (`ReflectionVerdict.review_meta_line`).
      at most 20 s (`_RATE_LIMIT_RETRY_BACKOFF_SECONDS`,
      `reflection_node.rate_limit_backoff`), and adds the note "retry
      delayed before dispatch (provider capacity)".
-5. A single-side Bull/Bear correction is allowed once per mutual round
-   (`correction_used_for_round`).
 6. A data-agent retry marks every earlier debate round as superseded
    (`superseded_through_round`); the next Bull/Bear round starts fresh.
 
@@ -703,16 +715,26 @@ would only lead to another Judge call against the same unavailable model.
 
 | Reason | When |
 |---|---|
-| `no_evidence` | no verdict and no agent output, or every agent failed; or the Judge was skipped for that |
+| `llm_credit_exhausted` | any of the reasons below, when an agent, a debate side or the Judge failed because the Anthropic API credit is used up (chapter 14, section 3.16) |
+| `no_evidence` | no verdict and no agent output, or every agent failed |
 | `insufficient_evidence` | no verdict and fewer usable agents than the minimum |
 | `debate_unavailable` | the Judge was skipped because both sides were unavailable |
 | `judge_unavailable` | the Judge call failed (provider error, unparseable at the cap, non-English), or no verdict for another reason |
+
+The `debate_unavailable` and `judge_unavailable` rows apply only when no
+valid verdict exists in this analysis. If a later Judge pass fails (a
+correction pass, a re-debate after a retry wave, round 2 or 3) after an
+earlier pass gave a valid verdict, the node keeps the newest valid verdict
+(`DebateState.latest_valid_verdict`), in the same spirit as "a retry wave
+that brought nothing keeps the verdict" (3.4). The confidence note then
+says "The last Judge pass failed (...), so this recommendation keeps the
+Judge's earlier valid verdict from round N."
 
 With a reason, the node sets `final_recommendation=None`. The workflow
 keeps the agent runs, debate and reflections for inspection, writes no
 recommendation, no tiers, no episodic memory, no procedural memory and no
 archive notes, and calls `mark_analysis_failed` with the reason. These
-four values are listed in `shared/enums.py::AnalysisFailureReason`
+five values are listed in `shared/enums.py::AnalysisFailureReason`
 together with the queue's own reasons (`timeout`, `cancelled`,
 `service_restart`, `worker_error`, `workflow_error`).
 
@@ -728,12 +750,24 @@ confidence and applies, in this order:
 | Step | Rule | Constant |
 |---|---|---|
 | 1 | debate did not converge: subtract 0.15 | `_UNCONVERGED_DEBATE_PENALTY` |
-| 2 | last Reflection round not verified: subtract 0.15 | `_UNVERIFIED_REFLECTION_PENALTY` |
+| 2 | last Reflection round not verified: no deduction; the note lists the open issues (below) | none |
 | 3a | usable-agent ratio below 0.5: cap at 0.3 | `_LOW_PARTICIPATION_CONFIDENCE_CAP` |
 | 3b | ratio from 0.5 to below 0.8: subtract 0.15 | `_PARTIAL_PARTICIPATION_PENALTY` |
 | 4 | BUY while the ticker is at or above `MAX_POSITION_WEIGHT_PCT` (50) of net value: action becomes HOLD | `engine.py` |
 | 5 | exactly one side's final argument unavailable: cap at 0.3, and `debate_converged` is reported as False | `_ONE_SIDE_UNAVAILABLE_CONFIDENCE_CAP` |
 | 6 | same action as the prior open recommendation, with fewer usable agents than the prior had: confidence may not exceed the prior's (final values on both sides: this cap is about what was issued) | reaffirmation cap |
+
+**Why an unverified Reflection costs no confidence.** Reflection's last
+pass runs after the Judge, so the Judge never saw the issues it raises,
+and the issue often sits on a side that the correction cap or the retry
+cap no longer lets answer. A flat 0.15 for that case was tried. Across five
+Claude batches it was applied 32 times. Only once did it rest on a real
+figure error that the Judge relied on, and even then it lowered a BUY for
+an error in the Bear's case. Whether it fired depended on the kind label
+Reflection chose (0 penalties in one batch, 5 in the next, on the same
+code). It also dropped BUYs below the tier minimum. The open issues stay
+visible in the note and in the stored reflections. A data agent that
+fails or is not well supported still counts through steps 3a/3b.
 
 The result is rounded to 2 decimals (without it 0.70 - 0.15 was served as
 0.5499999999999999). The Judge's own leaning and confidence are kept next
@@ -765,11 +799,52 @@ note starts with `AnalysisState.confidence_adjustment_note()`:
 - "Bull/Bear debate did not converge within the round cap; confidence
   reflects that.";
 - "Reflection could not fully verify the debate content ..." with causes
-  from `_classify_reflection_causes`; or an informational note when an
-  earlier round found issues that a later round verified.
+  from `_classify_reflection_causes`, ending "confidence is not reduced
+  for this.";
+  or an informational note when an earlier round found issues that a
+  later round verified.
 
 Then the engine appends the sentences of steps 4-6 (for example "BUY
 changed to HOLD: MSFT is already 52.3% of the portfolio's net value ...").
+
+Every step that lowers the confidence also adds a fixed sentence with the
+amount, after the state's notes, so the amounts add up to the difference
+between the Judge's confidence and the stored one:
+"Confidence lowered by 0.15 because the Bull/Bear debate did not
+converge.", "Confidence lowered by 0.15
+because only 7 of 9 selected agents produced usable evidence." (also for
+the 0.30 cap, with the actual amount); the one-side cap and the
+reaffirmation cap add "(lowered by D)" to their sentences. COST lost 0.30
+in two steps while the note named only one; now both appear. A step that
+does not lower the value adds nothing. Each sentence states its amount
+only, never an intermediate value.
+
+The note then ends with code-built sentences about the stored value
+(`_stored_confidence_sentence`): "Stored confidence is 0.27, against the
+Judge's 0.57, because of the code adjustments listed in this note." when
+the two differ, and, when the Judge was shown its own earlier confidence
+(before code adjustments) and the recommendation published then had a
+different value: "The Judge compared its confidence with its own earlier
+0.78 from <date>, before code adjustments; the recommendation published
+then had 0.63, and this one is stored at 0.74." The Judge's rationale is
+not changed. Why: NVDA's rationale said confidence was "a little lower
+than the 0.78" while the published value rose from 0.63 to 0.74; the
+comparison with the Judge's own figure is by design
+(`previous_verdict_line`), so the note now states both numbers.
+
+Last comes the backup-model sentence (`_backup_model_sentence`), only
+when at least one Bull, Bear, Judge or Reflection call of the analysis
+was answered by the provider's fallback model (`fallback_calls` on each
+`DebateArgument`, `JudgeVerdict` and `ReflectionVerdict`, counted by the
+router, chapter 14 section 3.10): "Backup model: 4 Bull, Bear, Judge or
+reflection call(s) in this analysis were answered by the provider's
+fallback model, not its primary model. The final Judge verdict was
+written by gemini-3.6-flash." (`JudgeVerdict.model` of the verdict the
+recommendation uses: the model that wrote its stored rationale, which is
+the rewrite's model when the figure rewrite was accepted). It changes no
+value. Why: in one Gemini
+batch 15 of 19 Judges ran on the fallback model and nothing told the
+reader.
 
 **`debate_converged`** on the saved recommendation is true only when the
 Judge converged, the final verdict is not a failure, and no side was
@@ -790,8 +865,9 @@ weight if every tier fills (SELL: shares sold of those held).
 **Order of checks for a BUY:**
 
 1. `confidence < MIN_BUY_TIER_CONFIDENCE` (0.5): no tiers, no lookups, no
-   LLM call; a `LowConfidenceNote`. (A Bull-only debate can give BUY
-   0.30, which would otherwise reserve real cash.)
+   LLM call; a plain note. (A Bull-only debate can give BUY 0.30, which
+   would otherwise reserve real cash.) The ticker's earlier unfilled BUY
+   tiers are then closed as superseded (below).
 2. Live price (from the market-data provider) and cash balance (from
    core-service). If either lookup fails, there are no tiers, and the
    note says which lookup failed.
@@ -853,7 +929,8 @@ and the fallback model:
 
 - prices and quantities are parsed as `Decimal` through `str()`, never
   float, so `164.23` stays exactly `164.23`;
-- tiers with a non-positive price or quantity are dropped;
+- tiers with a non-positive or non-finite (`NaN`, `Infinity`) price or
+  quantity are dropped; the other tiers of the answer are kept;
 - BUY tiers below the minimum size are dropped;
 - BUY total above the budget: if the excess is at most 0.5% of the budget
   (`_BUDGET_OVERSHOOT_TOLERANCE`), the last tier's quantity is trimmed
@@ -873,11 +950,21 @@ tier. Its tiers pass the same checks, and the note says "Entry/exit tiers
 were computed by the fallback model (...)". (Without it, one strong-model
 timeout would cost every tier.)
 
-**The three note types.** `KeepEarlierTiersNote` is a `str` subclass with
-two children, `BudgetBlockedNote` and `LowConfidenceNote`. When a BUY gets
-no tiers with one of these notes, the workflow *keeps* the ticker's earlier
-unfilled BUY tiers instead of closing them, and adds "Kept N earlier
-unfilled BUY tier(s) ...". N comes from
+**Keeping or closing earlier tiers.** `BudgetBlockedNote` is a `str`
+subclass. Only when a BUY gets no
+tiers purely for a budget reason (no budget left, budget below the minimum
+tier, or a proposal over budget) does the workflow *keep* the ticker's
+earlier unfilled BUY tiers, adding "Kept N earlier unfilled BUY tier(s)
+...". Every other BUY without tiers, including one whose confidence is
+below `MIN_BUY_TIER_CONFIDENCE`, goes through the normal invalidation
+path: the earlier unfilled BUY tiers are closed as `superseded` ("Closed
+N earlier unfilled BUY tier(s) of recommendation ... as superseded:
+replaced by a newer BUY recommendation."), with `tier.cancelled` events.
+Before this, KO's BUY at 0.45 kept three tiers sized at the earlier 0.62
+(17.9% of net value). A HOLD or SELL already closed them.
+Open BUY tiers of other tickers still reduce a new BUY's budget across
+analyses and batches (`committed_buy_cash`); that is intended: cash
+reserved by an open tier is not free. N comes from
 `RecommendationTierRepository.unfilled_buy_tier_count`, which counts only
 tiers whose recommendation's `window_expires_at` is still in the future
 and, for a pending tier of a system analysis, whose recommendation is
@@ -1057,9 +1144,9 @@ All settings are in `services/ai-service/config.py` (class
 | code: `CONFIDENCE_CHANGE_TO_EXPLAIN` (`judge.py`) | 0.05 | confidence move against the Judge's own earlier verdict that needs a stated change |
 | code: `_ONE_OFF_MATERIAL_PE_RATIO` (`judge.py`) | 1.10 | forward / trailing P/E needed for the valuation note |
 | code: `_DEBATE_SIDE_STAGGER_SECONDS` (`nodes.py`) | 0.5 | Bear starts this much later than Bull |
-| code: `FRESH_FILING_BUDGET_SECONDS` (`nodes.py`) | 600.0 | longest wait for the inline fresh-filing ingest in `supervisor_node` (3.2) |
+| code: `FRESH_FILING_BUDGET_SECONDS` (`nodes.py`) | 600.0 | longest wait for the inline fresh-filing ingest in `supervisor_node` (3.3) |
 | code: `_GRAPH_RECURSION_LIMIT` (`analysis_workflow.py`) | 100 | LangGraph recursion limit |
-| code: penalties/caps (`engine.py`) | 0.15 / 0.15 / 0.3 / 0.15 / 0.3 | see 3.12 |
+| code: penalties/caps (`engine.py`) | 0.15 / 0.3 / 0.15 / 0.3 | see 3.12 |
 | code: participation thresholds (`state.py`) | 0.5 / 0.8 | low / partial participation |
 | code: `_BUDGET_OVERSHOOT_TOLERANCE` (`position_sizing.py`) | 0.005 | BUY overshoot that is trimmed |
 | code: `_RATE_LIMIT_RETRY_BACKOFF_SECONDS` (`nodes.py`) | 20.0 | max wait before a gated retry |
@@ -1131,7 +1218,7 @@ Reason: the `delete-orphan` cascade can delete real tiers (3.16).
 
 | Symptom | What the system does | How to diagnose |
 |---|---|---|
-| analysis `failed`, `failure_reason=judge_unavailable` | no recommendation saved | `bash scripts/logs.sh ai-service grep judge_node` (look for `judge_node.delayed_retry`, `judge_node.failed`) |
+| analysis `failed`, `failure_reason=judge_unavailable` | no recommendation saved (no Judge pass of the analysis gave a valid verdict; otherwise the earlier verdict is kept, 3.11) | `bash scripts/logs.sh ai-service grep judge_node` (look for `judge_node.delayed_retry`, `judge_node.failed`) |
 | `failure_reason=insufficient_evidence` | Bull/Bear/Judge skipped | log `agent_join_node.insufficient_evidence_skipping_debate` (fields `usable_agents`, `minimum`) |
 | `failure_reason=debate_unavailable` | Judge skipped, both sides missing | `bull_node.failed`, `bear_node.failed`, `debate_join_node.side_repair_failed`, `judge_node.late_side_repair_failed` |
 | an extra debate round with "Judge response could not be parsed" | the Judge's JSON was unreadable twice | `judge.unparseable_response` (`parse_error`, `error_pos`, `error_context`, `raw_chars`), `judge.json_reask_failed` |
@@ -1304,12 +1391,14 @@ tier can only become a trade after the owner accepts it."
    retries, after 240 s of waiting, or at once when every chain model is
    out of its daily quota. The last failure gives `judge_failed`,
    `judge_unavailable`; the debate stops, Reflection skips its review,
-   retries are dropped, and the analysis fails with no recommendation.
+   and retries are dropped. If this was the first Judge pass, the
+   analysis fails with no recommendation; if an earlier pass gave a valid
+   verdict, that verdict is kept and the note says so (3.11).
 5. 0.85 - 0.15 (not converged) = 0.70; ratio 4/9 = 0.44 < 0.5, so it is
-   capped at 0.30 (an unverified Reflection would subtract another 0.15
-   before the cap, still ending at 0.30 or below).
-6. No tiers (`LowConfidenceNote`, below 0.5); no cash is reserved; the
-   earlier unfilled BUY tiers are kept and the note says so.
+   capped at 0.30 (an unverified Reflection adds a note, not a
+   deduction).
+6. No tiers (confidence below 0.5); no cash is reserved; the earlier
+   unfilled BUY tiers are closed as superseded and the note says so.
 7. A SELL without SELL tiers closes every unfilled BUY set of that ticker
    as `superseded` ("bearish view").
 8. Only the portfolio's owner (`ensure_portfolio_owner`); organization

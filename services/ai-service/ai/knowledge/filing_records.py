@@ -53,7 +53,7 @@ _AMOUNT_FIELDS = {("one_off_items", "amount_text"),
 _AMOUNTS_IN_QUOTE = {("one_off_items", "amount_text")}
 _UNIT_CHECK_FIELDS = _AMOUNT_FIELDS | {("guidance", "value_text")}
 _UNIT_REQUIRED_MIN = 10.0
-_OWN_PERIOD_MONTHS = {"10-Q": 3, "10-K": 12}
+OWN_PERIOD_MONTHS = {"10-Q": 3, "10-K": 12}
 _PERIOD_END_TOLERANCE_DAYS = 7
 QUOTE_MIN_CHARS = 25
 _QUOTE_PART_MIN_CHARS = 12
@@ -385,7 +385,7 @@ def _one_off_period_issue(
         end = date.fromisoformat(period_end)
     except ValueError:
         return "bad_period_end"
-    expected = _OWN_PERIOD_MONTHS.get(ctx.form or "")
+    expected = OWN_PERIOD_MONTHS.get(ctx.form or "")
     if expected is not None and months != expected:
         return "not_own_period"
     if (ctx.report_date is not None
@@ -397,7 +397,7 @@ def _one_off_period_issue(
 
 def _ended_before_own_period(
         record: dict[str, str | None], ctx: _Context) -> bool:
-    months = _OWN_PERIOD_MONTHS.get(ctx.form or "")
+    months = OWN_PERIOD_MONTHS.get(ctx.form or "")
     value = record.get("date")
     if (record.get("status") not in ("completed", "terminated")
             or months is None or ctx.report_date is None or not value):
@@ -580,14 +580,16 @@ def ordered_rows(rows: Sequence[FilingRecordRow]) -> list[FilingRecordRow]:
         rows, key=lambda r: (r.filing_date, r.filename), reverse=True)
 
 
-def _items(row: FilingRecordRow, category: str) -> list[dict[str, Any]]:
-    items = (row.records or {}).get(category)
+def record_items(records: dict[str, Any] | None,
+                 category: str) -> list[dict[str, Any]]:
+    items = (records or {}).get(category)
     return ([i for i in items
              if isinstance(i, dict)] if isinstance(items, list) else [])
 
 
 def legal_record_count(rows: Sequence[FilingRecordRow]) -> int:
-    return sum(len(_items(row, "legal_matters")) for row in rows)
+    return sum(
+        len(record_items(row.records, "legal_matters")) for row in rows)
 
 
 _QUOTE_SHOWN_CHARS = 200
@@ -685,7 +687,8 @@ def render_filing_records(rows: Sequence[FilingRecordRow]) -> str:
             f"{report} [{recency}]")
         count = 0
         for category, (letter, _) in CATEGORIES.items():
-            for number, item in enumerate(_items(row, category), start=1):
+            items = record_items(row.records, category)
+            for number, item in enumerate(items, start=1):
                 lines.append(
                     _record_line(f"F{index}.{letter}{number}", category, item))
                 count += 1
@@ -717,7 +720,7 @@ def record_by_id(rows: Sequence[FilingRecordRow],
     if category is None or not 1 <= filing_index <= len(ordered):
         return None
     row = ordered[filing_index - 1]
-    items = _items(row, category)
+    items = record_items(row.records, category)
     if not 1 <= number <= len(items):
         return None
     return {

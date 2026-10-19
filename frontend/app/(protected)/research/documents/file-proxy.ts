@@ -1,6 +1,6 @@
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, readApiError } from "@/app/lib/backend";
-import { UUID_RE } from "../limits";
+import { UUID_RE } from "@/app/lib/format";
 
 // Headers passed through from the backend file response.
 const PASS_THROUGH = ["content-type", "content-length", "content-security-policy"];

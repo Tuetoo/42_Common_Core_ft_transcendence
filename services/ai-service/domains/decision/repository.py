@@ -1,13 +1,24 @@
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 from uuid import UUID, uuid4
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from domains.analysis.model import Recommendation
 from domains.decision.model import (DecisionOutcome, DecisionReview,
                                     InvestmentDecision)
 from shared.database import count_query
 from shared.exceptions import NotFoundError
 from shared.schemas import PaginationParams
+
+
+class PendingDecision(NamedTuple):
+    id: UUID
+    ticker: str
+    created_at: datetime
+    user_id: UUID
+    action: str
+    analysis_id: UUID
 
 
 class InvestmentDecisionRepository:
@@ -62,19 +73,25 @@ class InvestmentDecisionRepository:
 
     async def list_pending_review(
             self, *, min_age_days: int, max_age_days: int,
-            limit: int = 200) -> list[InvestmentDecision]:
+            limit: int = 200) -> list[PendingDecision]:
         now = datetime.now(UTC)
         already_evaluated = select(DecisionOutcome.decision_id).where(
             DecisionOutcome.evaluation_days == min_age_days)
         stmt = (
-            select(InvestmentDecision).where(
+            select(
+                InvestmentDecision.id, InvestmentDecision.ticker,
+                InvestmentDecision.created_at, InvestmentDecision.user_id,
+                Recommendation.recommendation,
+                Recommendation.analysis_id).join(
+                    Recommendation, Recommendation.id ==
+                    InvestmentDecision.recommendation_id).where(
                 InvestmentDecision.created_at.between(
                     now - timedelta(days=max_age_days),
                     now - timedelta(days=min_age_days))).where(
                     InvestmentDecision.id.not_in(already_evaluated)).order_by(
                         InvestmentDecision.created_at).limit(limit))
         result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        return [PendingDecision(*row) for row in result.all()]
 
 
 class DecisionOutcomeRepository:

@@ -18,7 +18,13 @@ export function formatNumber(value: string | number | null | undefined, maxDecim
 // accept lower case too; the actions upper-case the value before sending.
 export const TICKER_PATTERN = "[A-Za-z0-9.\\-]{1,10}";
 export const TICKER_TITLE = "1-10 characters: letters, digits, '.' or '-' (for example BRK.B)";
-const TICKER_RE = /^[A-Z0-9.-]{1,10}$/;
+export const TICKER_RE = /^[A-Z0-9.-]{1,10}$/;
+
+// Database ids (UUIDs) in paths and form fields.
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// shared/enums.py SystemRole.
+export const SYSTEM_ROLES = ["guest", "user", "moderator", "admin"] as const;
 
 // Portfolio and watchlist names (domains/portfolio/schema.py).
 export const NAME_MAX_LENGTH = 128;

@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { getAccessToken } from "@/app/lib/session";
+import { getAccessToken, getUnreadTotal } from "@/app/lib/session";
 import { backendFetch } from "@/app/lib/backend";
 
 type Notification = { id: string };
@@ -41,13 +41,5 @@ export async function markAllNotificationsRead(): Promise<void> {
 // notifications sent while it was down never reached it. null: unknown.
 export async function getUnreadCount(): Promise<number | null> {
   const accessToken = await getAccessToken();
-  if (!accessToken) return null;
-  try {
-    const res = await backendFetch("/notifications?unread_only=true&page_size=1", accessToken, { cache: "no-store" });
-    if (!res.ok) return null;
-    const { total }: { total: number } = await res.json();
-    return total;
-  } catch {
-    return null;
-  }
+  return accessToken ? getUnreadTotal(accessToken) : null;
 }

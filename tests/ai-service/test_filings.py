@@ -42,13 +42,12 @@ _NO_RECORDS = {
 
 @pytest.fixture
 def fresh_sec_caches(monkeypatch):
-    sec_edgar._reset_caches_for_tests()
+    monkeypatch.setattr(sec_edgar, "_submissions_cache", {})
+    monkeypatch.setattr(sec_edgar, "_quarter_cache", {})
     monkeypatch.setattr(
         sec_edgar.settings, "SEC_EDGAR_USER_AGENT", "Test test@example.com")
     monkeypatch.setattr(
         sec_edgar.settings, "SEC_EDGAR_MAX_REQUESTS_PER_SECOND", 0.0)
-    yield
-    sec_edgar._reset_caches_for_tests()
 
 
 def _validated(data: Any, raw: str, **options: Any) -> dict[str, Any]:
@@ -99,6 +98,23 @@ class _FakeFiling:
         if self._raises_on_text:
             raise RuntimeError("simulated real filing-text fetch failure")
         return self._text_content
+
+
+class _SgmlFiling(_FakeFiling):
+
+    def __init__(
+            self, filing_date: date, sgml_text: str | None,
+            sgml_error: Exception | None = None) -> None:
+        super().__init__(
+            filing_date, f"<p>{_REAL_PROSE} via text</p>",
+            raises_on_text=True)
+        self._sgml_text = sgml_text
+        self._sgml_error = sgml_error
+
+    def sgml(self) -> SimpleNamespace:
+        if self._sgml_error is not None:
+            raise self._sgml_error
+        return SimpleNamespace(text=lambda: self._sgml_text)
 
 
 class _FakeCompany:
@@ -243,6 +259,67 @@ class TestListNewFilings:
                     "AMD_10-Q_2025-11-05.txt"
                 }
 
+    async def test_text_comes_from_the_sgml_and_failures_log_the_reason(
+            self, monkeypatch):
+        filing = _SgmlFiling(date(2026, 2, 4), f"{_REAL_PROSE} via sgml")
+        _patch_company(monkeypatch, {"10-K": [filing]})
+        result = await sec_edgar_filings.list_new_filings(
+            "AMD", already_ingested_filenames=set())
+        assert [r.text for r in result] == [
+            f"[summary of {len(_REAL_PROSE.split()) + 2} words for AMD 10-K]"
+        ]
+        assert filing.text_call_count == 0
+
+        cases = {
+            "empty-sgml": _SgmlFiling(date(2026, 2, 4), None),
+            "sgml-raises": _SgmlFiling(
+                date(2026, 2, 4), None, sgml_error=OSError("sgml 404"))
+        }
+        for case_id, filing in cases.items():
+            _patch_company(monkeypatch, {"10-K": [filing]})
+            with capture_logs() as logs:
+                result = await sec_edgar_filings.list_new_filings(
+                    "AMD", already_ingested_filenames=set())
+            assert result == [], case_id
+            assert filing.text_call_count == 1, case_id
+            failed = [
+                e for e in logs
+                if e["event"] == "sec_edgar_filings.filing_text_fetch_failed"
+            ]
+            assert failed[0]["error"] == repr(
+                RuntimeError("simulated real filing-text fetch failure")
+            ), case_id
+        assert any(
+            e["event"] == "sec_edgar_filings.sgml_text_failed"
+            and e["error"] == repr(OSError("sgml 404")) for e in logs)
+
+        fallback = _FakeFiling(date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>")
+        assert sec_edgar_filings.filing_text(fallback) == (
+            f"<p>{_REAL_PROSE}</p>")
+
+    async def test_a_failed_amendment_check_logs_the_reason(
+            self, monkeypatch):
+        original = _FakeFiling(
+            date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>",
+            period_of_report="2025-12-27")
+        amendment = _FakeFiling(
+            date(2026, 3, 1), "x", raises_on_text=True,
+            period_of_report="2025-12-27")
+        _patch_company(
+            monkeypatch, {
+                "10-K": [original],
+                "10-K/A": [amendment]
+            })
+        with capture_logs() as logs:
+            result = await sec_edgar_filings.list_new_filings(
+                "AMD", already_ingested_filenames=set())
+        assert len(result) == 1 and "+amendment" not in result[0].text
+        failed = [
+            e for e in logs
+            if e["event"] == "sec_edgar_filings.amendment_check_failed"
+        ]
+        assert failed[0]["error"].startswith("RuntimeError(")
+
     async def test_only_an_amendment_for_the_same_period_is_merged_in(
             self, monkeypatch):
         original = _FakeFiling(
@@ -327,8 +404,10 @@ class TestFilingIngestion:
         async def _summarize(raw, **kwargs):
             return filing_summary.FilingSummary("summary")
 
+        tiers: list[LLMTier] = []
+
         async def _extract(raw, **kwargs):
-            assert kwargs["tier"] == LLMTier.HIGHEST_ACCURACY
+            tiers.append(kwargs["tier"])
             raise ValueError("bad reply")
 
         async def _upload(*args, **kwargs):
@@ -346,6 +425,11 @@ class TestFilingIngestion:
             "KO", already_ingested_filenames=set())
         assert out[0].text == "summary" and out[0].records is None
         assert "sec_edgar_filings.records_failed" in capsys.readouterr().out
+        monkeypatch.setattr(
+            sec_edgar_filings.settings, "FILING_LLM_TIER", "cheap")
+        await sec_edgar_filings.list_new_filings(
+            "KO", already_ingested_filenames=set())
+        assert tiers == [LLMTier.HIGHEST_ACCURACY, LLMTier.CHEAP]
 
     @pytest.mark.usefixtures("fresh_sec_caches")
     async def test_ingestion_stores_records_after_the_document(
@@ -1138,7 +1222,7 @@ class TestSecEdgarLookups:
         assert old is not None and old.report_date == "2018-12-31"
         assert len(calls) == 2
 
-        sec_edgar._reset_caches_for_tests()
+        sec_edgar._submissions_cache.clear()
 
         def _not_found(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404)
@@ -1495,7 +1579,6 @@ class TestFilingRecords:
                       "use a table row only when no sentence states it",
                       "period header words"):
             assert words in prompt
-        assert not hasattr(frec, "RECORDS_PROMPT")
 
         for prompt in (filing_summary._10K_SYSTEM_PROMPT,
                        filing_summary._10Q_SYSTEM_PROMPT):
@@ -1856,6 +1939,7 @@ class TestFilingSummaries:
         )
         assert (out.text, out.truncated) == ("Full summary.", False)
         assert not hasattr(out, "records")
+        assert {c["tier"] for c in router.calls} == {LLMTier.HIGHEST_ACCURACY}
         assert [c["max_tokens"] for c in router.calls] == [12288, 16384]
         assert frec.RECORDS_MARKER not in (
             router.calls[0]["messages"][0].content)
@@ -1872,6 +1956,14 @@ class TestFilingSummaries:
         )
         assert (out.text, out.truncated) == ("Cut again", True)
         assert "filing_summary.output_truncated" in capsys.readouterr().out
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(filing_summary.settings, "FILING_LLM_TIER", "cheap")
+            cheap = _RecordingRouter([("Short.", "end_turn")])
+            await filing_summary.summarize_filing(
+                _CHARGES_RAW, form="10-Q", ticker="INTC",
+                filing_date="2026-07-24",
+                llm_router=cheap)  # type: ignore[arg-type]
+        assert cheap.calls[0]["tier"] == LLMTier.CHEAP
 
         records_reply = _records_reply({
             **{
@@ -2513,7 +2605,6 @@ class TestRegenerateSummariesScript:
         assert failed == 1
         assert f"FAILED {other}: RuntimeError: core down" in out
         assert f"stored {name}" in out
-        assert not hasattr(regen, "_prior")
 
 
 def _golden_chunk(chunk_id: str, category: str,

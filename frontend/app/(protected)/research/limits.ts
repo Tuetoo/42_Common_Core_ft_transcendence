@@ -3,8 +3,10 @@
 // Sources (the backend stays the source of truth):
 // - services/core-service/domains/research/schema.py (notes, tags, comments)
 // - services/core-service/config.py (document size, extensions, categories)
-// - shared/schemas.py (ticker pattern), shared/enums.py (document enums)
+// - shared/enums.py (document enums); the ticker rule is in app/lib/format.ts
 // - services/ai-service/domains/rag/schema.py (question length)
+
+import { TICKER_RE, TICKER_TITLE } from "@/app/lib/format";
 
 export const NOTE_TITLE_MAX = 256;
 export const NOTE_CONTENT_MAX = 200_000;
@@ -14,12 +16,6 @@ export const COMMENT_MAX = 10_000;
 export const QUESTION_MAX = 2000;
 export const DOCUMENT_TITLE_MAX = 256;
 export const SEARCH_TEXT_MAX = 200;
-
-// The backend upper-cases tickers itself, so lower case is accepted in
-// forms; the HTML pattern is case-insensitive on purpose.
-export const TICKER_RE = /^[A-Z0-9.\-]{1,10}$/;
-export const TICKER_HTML_PATTERN = "[A-Za-z0-9.\\-]{1,10}";
-export const TICKER_HINT = "1-10 characters: letters, digits, '.' or '-'";
 
 export const DOCUMENT_MAX_BYTES = 20 * 1024 * 1024;
 export const DOCUMENT_EXTENSIONS = [".pdf", ".txt", ".md"] as const;
@@ -41,8 +37,6 @@ export const DOCUMENT_CATEGORIES = [
 export const DOCUMENT_STATUSES = ["uploaded", "parsing", "chunking", "embedding", "ready", "failed"] as const;
 export const FINAL_DOCUMENT_STATUSES = ["ready", "failed"];
 
-export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -53,7 +47,7 @@ export function formatBytes(bytes: number): string {
 export function tickerError(raw: string): string | null {
   const ticker = raw.trim().toUpperCase();
   if (!ticker) return null;
-  return TICKER_RE.test(ticker) ? null : `Invalid ticker: use ${TICKER_HINT}.`;
+  return TICKER_RE.test(ticker) ? null : `Invalid ticker: use ${TICKER_TITLE}.`;
 }
 
 // Splits "a, b, c" into clean tags and checks the backend's limits.

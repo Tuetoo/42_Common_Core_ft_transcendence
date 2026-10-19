@@ -352,9 +352,14 @@ class TestNearDuplicateArchivalSupersede:
         self._patch_embed_texts(
             monkeypatch, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
+        async def _owners(analysis_ids):
+            return {analysis_id: None for analysis_id in analysis_ids}
+
+        monkeypatch.setattr(archival_module, "_analysis_owners", _owners)
+
         result = await archival_module._find_near_duplicate_of_recent_report(
             category=DocumentCategory.MACRO_RESEARCH,
-            content="Oil prices content", ticker=None)
+            content="Oil prices content", ticker=None, owner=None)
 
         assert result is None
 
@@ -718,7 +723,8 @@ class TestFilingFallbackNotPersisted:
         monkeypatch.setattr(
             sec_edgar_filings, "_fetch_real_filings_sync",
             lambda ticker, names: [(
-                "AMD_10-Q_2026-08-05.txt", "10-Q", "2026-08-05", "raw", None)])
+                "AMD_10-Q_2026-08-05.txt", "10-Q", "2026-08-05", "raw", None,
+                None)])
 
         async def _upload(*args, **kwargs):
             return None

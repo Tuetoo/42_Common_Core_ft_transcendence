@@ -691,12 +691,12 @@ accepted for this deployment.
 | `client_max_body_size` | `25m` | largest request body the gateway forwards | `nginx.conf` |
 | `resolver` | `127.0.0.11 valid=10s ipv6=off` | Docker DNS, 10 s cache | `nginx.conf` |
 | `limit_req_zone` | `rate=10r/s`, zone `auth_zone:10m`, key `$binary_remote_addr` | login API rate | `nginx.conf` |
-| `limit_req` (auth) | `burst=20 nodelay`, status 429 | burst allowance | `nginx.conf`, `location /api/v1/auth` |
+| `limit_req` (auth) | `burst=20 nodelay`, status 429 | burst allowance | `api_locations.conf`, `location /api/v1/auth` |
 | `limit_req_zone` (public) | `rate=5r/s`, zone `public_zone:10m`, key `$binary_remote_addr` | public API rate per client address | `nginx.conf` |
 | `limit_req` (public) | `burst=20 nodelay`, status 429 | burst allowance | `api_locations.conf`, `location /api/v1/public` |
 | `worker_processes` / `worker_connections` | `auto` / `1024` | one worker per CPU; connections per worker (client and upstream sides) | `nginx.conf` (top level) |
 | `proxy_read_timeout` `/ws` | `3600s` | an idle WebSocket closes after one hour without traffic | `nginx.conf` |
-| `proxy_read_timeout` `/api/v1/rag` | `180s` | long streamed answers | `nginx.conf` |
+| `proxy_read_timeout` `/api/v1/rag` | `180s` | long streamed answers | `api_locations.conf` |
 | `proxy_read_timeout` `/` (frontend) | `180s` | the streamed document answers through the frontend route | `nginx.conf` |
 | other proxied paths | nginx default (60 s read timeout) | | |
 | `ssl_protocols` | `TLSv1.2 TLSv1.3` | | `nginx.conf` |

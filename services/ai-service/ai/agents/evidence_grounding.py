@@ -18,9 +18,10 @@ def extract_reported_percentages(*texts: str | None) -> set[str]:
 
 def final_answer_has_unverifiable_percentages(
         final_answer: str, trusted: set[str]) -> list[str]:
+    trusted_values = {float(pct[:-1]) for pct in trusted}
     return [
         pct for pct in _PERCENTAGE_RE.findall(final_answer)
-        if pct not in trusted
+        if float(pct[:-1]) not in trusted_values
     ]
 
 

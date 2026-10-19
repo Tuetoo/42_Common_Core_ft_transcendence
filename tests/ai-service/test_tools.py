@@ -741,7 +741,7 @@ class TestNewsTools:
         assert observation_yield(text) == 0
 
     @pytest.mark.asyncio
-    async def test_unknown_ticker_is_cached_but_a_failure_is_not(
+    async def test_lookup_reads_the_daily_sec_map_on_every_call(
             self, monkeypatch):
         calls = {"n": 0}
 
@@ -749,7 +749,6 @@ class TestNewsTools:
             calls["n"] += 1
             return {"AAPL": "Apple Inc."}
 
-        monkeypatch.setattr(relevance_module, "_company_name_cache", {})
         monkeypatch.setattr(relevance_module, "load_ticker_to_title", _titles)
         monkeypatch.setattr(
             relevance_module.settings, "SEC_EDGAR_USER_AGENT",
@@ -757,8 +756,6 @@ class TestNewsTools:
 
         lookup = relevance_module.lookup_company_name
         assert await lookup("ZZZZ") is None
-        assert await lookup("ZZZZ") is None
-        assert await lookup("AAPL") == "Apple Inc."
         assert await lookup("AAPL") == "Apple Inc."
         assert calls["n"] == 2
 
@@ -768,7 +765,6 @@ class TestNewsTools:
             calls["n"] += 1
             raise ProviderRequestError("down")
 
-        monkeypatch.setattr(relevance_module, "_company_name_cache", {})
         monkeypatch.setattr(
             relevance_module, "load_ticker_to_title", _failing_titles)
 
@@ -945,6 +941,45 @@ class TestPortfolioTools:
         assert "%" not in scenario
 
     @pytest.mark.asyncio
+    async def test_composition_labels_both_weights_and_flags_the_cap(
+            self, monkeypatch):
+
+        async def _holdings(portfolio_id: str) -> list[dict[str, Any]]:
+            return [{
+                "ticker": "AAPL",
+                "quantity": 10,
+                "average_cost": 120.0
+            }, {
+                "ticker": "MSFT",
+                "quantity": 6,
+                "average_cost": 250.0
+            }]
+
+        cash = {"value": 250.0}
+
+        async def _cash(portfolio_id: str) -> float:
+            return cash["value"]
+
+        monkeypatch.setattr(
+            portfolio_tool_module, "get_portfolio_holdings", _holdings)
+        monkeypatch.setattr(
+            portfolio_tool_module, "get_portfolio_cash_balance", _cash)
+        composition = await GetPortfolioCompositionTool(
+            portfolio_id="p1", market_provider=_FakeMarketProvider()).run()
+        lines = composition.splitlines()
+        assert lines[1].endswith(
+            "weight_of_net_value=50.7% weight_of_holdings_value=54.5%")
+        assert lines[2].endswith(
+            "weight_of_net_value=42.3% weight_of_holdings_value=45.5%")
+        assert lines[-1] == (
+            "Single-holding cap: 50% of net value (holdings + cash). "
+            "Holdings above the cap: MSFT (50.7%).")
+        cash["value"] = 2000.0
+        composition = await GetPortfolioCompositionTool(
+            portfolio_id="p1", market_provider=_FakeMarketProvider()).run()
+        assert composition.endswith("Holdings above the cap: none.")
+
+    @pytest.mark.asyncio
     async def test_missing_live_price_marks_or_refuses_the_total(
             self, _portfolio_backend):
         market = _FlakyMarket(failing={"AMD"})
@@ -1069,6 +1104,11 @@ class TestIndicators:
         assert all("2026-09-01" not in line for line in lines)
         no_volume = [_bar(0, 1.0, 0), _bar(1, 2.0, 0)]
         assert describe_high_volume_sessions(no_volume, 2) == []
+        first = _bar(0, 191.0, 90e6).model_copy(update={"open": 180.0})
+        lines = describe_high_volume_sessions([first, *bars[1:]], shown=5)
+        assert lines[1] == (
+            "- 2026-09-01: volume 90,000,000, up day (+6.11%, no earlier "
+            "session in the data; from this session's open 180 -> 191)")
 
     @pytest.mark.asyncio
     async def test_technical_and_volatility_tool_observations(
@@ -1837,7 +1877,7 @@ class TestPositionSizing:
             assert "no lookup expected" in str(exc_info.value), case_id
 
     @pytest.mark.asyncio
-    async def test_low_confidence_buy_keeps_the_open_tiers(
+    async def test_low_confidence_buy_supersedes_the_open_tiers(
             self, workflow_env, rows, monkeypatch):
         from database import SessionLocal
         from sqlalchemy import select
@@ -1869,7 +1909,7 @@ class TestPositionSizing:
         await wf.run_analysis_workflow(
             str(analysis_id), analysis_type=AnalysisType.FULL)
 
-        assert await rows.tier_statuses(old_rec) == [_P]
+        assert await rows.tier_statuses(old_rec) == ["superseded"]
         async with SessionLocal() as s:
             new = (
                 await s.execute(
@@ -1878,11 +1918,11 @@ class TestPositionSizing:
                 )).scalar_one()
         assert "below the minimum of 0.50 for BUY tiers" in (
             new.tier_generation_note)
+        assert "Kept 1 earlier" not in new.tier_generation_note
         assert (
-            "Kept 1 earlier unfilled BUY tier(s) for UNH (not superseded): "
-            "this BUY produced no tiers because its confidence is below the "
-            "minimum for tiers.") in new.tier_generation_note
-        assert "tier.cancelled" not in [n for n, _ in events]
+            f"Closed 1 earlier unfilled BUY tier(s) of recommendation "
+            f"{old_rec}") in new.tier_generation_note
+        assert "tier.cancelled" in [n for n, _ in events]
 
     def test_tier_sizing_note_for_buy_and_sell(self):
         note = tier_sizing_note(
@@ -1912,7 +1952,8 @@ class TestServiceScripts:
     def test_script_layout_and_parent_walks(self, tmp_path):
         for name in ("probe_model_latency.py", "measure_rag_recall.py",
                      "verify_portfolio_backtest.py",
-                     "generate_rag_golden_set.py"):
+                     "generate_rag_golden_set.py",
+                     "probe_anthropic_schemas.py"):
             flat = tmp_path / name / "app" / "scripts"
             flat.mkdir(parents=True)
             shutil.copy(_SCRIPTS / name, flat / name)
@@ -1935,6 +1976,28 @@ class TestServiceScripts:
                 and "if len(" not in line
             ]
             assert not unguarded, name
+
+    @pytest.mark.asyncio
+    async def test_schema_probe_builds_every_agents_step_schema(self):
+        from ai.llm.anthropic_provider import (anthropic_output_schema,
+                                               reduced_output_schema)
+
+        probe = importlib.import_module("scripts.probe_anthropic_schemas")
+        schemas = await probe.step_schemas()
+        assert set(schemas) == {
+            "market", "news", "sentiment", "filing", "technical",
+            "fundamental", "risk", "macro", "portfolio"
+        }
+        for role, schema in schemas.items():
+            full = anthropic_output_schema(schema)
+            assert full is not None, role
+            reduced = reduced_output_schema(full)
+            assert reduced["properties"]["reported_metrics"] == (
+                full["properties"]["reported_metrics"]), role
+            arms = reduced["properties"]["action_input"]["anyOf"]
+            assert [a["type"] for a in arms] == ["object", "null"], role
+        technical = schemas["technical"]["properties"]
+        assert "macd_trend" in str(technical["reported_metrics"])
 
     @pytest.mark.asyncio
     async def test_latency_probe_records_time_or_cap_with_judge_prompt(

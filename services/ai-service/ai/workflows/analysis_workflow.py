@@ -11,7 +11,6 @@ from ai.knowledge.recycled_content import recycled_share
 from ai.memory.agent_memory import (maybe_remember_trajectory, owner_uuid,
                                     stored_judge_verdict)
 from ai.recommendation.position_sizing import (BudgetBlockedNote,
-                                               KeepEarlierTiersNote,
                                                current_position_weight_pct,
                                                generate_position_sizing,
                                                tier_side_for_action)
@@ -111,17 +110,15 @@ async def _resolve_prior_recommendation(
         action = RecommendationAction(prior.recommendation)
     except ValueError:
         return None
-    well = _count_usable_persisted_runs(runs)
-    total = len(runs)
     judge_leaning, judge_confidence = stored_judge_verdict(
         prior.judge_leaning, prior.judge_confidence)
     return PriorRecommendation(
-        recommendation_id=str(prior.id), analysis_id=str(prior.analysis_id),
-        action=action, confidence=float(prior.confidence),
-        issued_at=prior.created_at, accepted=prior.accepted_at is not None,
-        well_supported_count=well if total else None, agent_count=total
-        or None, judge_leaning=judge_leaning,
-        judge_confidence=judge_confidence)
+        analysis_id=str(prior.analysis_id), action=action,
+        confidence=float(prior.confidence), issued_at=prior.created_at,
+        accepted=prior.accepted_at is not None,
+        well_supported_count=(
+            _count_usable_persisted_runs(runs) if runs else None),
+        judge_leaning=judge_leaning, judge_confidence=judge_confidence)
 
 
 def _count_usable_persisted_runs(
@@ -245,10 +242,10 @@ async def _run_and_persist(
         state, config={"recursion_limit": _GRAPH_RECURSION_LIMIT})
 
     final_rec: dict[str, Any] | None = result["final_recommendation"]
-    no_verdict: str | None = result.get("no_verdict_reason")
+    no_verdict: str = (
+        result.get("no_verdict_reason")
+        or AnalysisFailureReason.JUDGE_UNAVAILABLE.value)
     superseded: list[TierInvalidation] = []
-    if final_rec is None and no_verdict is None:
-        no_verdict = "judge_unavailable"
     recommendation = None
 
     async with SessionLocal() as session:
@@ -388,8 +385,7 @@ async def _run_and_persist(
             learning_pending = True
 
     if final_rec is None:
-        await mark_analysis_failed(
-            analysis_uuid, no_verdict or "judge_unavailable")
+        await mark_analysis_failed(analysis_uuid, no_verdict)
         return
 
     try:
@@ -427,7 +423,7 @@ async def _save_recommendation_and_tiers(
         closed_out: list[TierInvalidation] | None = None) -> Recommendation:
     action = RecommendationAction(final_rec["action"])
     sizing = None
-    keep_note: KeepEarlierTiersNote | None = None
+    keep_note: BudgetBlockedNote | None = None
     notes: list[str] = []
     tier_repo = RecommendationTierRepository(session)
     portfolio_uuid = UUID(portfolio_id) if portfolio_id else None
@@ -451,7 +447,7 @@ async def _save_recommendation_and_tiers(
                     ", ".join(dict.fromkeys(
                         h.public_label() for h in holders)) + ".")
             if (action == RecommendationAction.BUY and sizing is None
-                    and isinstance(sizing_note, KeepEarlierTiersNote)):
+                    and isinstance(sizing_note, BudgetBlockedNote)):
                 keep_note = sizing_note
         except Exception:
             logger.exception(

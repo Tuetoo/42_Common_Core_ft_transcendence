@@ -226,13 +226,8 @@ def relink_consent_items(
     return out
 
 
-_company_name_cache: dict[str, str | None] = {}
-
-
 async def lookup_company_name(ticker: str) -> str | None:
     ticker = ticker.upper()
-    if ticker in _company_name_cache:
-        return _company_name_cache[ticker]
     if not settings.SEC_EDGAR_USER_AGENT:
         logger.info(
             "news_relevance.company_name_lookup_skipped", ticker=ticker,
@@ -245,9 +240,7 @@ async def lookup_company_name(ticker: str) -> str | None:
             "news_relevance.company_name_lookup_failed", ticker=ticker,
             error=str(exc))
         return None
-    name = titles.get(ticker) or None
-    _company_name_cache[ticker] = name
-    return name
+    return titles.get(ticker) or None
 
 
 async def lookup_search_name(ticker: str) -> str | None:

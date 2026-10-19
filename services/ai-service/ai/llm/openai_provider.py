@@ -1,7 +1,11 @@
 from collections.abc import AsyncIterator
 from typing import Any, cast
-from ai.llm.base import (LLMConfigError, LLMMessage, LLMProviderAdapter,
-                         LLMRequestError, LLMResponse, LLMUsage)
+import openai
+from ai.llm.base import (LLMConfigError, LLMCreditExhaustedError, LLMError,
+                         LLMInvalidRequestError, LLMMessage,
+                         LLMProviderAdapter, LLMProviderTimeoutError,
+                         LLMRateLimitError, LLMRequestError, LLMResponse,
+                         LLMServerOverloadedError, LLMUsage)
 from config import settings
 from openai import NOT_GIVEN, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -17,6 +21,35 @@ def _get_client() -> AsyncOpenAI:
             raise LLMConfigError("OPENAI_API_KEY is not configured")
         _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     return _client
+
+
+_RATE_LIMIT_CODE = 429
+_QUOTA_ERROR_CODE = "insufficient_quota"
+
+
+def _mapped_error(exc: Exception, *, model: str, action: str) -> LLMError:
+    if isinstance(exc, LLMError):
+        return exc
+    if isinstance(exc, openai.APITimeoutError):
+        return LLMProviderTimeoutError(
+            f"OpenAI {action} for model {model!r} timed out")
+    detail = (
+        f"OpenAI {action} failed for model {model!r}: "
+        f"{type(exc).__name__}: {str(exc)[:200]}")
+    if isinstance(exc, openai.APIStatusError):
+        code = exc.status_code
+        if code == _RATE_LIMIT_CODE and exc.code == _QUOTA_ERROR_CODE:
+            return LLMCreditExhaustedError(
+                "The OpenAI API quota is used up (insufficient_quota); no "
+                f"call to {model!r} can succeed until credit is added or "
+                "LLM_DEFAULT_PROVIDER is switched.")
+        if code == _RATE_LIMIT_CODE:
+            return LLMRateLimitError(detail, requests_sent=1)
+        if code >= 500:
+            return LLMServerOverloadedError(detail, requests_sent=1)
+        if code >= 400:
+            return LLMInvalidRequestError(detail)
+    return LLMRequestError(detail)
 
 
 def _to_openai_messages(
@@ -52,8 +85,8 @@ class OpenAIAdapter(LLMProviderAdapter):
                     temperature=temperature, max_tokens=max_tokens,
                     timeout=timeout)
         except Exception as exc:
-            raise LLMRequestError(
-                f"OpenAI completion failed for model {model!r}") from exc
+            raise _mapped_error(
+                exc, model=model, action="completion") from exc
 
         choice = resp.choices[0]
         return LLMResponse(
@@ -79,5 +112,5 @@ class OpenAIAdapter(LLMProviderAdapter):
                 if delta:
                     yield delta
         except Exception as exc:
-            raise LLMRequestError(
-                f"OpenAI streaming failed for model {model!r}") from exc
+            raise _mapped_error(
+                exc, model=model, action="streaming") from exc

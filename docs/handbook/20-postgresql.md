@@ -97,7 +97,6 @@ official image runs files in that folder **only once**, when the data
 volume (`postgres_data`) is empty. The file is short:
 
 ```
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE SCHEMA IF NOT EXISTS auth;
 CREATE SCHEMA IF NOT EXISTS core;
 CREATE SCHEMA IF NOT EXISTS ai;
@@ -578,7 +577,7 @@ This is a short map. The full column lists are in `../ERD.md`.
 | Decisions | `investment_decisions`, `decision_outcomes`, `decision_reviews` |
 | Backtests | `backtests`, `backtest_metrics`, `benchmarks`, `benchmark_results` |
 | Analytics | `recommendation_metrics`, `agent_metrics` |
-| Market data cache | `instruments`, `price_bars` |
+| Market data cache | `instruments` (one row per ticker, the parent of its bars; `name`, `sector` and `exchange` are no longer filled and nothing reads them), `price_bars` (upserted with `ON CONFLICT (instrument_id, interval, timestamp) DO UPDATE`) |
 | Filings | `filing_records`: one row per SEC filing document (`ticker`, `filename` unique, `form`, `filing_date`, `report_date`, `records` JSONB with the structured records of the filing, `created_at`); index `ix_filing_records_ticker_filing_date`. Keyed by filename, not by document id, so a document delete does not remove it; ingesting the same filing again overwrites it (upsert by `filename`). Rebuildable with `scripts/backfill_filing_records.py` (chapter 18) |
 
 How an analysis is stored: one `analyses` row (ticker, status,
@@ -671,7 +670,8 @@ reachable.
    and records the three revisions in `manifest.json`
    (`postgres.alembic_versions`). A restore can then tell which code
    version the data belongs to.
-4. Qdrant snapshots, the object storage tarball and avatars follow (see
+4. Qdrant snapshots, a copy of every object in object storage (through
+   its S3 API) and the avatars tarball follow (see
    [21-qdrant.md](21-qdrant.md) and
    [22-object-storage.md](22-object-storage.md)), then `SHA256SUMS` and
    `manifest.json`.
@@ -775,7 +775,10 @@ with a dump and restore.
 Alternative: real foreign keys. Reason: keeps services independent
 (separate migrations, separate restores). The consistency that foreign
 keys would give is provided by events (`portfolio.deleted`,
-`document.deleted`) instead. The rule is written in `../ERD.md`; a new
+`document.deleted`, `user.deleted`, `organization.deleted`) instead, and
+for deleted accounts and organizations also by the nightly sweeps in
+core and ai ([26-scheduler-jobs.md](26-scheduler-jobs.md)), which repair
+a lost event. The rule is written in `../ERD.md`; a new
 model must not declare a foreign key into another service's schema.
 
 **`search_path` through asyncpg `server_settings`.**
@@ -898,9 +901,9 @@ stack up.
    service last started. If there is no log file for that day, the script
    stops with "no log file".
 
-5. **Show a portfolio with its holdings and transactions.** The scripts
-   use the development portfolio `d72855ea-2776-41c3-bc77-ce1a4c1435d5`
-   by default (`scripts/lib.sh`); use your own id if it differs.
+5. **Show a portfolio with its holdings and transactions.** The queries
+   use the example portfolio id `d72855ea-2776-41c3-bc77-ce1a4c1435d5`;
+   use your own (`PORTFOLIO_ID`, chapter 02, section 3.2 step 7).
    ```
    bash scripts/psql.sh -c "SELECT id, name, currency, owner_id, auto_analyze_at_open FROM core.portfolios ORDER BY created_at LIMIT 5;"
    bash scripts/psql.sh -c "SELECT ticker, quantity, average_cost FROM core.holdings WHERE portfolio_id = 'd72855ea-2776-41c3-bc77-ce1a4c1435d5' ORDER BY ticker;"
@@ -1032,7 +1035,7 @@ rejects the second insert.
 
 | File | What it holds |
 |---|---|
-| `infra/postgres/init-schemas.sql` | first-start script: `pgcrypto`, schemas `auth`, `core`, `ai` |
+| `infra/postgres/init-schemas.sql` | first-start script: schemas `auth`, `core`, `ai` (`gen_random_uuid()` is built into PostgreSQL 13+, so no extension) |
 | `docker-compose.yaml` (`postgres`, `postgres-exporter`, `adminer`) | image, volume, healthcheck, exporter, Adminer profile |
 | `shared/config.py` | `POSTGRES_*`, `DB_*` settings, URL assembly |
 | `shared/database.py` | `Base` + naming convention, `UUIDPKMixin`, `TimestampColumnsMixin`, engine factory (`search_path`), session factory, `make_get_db`, `count_query`, `check_database_connection`, `bootstrap_schema` |

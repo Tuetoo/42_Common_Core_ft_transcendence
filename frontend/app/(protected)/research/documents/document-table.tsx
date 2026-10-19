@@ -8,6 +8,10 @@ import { FINAL_DOCUMENT_STATUSES } from "../limits";
 import type { ResearchDocument } from "../types";
 
 const REFRESH_WHILE_PROCESSING_MS = 5000;
+// Stop when no listed status has moved for this long: the document is
+// stuck (core-service STUCK_PROCESSING_AFTER, 60 minutes), and polling
+// would never end. Reloading the page starts it again.
+const STOP_POLLING_AFTER_MS = 60 * 60 * 1000;
 
 function statusClass(status: string): string {
   if (status === "ready") return "pill pill-up";
@@ -23,12 +27,21 @@ export function DocumentTable({ documents, meId }: { documents: ResearchDocument
   // Indexing runs in the background (uploaded -> parsing -> chunking ->
   // embedding -> ready/failed). While any listed document is still on its
   // way, reload the server data now and then so the status pills move.
-  const processing = documents.some((d) => !FINAL_DOCUMENT_STATUSES.includes(d.status));
+  // The key changes whenever a pending document moves on, which restarts
+  // the stop clock.
+  const pendingKey = documents
+    .filter((d) => !FINAL_DOCUMENT_STATUSES.includes(d.status))
+    .map((d) => `${d.id}:${d.status}`)
+    .join(",");
   useEffect(() => {
-    if (!processing) return;
-    const timer = setInterval(() => router.refresh(), REFRESH_WHILE_PROCESSING_MS);
+    if (!pendingKey) return;
+    const since = Date.now();
+    const timer = setInterval(() => {
+      if (Date.now() - since > STOP_POLLING_AFTER_MS) clearInterval(timer);
+      else router.refresh();
+    }, REFRESH_WHILE_PROCESSING_MS);
     return () => clearInterval(timer);
-  }, [processing, router]);
+  }, [pendingKey, router]);
 
   return (
     <div className="flex flex-col gap-4">

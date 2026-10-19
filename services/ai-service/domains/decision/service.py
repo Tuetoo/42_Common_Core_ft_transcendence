@@ -245,12 +245,8 @@ class DecisionService:
                 "cannot generate a review until "
                 "ai/workflows/review_workflow.py "
                 "has scored it")
-        recommendation = await self.session.get(
+        recommendation = await self.session.get_one(
             Recommendation, decision.recommendation_id)
-        if recommendation is None:
-            raise NotFoundError(
-                f"Recommendation {decision.recommendation_id} referenced by "
-                f"decision {decision_id} no longer exists")
 
         router = llm_router or LLMRouter()
         prompt = self._build_review_prompt(decision, recommendation, outcome)

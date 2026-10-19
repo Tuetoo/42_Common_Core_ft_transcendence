@@ -1230,6 +1230,25 @@ class TestReadAccess:
                      str(decision.user_id))] * 2
 
     @pytest.mark.asyncio
+    async def test_review_generation_is_rate_limited_per_user(
+            self, client, db_session, monkeypatch, ai_events_published):
+        import domains.decision.service as decision_service
+        from config import settings
+
+        monkeypatch.setattr(settings, "DECISION_REVIEW_RATE_LIMIT_PER_DAY", 1)
+        router = _ScriptedReviewRouter(
+            json.dumps({"review_text": "review", "lessons_learned": None}))
+        monkeypatch.setattr(decision_service, "LLMRouter", lambda: router)
+        decision = await _make_decision_with_outcome(db_session)
+        url = f"/api/v1/decisions/{decision.id}/review"
+        headers = _headers(decision.user_id)
+        assert (await client.post(url, headers=headers)).status_code == 201
+        limited = await client.post(url, headers=headers)
+        assert limited.status_code == 429
+        assert int(limited.headers["Retry-After"]) >= 1
+        assert len(ai_events_published) == 1
+
+    @pytest.mark.asyncio
     async def test_member_cannot_decide_on_a_shared_system_analysis(
             self, client, db_session, monkeypatch):
         import clients.auth_client as auth_client
@@ -2239,14 +2258,6 @@ class TestCoreClient:
             assert not isinstance(
                 upstream.value, TransactionRejectedError), case_id
 
-        expected = (
-            "Core-service refused a transaction for a business reason (4xx "
-            "other than 408/429: insufficient cash, not enough shares held, "
-            "409 conflict, unknown portfolio). Retrying the same order the "
-            "next day will not change the answer, unlike a 5xx/timeout.")
-        assert "default_message" in vars(TransactionRejectedError)
-        assert TransactionRejectedError.default_message == expected
-
     @pytest.mark.asyncio
     async def test_get_helpers_and_cache_failure(self, monkeypatch):
         import clients.core_client as core_client
@@ -2409,6 +2420,284 @@ class TestEvents:
 
         await wf.publish_backtest_finished(uuid4(), completed=True)
         assert ai_events_published == []
+
+
+async def _seed_user_ai_rows(user_id):
+    from database import SessionLocal
+    from domains.analysis.model import (Agent, AgentResult, AgentRun, Analysis,
+                                        DebateArgument, DebateSession,
+                                        Recommendation, RecommendationTier,
+                                        Reflection)
+    from domains.analytics.model import RecommendationMetric
+    from domains.backtest.model import Backtest, BacktestMetrics
+    from domains.decision.model import (DecisionOutcome, DecisionReview,
+                                        InvestmentDecision)
+    from domains.knowledge.model import AgentReport, KgEntity, KgRelation
+    from domains.memory.model import AgentMemory, EpisodicMemory
+
+    async with SessionLocal() as session:
+        agent = Agent(name=f"cleanup-{uuid4().hex[:8]}")
+        entity = KgEntity(
+            name=f"E{uuid4().hex[:6]}", normalized_name=uuid4().hex,
+            entity_type="company")
+        analysis = Analysis(
+            user_id=user_id, ticker="DEL", status="completed")
+        session.add_all([agent, entity, analysis])
+        await session.flush()
+        rec = Recommendation(
+            analysis_id=analysis.id, recommendation="buy", confidence=0.7,
+            reasoning="r", debate_converged=True)
+        run = AgentRun(analysis_id=analysis.id, agent_id=agent.id,
+                       status="completed")
+        debate = DebateSession(analysis_id=analysis.id)
+        report = AgentReport(
+            analysis_id=analysis.id, agent_role="news", ticker="DEL",
+            category="news", content="c")
+        backtest = Backtest(
+            user_id=user_id, strategy_name="s", benchmark_symbol="SPY",
+            start_date=date(2026, 9, 1), end_date=date(2026, 9, 10),
+            initial_capital=1000.0, status="completed")
+        session.add_all([rec, run, debate, report, backtest])
+        await session.flush()
+        decision = InvestmentDecision(
+            user_id=user_id, recommendation_id=rec.id, ticker="DEL",
+            action_taken="followed")
+        session.add_all([
+            decision,
+            RecommendationTier(
+                recommendation_id=rec.id, side="buy",
+                target_price=Decimal(1), quantity=Decimal(1)),
+            RecommendationMetric(recommendation_id=rec.id, accuracy_score=1),
+            Reflection(analysis_id=analysis.id, verified=True),
+            AgentResult(agent_run_id=run.id, score=0.5),
+            DebateArgument(
+                debate_session_id=debate.id, side="bull", content="a"),
+            KgRelation(
+                source_entity_id=entity.id, target_entity_id=entity.id,
+                relation_type="r", source_report_id=report.id),
+            EpisodicMemory(
+                user_id=user_id, analysis_id=analysis.id, ticker="DEL",
+                recommendation="buy", confidence=0.7, summary="s"),
+            AgentMemory(
+                agent_id=agent.id, user_id=user_id, score=1.0, content={}),
+            BacktestMetrics(backtest_id=backtest.id)
+        ])
+        await session.flush()
+        session.add_all([
+            DecisionOutcome(decision_id=decision.id, evaluation_days=7),
+            DecisionReview(decision_id=decision.id, review_text="t")
+        ])
+        await session.commit()
+        return {"report": report.id, "analysis": analysis.id}
+
+
+async def _seed_system_report():
+    from database import SessionLocal
+    from domains.analysis.model import Analysis
+    from domains.knowledge.model import AgentReport
+
+    async with SessionLocal() as session:
+        analysis = Analysis(user_id=None, ticker="SYS", status="completed")
+        session.add(analysis)
+        await session.flush()
+        report = AgentReport(
+            analysis_id=analysis.id, agent_role="news", ticker="SYS",
+            category="news", content="c")
+        session.add(report)
+        await session.commit()
+        return analysis.id, report.id
+
+
+async def _ai_rows_of(user_id):
+    from database import SessionLocal
+    from domains.analysis.model import Analysis
+    from domains.backtest.model import Backtest
+    from domains.decision.model import InvestmentDecision
+    from domains.knowledge.model import AgentReport
+    from domains.memory.model import AgentMemory, EpisodicMemory
+
+    analyses = select(Analysis.id).where(Analysis.user_id == user_id)
+    async with SessionLocal() as session:
+        counts = {}
+        for name, query in (
+                ("analyses", analyses),
+                ("reports", select(AgentReport.id).where(
+                    AgentReport.analysis_id.in_(analyses))),
+                ("decisions", select(InvestmentDecision.id).where(
+                    InvestmentDecision.user_id == user_id)),
+                ("backtests", select(Backtest.id).where(
+                    Backtest.user_id == user_id)),
+                ("episodic", select(EpisodicMemory.id).where(
+                    EpisodicMemory.user_id == user_id)),
+                ("procedural", select(AgentMemory.id).where(
+                    AgentMemory.user_id == user_id))):
+            counts[name] = len((await session.execute(query)).all())
+    return counts
+
+
+class TestUserDeletion:
+
+    @pytest.mark.asyncio
+    async def test_user_deleted_removes_only_that_users_ai_data(
+            self, _schema_ready, monkeypatch):
+        import ai.rag.indexing as indexing
+        import event_listener
+        import user_cleanup
+        from database import SessionLocal
+        from domains.analysis.model import Analysis
+        from domains.knowledge.model import AgentReport
+
+        removed_vectors: list[str] = []
+
+        async def _fake_delete_chunks(document_id):
+            removed_vectors.append(document_id)
+            return 1
+
+        monkeypatch.setattr(
+            indexing, "delete_document_chunks", _fake_delete_chunks)
+        subscriber = event_listener.build_durable_subscriber()
+        assert EventName.USER_DELETED in subscriber._handlers
+
+        gone, other = uuid4(), uuid4()
+        mine = await _seed_user_ai_rows(gone)
+        await _seed_user_ai_rows(other)
+        system_analysis, system_report = await _seed_system_report()
+        everything = dict.fromkeys(
+            ("analyses", "reports", "decisions", "backtests", "episodic",
+             "procedural"), 1)
+        try:
+            await event_listener._handle_user_deleted({"user_id": str(gone)})
+            assert await _ai_rows_of(gone) == dict.fromkeys(everything, 0)
+            assert await _ai_rows_of(other) == everything
+            assert removed_vectors == [str(mine["report"])]
+            async with SessionLocal() as session:
+                assert await session.get(AgentReport, system_report)
+
+            removed_vectors.clear()
+            assert await user_cleanup.delete_user_data(
+                gone, strict=True) == {
+                    "archived_reports": 0,
+                    "decisions": 0,
+                    "analyses": 0,
+                    "backtests": 0,
+                    "agent_memories": 0
+                }
+            await event_listener._handle_user_deleted({"user_id": "bad"})
+            assert removed_vectors == []
+        finally:
+            await user_cleanup.delete_user_data(other)
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(AgentReport).where(AgentReport.id == system_report))
+                await session.execute(
+                    delete(Analysis).where(Analysis.id == system_analysis))
+                await session.commit()
+
+    @pytest.mark.asyncio
+    async def test_handler_raises_on_a_failed_step_so_the_event_is_retried(
+            self, _schema_ready, monkeypatch):
+        import ai.rag.indexing as indexing
+        import event_listener
+        import user_cleanup
+
+        async def _no_vectors(document_id):
+            return 0
+
+        async def _broken(session, user_id):
+            raise RuntimeError("database hiccup")
+
+        monkeypatch.setattr(indexing, "delete_document_chunks", _no_vectors)
+        user = uuid4()
+        await _seed_user_ai_rows(user)
+        real_step = user_cleanup._delete_agent_memories
+        monkeypatch.setattr(user_cleanup, "_delete_agent_memories", _broken)
+        try:
+            with pytest.raises(RuntimeError, match="agent_memories"):
+                await event_listener._handle_user_deleted(
+                    {"user_id": str(user)})
+            rows = await _ai_rows_of(user)
+            assert rows["procedural"] == 1 and rows["analyses"] == 0
+        finally:
+            monkeypatch.setattr(
+                user_cleanup, "_delete_agent_memories", real_step)
+            assert await user_cleanup.delete_user_data(user, strict=True)
+
+    @pytest.mark.asyncio
+    async def test_sweep_lookup_error_deletes_nothing_and_fails(
+            self, client, monkeypatch):
+        import ai.rag.indexing as indexing
+        import shared.deleted_users as deleted_users
+        import user_cleanup
+
+        async def _auth_down(settings, user_ids):
+            raise httpx.ConnectError("auth down")
+
+        async def _no_vectors(document_id):
+            return 0
+
+        monkeypatch.setattr(indexing, "delete_document_chunks", _no_vectors)
+        monkeypatch.setattr(deleted_users, "deleted_user_ids", _auth_down)
+        user = uuid4()
+        await _seed_user_ai_rows(user)
+        try:
+            r = await client.post("/internal/scheduler/deleted-user-sweep")
+            assert r.status_code == 500
+            assert r.json()["all_units_failed"] == ["users_lookup"]
+            assert r.json()["lookup_failed"] is True
+            assert set((await _ai_rows_of(user)).values()) == {1}
+        finally:
+            await user_cleanup.delete_user_data(user, strict=True)
+
+    @pytest.mark.asyncio
+    async def test_sweep_cleans_deleted_users_and_survives_a_failure(
+            self, client, monkeypatch):
+        import ai.rag.indexing as indexing
+        import shared.deleted_users as deleted_users
+        import user_cleanup
+
+        async def _no_vectors(document_id):
+            return 0
+
+        monkeypatch.setattr(indexing, "delete_document_chunks", _no_vectors)
+        failing, deleted, live = uuid4(), uuid4(), uuid4()
+        for user in (failing, deleted, live):
+            await _seed_user_ai_rows(user)
+
+        asked: list[set[UUID]] = []
+
+        async def _deleted_ids(settings, user_ids):
+            asked.append(set(user_ids))
+            return set(user_ids) & {failing, deleted}
+
+        real_backtests = user_cleanup._delete_backtests
+
+        async def _backtests(session, user_id):
+            if user_id == failing:
+                raise RuntimeError("database hiccup")
+            return await real_backtests(session, user_id)
+
+        monkeypatch.setattr(deleted_users, "deleted_user_ids", _deleted_ids)
+        monkeypatch.setattr(user_cleanup, "_delete_backtests", _backtests)
+        url = "/internal/scheduler/deleted-user-sweep"
+        try:
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert (body["deleted"], body["cleaned"], body["failed"]) == (
+                2, 1, 1)
+            assert {failing, deleted, live} <= asked[0]
+            assert set((await _ai_rows_of(deleted)).values()) == {0}
+            assert (await _ai_rows_of(failing))["backtests"] == 1
+            assert (await _ai_rows_of(failing))["analyses"] == 0
+            assert set((await _ai_rows_of(live)).values()) == {1}
+
+            monkeypatch.setattr(
+                user_cleanup, "_delete_backtests", real_backtests)
+            r = await client.post(url)
+            assert r.status_code == 200 and r.json()["failed"] == 0
+            assert set((await _ai_rows_of(failing)).values()) == {0}
+        finally:
+            await user_cleanup.delete_user_data(live)
 
 
 class TestDurableEvents:

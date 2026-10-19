@@ -180,11 +180,19 @@ export default function PrivacyPolicyPage() {
         <li>its email address and username are replaced with anonymous values;</li>
         <li>its profile fields and profile picture are cleared;</li>
         <li>its Google or GitHub links are removed;</li>
-        <li>the account is deactivated and can no longer sign in.</li>
+        <li>the account is deactivated and can no longer sign in;</li>
+        <li>its sign-in sessions, the open invitations it sent and the invitations sent to it are deleted;</li>
+        <li>
+          its private content is deleted: documents, notes, portfolios that only it can see, watchlists, API keys and
+          notifications;
+        </li>
+        <li>all its AI data is deleted: analyses, recommendations, decisions, backtests and agent memories;</li>
+        <li>an organization it owned that has no other member is deleted with its content.</li>
       </ul>
       <p>
-        Content created earlier, such as portfolio records, stays in the system but is no longer linked to anyone
-        who can be identified.
+        Content shared with an organization (for example a shared document or portfolio) belongs to that
+        organization and stays there; its author is shown as an anonymous account. Most data is deleted at once. A
+        nightly job deletes anything that was missed, so all of it is gone within about a day.
       </p>
 
       <h2>7. Security</h2>

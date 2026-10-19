@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 import structlog
 from ai.knowledge.recycled_content import scratchpad_field
-from ai.providers.base import NewsArticle, NewsProvider, ProviderError
+from ai.providers.base import (NewsArticle, NewsProvider, ProviderError,
+                               ProviderQuotaError, ProviderUnavailableError)
 from ai.providers.news_relevance import (COMPANY_BUSINESS, CONSUMER_PRODUCT,
                                          EVIDENCE_KINDS, OPINION_LISTICLE,
                                          STOCK_MARKET, UNCLASSIFIED,
@@ -225,10 +226,31 @@ class SearchNewsTool(Tool):
 
     def __init__(
             self, provider: NewsProvider | None = None,
-            ticker: str | None = None) -> None:
+            ticker: str | None = None,
+            fallback_tool: str | None = None) -> None:
         self.provider = provider or get_news_provider()
         self.ticker = ticker
+        self.fallback_tool = fallback_tool
         self._consumer_shown: set[str] = set()
+
+    def _failed(self, query: str, exc: ProviderError) -> str:
+        if isinstance(exc, ProviderUnavailableError):
+            next_step = (
+                f"use {self.fallback_tool} for news instead"
+                if self.fallback_tool else
+                "proceed with the evidence you have")
+            return (
+                f"News search failed for {query!r}: the news provider is not "
+                f"configured for this run; do not call {self.name} again, "
+                f"{next_step}")
+        text = f"News search failed for {query!r}: {exc}"
+        if not isinstance(exc, ProviderQuotaError):
+            return text
+        if self.fallback_tool:
+            return f"{text} -- use {self.fallback_tool} for news instead"
+        return (
+            f"{text} -- NewsAPI is unavailable this run; do not call "
+            f"{self.name} again, proceed with the evidence you have")
 
     async def run(  # type: ignore[override]
             self, query: str, limit: int = 20) -> str:
@@ -246,7 +268,7 @@ class SearchNewsTool(Tool):
         try:
             articles = await self.provider.search_news(query, limit=limit)
         except ProviderError as exc:
-            return f"News search failed for {query!r}: {exc}"
+            return self._failed(query, exc)
         articles = await self._with_recent(query, articles)
 
         if not articles and self.ticker is not None and ") AND (" in query:
@@ -259,7 +281,7 @@ class SearchNewsTool(Tool):
             try:
                 articles = await self.provider.search_news(query, limit=limit)
             except ProviderError as exc:
-                return f"News search failed for {query!r}: {exc}"
+                return self._failed(query, exc)
             articles = await self._with_recent(query, articles)
 
         if not articles:

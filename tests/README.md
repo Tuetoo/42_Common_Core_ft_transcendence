@@ -22,10 +22,10 @@ tests/
   auth_tokens.py        access_token(), auth_headers(), bearer_headers()
 ```
 
-The unit suites hold 42 (auth), 84 (core) and 375 (ai) collected tests,
-501 in total, from 489 test functions in 21 files: 3 (auth), 4 (core) and
+The unit suites hold 54 (auth), 102 (core) and 414 (ai) collected tests,
+570 in total, from 558 test functions in 21 files: 3 (auth), 4 (core) and
 14 (ai), plus the 4 alembic_contract.py checks, which every suite
-collects. With the one integration test, the repository has 494 test
+collects. With the one integration test, the repository has 563 test
 functions. Coverage of the service code is about 75% (auth), 66% (core)
 and 90% (ai); coverage of `shared/` is 78%, 80% and 77% in the three
 runs. Tests
@@ -178,6 +178,18 @@ data (names start with `E2E <runid>`), checks the sections `platform`,
 `--with-analysis`), `admin`, and finally `cleanup` removes everything it
 created and soft-deletes its users (`--keep` skips that). It never
 changes anything it did not create.
+
+The section `deletion` is opt-in (`bash scripts/e2e.sh core --only
+deletion --verbose`); the default run skips it. It registers one more
+throwaway user (`e2e-<runid>-dora@example.com`), gives it a private
+document, note with comment, portfolio, watchlist, API key and a
+one-member organization with an open invitation, deletes it with the
+admin route, and checks that login, the old token and the API key fail,
+that the organization and the invitation are gone in auth, and that no
+core row and no S3 object of the user is left. Then it calls the two
+nightly deleted-user sweeps (core and ai) and expects `failed=0` with no
+`lookup_failed` or `refused`. Data of a deleted account is removed by the
+deletion itself, so `cleanup` does not try to remove it again.
 
 It needs an access token of your admin account (2 hours):
 

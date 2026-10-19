@@ -5,7 +5,6 @@ from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlparse
 from uuid import UUID, uuid4
 import httpx
-import pyotp
 import pytest
 from helpers import (PASSWORD, current_user_id, enable_2fa, login,
                      login_response, make_user, next_code, register,
@@ -42,17 +41,6 @@ async def two_factor_row(db_session, user_id):
         select(TwoFactorSecret).where(
             TwoFactorSecret.user_id == UUID(user_id)))
     return result.scalar_one()
-
-
-async def user_with_plain_text_secret(client, mock_email, db_session):
-    user = await make_user(client, mock_email, db_session)
-    setup = await client.post(
-        "/api/v1/auth/2fa/setup", headers=user["headers"])
-    secret = setup.json()["data"]["secret"]
-    row = await two_factor_row(db_session, user["id"])
-    row.secret = secret
-    await db_session.flush()
-    return user, secret
 
 
 @pytest.fixture
@@ -551,27 +539,16 @@ class TestTwoFactor:
             client, "frank@example.com", totp_code=next_code(secret))
         assert with_code.status_code == 200
 
-        import security
-
-        user, secret = await user_with_plain_text_secret(
-            client, mock_email, db_session)
-        verify = await client.post(
-            "/api/v1/auth/2fa/verify", json={"code": pyotp.TOTP(secret).now()},
-            headers=user["headers"])
-        assert verify.status_code == 204
-        row = await two_factor_row(db_session, user["id"])
-        assert security.is_encrypted(row.secret)
-        assert security.decrypt_secret(row.secret) == secret
-
         user = await make_user(
             client, mock_email, db_session, prefix="unreadable")
         secret = await enable_2fa(client, user["headers"])
         row = await two_factor_row(db_session, user["id"])
-        row.secret = "fernet:written-with-a-key-that-is-gone"
-        await db_session.flush()
-        response = await login_response(
-            client, user["email"], totp_code=next_code(secret))
-        assert response.status_code == 409
+        for stored in ("fernet:written-with-a-key-that-is-gone", secret):
+            row.secret = stored
+            await db_session.flush()
+            response = await login_response(
+                client, user["email"], totp_code=next_code(secret))
+            assert response.status_code == 409, stored
         assert "Ask an administrator to reset your 2FA" in (
             response.json()["error"]["message"])
         disable = await client.post(
@@ -806,8 +783,7 @@ class TestProfile:
         headers, _ = await register_and_login(
             client, mock_email, "profile@example.com", "profileuser")
         for body in ({"bio": "x" * 501}, {"timezone": "Mars/Olympus"},
-                     {"theme": "neon"}, {"username": "bad name!"},
-                     {"first_name": "x" * 101}, {"preferred_currency": "usd"},
+                     {"username": "bad name!"}, {"first_name": "x" * 101},
                      {"notification_preferences": {"sms": True}
                       }, {"username": None}):
             r = await client.patch(
@@ -829,7 +805,9 @@ class TestProfile:
         data = r.json()["data"]
         assert data["profile"]["bio"] is None
         assert data["profile"]["timezone"] == "Europe/Paris"
-        assert data["settings"]["theme"] == "dark"
+        assert data["settings"] == {
+            "notification_preferences": {"email": True}
+        }
 
         from config import settings
 
@@ -1073,6 +1051,29 @@ PURGE = "/internal/scheduler/purge-unverified"
 
 class TestUnverifiedPurge:
 
+    async def test_failed_leftover_lookup_keeps_the_purge_events(
+            self, client, mock_email, db_session, captured_events,
+            monkeypatch):
+        from domains.admin.repository import AdminRepository
+
+        old_id, _ = await _unverified_user(
+            client, mock_email, db_session, days_old=8)
+
+        async def _broken(self):
+            raise RuntimeError("database hiccup")
+
+        monkeypatch.setattr(
+            AdminRepository, "deleted_ids_with_leftovers", _broken)
+        r = await client.post(PURGE)
+        assert r.status_code == 500, r.text
+        body = r.json()
+        assert body["all_units_failed"] == ["deleted_account_leftovers_lookup"]
+        assert body["deleted_account_leftovers"]["lookup_failed"] is True
+        assert str(old_id) in {
+            payload["user_id"]
+            for name, payload in captured_events if name == "user.deleted"
+        }
+
     async def test_only_old_never_verified_accounts_are_deleted(
             self, client, mock_email, db_session, captured_events,
             monkeypatch):
@@ -1093,6 +1094,16 @@ class TestUnverifiedPurge:
         seen = await users.get_by_id(seen_id)
         seen.last_seen_at = datetime.now(UTC) - timedelta(days=20)
         verified = await make_user(client, mock_email, db_session)
+        from domains.organization.model import OrganizationInvitation
+
+        org = await client.post(
+            "/api/v1/organizations", json={"name": "Inviter"},
+            headers=verified["headers"])
+        live_invitation = OrganizationInvitation(
+            organization_id=UUID(org.json()["data"]["id"]), email=old_email,
+            role="member", invited_by=UUID(verified["id"]),
+            expires_at=datetime.now(UTC) + timedelta(days=2))
+        db_session.add(live_invitation)
         await db_session.flush()
 
         r = await client.post(PURGE)
@@ -1111,6 +1122,8 @@ class TestUnverifiedPurge:
             assert row.deleted_at is None
         gone = await users.get_by_id(old_id)
         assert gone.deleted_at is not None and gone.email != old_email
+        assert await db_session.get(
+            OrganizationInvitation, live_invitation.id) is not None
         await reset_rate_limits()
         r = await client.post(
             "/api/v1/auth/register", json={

@@ -280,7 +280,7 @@ async def summarize_filing(
         user_content = combined_text
         try:
             response = await router.complete(
-                LLMTier.HIGHEST_ACCURACY, [
+                LLMTier(settings.FILING_LLM_TIER), [
                     LLMMessage(role="system", content=system_prompt),
                     LLMMessage(role="user", content=user_content)
                 ], temperature=0.0, retries=AGENT_LLM_CALL_RETRIES,
