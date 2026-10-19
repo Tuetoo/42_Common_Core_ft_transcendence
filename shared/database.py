@@ -95,7 +95,7 @@ async def check_database_connection(engine: AsyncEngine) -> bool:
     except Exception:
         return False
 
-_ALEMBIC_MAIN_OPTIONS = ("prepend_sys_path", "version_path_separator")
+_ALEMBIC_MAIN_OPTIONS = ("prepend_sys_path", "path_separator")
 
 
 class SchemaBootstrapError(RuntimeError):
@@ -115,8 +115,6 @@ def build_alembic_config(alembic_ini: Path) -> Config:
     for key in _ALEMBIC_MAIN_OPTIONS:
         if key in section:
             config.set_main_option(key, section[key])
-    config.set_main_option(
-        "path_separator", section.get("path_separator", "os"))
     return config
 
 

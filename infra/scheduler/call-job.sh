@@ -21,6 +21,8 @@
 #                    verified their email, one by one (auth-service).
 #   notification-retention 300s: deletes old read notifications in
 #                    batches (core-service).
+#   deleted-user-sweep-core 900s, deleted-user-sweep-ai 900s: clean the
+#                    data of deleted accounts, one user at a time.
 . /scripts/env.sh
 job="$1"
 case "$job" in
@@ -47,7 +49,7 @@ case "$job" in
     rag-ingest)
         url="${AI_SERVICE_URL}/internal/scheduler/rag-ingest"
         max_time=3600
-        message="ingesting new SEC filings and news for tracked tickers, and the macro research report"
+        message="ingesting new SEC filings and news for tracked tickers, and the macro research report (spends LLM, NewsAPI and embedding quota)"
         ;;
     purge-unverified)
         url="${AUTH_SERVICE_URL}/internal/scheduler/purge-unverified"
@@ -58,6 +60,16 @@ case "$job" in
         url="${CORE_SERVICE_URL}/internal/scheduler/notification-retention"
         max_time=300
         message="deleting old read notifications"
+        ;;
+    deleted-user-sweep-core)
+        url="${CORE_SERVICE_URL}/internal/scheduler/deleted-user-sweep"
+        max_time=900
+        message="deleting core data left by deleted accounts"
+        ;;
+    deleted-user-sweep-ai)
+        url="${AI_SERVICE_URL}/internal/scheduler/deleted-user-sweep"
+        max_time=900
+        message="deleting ai data left by deleted accounts"
         ;;
     *)
         echo "[$(date)] call-job: unknown job '${job}'" >&2

@@ -66,7 +66,6 @@ class ConnectionRepository:
                                Connection.requester_id == user_id,
                                Connection.addressee_id == user_id),
                            ~((Connection.status == ConnectionStatus.BLOCKED)
-                             & Connection.blocked_by.is_not(None)
                              & (Connection.blocked_by != user_id))))
         return [tuple(row) for row in result.all()]
 

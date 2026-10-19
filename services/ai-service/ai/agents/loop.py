@@ -359,7 +359,6 @@ _PENALTY_TOOL_ERROR = 0.05
 _PENALTY_TOOL_ERROR_CAP = 0.15
 _PENALTY_CORRECTION = 0.04
 _PENALTY_CORRECTION_CAP = 0.12
-_PENALTY_NO_ACCEPTED_TURN = 0.10
 _PENALTY_TRUNCATED = 0.05
 _PENALTY_FALLBACK_SERVED = 0.03
 _PENALTY_WARNING = 0.08
@@ -367,6 +366,7 @@ _PENALTY_WARNING_CAP = 0.16
 _PENALTY_RECYCLED = 0.10
 _SCORE_WELL_SUPPORTED_FLOOR = 0.40
 _TRUNCATED_FINISH_RE = re.compile(r"length|max_tokens", re.IGNORECASE)
+_LIVE_DATA_TOOLS = frozenset({"get_current_price"})
 
 
 def _evidence_quality_score(
@@ -398,8 +398,6 @@ def _evidence_quality_score(
     score -= min(tool_errors * _PENALTY_TOOL_ERROR, _PENALTY_TOOL_ERROR_CAP)
     score -= min(corrections * _PENALTY_CORRECTION, _PENALTY_CORRECTION_CAP)
     score -= min(warnings * _PENALTY_WARNING, _PENALTY_WARNING_CAP)
-    if meta is None:
-        score -= _PENALTY_NO_ACCEPTED_TURN
     if truncated:
         score -= _PENALTY_TRUNCATED
     if fallback_served:
@@ -411,7 +409,6 @@ def _evidence_quality_score(
         "tool_errors": tool_errors,
         "corrections": corrections,
         "warnings": warnings,
-        "no_accepted_turn": meta is None,
         "truncated": truncated,
         "fallback_served": fallback_served,
         "recycled": recycled
@@ -537,7 +534,6 @@ class ReActAgentLoop:
         non_english_rejections = 0
         flagged_duplicate_signature: tuple[str | None, str] | None = None
 
-        _LIVE_DATA_TOOLS = frozenset({"get_current_price"})
         executed_signatures: set[tuple[str, str]] = {
             (
                 entry.action,
@@ -591,7 +587,7 @@ class ReActAgentLoop:
                 correction_retries += 1
 
                 if (response.finish_reason
-                        and "MAX_TOKENS" in response.finish_reason):
+                        and "MAX_TOKENS" in response.finish_reason.upper()):
                     observation = (
                         "Your previous response was cut off before it "
                         "finished "
@@ -999,10 +995,14 @@ class ReActAgentLoop:
 
         raw_reported_metrics = data.get("reported_metrics")
         raw_thought = data.get("thought")
+        action = data.get("action")
+        action_input = data.get("action_input")
         return _ParsedStep(
             thought="" if raw_thought is None else str(raw_thought),
-            action=data.get("action") or None,
-            action_input=data.get("action_input") or None,
+            action=action if isinstance(action, str) and action else None,
+            action_input=(
+                action_input
+                if isinstance(action_input, dict) and action_input else None),
             finish_answer=_coerce_finish_answer(data.get("finish_answer")),
             reported_metrics=(
                 raw_reported_metrics if isinstance(raw_reported_metrics, dict)

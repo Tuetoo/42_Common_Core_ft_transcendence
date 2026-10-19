@@ -57,7 +57,7 @@ backups/2026-10-05_0230/
   the host (mounted at `/backups` in the scheduler). `./backups/` is
   gitignored.
 - **Schedule:** every day at **02:30 America/New_York** (scheduler
-  crontab), between the review job (02:00) and RAG ingestion (03:00).
+  crontab), between the review job (02:00) and RAG ingestion (03:05).
   Backups run only while the scheduler runs. The cloud host keeps it
   stopped, so the cloud makes no backups; backups are made on the local
   stack (`docs/DEPLOYMENT.md` section 6).
@@ -88,6 +88,15 @@ lost Docker volume -- not against losing the whole machine. Copy
 and keep `.env.docker` and a copy of it somewhere safe as well (it is
 **not** in the backups, see section 7). The backups contain personal
 data and password hashes: store them as carefully as the database.
+They also keep the data of a deleted account until they expire (up to
+`BACKUP_RETENTION_DAYS` days, or longer for the newest 3 backups).
+
+**Deleted accounts after a restore.** A restore brings back the state of
+the backup, so an account deleted after the backup was made is active
+again, with its data. Delete such accounts again after the restore
+(admin users page, or `DELETE /api/v1/admin/users/{id}`). The nightly
+deleted-user sweeps only clean accounts that are deleted in the restored
+`auth.users`; they cannot know about a deletion the backup does not hold.
 
 ## 3. How to verify a backup
 

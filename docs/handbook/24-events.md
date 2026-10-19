@@ -34,6 +34,7 @@ AlphaMind uses Redis for two different kinds of delivery:
  core-service --XADD stream:document.uploaded --+
               --XADD stream:document.deleted ---+    +------------------+
               --XADD stream:portfolio.deleted --+--> | Redis stream     | --> ai-service
+ auth-service --XADD stream:user.deleted -------+    |                  |
                                                      | + consumer group |     (XREADGROUP,
  ai-service ----XADD stream:document.status_changed  | "workers"        |      XACK)
                                                 --+-> +------------------+ --> core-service
@@ -48,8 +49,9 @@ AlphaMind uses Redis for two different kinds of delivery:
   message is still there and is delivered again.
 
 AlphaMind uses pub/sub for notifications and live screen updates (losing
-one is annoying but not harmful) and streams for the four events where a
-lost message would leave the data wrong.
+one is annoying but not harmful) and streams for the five events where a
+lost message would leave the data wrong (`user.deleted` goes on both:
+pub/sub for core, a stream for ai).
 core-service's three durable events are first stored in a database
 table (the outbox, `core.event_outbox`) in the same transaction as the
 change, so they survive a Redis outage until they are published
@@ -103,9 +105,9 @@ field on the wire (section 3.4).
 
 | Event | Producer (where) | Transport | Consumer (handler) | Payload fields | Effect |
 |---|---|---|---|---|---|
-| `document.uploaded` | core (`domains/research/service.py::_publish_uploaded`) | durable | ai (`event_listener.py::_handle_document_uploaded`) | `document_id, owner_id, organization_id, storage_bucket, storage_key, document_type, category, ticker, content_date, filename, is_system` | runs RAG ingestion (`run_rag_ingestion_workflow`); `owner_id` and `organization_id` decide who may later retrieve the chunks |
-| `document.deleted` | core (`ResearchService.delete_document`, also `scripts/delete_documents.py`) | durable | ai (`_handle_document_deleted`) | `document_id` | `ai/rag/indexing.py::delete_document_completely`: Qdrant points, BM25, `ai.document_chunks`, `ai.embedding_jobs`. `ai.filing_records` is keyed by the filing's filename, not by document id, and is NOT deleted: when the same filing is ingested again, its row is overwritten (upsert by `filename`) |
-| `portfolio.deleted` | core (`domains/portfolio/api.py::delete_portfolio`) | durable | ai (`_handle_portfolio_deleted`) | `portfolio_id, user_id` (owner) | closes unfilled tiers (status `expired`), then publishes `tier.cancelled` per tier |
+| `document.uploaded` | core (`domains/research/service.py::_publish_uploaded`) | durable | ai (`event_listener.py::_handle_document_uploaded`) | `document_id, owner_id, organization_id, storage_bucket, storage_key, document_type, category, ticker, content_date, filename` | runs RAG ingestion (`run_rag_ingestion_workflow`); `owner_id` and `organization_id` decide who may later retrieve the chunks |
+| `document.deleted` | core (`ResearchService.delete_document`, `scripts/delete_documents.py`, `_handle_user_deleted` for a deleted user's private documents, and `_handle_organization_deleted` for a deleted organization's documents, the same two cleanups in the nightly `deleted-user-sweep-core` job, and `scripts/clean_organizations.py`; all through `delete_document_row`) | durable | ai (`_handle_document_deleted`) | `document_id` | `ai/rag/indexing.py::delete_document_completely`: Qdrant points, BM25, `ai.document_chunks`, `ai.embedding_jobs`. `ai.filing_records` is keyed by the filing's filename, not by document id, and is NOT deleted: when the same filing is ingested again, its row is overwritten (upsert by `filename`) |
+| `portfolio.deleted` | core (`domains/portfolio/api.py::delete_portfolio`, and `_handle_user_deleted` for a deleted user's private portfolios, and `_handle_organization_deleted` (`_release_portfolios`) for a deleted organization's portfolios whose owner is a deleted account, also from the nightly sweep and `scripts/clean_organizations.py`; all through `delete_portfolio_row`) | durable | ai (`_handle_portfolio_deleted`) | `portfolio_id, user_id` (owner) | closes unfilled tiers (status `expired`), then publishes `tier.cancelled` per tier |
 | `document.status_changed` | ai (`rag_ingestion_workflow.py::_publish_status`) | durable AND pub/sub | core: durable `_persist_document_status`; pub/sub `_broadcast_document_status_changed` | `document_id, status` | durable: writes `core.documents.status` and notifies owner on `ready`/`failed`; pub/sub: push to `document:<id>` |
 | `analysis.started` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_analysis_started` | `analysis_id, user_id ("" = system), ticker, portfolio_id` | push to `analysis:<id>` (the analysis page refreshes on it), notification |
 | `analysis.completed` | ai (`analysis_workflow.py`) | pub/sub | core `_handle_analysis_completed` | same as started | push, notification |
@@ -122,13 +124,13 @@ field on the wire (section 3.4).
 | `backtest.deleted` | ai (`domains/backtest/api.py::delete_backtest`, after the commit as a background task) | pub/sub | core `_handle_backtest_deleted` | `backtest_id, user_id, kind` | notification to the owner |
 | `organization.created` | auth (`domains/organization/service.py`) | pub/sub | core `_handle_organization_created` | `organization_id, organization_name, actor_id, user_id` (the affected member, or `None`), `role` (or `None`), `member_ids` (members to notify, sorted, unique) | notification to members |
 | `organization.updated` | auth | pub/sub | core | same | notification to members |
-| `organization.deleted` | auth | pub/sub | core | same | open sockets (Yjs and channels) of every former member are re-checked (section 3.8); notification to former members |
+| `organization.deleted` | auth (owner `DELETE /organizations/{id}`; also `AdminService._delete` when the deleted user was the owner and no other member is left, and the nightly purge-unverified job's `clean_deleted_account_leftovers` for such an organization of an account deleted earlier) | pub/sub | core | same | open sockets (Yjs and channels) of every former member are re-checked (section 3.8); notification to former members. core deletes the organization's documents (`document.deleted`) and notes, deletes the shared portfolios of deleted owners (`portfolio.deleted`) and makes the others private again (`delete_organization_content`, chapter 12) |
 | `organization.member.joined` | auth (invitation accept) | pub/sub | core | same | welcome to the new member, notice to others |
 | `organization.member.left` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.member.removed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
-| `organization.role.changed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
+| `organization.role.changed` | auth (also when a deleted owner's organization passes to a successor) | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.invitation.created` | auth | pub/sub | core | same (`user_id` = the invitee when the email has an account, else `None`) | notification to the actor and to the invited user (when the email has an account) |
-| `organization.invitation.revoked` | auth | pub/sub | core | same (`user_id` as above, `role` = the invitation role) | notification to the actor and to the invited user (when the email has an account) |
+| `organization.invitation.revoked` | auth (`revoke_invitation`; also `AdminService._delete` and `clean_deleted_account_leftovers`, one per open invitation the deleted user sent, with that user as `actor_id`) | pub/sub | core | same (`user_id` as above, `role` = the invitation role) | notification to the actor and to the invited user (when the email has an account); a deleted sender (the `AdminService._delete` path) gets no notification, because core skips deleted users |
 | `friend.requested` | auth (`domains/social/service.py`) | pub/sub | core `_handle_friend_requested` | `actor_id, user_id, actor_username, other_username` | notification to `user_id` and to the actor |
 | `friend.accepted` | auth | pub/sub | core | same | notification to both users |
 | `friend.removed` | auth (every `DELETE /connections/{id}`) | pub/sub | core | same + `action` (`removed`, `declined`, `cancelled`, `unblocked`) | open sockets of both users re-checked; notification to the actor, and to the other user only for `removed` |
@@ -137,19 +139,42 @@ field on the wire (section 3.4).
 | `user.role.changed` | auth (admin) | pub/sub | core | same | open sockets of the user re-checked; notification to the user and the actor |
 | `user.deactivated` | auth (admin) | pub/sub | core | same | every open socket of the user closed (4401); notification to the user and the actor |
 | `user.reactivated` | auth (admin) | pub/sub | core | same | notification to the user and the actor |
-| `user.deleted` | auth (admin delete, nightly unverified purge) | pub/sub | core `_handle_user_deleted` | same (`username` is the name before the soft delete renamed it) | every open socket of the user closed (4401); logged `user_deleted_received`; notification to the admin who deleted (the purge, where actor = user, notifies nobody) |
+| `user.deleted` | auth (admin delete, nightly unverified purge; `events_out.publish_events`, which also XADDs it to `stream:user.deleted`) | pub/sub AND durable | core `_handle_user_deleted` (pub/sub); ai `_handle_user_deleted` (durable) | same (`username` is the name before the soft delete renamed it) | core: every open socket of the user closed (4401); logged `user_deleted_received`; the user's private data is deleted (`delete_private_user_data`, log `user_data_cleaned`, chapter 12): private documents (`document.deleted`), private notes, private portfolios (`portfolio.deleted`), watchlists, API keys, notifications; notification to the admin who deleted (the purge, where actor = user, notifies nobody). ai: the user's analyses with everything under them, archived reports with their vectors and graph relations, decisions, backtests, episodic and procedural memories (`user_cleanup.delete_user_data`, log `ai_user_data_cleaned`, chapter 13 section 3.8) |
 | `user.presence.changed` | auth (`domains/auth/service.py::presence_event`, published after the commit) | pub/sub | core `_handle_user_presence_changed` | `user_id, is_online` | push to `presence:<user_id>` and to `user:<friend_id>` of each accepted friend (friend list from auth `GET /internal/users/{id}/friends`) |
 
 Notes on the table:
 
-- ai-service consumes only the three durable events. It has no pub/sub
-  subscriber; only core-service listens to auth events.
+- ai-service consumes only durable events: core's three and auth's
+  `user.deleted`. It has no pub/sub subscriber; only core-service listens
+  to auth's pub/sub events.
 - `user.deactivated` and `user.deleted` do not block HTTP requests.
   Blocking is done on every request by the live user-state check in
   `shared/user_state.py` (see [29-security.md](29-security.md)). The events
   create notifications and close the user's open Yjs editor sockets
   (a WebSocket is checked only when it connects, so without the event an
   open editor would keep working until its token expired).
+- Deletion policy: a deleted user's personal data is removed completely
+  in every service; organization content and system data not keyed to
+  the user stay. `user.deleted` is the fast path. core and ai each also
+  run a nightly deleted-user sweep (`deleted-user-sweep-core` 04:30,
+  `deleted-user-sweep-ai` 04:40 New York, chapter 26). It asks auth
+  (`POST /internal/users/deleted`) which owners of leftover data are
+  deleted, and runs the same idempotent cleanup. This repairs a lost
+  event and data an in-flight request wrote after the cleanup.
+  core creates no notification for a deleted user, so a late ai event
+  about that user (for example `tier.cancelled`) leaves no row
+  (chapter 12, section 3.11).
+- auth has no outbox. If its publish of `user.deleted` fails, both the
+  pub/sub and the stream copy are lost, and the sweeps clean the data
+  the next night. A lost `organization.deleted` is repaired by the same
+  core job: it asks auth which referenced organizations no longer exist
+  (`POST /internal/organizations/missing`) and runs
+  `delete_organization_content` for them; on a lookup error it deletes
+  nothing, and a safety brake (`ORGANIZATION_SWEEP_MAX_MISSING`, default
+  5) refuses a run where auth reports too many organizations as missing.
+  Both core cleanups run
+  inline in core's pub/sub loop, so other events wait while they run
+  (chapter 12, section 3.15).
 - `recommendation.ready` has its own payload shape: the recommendation id
   is in `id`, and `user_id` is `None` (not `""`) for a system analysis.
   core treats both `None` and `""` as "nobody to notify" (a falsy check,
@@ -340,7 +365,9 @@ strings in `_UPLOADED_REQUIRED_FIELDS` (`document_id`, `storage_bucket`,
 instead of failing five times and being dead-lettered. In the same way a
 `document.deleted` without a string `document_id` logs
 `document_deleted_missing_document_id`, and a `portfolio.deleted` whose
-`portfolio_id` is not a UUID logs `portfolio_deleted_bad_portfolio_id`.
+`portfolio_id` is not a UUID logs `portfolio_deleted_bad_portfolio_id`,
+and a `user.deleted` whose `user_id` is not a UUID logs
+`user_deleted_bad_user_id`.
 A database error inside a handler is NOT caught: it propagates, so the
 entry stays pending and is retried.
 
@@ -348,7 +375,7 @@ Who consumes what:
 
 | Service | Builder | Consumer name | Streams |
 |---|---|---|---|
-| ai-service | `services/ai-service/event_listener.py::build_durable_subscriber` | `ai-service` (`settings.SERVICE_NAME`) | `stream:document.uploaded`, `stream:document.deleted`, `stream:portfolio.deleted` |
+| ai-service | `services/ai-service/event_listener.py::build_durable_subscriber` | `ai-service` (`settings.SERVICE_NAME`) | `stream:document.uploaded`, `stream:document.deleted`, `stream:portfolio.deleted`, `stream:user.deleted` |
 | core-service | `services/core-service/event_listener.py::build_durable_subscriber` | `core-service` | `stream:document.status_changed` |
 
 Both use the group `workers`. The consumer name must stay the same across
@@ -412,6 +439,10 @@ one consumer only. Their handlers are idempotent instead:
 - `cancel_unfilled_tiers_for_portfolio` only touches tiers still in
   `pending_acceptance` / `accepted_awaiting_trigger`; a second run finds
   nothing and publishes nothing.
+- `user_cleanup.delete_user_data` (ai's `user.deleted` handler) deletes
+  only rows that are still there, so a redelivery does nothing. It runs
+  with `strict=True`: a failed step raises, the entry stays pending and is
+  retried.
 
 ### 3.5 Publishing after the commit
 
@@ -429,7 +460,9 @@ How each service follows the rule:
   `flush()`; the commit happens in `get_db`'s teardown, which (with
   `scope="function"`) runs before the response is sent; background tasks
   run after the response. `document.uploaded`, `document.deleted` and
-  `portfolio.deleted` all follow this pattern. The operator script
+  `portfolio.deleted` all follow this pattern. The `user.deleted`
+  cleanup and the nightly deleted-user sweep in core commit each step
+  themselves, then call `publish_now`. The operator script
   `services/core-service/scripts/delete_documents.py` uses the outbox
   too: per document it enqueues `document.deleted` in the delete's
   transaction, commits, then calls `outbox.publish_now` (which never
@@ -441,7 +474,9 @@ How each service follows the rule:
   `publish_events(pending)`. `publish_events` first drops cached
   organization memberships (`invalidate_membership_cache`) for every
   member a membership event affects, then publishes each event; a publish
-  failure is logged (`event_publish_failed`) and never raised. The
+  failure is logged (`event_publish_failed`) and never raised.
+  `user.deleted` (`ALSO_DURABLE_EVENTS`) is also XADDed to its stream for
+  ai-service (`durable_event_publish_failed` on error). The
   membership events are those in `MEMBERSHIP_EVENTS` (organization
   created, deleted, member joined, left, removed, role changed); the
   affected member is the payload's `user_id`, and for a deleted
@@ -718,7 +753,9 @@ that notify the user and the actor (`_notify_pair`: friend, user and
 invitation events) log `event_missing_recipient` when both are missing;
 `organization_member_joined_missing_user_id`,
 `user_presence_changed_missing_user_id` and `tier_event_without_recipient`
-are logged by their own handlers (`event_listener.py:239, :560, :643`).
+are logged by their own handlers (`_handle_organization_member_joined`,
+`_handle_user_presence_changed`, `_handle_tier_event` in
+`event_listener.py`).
 
 The WebSocket side (channels, authorization, message shapes) is in
 [25-realtime-yjs.md](25-realtime-yjs.md).
@@ -764,7 +801,7 @@ them:
 ## 5. Design decisions and why
 
 **Two transports instead of one.**
-Decision: pub/sub for notifications and live pushes, streams for four
+Decision: pub/sub for notifications and live pushes, streams for five
 events. Alternative: everything on streams. Reason: a consumer group gives
 each entry to ONE consumer, which is the wrong shape for "tell every
 replica so it can push to its own sockets". And a missed live update only
@@ -780,6 +817,9 @@ zero chunks, with no error anywhere.
 document would leave its chunks in Qdrant and BM25, orphaned but still
 searchable. `portfolio.deleted` is durable because a missed one would
 leave tiers that later try to trade in a portfolio that no longer exists.
+`user.deleted` goes on a stream for ai so that a restart of ai-service
+does not skip a deleted user's cleanup; the nightly sweep is the
+backstop for a publish that never happened.
 
 **`document.status_changed` is published twice.**
 Decision: one durable publish (core persists the status) and one pub/sub
@@ -823,7 +863,7 @@ error level for a human to inspect.
 Alternative: start a background task per event. Reason: an inline await
 means the entry is acknowledged only after the work really finished, so a
 crash mid-ingestion leads to a retry. The cost is that ingestion jobs (and
-the other two durable events of ai-service) wait behind each other, which
+the other durable events of ai-service) wait behind each other, which
 is fine at this project's document volume.
 
 ## 6. When things go wrong
@@ -852,8 +892,9 @@ Useful log events at INFO level (visible by default), by service:
 | Service | Events |
 |---|---|
 | core-service and ai-service, at start | `durable_event_subscriber_started`, `cross_service_subscriber_started` (core only: ai has no pub/sub subscriber) |
-| ai-service | `document_uploaded_received`, `document_deleted_received`, `rag_ingestion_complete`, `portfolio_deleted_tiers_cancelled` (with `count`) |
-| core-service | `outbox_published_pending` (the dispatcher published rows the `publish_now` path could not), `outbox_purged`, `websocket_analysis_broadcast` (with `sockets=`, the number of local sockets reached, so "the client missed it" can be told apart from "nobody was connected"), `user_deleted_received` |
+| ai-service | `document_uploaded_received`, `document_deleted_received`, `rag_ingestion_complete`, `portfolio_deleted_tiers_cancelled` (with `count`), `user_deleted_received`, `ai_user_data_cleaned` (counts per step), `ai_user_data_cleanup_failed` |
+| core-service and ai-service, nightly sweep | `deleted_user_sweep_completed` and `deleted_organization_sweep_completed` (core), each with candidates, deleted, cleaned, failed, lookup_failed and refused; `deleted_user_sweep_item_failed`; `deleted_organization_sweep_item_failed`; `deleted_user_sweep_lookup_failed`; `deleted_organization_sweep_lookup_failed` (core); `deleted_organization_sweep_refused` (core, error: safety brake); `deleted_user_sweep_candidates_failed` (candidate query failed), core also `deleted_organization_sweep_candidates_failed`, `document_file_owners_lookup_failed` (bucket listing failed) and `deleted_user_files_removed` (unreferenced files of a deleted user deleted) |
+| core-service | `outbox_published_pending` (the dispatcher published rows the `publish_now` path could not), `outbox_purged`, `websocket_analysis_broadcast` (with `sockets=`, the number of local sockets reached, so "the client missed it" can be told apart from "nobody was connected"), `user_deleted_received`, `user_data_cleaned` and `organization_data_cleaned` (counts per step), `user_data_cleanup_failed` and `organization_data_cleanup_failed` (one step failed), `notification.skipped_deleted_user` |
 
 Warnings worth a look: `document_uploaded_malformed`,
 `document_upload_republished`, `outbox_publish_deferred`,
@@ -976,7 +1017,8 @@ only where losing a message would leave the data wrong."
 
 1. **Which events are durable?**
    `document.uploaded`, `document.deleted`, `portfolio.deleted` (core ->
-   ai) and the database half of `document.status_changed` (ai -> core).
+   ai), the stream copy of `user.deleted` (auth -> ai) and the database
+   half of `document.status_changed` (ai -> core).
 
 2. **Why not make every event durable?**
    A consumer group gives each entry to one consumer, but live pushes must
@@ -1020,7 +1062,9 @@ only where losing a message would leave the data wrong."
    run reclaim what the previous run left unacknowledged.
 
 10. **Does ai-service listen to auth-service events?**
-   No. Only core-service has a pub/sub subscriber.
+   Only to one: it reads `user.deleted` from `stream:user.deleted`. It
+   has no pub/sub subscriber; only core-service listens to auth's
+   pub/sub events.
 
 </details>
 
@@ -1039,7 +1083,7 @@ only where losing a message would leave the data wrong."
 | `services/core-service/domains/portfolio/api.py` | `portfolio.deleted` written to the outbox |
 | `services/core-service/domains/notification/service.py` | `notify_user`, `notify_users`, `notify_after_commit` |
 | `services/core-service/websocket_manager.py` | channel fan-out, `ws:fanout` relay |
-| `services/ai-service/event_listener.py` | the three durable handlers |
+| `services/ai-service/event_listener.py` | the four durable handlers |
 | `services/ai-service/ai_events.py` | payload builders, `publish_event`, `publish_events`, tier cancel reasons |
 | `services/ai-service/ai/workflows/rag_ingestion_workflow.py` | `_publish_status` (durable with retries + best-effort pub/sub) |
 | `services/ai-service/ai/workflows/analysis_workflow.py` | analysis lifecycle publishes (through `ai_events.publish_event`) |

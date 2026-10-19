@@ -4,6 +4,7 @@ import { getMe } from "@/app/lib/session";
 import { TICKER_PATTERN, TICKER_TITLE, formatMetric, type Metric, type TimeseriesPoint } from "@/app/lib/format";
 import { ActionDistributionChart, StatusDonutChart, TimeseriesChart } from "./charts";
 import { LiveRefresh } from "./live-refresh";
+import { firstParam } from "../pager";
 import { PrintButton } from "./print-button";
 
 type Accuracy = { evaluated: number; rate: number | null };
@@ -47,10 +48,6 @@ const STATUSES = ["completed", "failed", "running", "pending"];
 
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
-function first(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value)?.trim() ?? "";
-}
-
 function percent(value: number | null): string {
   return value === null ? "—" : `${Math.round(value * 100)}%`;
 }
@@ -64,21 +61,21 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
   const params = await searchParams;
   // The URL is user input: keep only values the backend understands.
   const filters = {
-    from: first(params.from),
-    to: first(params.to),
-    ticker: first(params.ticker).toUpperCase(),
-    action: ACTIONS.includes(first(params.action)) ? first(params.action) : "",
-    status: STATUSES.includes(first(params.status)) ? first(params.status) : "",
+    from: firstParam(params.from),
+    to: firstParam(params.to),
+    ticker: firstParam(params.ticker).toUpperCase(),
+    action: ACTIONS.includes(firstParam(params.action)) ? firstParam(params.action) : "",
+    status: STATUSES.includes(firstParam(params.status)) ? firstParam(params.status) : "",
   };
   // Set by the CSV export route when the backend refused the export.
-  const exportError = first(params.export_error).slice(0, 300);
-  const metric: Metric = METRICS.some((m) => m.value === first(params.metric))
-    ? (first(params.metric) as Metric)
+  const exportError = firstParam(params.export_error).slice(0, 300);
+  const metric: Metric = METRICS.some((m) => m.value === firstParam(params.metric))
+    ? (firstParam(params.metric) as Metric)
     : "analyses";
-  const interval = first(params.interval) === "week" ? "week" : "day";
+  const interval = firstParam(params.interval) === "week" ? "week" : "day";
 
   const query = new URLSearchParams(Object.entries(filters).filter(([, v]) => v !== ""));
-  const { me, accessToken } = await getMe();
+  const { accessToken } = await getMe();
   const [overviewRes, seriesRes] = await Promise.all([
     backendFetch(`/analytics/overview?${query}`, accessToken, { cache: "no-store" }),
     backendFetch(`/analytics/timeseries?${query}&metric=${metric}&interval=${interval}`, accessToken, {
@@ -116,7 +113,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
             {overview && ` · ${overview.range.from} to ${overview.range.to}`}
           </p>
           <div className="print:hidden mt-2">
-            <LiveRefresh accessToken={accessToken} userId={me.id} renderedAt={renderedNow()} />
+            <LiveRefresh renderedAt={renderedNow()} />
           </div>
         </div>
         <div className="flex gap-2 print:hidden">

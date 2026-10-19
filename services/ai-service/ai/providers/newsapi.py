@@ -42,7 +42,7 @@ def _raise_if_rate_limited(query: str) -> None:
     raise ProviderQuotaError(
         f"NewsAPI search failed for query {query!r}: request limit reached "
         f"({_rate_limited.reason}); no NewsAPI request for another "
-        f"{remaining / 60:.0f} min -- use web_search for news instead")
+        f"{remaining / 60:.0f} min")
 
 
 def _raise_for_error_response(resp: httpx.Response, query: str) -> None:
@@ -68,8 +68,7 @@ def _raise_for_error_response(resp: httpx.Response, query: str) -> None:
             cooldown_seconds=settings.NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS)
         raise ProviderQuotaError(
             f"NewsAPI search failed for query {query!r}: request limit "
-            f"reached "
-            f"({detail}) -- use web_search for news instead")
+            f"reached ({detail})")
     raise ProviderRequestError(
         f"NewsAPI search failed for query {query!r}: {detail}" +
         (f": {message}" if message else ""))

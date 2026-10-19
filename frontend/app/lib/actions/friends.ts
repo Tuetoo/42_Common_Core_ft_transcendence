@@ -3,16 +3,13 @@
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, readApiError } from "@/app/lib/backend";
+import { USERNAME_RE } from "@/app/(public)/field-rules";
 
 export type FriendActionState = {
   error?: string;
   success?: boolean;
   username?: string;
 };
-
-// Same rule as USERNAME_PATTERN in the auth service; the backend checks
-// 3-32 characters (ConnectionCreate) and then looks the user up.
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 
 export async function sendFriendRequest(
   _prevState: FriendActionState,
@@ -81,9 +78,6 @@ export async function respondToConnection(connectionId: string, kind: Connection
   }
 
   if (!res.ok) {
-    if (res.status === 403 && kind === "remove") {
-      return { error: "Only the person who blocked can unblock." };
-    }
     return { error: (await readApiError(res, "That didn't work")).message };
   }
 

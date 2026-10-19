@@ -154,8 +154,8 @@ export default async function AdminUserDetailPage({ params }: { params: Promise<
               />
             </div>
             <p className="text-[12px] text-[var(--text-faint)] m-0">
-              Deactivating signs the user out everywhere. Deleting anonymises the account; organizations it owns pass
-              to another member.
+              Deactivating signs the user out everywhere. Deleting anonymises the account and permanently deletes its
+              private data. Organizations it owns pass to another member, or are deleted if there is none.
             </p>
           </div>
 

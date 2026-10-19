@@ -77,7 +77,7 @@ service. Access tokens are self-contained, and the role check reads Redis.
 | **OAuth 2.0 authorization code flow** | The browser goes to Google or GitHub, the user agrees, the provider redirects back with a one-time `code`, and the server swaps the code for a provider access token. A random `state` value proves the callback belongs to a sign-in this server started; a nonce cookie proves the same browser started it; PKCE ties the code to this server's flow. | "Sign in with Google/GitHub". |
 | **Fixed-window rate limit** | Count requests per key in a time window that starts at the first request; refuse when the count passes the limit. | Login, registration, reset, resend, invitations, 2FA codes. |
 | **Fail open** | When the protection system itself (Redis) is down, let the request through and log it. | A Redis outage must not lock every user out of login. |
-| **Soft delete** | Keep the row, mark it deleted, and remove personal data. | Other services keep foreign references to user ids. |
+| **Soft delete** | Keep the row, mark it deleted, and remove personal data from auth: profile, email, sessions, invitations, OAuth links, 2FA, connections. core and ai then delete the user's private data. | Other services keep foreign references to user ids. |
 | **Pub/sub event** | A Redis `PUBLISH` on a channel; every subscriber that is connected right now gets it, nobody else. | auth-service tells core-service about organization, friend and account changes. |
 | **Alembic revision** | One migration step (a Python file with `upgrade()` and `downgrade()`) that changes the database schema. Alembic records the current revision in a table `alembic_version`. | The `auth` schema is created and changed only by Alembic revisions. |
 
@@ -170,7 +170,7 @@ From `domains/auth/model.py`, `domains/organization/model.py` and
 |---|---|---|
 | `users` | `id`, `email`, `username`, `password_hash`, `system_role` (default `user`), `is_active`, `is_verified`, `last_seen_at`, `deleted_at`, `created_at`, `updated_at` | unique indexes on `lower(email)` and `lower(username)` (`uq_users_email_lower`, `uq_users_username_lower`) |
 | `user_profiles` | `user_id` (1:1), `first_name`, `last_name`, `avatar_url`, `bio`, `timezone`, `country` | |
-| `user_settings` | `user_id` (1:1), `preferred_currency` (`USD`), `theme` (`system`), `default_model`, `notification_preferences` (JSONB) | core-service reads `notification_preferences` through `/internal/users/{id}/notification-settings`; `preferred_currency`, `theme` and `default_model` are stored and returned by `/me`, but nothing reads them yet: neither the frontend nor any backend service (ai-service does not pick a per-user model, core-service does not convert amounts) |
+| `user_settings` | `user_id` (1:1), `preferred_currency` (`USD`), `theme` (`system`), `default_model`, `notification_preferences` (JSONB) | core-service reads `notification_preferences` through `/internal/users/{id}/notification-settings`, and it is the only field `/me` returns or changes. `preferred_currency`, `theme` and `default_model` are unused columns, not exposed by the API; they stay until a migration drops them |
 | `user_sessions` | `user_id`, `refresh_token_hash` (unique), `expires_at`, `ip_address`, `device_info`, `created_at`, `revoked_at`, `revoked_reason` | one row per refresh token |
 | `oauth_accounts` | `user_id`, `provider`, `provider_user_id` | unique (`provider`, `provider_user_id`) |
 | `two_factor_secrets` | `user_id` (1:1), `secret`, `enabled`, `last_used_step` | `secret` is stored encrypted (`fernet:<token>`, `security.py`) |
@@ -383,7 +383,7 @@ refresh tokens.
 |---|---|---|
 | `rotated` | `claim_session_for_rotation` (every refresh) | replaced by a refresh; the token was single-use |
 | `logout` | `revoke_session` (default reason), called by logout | the user logged out of this session |
-| `revoked_all` | `revoke_all_sessions` (default reason) | password reset confirmed, account deactivated by an admin or moderator, account deleted |
+| `revoked_all` | `revoke_all_sessions` (default reason) | password reset confirmed, account deactivated by an admin or moderator (a deleted account's sessions are deleted instead, `delete_sessions`) |
 | `reuse` | `revoke_rotation_successors(..., reason=REUSE)` in `refresh` | revoked because a rotated token from its chain was presented again after the grace period |
 | `NULL` | rows revoked before the column existed (migration `f1190b000001`) | a refresh with such a token just gets 401 |
 
@@ -579,8 +579,7 @@ Code: `AuthService.setup_two_factor`, `verify_two_factor`,
   `UserRepository.upsert_two_factor_secret` encrypts before it writes, and
   `_check_totp` decrypts. Fernet is AES-128-CBC with an HMAC, so a
   leaked database does not give away every user's second factor. A value
-  without the prefix is a plain-text secret: it still works, and
-  `_check_totp` encrypts it after the user's next successful check.
+  without the prefix cannot be read and gives the same 409 as below.
   Because reading tries both keys, secrets written in development before
   a `TOTP_ENCRYPTION_KEY` was set stay readable after it is set.
   If neither key can read a stored value (for example after both
@@ -882,9 +881,8 @@ deactivated user would keep their power until the token expires.
   uploaded, built by `default_avatar_url`) and `settings`.
 - `PATCH /api/v1/auth/me` (`MeUpdate`): PATCH semantics (only fields sent
   change; an explicit `null` clears a nullable field; `null` for
-  `username`, `theme` or `preferred_currency` is 422). Validation:
-  username pattern, `timezone` must be a real IANA zone, `theme` in
-  system/light/dark, `preferred_currency` three capital letters,
+  `username` is 422; an unknown field is ignored). Validation:
+  username pattern, `timezone` must be a real IANA zone,
   `notification_preferences` keys in `in_app`/`email`/`websocket` with
   boolean values. Publishes `user.updated` with the *names* of changed
   fields (never values).
@@ -951,7 +949,8 @@ a member who is not the owner gets 403.
 Member roles (`OrganizationRole`): `owner`, `admin`, `member`, `viewer`.
 There is no user-initiated ownership transfer: the owner cannot leave
 (delete the organization instead). Ownership passes to another member
-only when an admin deletes the owner's account (section 3.19).
+only when the owner's account is deleted (by an admin, by the nightly
+purge of unverified accounts or by its leftover cleanup, section 3.19).
 
 Invitation flow:
 
@@ -1047,8 +1046,7 @@ need the permission `connection:write` (a guest gets 403); blocking and
   loops and guessing usernames through the 404 answer.
 - `GET ""` (optional `?status=pending|accepted|blocked`). A block is
   hidden from the user who was blocked: only the blocker sees the
-  `blocked` row (`ConnectionRepository.list_for_user_with_other_user`). A
-  legacy `blocked` row with `blocked_by` NULL stays visible to both.
+  `blocked` row (`ConnectionRepository.list_for_user_with_other_user`).
 - `POST /{id}/accept`: only the addressee. Event `friend.accepted`.
   Accept, block and remove read the row's status and then write it, so
   they take a row lock first (`SELECT ... FOR UPDATE`); otherwise a
@@ -1149,10 +1147,10 @@ can de-duplicate across its replicas.
 
 | Event | Payload | Published when |
 |---|---|---|
-| `user.updated` | `user_id, actor_id, username, role, is_active, changed` (field names) | own profile/settings/password/2FA/avatar change (any changed field, including `bio` or `theme`; a PATCH that changes nothing and a repeated `/2fa/verify` publish nothing); admin edit |
+| `user.updated` | `user_id, actor_id, username, role, is_active, changed` (field names) | own profile/settings/password/2FA/avatar change (any changed field, including `bio`; a PATCH that changes nothing and a repeated `/2fa/verify` publish nothing); admin edit |
 | `user.role.changed` | same | admin changes the role |
 | `user.deactivated` / `user.reactivated` | same | admin or moderator |
-| `user.deleted` | same (`username` is the name before the soft delete set it to `deleted_<hex>`) | admin soft delete; the nightly unverified-account purge (`actor_id` is the user itself) |
+| `user.deleted` | same (`username` is the name before the soft delete set it to `deleted_<hex>`) | admin soft delete; the nightly unverified-account purge (`actor_id` is the user itself). The only event auth sends twice: on pub/sub (core) and on the durable stream `stream:user.deleted` (ai; `events_out.ALSO_DURABLE_EVENTS`) |
 | `organization.created` / `.updated` / `.deleted` | `organization_id, organization_name, actor_id, user_id, role, member_ids` | |
 | `organization.member.joined` / `.left` / `.removed` | same | |
 | `organization.role.changed` | same | |
@@ -1186,8 +1184,10 @@ admin page reads its counts from the database.
 | `GET /internal/users/{id}/organizations` | core and ai membership lookups | `[{id, name, role}]` |
 | `GET /internal/connections/check?user_a=&user_b=` | core WebSocket presence channel | `{connected: bool}` |
 | `GET /internal/users/{id}/friends` | core presence push to friends (`auth_client.list_friend_ids`) | `{friend_ids: [uuid, ...]}`: the other side of every `accepted` connection, in both directions (pending and blocked are left out) |
-| `GET /internal/users/{id}/notification-settings` | core notifications | `{email, notification_preferences}`; `email` is `null` when the account is deleted, deactivated or unverified (an anonymized, placeholder or unproven address), so core sends no email to it |
-| `POST /internal/scheduler/purge-unverified` | the scheduler (`call-job.sh purge-unverified`, daily 04:10 New York) | `{retention_days, candidates, deleted, skipped, failed}`; 500 with `all_units_failed: ["accounts"]` when every attempted account failed (`shared/scheduled_jobs.py`) |
+| `GET /internal/users/{id}/notification-settings` | core notifications | `{email, deleted, notification_preferences}`; `email` is `null` when the account is deleted, deactivated or unverified (an anonymized, placeholder or unproven address), so core sends no email to it; `deleted` is true for a deleted account, and core then creates no notification at all |
+| `POST /internal/users/deleted` | the nightly deleted-user sweeps of core and ai (`shared/deleted_users.py::deleted_user_ids`, batches of 500) | body `{user_ids: [uuid, ...]}` (at most 500, else 422); answers `{deleted_ids: [...]}`, the subset whose account is deleted (`deleted_at` set). An unknown id is not in the answer, so a sweep never treats it as deleted |
+| `POST /internal/organizations/missing` | core's nightly sweep (`shared/deleted_users.py::missing_organization_ids`) | body `{organization_ids: [...]}` (at most 500); answers `{missing_ids: [...]}`, the ids with no organization row (deleted). core deletes content only after a successful answer |
+| `POST /internal/scheduler/purge-unverified` | the scheduler (`call-job.sh purge-unverified`, daily 04:10 New York) | `{retention_days, candidates, deleted, skipped, failed, deleted_account_leftovers: {candidates, cleaned, failed, lookup_failed}}`; 500 (`shared/scheduled_jobs.py`) with `all_units_failed` naming the step: `accounts` (every attempted account failed), `deleted_account_leftovers` (every leftover cleanup failed) or `deleted_account_leftovers_lookup` (the leftover query failed) (section 3.19) |
 
 ### 3.19 Administration (`domains/admin/`) and the first admin
 
@@ -1212,8 +1212,16 @@ becomes unverified and gets a new verification email. Soft delete sets
 `deleted_at`, `is_active=false`, replaces email and username with
 `deleted-<hex>@deleted.alphamind.local` / `deleted_<hex>`, sets a random
 password, clears the profile, deletes OAuth links, 2FA secret and
-connections, removes organization memberships except owner rows, revokes
-all sessions, and the route deletes the avatar file after the commit.
+connections, deletes the open invitations the user sent (queuing one
+`organization.invitation.revoked` per unexpired one, with the user as
+actor, so the invitee is told) and, only for a verified account, every
+invitation addressed to the old email in any case
+(`delete_invitations_of_user`, run before the email is replaced; an
+unverified account never proved it owns the address, so a live
+invitation to it survives the purge),
+removes all the user's organization memberships, deletes all the
+user's sessions with their IP and device (`delete_sessions`), and the
+route deletes the avatar file after the commit.
 The steps after the permission checks are one method,
 `AdminService._delete(user, actor_id)`, shared with the nightly purge of
 unverified accounts (`purge_unverified_accounts`, section 3.4; a purge
@@ -1228,11 +1236,36 @@ that account only, drops its queued events and is logged
 (`unverified_account_purge_skipped`). The run ends with the log line
 `unverified_accounts_purged` (candidates, deleted, skipped, failed). An
 organization the deleted user owned passes to its longest-standing
-admin, else its longest-standing other member (`successor_member`), who
+active admin, else its longest-standing active member, and only when no
+member is active to its longest-standing admin or member
+(`successor_member`, which orders by `users.is_active` first), who
 becomes owner (event `organization.role.changed`, log
 `organization_owner_transferred`); without this nobody could manage it
-any more. Only an organization with no other member keeps its deleted
-owner row. A moderator (`user:deactivate` without `user:manage`) may
+any more. An organization with no other member is deleted with its
+memberships and invitations (`_delete_orphaned_organization`, log
+`organization_deleted_without_successor`), and `organization.deleted`
+is queued with the same payload as a normal delete. core then deletes
+the organization's documents and notes, deletes the shared portfolios
+of deleted owners and makes the others private again (chapter 12).
+
+Accounts deleted before these steps existed can still hold auth
+leftovers: sessions, open invitations they sent, memberships, and
+organizations they owned. The same nightly job therefore runs
+`AdminService.clean_deleted_account_leftovers` after the purge. It lists
+the deleted accounts that still have any of these
+(`AdminRepository.deleted_ids_with_leftovers`). For each one, in its own
+transaction, it runs the steps `_delete` uses
+(`_remove_organization_ties_and_sessions`): revoke and delete the open
+sent invitations, hand over or delete the owned organizations as above,
+remove the memberships and delete the sessions. Invitations to the old
+address cannot be found any more, because the address was already
+replaced. A cleaned account has nothing left, so the next run skips it.
+A failure rolls back that account only (`deleted_account_leftovers_failed`);
+a failed candidate query is logged (`deleted_account_leftovers_lookup_failed`)
+and reported as a failed job step, after the purge's own work;
+the run ends with `deleted_account_leftovers_cleaned`.
+
+A moderator (`user:deactivate` without `user:manage`) may
 deactivate and reactivate only accounts whose role is `user` or `guest`.
 When an admin changes an email and does not set `is_verified` in the
 same request, the account becomes unverified and a verification link
@@ -1405,9 +1438,16 @@ take over a local account.
 shoulder-surfed code must not work twice.
 
 **Soft delete instead of a real delete.**
-*Reason:* core and ai keep rows that reference user ids (portfolios,
-analyses). The personal data goes, the id stays, and the Redis mirror
-keeps the id blocked.
+*Reason:* other services keep rows that reference user ids
+(organization content, analyses). auth removes the personal data it
+holds (profile, email, sessions, invitations, OAuth links, 2FA,
+connections). On `user.deleted`, core deletes the user's private
+content (chapter 12) and ai deletes the user's analyses, decisions,
+backtests and memories (chapter 13). A nightly sweep in core and in ai
+repeats that cleanup for every deleted account that still owns data, so
+a lost event or a write that raced the deletion is cleaned the next
+night (chapter 26). The id stays, and the Redis mirror keeps it
+blocked.
 
 **First admin by command-line script.**
 *Alternative:* "the first registered user is admin", or a setup endpoint.
@@ -1741,7 +1781,7 @@ in the database and in Redis.)
 | `services/auth-service/user_state_sync.py` | writes the live role/active mirror (`commit_with_state`, startup sync) |
 | `services/auth-service/deps.py` | `get_current_user`, `require_recent_login` (2FA setup/verify) and permission-checked dependencies |
 | `services/auth-service/database.py` | engine, sessions, Alembic bootstrap |
-| `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai, and the scheduler's `purge-unverified` |
+| `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai (including `users/deleted` and `organizations/missing` for the nightly sweeps), and the scheduler's `purge-unverified` with its leftover cleanup step |
 | `services/auth-service/domains/auth/model.py` | users, profiles, settings, sessions (`SessionRevokeReason`), OAuth accounts, 2FA secrets |
 | `services/auth-service/domains/auth/schema.py` | request/response models, password and username rules |
 | `services/auth-service/domains/auth/repository.py` | data access, atomic rotation claim, rotation-chain revocation (`revoke_rotation_successors`), session purge, TOTP step consume |

@@ -128,13 +128,12 @@ identity file. The entrypoint:
 
 1. requires `S3_ACCESS_KEY` and `S3_SECRET_KEY`, and refuses values with a
    newline or tab (they would need JSON escapes it does not produce);
-2. with `umask 077`, writes `/etc/seaweedfs/s3.json` (path configurable
-   with `OBJECTSTORE_S3_CONFIG`) through a temporary file and a rename.
+2. with `umask 077`, writes `/etc/seaweedfs/s3.json` through a temporary
+   file and a rename.
    The file has one identity, `alphamind`, with those keys and the actions
    `Admin`, `Read`, `List`, `Tagging`, `Write`;
 3. gives the file to the `seaweed` user (the image drops to that user);
-4. `exec`s the image's own `/entrypoint.sh` (configurable with
-   `SEAWEEDFS_ENTRYPOINT`) with the compose command plus
+4. `exec`s the image's own `/entrypoint.sh` with the compose command plus
    `-s3.config=/etc/seaweedfs/s3.json`. The image entrypoint fixes the
    ownership of `/data`, drops to the unprivileged `seaweed` user and
    starts `weed server ...`. SeaweedFS treats the presence of a config
@@ -179,6 +178,7 @@ gateway still rejected every request.
 | `upload_bytes(settings, bucket=, key=, content=, content_type=)` | `put_object` (with `ContentType` when known) |
 | `download_bytes(settings, bucket=, key=)` | `get_object` and read the whole body |
 | `delete_object(settings, bucket=, key=)` | `delete_object` |
+| `list_object_keys(settings, bucket=, prefix=)` | every key under a prefix (`list_objects_v2`, all pages); used by core's nightly deleted-user sweep to find document files no row references |
 | `check_storage_connection(settings)` | `list_buckets`; part of `/health` in core-service and ai-service (`"storage": true/false`) |
 | `close_storage_clients()` | clears the cache at shutdown (boto3 holds no persistent connection; this keeps the shutdown symmetric with the Redis, HTTP and Qdrant clients) |
 
@@ -242,8 +242,9 @@ system documents), in `ResearchService.upload`:
    For an organization upload, the user must be allowed to write in that
    organization. Nothing is stored before all of this passes.
 2. Duplicate check **before** touching storage: the same (tenant,
-   ticker, category, filename) returns the existing document (201,
-   `duplicate`) and uploads nothing. Exceptions:
+   ticker, category, filename) uploads nothing. The public route answers
+   409 `conflict`; the internal route for system documents returns the
+   existing document with `duplicate: true`. Exceptions:
    - an existing document in status `failed` is retried in place: its
      object is overwritten under the **same key**, the status reset to
      `uploaded`, and the event sent again;
@@ -253,7 +254,7 @@ system documents), in `ResearchService.upload`:
      `document.uploaded` event sent
      again (a repair path when ai-service never processed it or stopped
      in the middle) and logs `document_upload_republished`; the object is
-     not uploaded again.
+     not uploaded again, and the existing document is returned (201).
 3. `upload_bytes` to `documents/<owner_id>/<hex><ext>`.
 4. Insert the `core.documents` row with `storage_url = key`,
    `status = "uploaded"`, and the `document.uploaded` event as a row of
@@ -265,8 +266,10 @@ system documents), in `ResearchService.upload`:
    [20-postgresql.md](20-postgresql.md), "commit before the response").
 6. A background task publishes the durable event `document.uploaded`
    with `document_id`, `owner_id`, `organization_id`, `storage_bucket`,
-   `storage_key`, `document_type`, `category`, `ticker`, `content_date`,
-   `filename` and `is_system`, and marks the outbox row published. If
+   `storage_key`, `document_type`, `category`, `ticker`, `content_date`
+   and `filename`, and marks the outbox row published (ai-service treats
+   an event whose `owner_id` is the system owner id as a system
+   document). If
    Redis is down, the outbox dispatcher publishes it later
    ([24-events.md](24-events.md), section 3.5).
 
@@ -311,7 +314,20 @@ event `document.deleted`, and another deletes the stored file
 points, BM25 entries and bookkeeping rows. The file goes last on purpose:
 a failed commit leaves the row and its file intact, and a failed file
 delete only logs `document_orphan_cleanup_failed` and leaves an orphan
-object (no row points to it).
+object (no row points to it). For a deleted account, the nightly core
+sweep removes such orphans: it deletes every object under
+`documents/<owner_id>/` that no row references (chapter 12, section
+3.15). An orphan of a living user stays until removed by hand.
+
+**Account deletion.** When a user is deleted, core deletes that user's
+private documents the same way (row, `document.deleted`, then the
+object). Files of documents shared with an organization stay with the
+organization; when the organization is deleted, its documents and their
+objects go too (chapter 12, section 3.15). The candidate list of the
+nightly sweep comes from one listing of `documents/` compared with the
+`storage_url` values in `core.documents`
+(`users_with_unreferenced_files`), so a deleted user whose folder only
+holds files of kept organization documents is not a candidate.
 
 The event semantics (streams, consumer groups, retries) are explained in
 [24-events.md](24-events.md).
@@ -424,9 +440,6 @@ part, and `--only objectstore` refuses it. See
 | `S3_BUCKET_DOCUMENTS` | `research-documents` | the documents bucket | `shared/config.py` |
 | `MAX_UPLOAD_SIZE_BYTES` | `20 * 1024 * 1024` | upload size limit | `services/core-service/config.py` |
 | `ALLOWED_DOCUMENT_EXTENSIONS` | `.pdf`, `.txt`, `.md` | accepted file types (a class constant, not read from the environment) | `services/core-service/config.py` |
-| `OBJECTSTORE_S3_CONFIG` | `/etc/seaweedfs/s3.json` | where the identity file is written | `infra/objectstore/entrypoint.sh` |
-| `SEAWEEDFS_ENTRYPOINT` | `/entrypoint.sh` | the image entrypoint the script hands over to | `infra/objectstore/entrypoint.sh` |
-| `OBJECTSTORE_S3_PORT` | `9000` | port the healthcheck calls | `infra/objectstore/healthcheck.sh` |
 | image | `chrislusf/seaweedfs:4.47` | pinned SeaweedFS release | `docker-compose.yaml` |
 
 ---
@@ -485,8 +498,8 @@ format.
 | `objectstore` stays unhealthy | wrong keys, first start still running, or SeaweedFS failed | core/ai-service and the scheduler wait | `docker compose --env-file .env.docker logs objectstore`; look for `objectstore-entrypoint: wrote the S3 identity file` |
 | core/ai `/health` shows `"storage": false` | gateway down or keys rejected | 503 from `/health` | `bash scripts/objectstore.sh` (fails with AccessDenied if the keys differ) |
 | Upload returns 201 but the document stays `uploaded` (or stops at `parsing`, `chunking`, `embedding`) | `document.uploaded` still waiting in `core.event_outbox` (Redis down), ai-service down, or ai-service stopped in the middle | the outbox dispatcher publishes it when Redis is back; after the stuck limit (10 minutes `uploaded`, 60 minutes in a processing status, from the last status change) a re-upload of the same file re-sends the event, and the next nightly ingestion submits a stuck system document again | `bash scripts/psql.sh -c "SELECT id, filename, status, status_changed_at FROM core.documents WHERE status NOT IN ('ready', 'failed') ORDER BY status_changed_at;"`; [24-events.md](24-events.md) |
-| Document ends `failed` | parsing found no text (for example a scanned PDF), or embedding failed | status `failed`; a re-upload retries in place | ai-service log `rag_ingestion_failed` (success is `rag_ingestion_complete`); there is no OCR |
-| Log `document_orphan_cleanup_failed` | object could not be deleted after a failed insert, or after a committed document delete | an orphan object remains (no row points to it) | `bash scripts/objectstore.sh ls documents/<owner_id>/` and compare with `core.documents` |
+| Document ends `failed` | parsing found no text (for example a scanned PDF), or embedding failed | status `failed`; a re-upload retries in place (the object is overwritten under the same key); the nightly ingestion resubmits a failed system document while its first upload is less than `FAILED_DOCUMENT_RETRY_DAYS` (7) days old | ai-service log `rag_ingestion_failed` (success is `rag_ingestion_complete`); there is no OCR |
+| Log `document_orphan_cleanup_failed` | object could not be deleted after a failed insert, or after a committed document delete | an orphan object remains (no row points to it) | for a deleted account the nightly `deleted-user-sweep-core` removes it; otherwise `bash scripts/objectstore.sh ls documents/<owner_id>/` and compare with `core.documents` |
 | `GET .../content` returns an error for an existing row | object missing (restored database without matching object storage) | 5xx | `bash scripts/objectstore.sh ls <key prefix>`; restore both parts from the same backup |
 | Backup fails at "objectstore: copying bucket" | S3 API unreachable or keys rejected (the scheduler's `S3_*` settings) | run marked FAILED, old backups kept | scheduler log; `make backups`; `bash scripts/objectstore.sh` |
 | `restore.sh --verify` reports objectstore differences | objects changed or added since the backup, or an incomplete restore | exit code 1, nothing changed | rerun `restore.sh --yes --only objectstore`, then `--verify` again |
@@ -629,7 +642,8 @@ it is never indexed and does not duplicate the summary in search.
 | `infra/objectstore/entrypoint.sh` | writes the S3 identity file, starts SeaweedFS |
 | `infra/objectstore/healthcheck.sh` | SigV4-signed ListBuckets |
 | `shared/config.py` | `S3_*` settings |
-| `shared/storage.py` | boto3 client, `ensure_bucket`, upload/download/delete, health check |
+| `shared/storage.py` | boto3 client, `ensure_bucket`, upload/download/delete, `list_object_keys`, health check |
+| `services/core-service/event_listener.py` | account and organization cleanup; the nightly sweep's `users_with_unreferenced_files` and `delete_unreferenced_files` |
 | `services/core-service/main.py` | `ensure_bucket` at startup |
 | `services/core-service/domains/research/service.py` | upload, duplicate handling, download, delete, `document.uploaded` / `document.deleted` |
 | `services/core-service/api/internal.py` | system document routes used by ai-service jobs (`/internal/documents*`) |

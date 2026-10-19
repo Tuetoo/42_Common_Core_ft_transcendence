@@ -151,10 +151,8 @@ class GetMacroIndicatorsTool(Tool):
         trend = ""
         if len(points) >= 2:
             change = latest.value - points[0].value
-            direction = (
-                "up" if change > 0 else "down" if change < 0 else "flat")
             trend = (
-                f" ({direction} {abs(change):.2f} over the period, "
+                f" ({_direction(change)} {abs(change):.2f} over the period, "
                 f"from {_format_value(points[0].value, latest.unit)})")
 
         def fmt(value: float) -> str:

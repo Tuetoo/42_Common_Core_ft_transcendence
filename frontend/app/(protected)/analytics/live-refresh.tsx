@@ -3,9 +3,7 @@
 import { useEffect, useEffectEvent, useRef } from "react";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { useRouter } from "next/navigation";
-import { parseEnvelope, useChannel } from "@/app/lib/use-channel";
-
-type ConnectionStatus = "connecting" | "live" | "reconnecting";
+import { useUserChannelStatus, useUserEvents } from "@/app/lib/use-channel";
 
 // Notification types (shared/enums.py NotificationType) that change the
 // numbers on this page. The backend sends every notification to the
@@ -26,15 +24,7 @@ const POLL_INTERVAL_MS = 60_000;
 // Keeps the analytics page current. The socket only signals that something
 // changed; router.refresh() re-runs the server page, which fetches the real
 // numbers again with the filters in the URL.
-export function LiveRefresh({
-  accessToken,
-  userId,
-  renderedAt,
-}: {
-  accessToken: string;
-  userId: string;
-  renderedAt: string;
-}) {
+export function LiveRefresh({ renderedAt }: { renderedAt: string }) {
   const router = useRouter();
   const lastRefresh = useRef(0);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -54,27 +44,15 @@ export function LiveRefresh({
   }
   const onTick = useEffectEvent(scheduleRefresh);
 
-  // The server closes the socket with 4401 when the access token expires,
-  // so that retry first re-renders the page (which brings a fresh token;
-  // the socket then reconnects with it). Other drops only reconnect; the
-  // poll below catches up. Waits grow 2s, 4s, 8s ... 60s.
-  const { status: channel } = useChannel({
-    path: `/user:${userId}`,
-    token: accessToken,
-    baseDelayMs: 2000,
-    onMessage: (event) => {
-      const envelope = parseEnvelope(event.data);
-      if (envelope?.event === "notification" && RELEVANT_TYPES.has(String(envelope.payload.type))) {
-        scheduleRefresh();
-      }
-    },
-    onUnauthorized: () => {
-      lastRefresh.current = Date.now();
-      router.refresh();
-    },
+  // Events come from the sidebar's user: socket (use-live-unread.ts),
+  // which also renews an expired token; the poll below catches up after
+  // a drop.
+  const status = useUserChannelStatus();
+  useUserEvents((envelope) => {
+    if (envelope.event === "notification" && RELEVANT_TYPES.has(String(envelope.payload.type))) {
+      scheduleRefresh();
+    }
   });
-  const status: ConnectionStatus =
-    channel === "open" ? "live" : channel === "connecting" ? "connecting" : "reconnecting";
 
   useEffect(() => {
     lastRefresh.current = Date.now();
@@ -96,8 +74,10 @@ export function LiveRefresh({
     };
   }, []);
 
-  const label = status === "live" ? "Live" : status === "reconnecting" ? "Reconnecting…" : "Connecting…";
-  const color = status === "live" ? "var(--up)" : "var(--accent)";
+  // "ended": a fatal close (use-channel.ts) that is not retried.
+  const label =
+    status === "open" ? "Live" : status === "reconnecting" ? "Reconnecting…" : status === "ended" ? "Disconnected" : "Connecting…";
+  const color = status === "open" ? "var(--up)" : "var(--accent)";
 
   return (
     <div

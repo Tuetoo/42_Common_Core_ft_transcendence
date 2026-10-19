@@ -4,6 +4,7 @@
 
 export const USERNAME_PATTERN = "[A-Za-z0-9_.\\-]{3,32}";
 export const USERNAME_TITLE = "3 to 32 characters: letters, digits, dot (.), underscore (_) or hyphen (-).";
+export const USERNAME_RE = new RegExp(`^${USERNAME_PATTERN}$`);
 
 export const PASSWORD_MIN = 10;
 // bcrypt only reads the first 72 bytes, so the backend refuses longer
@@ -14,6 +15,17 @@ export const PASSWORD_TITLE = `At least ${PASSWORD_MIN} characters and at most $
 
 // Generous standard limit for an email address.
 export const EMAIL_MAX = 254;
+export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Profile timezones are IANA names the runtime knows.
+export function isTimezone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // For an input's onChange: marks the field invalid when the password is
 // too long in bytes, so the browser blocks the submit with this message.

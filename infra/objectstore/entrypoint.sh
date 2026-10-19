@@ -19,10 +19,6 @@
 #
 # Environment:
 #   S3_ACCESS_KEY, S3_SECRET_KEY   required
-#   OBJECTSTORE_S3_CONFIG          where to write the file
-#                                  (default /etc/seaweedfs/s3.json)
-#   SEAWEEDFS_ENTRYPOINT           the image entrypoint to exec
-#                                  (default /entrypoint.sh)
 
 set -eu
 
@@ -30,8 +26,7 @@ die() { echo "objectstore-entrypoint: ERROR: $*" >&2; exit 1; }
 
 : "${S3_ACCESS_KEY:?set S3_ACCESS_KEY (docker compose --env-file .env.docker)}"
 : "${S3_SECRET_KEY:?set S3_SECRET_KEY (docker compose --env-file .env.docker)}"
-CONFIG="${OBJECTSTORE_S3_CONFIG:-/etc/seaweedfs/s3.json}"
-UPSTREAM="${SEAWEEDFS_ENTRYPOINT:-/entrypoint.sh}"
+CONFIG=/etc/seaweedfs/s3.json
 
 # A newline or a tab in a key would need JSON escapes that this small
 # script does not produce; refuse it instead of writing a broken file.
@@ -77,4 +72,4 @@ fi
 echo "objectstore-entrypoint: wrote the S3 identity file $CONFIG (1 identity)"
 
 [ $# -gt 0 ] || die "no command given (expected: server -s3 ...)"
-exec "$UPSTREAM" "$@" "-s3.config=$CONFIG"
+exec /entrypoint.sh "$@" "-s3.config=$CONFIG"

@@ -10,6 +10,8 @@ import ai.recommendation.position_sizing as sizing_module
 import ai.tools.portfolio_tool as portfolio_tool_module
 import pytest
 from ai.agents import debate_common as dc
+from ai.agents.evidence_grounding import \
+    final_answer_has_unverifiable_percentages
 from ai.agents.fundamental import _TOOL_NOTE_RE
 from ai.agents.judge import JudgeAgent
 from ai.agents.loop import ReActAgentLoop
@@ -196,10 +198,10 @@ def _reaffirm_state(action: str = "buy", usable: int = 5) -> AnalysisState:
     for role in _ALL_ROLES[usable:]:
         outputs[role] = _failed(role, "rate_limit")
     prior = PriorRecommendation(
-        recommendation_id=str(uuid4()), analysis_id=str(uuid4()),
+        analysis_id=str(uuid4()),
         action=RecommendationAction.BUY, confidence=0.6,
         issued_at=datetime(2026, 9, 16, 14, 2, tzinfo=UTC), accepted=False,
-        well_supported_count=6, agent_count=9)
+        well_supported_count=6)
     return _state(
         ticker="MSFT", agent_outputs=outputs, prior_recommendation=prior,
         debate=DebateState(
@@ -260,18 +262,23 @@ class TestFinalRecommendation:
                     ])
             ])
         rec = _final(unverified)
-        note = unverified.confidence_adjustment_note()
-        assert rec.confidence == 0.85 - 0.15
+        assert rec.confidence == 0.85
+        assert rec.reasoning == "Some rationale"
+        assert rec.confidence_adjustment_note == (
+            unverified.confidence_adjustment_note())
         assert rec.debate_converged is True
-        assert note is not None
-        assert "Reflection could not fully verify" in note
-        assert "4 unresolved issues" in note
+        assert "Reflection could not fully verify" in (
+            rec.confidence_adjustment_note or "")
+        assert "4 unresolved issues" in rec.confidence_adjustment_note
+        assert rec.confidence_adjustment_note.endswith(
+            "confidence is not reduced for this.")
 
         clean = _hold_verdict_state(
             converged=True, history=[
                 ReflectionVerdict(round_number=1, verified=True, issues=[])
             ])
         assert _final(clean).confidence == 0.85
+        assert _final(clean).confidence_adjustment_note is None
         assert clean.confidence_adjustment_note() is None
 
         stacked = _hold_verdict_state(
@@ -279,7 +286,93 @@ class TestFinalRecommendation:
                 ReflectionVerdict(
                     round_number=1, verified=False, issues=["x"])
             ])
-        assert abs(_final(stacked).confidence - 0.55) < 1e-9
+        assert abs(_final(stacked).confidence - 0.70) < 1e-9
+        no_issues = _hold_verdict_state(
+            converged=True, history=[
+                ReflectionVerdict(round_number=1, verified=False, issues=[])
+            ])
+        assert _final(no_issues).confidence == 0.85
+        assert "Confidence lowered" not in (
+            _final(no_issues).confidence_adjustment_note or "")
+
+    def test_every_lowering_is_listed_with_its_amount(self):
+        outputs = {r: _ok(r) for r in _ALL_ROLES}
+        for role in _ALL_ROLES[7:]:
+            outputs[role] = _failed(role, "rate_limit")
+        state = _state(
+            ticker="COST", agent_outputs=outputs, reflection_history=[
+                ReflectionVerdict(
+                    round_number=1, verified=False,
+                    issues=["a", "b", "c"])
+            ], debate=DebateState(
+                round_number=2, converged=False, arguments=_args(),
+                verdicts=[_verdict("hold", 0.87)]))
+        rec = _final(state)
+        note = rec.confidence_adjustment_note or ""
+        assert rec.confidence == pytest.approx(0.57)
+        lowered = [
+            "Confidence lowered by 0.15 because the Bull/Bear debate did not "
+            "converge.",
+            "Confidence lowered by 0.15 because only 7 of 9 selected agents "
+            "produced usable evidence."
+        ]
+        for sentence in lowered:
+            assert sentence in note
+        assert note.count("Confidence lowered") == 2
+        assert note.endswith(
+            "Stored confidence is 0.57, against the Judge's 0.87, because of "
+            "the code adjustments listed in this note.")
+
+    def test_backup_model_use_is_disclosed_in_the_note(self):
+
+        def final(*, bull: int, judge: int, reflection: int):
+            args = _args()
+            args[0] = args[0].model_copy(update={"fallback_calls": bull})
+            state = _state(
+                agent_outputs={r: _ok(r) for r in _ALL_ROLES},
+                reflection_history=[
+                    ReflectionVerdict(
+                        round_number=1, verified=True,
+                        fallback_calls=reflection)
+                ], debate=DebateState(
+                    round_number=1, converged=True, arguments=args,
+                    verdicts=[
+                        _verdict(
+                            "hold", 0.6, model="backup-model",
+                            fallback_calls=judge)
+                    ]))
+            return _final(state)
+
+        rec = final(bull=2, judge=1, reflection=1)
+        assert rec.confidence == pytest.approx(0.6)
+        assert rec.confidence_adjustment_note == (
+            "Backup model: 4 Bull, Bear, Judge or reflection call(s) in this "
+            "analysis were answered by the provider's fallback model, not its "
+            "primary model. The final Judge verdict was written by "
+            "backup-model.")
+        unused = final(bull=0, judge=0, reflection=0)
+        assert unused.confidence_adjustment_note is None
+
+    def test_judge_own_previous_confidence_is_explained(self):
+        prior = PriorRecommendation(
+            analysis_id="a0",
+            action=RecommendationAction.BUY, confidence=0.63,
+            issued_at=_T0, accepted=False,
+            judge_leaning=RecommendationAction.BUY, judge_confidence=0.78)
+        state = _state(
+            ticker="NVDA", prior_recommendation=prior, debate=DebateState(
+                round_number=1, converged=True, arguments=_args(),
+                verdicts=[_verdict("buy", 0.74)]))
+        rec = _final(state)
+        assert rec.confidence == pytest.approx(0.74)
+        assert (rec.confidence_adjustment_note or "").endswith(
+            "The Judge compared its confidence with its own earlier 0.78 from "
+            "2026-09-28, before code adjustments; the recommendation "
+            "published then had 0.63, and this one is stored at 0.74.")
+        same = prior.model_copy(update={"judge_confidence": 0.63})
+        rec = _final(state.model_copy(update={"prior_recommendation": same}))
+        assert "compared its confidence" not in (
+            rec.confidence_adjustment_note or "")
 
     def test_reaffirmation_cap_rules(self):
         cases = {
@@ -303,10 +396,10 @@ class TestFinalRecommendation:
                     rationale="r")
             ])
         prior = PriorRecommendation(
-            recommendation_id="r0", analysis_id="a0",
+            analysis_id="a0",
             action=RecommendationAction.HOLD, confidence=0.6,
             issued_at=_T0 - timedelta(days=2), accepted=False,
-            well_supported_count=9, agent_count=9)
+            well_supported_count=9)
         rec = _final(
             _state(
                 ticker="MSFT", selected_agents=list(_NINE), debate=buy_debate,
@@ -448,7 +541,7 @@ class TestJudge:
         router = _Router(_judge_json(), repeat=True)
         monkeypatch.setattr(judge_module, "LLMRouter", lambda: router)
         prior = PriorRecommendation(
-            recommendation_id="r", analysis_id="a",
+            analysis_id="a",
             action=RecommendationAction.BUY, confidence=0.72,
             issued_at=datetime(2026, 9, 21, tzinfo=UTC), accepted=True)
         state = _state(
@@ -613,6 +706,37 @@ class TestJudge:
         for value, expected in cases:
             got = judge_module._parse_converged(value)
             assert got is expected, repr(value)
+
+    def test_latest_quarter_reaches_the_evidence_once(self):
+        growth = "Revenue growth YoY (get_fundamentals, FY2025): 14.0%"
+        cases = {
+            "with-growth": (
+                f"P/E 22.79.\n\n{_GOOGL_QUARTER_TEXT}\n{growth}",
+                f"- fundamental: P/E 22.79.\n\n{growth}\n"),
+            "quarter-last": (
+                f"P/E 22.79.\n\n{_GOOGL_QUARTER_TEXT}",
+                "- fundamental: P/E 22.79.\n")
+        }
+        for case_id, (summary, agent_line) in cases.items():
+            for warnings in ([], ["unverified figure"]):
+                out = _completed(
+                    AgentRole.FUNDAMENTAL, {
+                        "latest_quarter": {
+                            "text": _GOOGL_QUARTER_TEXT
+                        },
+                        "verification_warnings": warnings
+                    }, summary)
+                state = _state(
+                    ticker="GOOGL", debate=_two_sides(),
+                    agent_outputs={AgentRole.FUNDAMENTAL: out})
+                evidence = dc.format_evidence(state)
+                reference = dc.format_grounding_reference(state)
+                for text in (evidence, reference):
+                    assert text.count(_GOOGL_QUARTER_TEXT) == 1, case_id
+                assert agent_line in evidence, case_id
+                assert (agent_line in reference) is not bool(
+                    warnings), case_id
+                assert out.summary == summary, case_id
 
 
 _BA_QUARTER: dict[str, Any] = {
@@ -972,6 +1096,37 @@ def _xbrl_four(q: float, q_prior: float, ytd: float,
 
 
 class TestFigures:
+
+    def test_percent_written_as_a_word_reads_like_the_symbol(self):
+        assert dc.find_ungrounded_figures(
+            "September sales rose 13.0%",
+            "September net sales were up 13.0 percent") == set()
+        assert dc.find_ungrounded_figures(
+            "sales rose 13.0 Percent", "sales rose 13.0%") == set()
+        assert dc.find_ungrounded_figures(
+            "sales rose 13.0 percent", "sales rose 12%") == {"13.0 percent"}
+
+    def test_scaled_figure_matches_a_plain_amount_within_tolerance(self):
+        evidence = (
+            "a total transaction of $2,015,046.00 on September 29; stake "
+            "valued at approximately $1,536,696,660.80")
+        claims = {
+            "$2.0 million", "$2 million", "$2.02 million", "$1.54 billion",
+            "$2.1 million", "$2.00 million", "$2.0 billion", "$2 billion",
+            "$1.5 billion", "$1.9-2.0 million", "2.0 million", "$(2.0) million"
+        }
+        single = claims - {"$1.9-2.0 million", "2.0 million"}
+        assert dc.find_ungrounded_figures(
+            "; ".join(sorted(single)), evidence) == single
+        assert dc.scaled_figures_matching_plain_dollars(claims, evidence) == {
+            "$2.0 million", "$2 million", "$2.02 million", "$1.54 billion",
+            "$(2.0) million"
+        }
+        assert dc.scaled_figures_matching_plain_dollars(
+            {"$2.0 million"}, "2,015,046 shares") == set()
+        assert final_answer_has_unverifiable_percentages(
+            "weight is 10% after the trade, 10.4% before",
+            {"10.0%", "9.5%"}) == ["10.4%"]
 
     def test_figure_reading_ungrounded_and_precision(self):
         readings = {
@@ -1523,6 +1678,51 @@ class TestReflection:
             "found no evidence, not retried" in i for i in verdict.issues)
 
     @pytest.mark.asyncio
+    async def test_not_engaged_needs_the_other_sides_earlier_round(
+            self, monkeypatch):
+        state = _fundamental_debate_state()
+        state.debate.arguments.append(
+            DebateArgument(
+                round_number=2, side="bear",
+                argument="Bear r2: buybacks were cut to zero"))
+        state.debate.round_number = 2
+        issues = [
+            _issue("bear", "not_engaged", "earlier bull point",
+                   quote="Margin 45%"),
+            _issue("bear", "not_engaged", "agent evidence only"),
+            _issue("bear", "not_engaged", "own text", quote="Growth slowing"),
+            _issue("bull", "not_engaged", "parallel round 1",
+                   quote="Growth slowing"),
+            _issue("bull", "not_engaged", "later round, bull not re-run",
+                   quote="buybacks were cut to zero"),
+            _issue(None, "not_engaged", "no side", quote="Margin 45%"),
+            _issue("bear", "unsupported", "evidence quote still enough"),
+        ]
+        verdict = await _review(
+            monkeypatch, {"checked_claims": ["x"], "issues": issues}, state)
+        assert verdict.llm_review_ran is True
+        assert [(d.role, d.kind, d.evidence_quote)
+                for d in verdict.issue_details] == [
+            ("bear", "not_engaged", "Margin 45%"),
+            ("bear", "unsupported", "Gross margin 45% and revenue grew 16%"),
+        ]
+        assert set(verdict.retry_agents) == {AgentRole.BEAR}
+
+    def test_not_engaged_ignores_a_sides_unavailable_latest_round(self):
+        arguments = [
+            DebateArgument(round_number=1, side="bull", argument="bull r1"),
+            DebateArgument(round_number=1, side="bear", argument="bear r1"),
+            DebateArgument(
+                round_number=2, side="bull", argument="[unavailable]",
+                available=False, unavailable_kind="rate_limit"),
+            DebateArgument(round_number=2, side="bear", argument="bear r2"),
+        ]
+        assert reflection_module._earlier_other_side_text(
+            arguments, "bull") == ""
+        assert reflection_module._earlier_other_side_text(
+            arguments, "bear") == "bull r1"
+
+    @pytest.mark.asyncio
     async def test_bull_regeneration_and_badly_shaped_review(
             self, monkeypatch):
         review = json.dumps({
@@ -1588,6 +1788,15 @@ class TestReflection:
                 "issues": []
             })
         assert verdict.llm_review_ran is False
+        for payload in ('The bull cites {"pe": 31.2} as fair.', {"pe": 31.2}):
+            with capture_logs() as logs:
+                verdict = await _review(monkeypatch, payload)
+            assert verdict.llm_review_ran is False
+            assert verdict.llm_review_skip_reason == (
+                "the review response could not be parsed")
+            assert any(
+                e["event"] == "reflection.unparseable_response"
+                for e in logs)
         verdict = await _review(
             monkeypatch, {
                 "checked_claims": ["x"],
@@ -1785,6 +1994,24 @@ class TestPositionSizing:
             committed_buy_cash=Decimal("0"), capped_by_weight=False,
             min_notional=Decimal("100"), position=None)
         assert capped is not None and capped.window_days == 30
+
+        non_finite = json.dumps({
+            "window_days": 10,
+            "tiers": [
+                {"target_price": float("nan"), "quantity": 2.0},
+                {"target_price": float("inf"), "quantity": 2.0},
+                {"target_price": 100.0, "quantity": float("inf")},
+                {"target_price": 100.0, "quantity": 2.0},
+            ]
+        })
+        finite, _ = _validated_sizing(
+            non_finite, action=RecommendationAction.BUY, ticker="KO",
+            budget=Decimal("1000"), cash=Decimal("1000"),
+            committed_buy_cash=Decimal("0"), capped_by_weight=False,
+            min_notional=Decimal("100"), position=None)
+        assert finite is not None
+        assert [(t.target_price, t.quantity) for t in finite.tiers] == [
+            (Decimal("100.0"), Decimal("2.0"))]
 
         no_tiers = {
             "buy-without-budget": (

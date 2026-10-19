@@ -209,17 +209,13 @@ def _fernet() -> MultiFernet:
     return MultiFernet(keys)
 
 
-def is_encrypted(stored: str) -> bool:
-    return stored.startswith(PREFIX)
-
-
 def encrypt_secret(secret: str) -> str:
     return PREFIX + _fernet().encrypt(secret.encode()).decode()
 
 
 def decrypt_secret(stored: str) -> str:
-    if not is_encrypted(stored):
-        return stored
+    if not stored.startswith(PREFIX):
+        raise UnreadableTotpSecretError
     try:
         return _fernet().decrypt(stored[len(PREFIX):].encode()).decode()
     except InvalidToken as exc:

@@ -1,5 +1,5 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
-import { getMe } from "@/app/lib/session";
+import { getMe, getUnreadTotal } from "@/app/lib/session";
 import { markAllNotificationsRead } from "@/app/lib/actions/notifications";
 import { Pager, pageParam } from "../pager";
 import { LocalTime } from "@/app/(protected)/local-time";
@@ -19,20 +19,19 @@ type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
 export default async function NotificationsPage({ searchParams }: { searchParams: SearchParams }) {
   const page = pageParam((await searchParams).page);
-  const { me, accessToken } = await getMe();
+  const { accessToken } = await getMe();
 
-  const [notificationsRes, unreadRes] = await Promise.all([
+  const [notificationsRes, unreadCount] = await Promise.all([
     backendFetch(`/notifications?page=${page}&page_size=${PAGE_SIZE}`, accessToken, { cache: "no-store" }),
-    // "Mark all as read" covers every page, so ask whether any are unread at all.
-    backendFetch("/notifications?unread_only=true&page_size=1", accessToken, { cache: "no-store" }),
+    // "Mark all as read" covers every page, so ask whether any are unread at
+    // all (the same request as the layout's badge, made once).
+    getUnreadTotal(accessToken),
   ]);
   requireOk(notificationsRes, "Failed to load notifications");
 
   const { items: notifications, total }: { items: Notification[]; total: number } =
     await notificationsRes.json();
-  const hasUnread = unreadRes.ok
-    ? (await unreadRes.json()).total > 0
-    : notifications.some((n) => !n.read_at);
+  const hasUnread = unreadCount !== null ? unreadCount > 0 : notifications.some((n) => !n.read_at);
 
   return (
     <div className="page">
@@ -81,7 +80,7 @@ export default async function NotificationsPage({ searchParams }: { searchParams
 
       <div className="section">
         <h2 className="section-title">Live feed</h2>
-        <LiveFeed accessToken={accessToken} userId={me.id} />
+        <LiveFeed />
       </div>
     </div>
   );

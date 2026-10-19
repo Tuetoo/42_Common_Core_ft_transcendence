@@ -13,7 +13,7 @@ function newMarker(): string {
 
 // These are links the browser follows, so they need the gateway address as
 // the browser sees it — not BACKEND_API_URL, which is the server-side
-// address (https://gateway/... inside Docker, unknown to the browser).
+// address (http://gateway:8080/... inside Docker, unknown to the browser).
 // Empty NEXT_PUBLIC_GATEWAY_URL = same origin, when served by the gateway.
 export function OAuthButtons({ next = "" }: { next?: string }) {
   const base = `${process.env.NEXT_PUBLIC_GATEWAY_URL ?? ""}/api/v1/auth/oauth`;

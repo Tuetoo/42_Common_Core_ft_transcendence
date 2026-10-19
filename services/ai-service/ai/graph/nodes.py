@@ -28,8 +28,9 @@ from ai.graph.state import (AVAILABILITY_FAILURE_KINDS,
                             ReflectionIssue, ReflectionVerdict,
                             merge_debate_state, node_name)
 from ai.ingestion.sec_edgar_filings import ingest_new_filings
-from ai.llm.base import (LLMNonEnglishOutputError, LLMProviderTimeoutError,
-                         LLMRateLimitError, LLMServerOverloadedError, LLMTier)
+from ai.llm.base import (LLMCreditExhaustedError, LLMNonEnglishOutputError,
+                         LLMProviderTimeoutError, LLMRateLimitError,
+                         LLMServerOverloadedError, LLMTier)
 from ai.llm.router import (capacity_aware_delay, chain_capacity,
                            free_chain_model, tier_model_chain)
 from ai.recommendation.engine import (build_final_recommendation,
@@ -154,6 +155,8 @@ async def _run_agent_safely(
 
 
 def _failure_kind_of(exc: BaseException) -> FailureKind:
+    if isinstance(exc, LLMCreditExhaustedError):
+        return "credit_exhausted"
     if isinstance(exc, (LLMServerOverloadedError, LLMProviderTimeoutError)):
         return "server_overload"
     if isinstance(exc, LLMRateLimitError):
@@ -586,7 +589,10 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
             round_number=round_number, converged=False,
             leaning=RecommendationAction.HOLD, confidence=0.0,
             rationale=f"Judge unavailable: {exc}", judge_failed=True,
-            failure_reason=AnalysisFailureReason.JUDGE_UNAVAILABLE)
+            failure_reason=(
+                AnalysisFailureReason.LLM_CREDIT_EXHAUSTED if isinstance(
+                    exc, LLMCreditExhaustedError) else
+                AnalysisFailureReason.JUDGE_UNAVAILABLE))
     mutual_rounds_completed = state.debate.mutual_rounds_completed + (
         0 if is_correction_pass else 1)
     logger.debug(
@@ -727,32 +733,27 @@ async def reflection_node(state: AnalysisState) -> dict[str, Any]:
             state, retry_now)
         if no_progress_notes:
             verdict = verdict.with_extra_issues(no_progress_notes)
+
+    current_mutual_round = state.debate.mutual_rounds_completed
+    side_targets = {AgentRole.BULL, AgentRole.BEAR} & retry_now.keys()
+    if (len(side_targets) == 1 and
+            state.debate.correction_used_for_round == current_mutual_round):
+        logger.debug(
+            "debate_debug.reflection_node.correction_cap_hit",
+            mutual_round=current_mutual_round,
+            dropped_role=next(iter(side_targets)).value)
+        retry_now = {
+            role: reason
+            for role, reason in retry_now.items() if role not in side_targets
+        }
     if retry_now:
         retry_now, rate_limit_notes = await _rate_limit_gate_for_retry(
             retry_now)
         if rate_limit_notes:
             verdict = verdict.with_extra_issues(rate_limit_notes)
 
-    current_mutual_round = state.debate.mutual_rounds_completed
-    bull_bear_targets = {
-        role
-        for role in retry_now if role in (AgentRole.BULL, AgentRole.BEAR)
-    }
+    bull_bear_targets = {AgentRole.BULL, AgentRole.BEAR} & retry_now.keys()
     single_side_correction = len(bull_bear_targets) == 1
-    correction_cap_hit = (
-        single_side_correction
-        and state.debate.correction_used_for_round == current_mutual_round)
-    if correction_cap_hit:
-        logger.debug(
-            "debate_debug.reflection_node.correction_cap_hit",
-            mutual_round=current_mutual_round,
-            dropped_role=next(iter(bull_bear_targets)).value)
-        retry_now = {
-            role: reason
-            for role, reason in retry_now.items()
-            if role not in (AgentRole.BULL, AgentRole.BEAR)
-        }
-        single_side_correction = False
 
     result: dict[str, Any] = {
         "reflection_history": [verdict],
@@ -784,7 +785,7 @@ async def recommendation_node(state: AnalysisState) -> dict[str, Any]:
             "recommendation_node.no_verdict", ticker=state.ticker,
             reason=reason)
         return {"final_recommendation": None, "no_verdict_reason": reason}
-    verdict = state.debate.latest_verdict
+    verdict = state.debate.latest_valid_verdict
     assert verdict is not None
     recommendation = build_final_recommendation(state, verdict)
     return {"final_recommendation": recommendation.model_dump(mode="json")}

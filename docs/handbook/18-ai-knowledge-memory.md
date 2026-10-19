@@ -174,7 +174,7 @@ The Judge receives them as a "Track record" block, one line per call
 
 The lines show the FINAL action and confidence (what was issued). The
 Judge's own stored values are used only for the "earlier verdict"
-comparison (chapter 15, section 3.17). The rationale is deliberately not
+comparison (chapter 15, section 3.18). The rationale is deliberately not
 shown. The system prompt clause
 (`judge.py::_TRACK_RECORD_CLAUSE`) says to use the record only to
 calibrate confidence, never to repeat a call because it was made before.
@@ -218,7 +218,9 @@ stored at all (`procedural_memory.write_skipped`, reason
 without an owner, `memory_type` = `trajectory`, `score`, `content` JSONB).
 After each write, `prune_beyond_retention` keeps only the newest 3 rows
 for that agent, ticker and owner (the read path uses 2; one row of
-buffer). Without the pruning the table would grow without limit.
+buffer). Without the pruning the table would grow without limit. When an
+account is deleted, its procedural rows and its episodic rows are removed
+by the ai user cleanup (chapter 13, section 3.8); system rows stay.
 
 **Reading** (`retrieve_procedural_hints(role, ticker, user_id=...)`), once
 per selected role in `supervisor_node`, with the analysis owner:
@@ -312,11 +314,10 @@ before archiving:
    request for up to 4 texts) and compute the cosine similarity. The
    reports are embedded whole: the vectors in Qdrant belong to single
    chunks, so they cannot stand in for a whole report.
-3. A similarity at or above `near_duplicate_threshold()` is a match. The
-   threshold is `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` when set, otherwise
-   0.90 (chosen for the older `mistral-embed` model). `.env.example` sets
-   0.85, calibrated for `gemini-embedding-2`; cosine values are not
-   comparable across embedding models. Embedding meaning, not characters: two LLM rewordings of the
+3. A similarity at or above `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` is a
+   match. The default 0.85 is calibrated for `gemini-embedding-2` (the
+   default embedding); use 0.90 with the older `mistral-embed`. Cosine
+   values are not comparable across embedding models. Embedding meaning, not characters: two LLM rewordings of the
    same facts scored as low as 0.11 on character similarity. Without a
    known owner nothing is superseded.
 
@@ -332,11 +333,12 @@ If writing the rows fails, the chunks just indexed are deleted again
 that also fails) and the error is re-raised, so no orphan report stays
 searchable without its rows. Success logs `archival.report_archived`. Only
 *after* that, the matched old report is superseded (`_supersede_report`,
-one session and one commit): its chunks are removed from Qdrant, BM25,
-`ai.document_chunks` and `ai.embedding_jobs`
-(`ai/rag/indexing.py::delete_document_completely`), its KG relations are
-deleted (`delete_relations_for_report`), and its `ai.agent_reports` row is
-deleted. Log: `archival.superseded_near_duplicate` (chunks and relations
+one session and one commit, through `delete_archived_report`): its chunks
+are removed from Qdrant, BM25, `ai.document_chunks` and
+`ai.embedding_jobs` (`ai/rag/indexing.py::delete_document_completely`),
+its KG relations are deleted (`delete_relations_for_report`), and its
+`ai.agent_reports` row is deleted. The same helper removes the archived
+notes of a deleted user's analyses (chapter 13, section 3.8). Log: `archival.superseded_near_duplicate` (chunks and relations
 removed). A failed supersede is logged (`archival.supersede_failed`) and
 leaves one extra near-duplicate note, never a lost one.
 
@@ -578,8 +580,26 @@ thread (`asyncio.to_thread`). Time limits:
   15 s and treats the call as failed, so one slow SEC page cannot hold
   an analysis for minutes. The inner thread is not killed; it ends when
   the library's own request timeout fires.
-- `Company(ticker)`, `filing.text()` and `amendment.text()` are not
+- `Company(ticker)` and the text fetches (`filing_text`) are not
   wrapped; they are bounded only by the library's per-request timeout.
+
+**Filing text** (`filing_text`, used for the filing, its 10-K/A and
+`fetch_filing_text_sync`). It reads the primary document from the full
+submission file (`filing.sgml().text()`, the `{accession}.txt` download)
+and falls back to `filing.text()` only when that fails or is empty. Every
+modern 10-K and 10-Q is an inline-XBRL document that starts with
+`<?xml`, and for such a document `filing.text()` in edgartools 5.48 looks
+the primary document up through the legacy index page
+`/Archives/edgar/data/{cik}/{accession}-index.html`. SEC answers that
+URL with 403 (seen from October 2026), the library parses the error page
+as a page with no documents, and the call fails with `AttributeError:
+'NoneType' object has no attribute 'download'`. The submission file is
+not affected (ORCL's 10-K filed 2026-06-22: 62,218 words through the
+SGML path, while `filing.text()` fails). A failed SGML read is logged as
+`sec_edgar_filings.sgml_text_failed` (`error=repr(...)`) at info level;
+a failed fetch as `sec_edgar_filings.filing_text_fetch_failed` and a
+failed amendment lookup as `sec_edgar_filings.amendment_check_failed`,
+both with `error=repr(...)`.
 
 `edgartools` also has its own request limiter, `EDGAR_RATE_LIMIT_PER_SEC`
 (library default 9 per second), read by the library from the environment.
@@ -623,8 +643,8 @@ contention between back-to-back calls):
    (`sec_edgar_filings.raw_archive_failed`) and does not stop the filing.
 2. The period of report comes from `edgartools`, else from SEC's
    submissions JSON (`filing_period`, section 3.12).
-3. `ai/knowledge/filing_summary.py::summarize_filing` makes one
-   HIGHEST_ACCURACY call (temperature 0, timeout 300 s
+3. `ai/knowledge/filing_summary.py::summarize_filing` makes one call at
+   the tier `FILING_LLM_TIER` (`highest_accuracy` by default; temperature 0, timeout 300 s
    `_FILING_SUMMARY_TIMEOUT_SECONDS`, `max_tokens` 12,288
    `_SUMMARY_MAX_TOKENS`). The 10-K and 10-Q prompts differ: a 10-Q's risk
    factors section lists only changes since the last report, so the 10-Q
@@ -637,10 +657,24 @@ contention between back-to-back calls):
    income), and a hard rule that every figure must be traceable to the
    text. An unknown form gets the 10-K prompt (logged
    `filing_summary.unknown_form_type`).
-4. If the summary is real (not the fallback below), a second HIGHEST call
-   extracts the structured records (section 3.11). An exception there is
+4. If the summary is real (not the fallback below), a second call at the
+   same `FILING_LLM_TIER` extracts the structured records (section 3.11). An exception there is
    logged (`sec_edgar_filings.records_failed`) and the summary is still
    stored.
+
+**Cost of the two calls.** Both calls send the whole filing. On Anthropic
+(Sonnet 5.5 for `highest_accuracy`) a new ticker's five filings cost about
+$1-1.5 and 2-3 minutes inside its first analysis (one RUN2 batch: 30 calls,
+1.69M input tokens, $3.94 for three new tickers). `FILING_LLM_TIER=cheap`
+moves both to the cheap model (Haiku 5.5 on Anthropic); its 100K-token
+long-prompt price then applies to the largest 10-Ks (ORCL 10-K about
+140K tokens). The two calls do not share a prompt cache: Anthropic caches
+a prefix in the order tools, system, messages, and the two calls have
+different system prompts (the summary prompt and `RECORDS_ONLY_PROMPT`),
+so the identical filing text, which comes after them, is never part of a
+shared prefix. Putting the filing first would mean moving it into the
+system prompt and changing the shared provider interface, which was not
+done.
 
 **Input size.** `_TRUNCATION_STAIRCASE` cuts the combined text (original
 plus amendment) before the summary call: up to 1.2 million characters keep
@@ -732,7 +766,7 @@ billion impairment appeared once and were lost on a re-run, although every
 check passed), so a material number must not depend on model recall.
 
 **The call.** `filing_summary.extract_filing_records` is the one path that
-produces records, at ingestion (`tier=HIGHEST_ACCURACY`) and in the
+produces records, at ingestion (tier `FILING_LLM_TIER`) and in the
 backfill script (default tier `FILING_RECORDS_BACKFILL_LLM_TIER`, `cheap`;
 `--tier` overrides it). Prompt: `filing_records.RECORDS_ONLY_PROMPT` ("Read
 this SEC filing. Do not summarize it.") plus the schema. Temperature 0,
@@ -1130,7 +1164,7 @@ zero or the sign changed.
 **Where it appears**: appended to the `get_fundamentals` tool output and to
 the Fundamental summary, stored as `raw_output["latest_quarter"]`, shown at
 the top of the first `search_filings` result, and in the debate and Judge
-evidence (chapter 15, section 3.17). It fails open
+evidence, once (chapter 15, section 3.17). It fails open
 (`sec_edgar.latest_quarter_unavailable`, `sec_edgar.quarter_results_failed`);
 IFRS filers (20-F) have no us-gaap quarters.
 
@@ -1211,18 +1245,19 @@ not ok.
 |---|---|---|---|
 | `EPISODIC_CONTEXT_LIMIT` | 3 | `services/ai-service/config.py` | earlier calls shown to the Judge; 0 = off |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | same | review window for outcomes |
-| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | None (code uses 0.90) | same; `.env.example` sets 0.85 | cosine bar for superseding |
+| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | 0.85 | same | cosine bar for superseding (calibrated for `gemini-embedding-2`; use 0.90 with `mistral-embed`) |
 | `ARCHIVAL_RECYCLED_SHARE_MAX` | 0.5 | same | recycled share that blocks archival |
 | `KG_EXTRACTION_LLM_TIER` | `cheap` | same | tier of the triple extraction call |
 | `SEC_EDGAR_USER_AGENT` | empty | same | "Company Name contact@domain.com"; required by SEC for every request (filings, XBRL, official company names) |
 | `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` | 8.0 | same | spacing of the SEC requests sent by `ai/providers/sec_edgar.py` in one process (SEC allows 10/s); 0 = no spacing; `edgartools` requests have their own limiter (`EDGAR_RATE_LIMIT_PER_SEC`, library default 9, `.env.example` sets 2) |
 | `FILING_RECORDS_MAX_FILINGS` | 5 | same | newest filings whose records agents load and `search_filings` shows |
-| `FILING_RECORDS_BACKFILL_LLM_TIER` | `cheap` | same | default tier of the backfill's records-only call (`--tier` overrides; ingestion always uses HIGHEST) |
+| `FILING_RECORDS_BACKFILL_LLM_TIER` | `cheap` | same | default tier of the backfill's records-only call (`--tier` overrides; ingestion uses `FILING_LLM_TIER`) |
+| `FILING_LLM_TIER` | `highest_accuracy` | same | tier of the filing summary and records calls at ingestion (`highest_accuracy` or `cheap`) |
 | `PRIOR_NOTE_MAX_SIMILARITY` | 0.9 | same | `prior_note_similarity` at which a Risk or News answer counts as a copy of a prior note (archive skip, chapter 15) |
 | code: `_MIN_SCORE_TO_REMEMBER` | 0.7 | `ai/memory/agent_memory.py` | procedural memory bar |
 | code: `_DEFAULT_LIMIT` | 2 | same | hints per role |
 | code: `_MAX_STEPS_PER_TRAJECTORY` | 4 | same | steps kept per example |
-| code: `prune_beyond_retention(keep=3)` | 3 | `domains/memory/repository.py` | rows kept per role and ticker |
+| code: `prune_beyond_retention(keep=3)` | 3 | `domains/memory/repository.py` | rows kept per role, ticker and owner |
 | code: `_MIN_WORDS_TO_ARCHIVE` | 40 | `ai/knowledge/archival.py` | shortest archived note |
 | code: `_NEAR_DUPLICATE_DEDUP_LOOKBACK` | 3 | same | recent reports compared |
 | code: `_MAX_TRIPLES` | 15 | `ai/knowledge/archival.py` | triples per report |

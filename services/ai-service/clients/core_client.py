@@ -143,11 +143,6 @@ async def create_system_document(
 
 
 class TransactionRejectedError(UpstreamServiceError):
-    default_message = (
-        "Core-service refused a transaction for a business reason (4xx "
-        "other than 408/429: insufficient cash, not enough shares held, "
-        "409 conflict, unknown portfolio). Retrying the same order the "
-        "next day will not change the answer, unlike a 5xx/timeout.")
 
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code

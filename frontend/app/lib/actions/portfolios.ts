@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
-import { boundedText, CURRENCIES, NAME_MAX_LENGTH, normalizeTicker, positiveDecimal } from "@/app/lib/format";
+import { boundedText, CURRENCIES, NAME_MAX_LENGTH, normalizeTicker, positiveDecimal, UUID_RE } from "@/app/lib/format";
 
 // Every form state carries the submitted values back on an error: React
 // resets a form after its action runs, and the forms use these values as
@@ -19,7 +19,6 @@ function valuesOf(formData: FormData, names: string[]): FormValues {
   return values;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CASH_TICKER = "CASH";
 
 async function send(

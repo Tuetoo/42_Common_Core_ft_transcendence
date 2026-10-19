@@ -25,7 +25,7 @@ Browsers reach its public routes under `/api/v1/...`. Other services
         v                                            |  POST /internal/review/run
    gateway (nginx)                                   |  POST /internal/scheduler/tier-monitoring
         |  /api/v1/analyses, /market, /analytics,    |  POST /internal/scheduler/rag-ingest
-        |  /decisions, /backtests, /rag              |
+        |  /decisions, /backtests, /rag              |  POST /internal/scheduler/deleted-user-sweep
         v                                            v
  +------------------------------------------------------------------+
  | ai-service (FastAPI, uvicorn, one process, port 8000)            |
@@ -41,7 +41,8 @@ Browsers reach its public routes under `/api/v1/...`. Other services
  |        LLM calls -> ai/llm (router, Google key pool)             |
  |                                                                  |
  |  event_listener.py: durable Redis consumer (document.uploaded,   |
- |                     document.deleted, portfolio.deleted)         |
+ |                     document.deleted, portfolio.deleted,         |
+ |                     user.deleted)                                |
  +------------------------------------------------------------------+
       |            |            |             |               |
       v            v            v             v               v
@@ -115,6 +116,7 @@ All paths are relative to `services/ai-service/`.
 | `clients/` | HTTP clients for core-service (`core_client.py`: holdings, cash, snapshots, documents, transactions) and auth-service (`auth_client.py`: organization membership). |
 | `deps.py` | Access checks: `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
 | `event_listener.py` | Handlers for the durable Redis events. |
+| `user_cleanup.py` | Deletes a deleted user's ai data (`delete_user_data`) and runs the nightly deleted-user sweep (section 3.8). |
 | `ai_events.py` | Payload builders and a best-effort publisher for ai-service events. |
 | `observability.py` | ai-service Prometheus metrics. |
 | `qdrant.py`, `database.py` | Qdrant client and collection check, SQLAlchemy engine/session, Alembic upgrade at startup. |
@@ -134,7 +136,7 @@ forwards everything under `/api/v1/market`, which includes that path.
 | Prefix | Router file | Routes (from the decorators) |
 |---|---|---|
 | `/api/v1/analyses` | `domains/analysis/api.py` | `POST ""` (create, 201), `GET ""` (my analyses, paginated: own analyses only, newest first; system analyses on the caller's portfolio appear in analytics `scope=mine` (CSV `analysis_id`) and can be opened by id, not here), `GET /{analysis_id}` (full detail), `GET /{analysis_id}/recommendation`, `GET /{analysis_id}/tiers`, `GET /{analysis_id}/debate`, `GET /{analysis_id}/reflection`, `POST /{analysis_id}/decisions` (201) |
-| `/api/v1/decisions` | `domains/decision/api.py` | `GET ""`, `GET /{decision_id}/outcome`, `POST /{decision_id}/review` (201, LLM critique that replaces the stored review and publishes `decision.reviewed`, a notification to the user; 503 with `Retry-After: 60` and nothing stored or published when the LLM call fails), `GET /{decision_id}/review` |
+| `/api/v1/decisions` | `domains/decision/api.py` | `GET ""`, `GET /{decision_id}/outcome`, `POST /{decision_id}/review` (201, LLM critique that replaces the stored review and publishes `decision.reviewed`, a notification to the user; 503 with `Retry-After: 60` and nothing stored or published when the LLM call fails; 429 with `Retry-After` over the per-user limit), `GET /{decision_id}/review` |
 | `/api/v1/backtests` | `domains/backtest/api.py` | `POST ""` (a `strategy_name` reserved for the other two kinds is a 422), `POST /recommendation-replay`, `POST /portfolio`, `GET ""` (the caller's own backtests, newest first, `limit`/`offset`), `GET /{backtest_id}`, `GET /{backtest_id}/metrics`, `DELETE /{backtest_id}` (204; publishes `backtest.deleted`, a notification to the owner). The three create routes answer 429 when the caller already has `BACKTEST_MAX_ACTIVE_PER_USER` (2, a module constant) backtests pending or running (log `backtest_rejected_limit`; counted under a per-user advisory lock in the creating transaction, so two parallel creates cannot both pass). |
 | `/api/v1/market/instruments` | `domains/market/api.py` | `GET /{ticker}/prices` (JWT required; `interval` `1d`, `1wk` or `1mo`, default `1d`; `lookback_days` default 5, 1..3650 (`MAX_PRICE_LOOKBACK_DAYS` in `domains/market/repository.py`); newest bar first). There is no instrument-metadata route. |
 | `/api/v1/analytics` | `domains/analytics/api.py` | `GET /agents`, `GET /overview`, `GET /timeseries`, `GET /export.csv` |
@@ -193,12 +195,13 @@ exactly `/internal/*`.
 | `GET /internal/fx-rate?from_currency=&to_currency=` | core-service | Current FX rate via Yahoo (`USDGBP=X` style ticker), cached in Redis for 3600 s. A Redis error on the cache read or write is logged (`fx_rate_cache_read_failed` / `fx_rate_cache_write_failed`) and treated as a cache miss, not a 5xx. |
 | `POST /internal/review/run` | scheduler, daily 02:00 New York | Scores past recommendations and decision outcomes and rolls up agent metrics (`ai/workflows/review_workflow.py`); returns done, attempted and failed counts per step. Answers 500 with the same counts when every attempted recommendation or every attempted decision outcome failed. |
 | `POST /internal/scheduler/tier-monitoring` | scheduler, 17:00 New York on weekdays | Checks open tiers against the day's bar; skipped with 200 and `{"skipped": true, "reason": "non_trading_day"}` on a weekend or NYSE holiday (the only ai-service job tied to the trading session). Answers 500 with the same counts when every attempted tier (checked minus `closed_meanwhile` and `pending`) failed to execute, had no fresh price or had a failed price lookup. |
-| `POST /internal/scheduler/rag-ingest` | scheduler, daily 03:00 New York | Per-ticker filing and news ingestion plus the macro ingestion, as three steps (`filings`, `news`, `macro`). Answers 500 with the same body when every ticker a step attempted failed (an error, or a provider outage reported by the ingestion helpers), or the macro step failed. A source without its key or user agent is disabled (0 units, logged once) and a NewsAPI quota refusal defers that ticker's news; neither is a failure (chapter 26, section 3.5). |
+| `POST /internal/scheduler/rag-ingest` | scheduler, daily 03:05 New York | Per-ticker filing and news ingestion plus the macro ingestion, as three steps (`filings`, `news`, `macro`). Answers 500 with the same body when every ticker a step attempted failed (an error, or a provider outage reported by the ingestion helpers), or the macro step failed. A source without its key or user agent is disabled (0 units, logged once) and a NewsAPI quota refusal defers that ticker's news; neither is a failure (chapter 26, section 3.5). |
 | `GET /internal/stats` | auth-service admin page | Counts of analyses (total/completed/failed), recommendations, backtests. |
+| `POST /internal/scheduler/deleted-user-sweep` | scheduler, daily 04:40 New York | Runs `delete_user_data` for every deleted account that still owns ai rows (section 3.8). Answers `{candidates, deleted, cleaned, failed, lookup_failed, refused}`; 500 when every deleted user failed or auth could not be asked (step `users_lookup`; nothing is deleted then). |
 | `POST /internal/sentiment` | core-service, after a note or comment is saved | Lite-tier sentiment label; 503 with `Retry-After: 60` when the LLM is unavailable. |
 
 The scheduler times come from `infra/scheduler/crontab` (New York time;
-02:00 New York is usually 07:00 London, 03:00 is 08:00, 17:00 is 22:00).
+02:00 New York is usually 07:00 London, 03:05 is 08:05, 17:00 is 22:00).
 The 500 rule is `shared/scheduled_jobs.py::job_response`: a step that
 attempted at least one unit and failed every one answers 500 (log
 `scheduled_job_all_units_failed`, body plus `"all_units_failed": [steps]`),
@@ -282,7 +285,8 @@ The failure reasons a row can carry are listed in
 `shared/enums.py::AnalysisFailureReason`: `timeout`,
 `cancelled`, `service_restart`, `worker_error`, `workflow_error`, and the
 "no verdict" endings `judge_unavailable`, `no_evidence`,
-`debate_unavailable`, `insufficient_evidence` (chapter 16).
+`debate_unavailable`, `insufficient_evidence`, `llm_credit_exhausted`
+(chapter 16).
 
 ### 3.5 Startup and shutdown
 
@@ -305,8 +309,9 @@ The failure reasons a row can carry are listed in
 6. Starts the durable event listener as a background task
    (`build_durable_subscriber().run()` in `event_listener.py`). It
    handles `document.uploaded` (RAG ingestion), `document.deleted`
-   (remove from Qdrant, BM25 and Postgres) and `portfolio.deleted`
-   (cancel the portfolio's unfilled tiers). A transient ingestion error
+   (remove from Qdrant, BM25 and Postgres), `portfolio.deleted`
+   (cancel the portfolio's unfilled tiers) and `user.deleted` (delete
+   the user's ai data, section 3.8). A transient ingestion error
    is re-raised so the message stays unacknowledged and is delivered
    again (chapter 24). It is started with
    `shared.events.start_background_task(..., "durable_event_subscriber")`,
@@ -348,10 +353,10 @@ the vendor directly; they go through the singletons in
 
 | Accessor | Provider | Source |
 |---|---|---|
-| `get_market_data_provider()` | `YahooFinanceProvider` | Yahoo Finance through the `yfinance` library: current price, price history, instrument metadata, fundamentals from `.info`. No API key. `yfinance` is synchronous, so every call runs in `asyncio.to_thread`. |
+| `get_market_data_provider()` | `YahooFinanceProvider` | Yahoo Finance through the `yfinance` library: current price, price history, fundamentals from `.info`. No API key. `yfinance` is synchronous, so every call runs in `asyncio.to_thread`. |
 | `get_fundamental_data_providers()` | `[SecEdgarProvider, YahooFinanceProvider]` | SEC EDGAR (`data.sec.gov`, no key, needs `SEC_EDGAR_USER_AGENT`: SEC requires a descriptive User-Agent). Three uses: (1) annual fundamentals from XBRL "company facts" (`SecEdgarProvider.get_fundamentals`); `get_fundamentals` (`ai/tools/fundamentals_tool.py`) merges them with Yahoo: SEC first, Yahoo fills only the fields still empty. (2) The latest quarter from the same company facts (`latest_quarter_results`; chapter 18, section 3.12). (3) Filing periods: `filing_period(ticker, form, filing_date)` reads the EDGAR submissions JSON and returns the filer's own `reportDate`, used to label every filing passage and record. Every SEC request waits until `1 / SEC_EDGAR_MAX_REQUESTS_PER_SECOND` seconds (default 8 per second; SEC allows 10) have passed since the previous one, process-wide. Network errors and 5xx are retried, 4xx is final. |
 | `get_macro_data_provider()` | `FredProvider` | FRED (St. Louis Fed) series observations. Needs `FRED_API_KEY`. Aliases: `fed_funds_rate` (DFF), `cpi` (CPIAUCSL), `unemployment_rate` (UNRATE), `gdp` (GDP), `10y_treasury_yield` (DGS10), `vix` (VIXCLS); any other string is passed through as a series id. 15 s timeout per request. |
-| `get_news_provider()` | `NewsApiProvider` | NewsAPI `/v2/everything`. Needs `NEWSAPI_API_KEY`. The free tier gives about one month of history and 100 requests per rolling 24 hours, not per calendar day (as observed on the account page in October 2026). Every agent `search_news` sends 2 requests (relevancy plus `NEWSAPI_RECENT_EXTRA_LIMIT` newest), so one 15-ticker batch uses about 30-35: check `make health` (section 5) before a batch. Successful requests are counted in Redis `ai:newsapi:requests` (rolling 24 h, read by `make health`). An HTTP error is raised with its status and NewsAPI's `code`/`message` and logged as `newsapi.request_failed`; HTTP 429 or code `rateLimited`/`apiKeyExhausted` stops all NewsAPI requests of the process for `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600; log `newsapi.rate_limited_cooldown_started`), searches failing at once with "request limit reached ... use web_search". Credibility of a news or web result comes from NewsAPI's own source catalog (`source_catalog()`, `GET /v2/top-headlines/sources`, language `en`): an item is a catalog outlet when NewsAPI gave it a `source.id`, or its URL host is (a subdomain of) a catalog source host (`catalog_flag`). The catalog costs one counted request when refreshed; it is kept in Redis `ai:newsapi:source_catalog` for 7 days and refreshed after 24 h (from its stored `fetched_at`), with a 1 h process copy and a 15 min back-off after a failed load. A stale copy is served while a refresh is impossible (rate-limit cooldown, error; `newsapi.source_catalog_stale_served`). It fails open: no catalog means "unknown", never "not a catalog outlet". Logs: `newsapi.source_catalog_fetched`, `newsapi.source_catalog_fetch_failed`. |
+| `get_news_provider()` | `NewsApiProvider` | NewsAPI `/v2/everything`. Needs `NEWSAPI_API_KEY`. The free tier gives about one month of history and 100 requests per rolling 24 hours, not per calendar day (as observed on the account page in October 2026). Every agent `search_news` sends 2 requests (relevancy plus `NEWSAPI_RECENT_EXTRA_LIMIT` newest), so one 15-ticker batch uses about 30-35: check `make health` (section 5) before a batch. Successful requests are counted in Redis `ai:newsapi:requests` (rolling 24 h, read by `make health`). An HTTP error is raised with its status and NewsAPI's `code`/`message` and logged as `newsapi.request_failed`; HTTP 429 or code `rateLimited`/`apiKeyExhausted` stops all NewsAPI requests of the process for `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600; log `newsapi.rate_limited_cooldown_started`), searches failing at once with "request limit reached". `SearchNewsTool` adds the next step only for this quota error: "use web_search for news instead" when the caller has that tool (News, `fallback_tool`), otherwise "NewsAPI is unavailable this run; ... proceed with the evidence you have" (Sentiment). Without a key the provider raises `ProviderUnavailableError`, and the tool answers "the news provider is not configured for this run; do not call search_news again" with the same next step. Credibility of a news or web result comes from NewsAPI's own source catalog (`source_catalog()`, `GET /v2/top-headlines/sources`, language `en`): an item is a catalog outlet when NewsAPI gave it a `source.id`, or its URL host is (a subdomain of) a catalog source host (`catalog_flag`). The catalog costs one counted request when refreshed; it is kept in Redis `ai:newsapi:source_catalog` for 7 days and refreshed after 24 h (from its stored `fetched_at`), with a 1 h process copy and a 15 min back-off after a failed load. A stale copy is served while a refresh is impossible (rate-limit cooldown, error; `newsapi.source_catalog_stale_served`). It fails open per item: no catalog means "unknown", never "not a catalog outlet", on each result line. The News agent's run-level `fallback_sources_unverified` flag stays off without a catalog (chapter 15). Logs: `newsapi.source_catalog_fetched`, `newsapi.source_catalog_fetch_failed`. |
 | `get_web_search_provider()` | `TavilyProvider` | Tavily web search, "basic" depth, short snippets only (never raw page content), at most 10 results (`max_results` clamped to 1..10). With `news_days` it searches Tavily's news index for the last N days (`topic: "news"`); the News agent's fallback uses `NEWS_WEB_FALLBACK_DAYS` (7). Needs `TAVILY_API_KEY`; free tier 1,000 credits per month. |
 
 SEC filing documents (the 10-K/10-Q text that goes into RAG) are fetched
@@ -359,7 +364,8 @@ separately by `ai/ingestion/sec_edgar_filings.py` with the `edgartools`
 library (`from edgar import Company, set_identity`). The filing listings
 (recent filings, older submission pages, 10-K/A amendments) run in worker
 threads with a 15 s timeout each (`_EDGAR_API_TIMEOUT_SECONDS`); the
-company lookup and the document downloads (`filing.text()`) rely on the
+company lookup and the document downloads (`filing_text`: the primary
+document from the full submission file, chapter 18) rely on the
 library's own per-request HTTP timeout. Each filing is then summarised by
 an LLM, with a
 second LLM call for the structured filing records
@@ -397,7 +403,12 @@ technical indicator and volatility tools. The rules:
 - Weekly and monthly bars use plain age limits (6 and 27 days); other
   intervals 20 hours.
 - On a miss, exactly one live refresh runs and is written back
-  (`MarketService.refresh_from_external_provider`). If Yahoo fails and
+  (`MarketService.refresh_from_external_provider`). The refresh asks Yahoo
+  only for the bars: a new `ai.instruments` row gets the ticker and
+  `asset_type=equity`, and its `name`, `sector` and `exchange` columns stay
+  empty (nothing reads them, so the extra `.info` call that filled them
+  was removed; the columns are kept to avoid a migration). Each bar is one
+  `INSERT ... ON CONFLICT DO UPDATE` without a read-back. If Yahoo fails and
   some cached bars exist, the stale bars are served (logged as
   `market_cache.refresh_failed_serving_stale_cache`), because yesterday's
   close is still more useful to an agent than nothing.
@@ -425,6 +436,7 @@ folder call some of them for you.
 |---|---|---|
 | `analysis_cli.py` | Small client for the internal analysis routes: `create TICKER [--portfolio ID] [--user ID]`, `status ID`, `get ID`; and `committed PORTFOLIO_ID`, which reads the database and prints the BUY cash held by the portfolio's open tiers, per analysis, as the position-sizing budget counts it. Used by `scripts/run_analysis.sh` and `scripts/tiers.sh`. | `create` queues an analysis |
 | `probe_model_latency.py` | Sends Judge-sized requests to one Gemini model (default: the configured HIGHEST primary model) per pooled key and reports latency and what a 30/60/90 s timeout would keep. Used by `scripts/probe.sh`. `--health` instead sends one tiny request per key and per configured model ID. | No, but spends daily quota |
+| `probe_anthropic_schemas.py` | Sends each research agent's ReAct step schema (full and reduced) to the Anthropic model with `max_tokens=16` and reports which variant is accepted and the tokens used (chapter 14, section 3.16). | No, but spends a few cents of Anthropic credit |
 | `smoke_check.py` | One line per non-analysis feature check (RAG, KG, filing records, market, FX, FRED, core reads, auth, backtests). Its top also holds the `flatten`/`one_line` output helpers that `e2e_tier_check.py` and `delete_analyses.py` import. The `filing_records` check fails and lists the filing documents without an `ai.filing_records` row (a records call that failed at ingestion), with the backfill command. Used by `scripts/smoke.sh`. | Small, deliberate writes only: refreshes AAPL price bars and creates then deletes one scratch backtest (see its header) |
 | `e2e_tier_check.py` | Deterministic real-environment test of the tier chain with a synthetic recommendation. Used by `scripts/e2e.sh`. | Yes (test data, cleaned up unless `--keep`) |
 | `delete_analyses.py` | Deletes whole analyses and everything they wrote, then sweeps orphans (including knowledge-graph entities left without relations). Walks the live foreign-key tree first. | **Yes, destructive** |
@@ -435,6 +447,59 @@ folder call some of them for you.
 | `upload_seed_documents.py` | Uploads the RAG seed corpus from the repo-root `rag_seed_documents/` folder. | Writes documents |
 | `verify_portfolio_backtest.py` | Recomputes a portfolio backtest independently and compares. | Only with `--run`: it runs the production backtest, which creates a backtest row; the row is deleted unless `--keep` |
 
+### 3.8 Deleted users
+
+Policy: a deleted user's personal data is removed completely, in every
+service. Rows, objects and vectors that belong to that user alone are
+deleted. Content other people use (organization documents and notes) and
+system knowledge that is not keyed to a user stay. In ai this is
+`user_cleanup.py::delete_user_data(user_id)`.
+
+It runs in two ways:
+
+- **The event (fast path).** auth sends `user.deleted` on pub/sub for
+  core and also on the durable stream `stream:user.deleted` for ai
+  (chapter 24). `event_listener.py::_handle_user_deleted` calls
+  `delete_user_data(..., strict=True)`. A failed step raises, so the
+  message stays pending and is delivered again (at most 5 times).
+- **The nightly sweep (the guarantee).** `POST
+  /internal/scheduler/deleted-user-sweep` (04:40 New York) lists every
+  user id that still owns a row in `analyses`, `investment_decisions`,
+  `backtests`, `episodic_memories` or `agent_memories`, asks auth which of
+  them are deleted (`POST /internal/users/deleted`), and runs the same
+  cleanup for each one. One user's failure is logged
+  (`deleted_user_sweep_item_failed`) and the others still run. This
+  catches a lost event and anything an in-flight analysis or backtest
+  wrote after the event.
+
+Each step runs in its own session and commits (`shared/deleted_users.py::
+run_cleanup_steps`); logs `ai_user_data_cleaned` (counts per step) and
+`ai_user_data_cleanup_failed` (one step). A second run finds nothing.
+
+| Step | Deleted |
+|---|---|
+| `archived_reports` | `agent_reports` of the user's analyses, through `ai/knowledge/archival.py::delete_archived_report`: their Qdrant points and BM25 entries, `document_chunks`, `embedding_jobs`, and the `kg_relations` extracted from them. An archived report of a user's analysis is indexed with that user as owner, so it is user data. |
+| `decisions` | `investment_decisions` of the user (and any on the user's recommendations), with `decision_outcomes` and `decision_reviews`. |
+| `analyses` | `analyses` with `user_id` = the user, and everything under them: `recommendations`, `recommendation_tiers`, `recommendation_metrics`, `reflections`, `agent_runs`, `agent_results`, `debate_sessions`, `debate_arguments`; plus `episodic_memories` of the user or of those analyses. |
+| `backtests` | the user's `backtests`, through `BacktestRepository.delete` (metrics and benchmark results go by ORM cascade). |
+| `agent_memories` | procedural memories with `user_id` = the user. |
+
+Kept, because they are not keyed to the user: system analyses
+(`user_id` null) and their reports, `kg_entities` (shared entity names;
+an entity is not removed when its last relation goes), `agent_metrics`
+(per-agent averages), `agents`, `ticker_names`, `instruments`,
+`price_bars`, `filing_records`, `benchmarks`. The chunks of a user's
+private documents are removed by core's `document.deleted` events, not
+here. Short-lived Redis rate-limit counters (`ai:rag_ask:rate:<user>:*`,
+`ai:decision_review:rate:<user>:*`) expire on their own.
+
+In-flight work: a queued analysis of a deleted user is not started (the
+queue's owner check sees the account as inactive and marks it
+`cancelled`). An analysis or backtest that is already running is not
+stopped; its later writes fail on the deleted parent row or are removed
+by the next sweep. New requests are refused by the live user-state check
+(chapter 29).
+
 ## 4. Configuration
 
 Settings live in `services/ai-service/config.py` (class
@@ -442,15 +507,20 @@ Settings live in `services/ai-service/config.py` (class
 Values come from the environment; `config.py` holds every default.
 `.env.example` lists the settings an operator usually sets (keys, URLs,
 the embedding model); the tables in this handbook list all of them. The
-groups below summarise them. Chapter 14 has the full LLM table.
+groups below summarise them. Chapter 14 has the full LLM table. The
+provider and tier settings (`LLM_DEFAULT_PROVIDER`, every `*_LLM_TIER`,
+`LLM_ANTHROPIC_EFFORT`, `LLM_ANTHROPIC_THINKING_*`) accept only their
+listed values: any other value (a typo) stops ai-service at startup. An
+empty value means the default, except for `LLM_ANTHROPIC_EFFORT`, where it
+sends no effort.
 
 | Group | Settings (default) | Meaning |
 |---|---|---|
 | Service | `SERVICE_NAME` (`ai-service`), `POSTGRES_SCHEMA` (`ai`), `API_V1_PREFIX` (`/api/v1`, shared) | Identity and the database schema. |
 | Qdrant and embeddings | `QDRANT_HOST` (`qdrant`), `QDRANT_PORT` (6333), `QDRANT_URL` (None), `QDRANT_API_KEY` (empty; passed to the Qdrant client when set, also used by backup and restore), `QDRANT_COLLECTION_RESEARCH` (`research_documents_gemini`), `QDRANT_VECTOR_SIZE` (1536), `EMBEDDING_PROVIDER` (`google`), `GOOGLE_EMBEDDING_MODEL` (`gemini-embedding-2`), `GOOGLE_EMBEDDING_DIMENSIONS` (1536), `EMBEDDING_REQUEST_TIMEOUT_SECONDS` (30.0) | Where vectors live and which model makes them. Chapters 17 and 21. |
-| Archival | `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` (None = 0.90), `ARCHIVAL_RECYCLED_SHARE_MAX` (0.5), `KG_EXTRACTION_LLM_TIER` (`cheap`) | When an agent note is stored or superseded. Chapters 15 and 18. |
+| Archival | `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` (0.85; 0.90 with `mistral-embed`), `ARCHIVAL_RECYCLED_SHARE_MAX` (0.5), `KG_EXTRACTION_LLM_TIER` (`cheap`) | When an agent note is stored or superseded. Chapters 15 and 18. |
 | Prior notes | `PRIOR_NOTE_MAX_SIMILARITY` (0.9) | Word-sequence similarity at which a Risk or News answer is a copy of a prior note (News: sent back once; both: recycled, not archived). Chapter 15. |
-| Filings | `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` (8.0), `FILING_RECORDS_MAX_FILINGS` (5), `FILING_RECORDS_BACKFILL_LLM_TIER` (`cheap`) | SEC request spacing; how many filings' records agents see; default tier of the records backfill. Chapter 18. |
+| Filings | `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` (8.0), `FILING_RECORDS_MAX_FILINGS` (5), `FILING_RECORDS_BACKFILL_LLM_TIER` (`cheap`), `FILING_LLM_TIER` (`highest_accuracy`) | SEC request spacing; how many filings' records agents see; default tier of the records backfill; tier of the summary and records calls at ingestion. Chapter 18. |
 | News | `NEWS_RELEVANCE_BATCH_SIZE` (8), `NEWS_CONSUMER_MAX_ITEMS` (2), `NEWS_WEB_FALLBACK_DAYS` (7) | Items per relevance-classifier call; consumer-product items kept per run (never evidence); look-back of the Tavily news fallback. Chapters 15 and 17. |
 | LLM keys | `GOOGLE_API_KEY`, `GOOGLE_API_KEY_2` .. `_10`, `MISTRAL_API_KEY`, `MISTRAL_API_KEY_2` .. `_7`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (all empty) | Provider credentials. Chapter 14. |
 | LLM routing and resilience | `LLM_DEFAULT_PROVIDER` (`google`), `LLM_GOOGLE_MODEL_*`, pacing, timeouts, cooldowns | Chapter 14, section 4. |
@@ -458,7 +528,7 @@ groups below summarise them. Chapter 14 has the full LLM table.
 | Debate and verdict resilience | `JUDGE_RETRY_BUDGET_SECONDS` (240.0), `JUDGE_RETRY_MAX_ATTEMPTS` (4), `DEBATE_SIDE_REPAIR_DELAY_SECONDS` (60.0), `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60.0), `MIN_USABLE_AGENTS_FOR_DEBATE` (4), `JUDGE_STATE_QUARTER_DECLINE_PCT` (15.0) | Chapter 16. |
 | Agents | `AGENT_PREFETCH_ENABLED` (True), `FALLBACK_ANCHOR_MIN_WORD_SHARE` (0.3), `SENTIMENT_THINKING_BUDGET` (1024) | Fixed first tool calls run in code; word-share similarity of the fallback evidence anchor; thinking budget of Sentiment's ReAct turns on Lite models (0 = off). Chapters 14 and 15. |
 | Recommendation and tiers | `TIER_MIN_NOTIONAL_USD` (100.0), `TIER_MIN_NOTIONAL_PORTFOLIO_FRACTION` (0.01), `MAX_POSITION_WEIGHT_PCT` (50.0), `MIN_BUY_TIER_CONFIDENCE` (0.5), `TIER_WINDOW_DAYS_MAX` (30), `SYSTEM_TIER_ACCEPTANCE_HOURS` (72: how long a pending tier of a system analysis may wait for acceptance) | Chapter 16. There is no per-recommendation BUY cap (owner decision). |
-| Memory and review | `EPISODIC_CONTEXT_LIMIT` (3), `AI_ACCURACY_EVALUATION_DAYS` (30) | Chapters 18 and 19. |
+| Memory and review | `EPISODIC_CONTEXT_LIMIT` (3), `AI_ACCURACY_EVALUATION_DAYS` (30), `REVIEW_GIVE_UP_AFTER_DAYS` (30), `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` (3), `DECISION_REVIEW_RATE_LIMIT_PER_DAY` (20) | Chapters 18 and 19. |
 | Data providers | `SEC_EDGAR_USER_AGENT`, `FRED_API_KEY`, `NEWSAPI_API_KEY`, `TAVILY_API_KEY` (empty), `NEWSAPI_SEARCH_IN` (`title,description`), `NEWSAPI_SORT_BY` (`relevancy`), `NEWSAPI_RECENT_EXTRA_LIMIT` (10), `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600.0) | Section 3.6. |
 | RAG assistant | `RAG_TOP_K_RESULTS` (5), `RAG_ASK_RATE_LIMIT_PER_MINUTE` (10), `RAG_ASK_RATE_LIMIT_PER_DAY` (200), `RAG_ASK_LLM_TIER` (`cheap`), `RAG_ASK_MAX_OUTPUT_TOKENS` (1024), `RAG_ASK_SNIPPET_CHARS` (300), `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120.0) | Chapter 17. |
 | User sentiment | `SENTIMENT_MAX_INPUT_CHARS` (6000), `SENTIMENT_TIMEOUT_SECONDS` (240) | `POST /internal/sentiment`. |
@@ -525,7 +595,7 @@ confidence), not a reason to crash the analysis.
 | Scheduler job shows no fresh heartbeat after a run | The job answered 500 because every attempted item failed. | Log `scheduled_job_all_units_failed` (`job`, `steps`); then the job's own log lines. |
 | Fundamental or Judge has no "Latest quarter" line | SEC companyfacts has no usable us-gaap quarter (IFRS filer) or the lookup failed. | Log `sec_edgar.latest_quarter_unavailable`, `sec_edgar.quarter_results_failed`; a missing year-to-date line logs `sec_edgar.year_to_date_unavailable` (its `metrics` field says why per metric). |
 | Filing passages have no report period | EDGAR has no `reportDate` for that filing (XOM's filings before its new CIK). | Log `sec_edgar.filing_period_unavailable`. |
-| News agent says "request limit reached ... use web_search" | NewsAPI rate limit; one-hour cooldown. | Log `newsapi.request_failed` with status and code; `make health` shows the rolling 24 h usage. |
+| News or Sentiment says "request limit reached" ("use web_search for news instead" for News, "NewsAPI is unavailable this run" for Sentiment) | NewsAPI rate limit; one-hour cooldown. | Log `newsapi.request_failed` with status and code; `make health` shows the rolling 24 h usage. |
 
 ## 7. Demo walkthrough
 
@@ -698,6 +768,8 @@ then `... analysis_cli status <id>` and `... analysis_cli get <id>`.
 | `services/ai-service/domains/analysis/schema.py` | `AnalysisCreate`, `AnalysisDetailRead` and nested read models. |
 | `services/ai-service/ai/workflows/analysis_workflow.py` | `run_analysis_workflow`, persistence, `mark_analysis_failed`. |
 | `services/ai-service/event_listener.py` | Durable event handlers. |
+| `services/ai-service/user_cleanup.py` | `delete_user_data`, `users_with_data`, `sweep_deleted_users`. |
+| `shared/deleted_users.py` | `run_cleanup_steps`, `deleted_user_ids` (asks auth), `run_deleted_user_sweep` (shared with core). |
 | `services/ai-service/qdrant.py` | Qdrant client and `ensure_collection`. |
 | `services/ai-service/database.py` | `ensure_schema` (Alembic at startup). |
 | `services/ai-service/observability.py` | Prometheus metrics. |

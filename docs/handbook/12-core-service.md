@@ -680,7 +680,7 @@ date of the content (a filing's SEC filing date), unlike `uploaded_at`.
    |                  | BackgroundTask: XADD stream:document.uploaded --------->|               |
    |                  |   {document_id, owner_id, organization_id, storage_bucket,             |
    |                  |    storage_key, document_type, category, ticker, content_date,         |
-   |                  |    filename, is_system}                                  |-- consumer -->|
+   |                  |    filename}                                             |-- consumer -->|
    |                  |                                                           |  group reads  |
    |                  |                         ai-service: parsing -> chunking -> embedding ->|
    |                  |                         ready | failed; each step publishes          |
@@ -743,22 +743,33 @@ when its event was published but ai-service never processed it (for
 example, the stream entry was dead-lettered), or stay at `parsing`,
 `chunking` or `embedding` when ai-service stopped in the middle and its
 last status event was the last thing it managed to publish. Re-uploading
-the same file after that limit publishes the event again; ai-service
-re-indexes idempotently (it deletes the document's old chunks first), and
-the forward-only rule lets the statuses that follow move the row on to
-`ready` or `failed`. A retried failed upload counts as a new upload, so the
-limit is measured from the retry. The event cannot be lost between the
-commit and the publish: it is stored in the outbox first (next
-paragraph). The duplicate check runs before anything is written to
+the same file after that limit locks the row, checks again that it is
+still stuck, resets it to `uploaded` with `status_changed_at` = now (as a
+retried failed upload does) and publishes
+the event again; ai-service re-indexes idempotently (it deletes the
+document's old chunks first), and the forward-only rule lets the statuses
+that follow move the row on to `ready` or `failed`. Because the stuck
+clock restarts, the document is not republished again while that
+re-ingestion runs. A retried failed upload restarts the stuck clock
+too, so the stuck limit is measured from the retry. The event cannot be
+lost between the commit and the publish: it is stored in the outbox
+first (next paragraph). The duplicate check runs before anything is written to
 object storage, so a duplicate leaves no orphan object and does not make
 ai-service re-index the old id with new content.
 
 Auto-ingestion's dedup list (`GET /internal/documents/filenames`,
 `DocumentRepository.list_filenames`) covers every owner and leaves out
-`failed` documents, so a filing whose ingestion failed (for example on a
-transient embedding error) is fetched and submitted again, which then
-retries it in place. It also leaves out documents stuck in a non-final
-status by the same rule, so the next ingestion run submits them again
+`failed` documents first uploaded within the last
+`FAILED_DOCUMENT_RETRY_DAYS` (default 7) days, so a filing whose ingestion
+failed (for example on a transient embedding error) is fetched and
+submitted again by each nightly run for about a week, which retries it in
+place. An older `failed` document counts as present and is no longer
+retried; `0` turns the nightly retry off. A retry keeps the document's
+first `uploaded_at`, so this age is measured from the first upload (a
+re-uploaded failed document therefore keeps its first upload date in the
+document list and its date sort). The list also leaves out documents
+stuck in a non-final status, by the stuck limits above, so the next
+ingestion run submits them again
 and the duplicate path above republishes their event. A document that is
 `ready`, or whose status changed within the limit for its status, counts
 as present, so a document that is still being processed is never
@@ -827,7 +838,8 @@ sandbox`; any other type answers 415 with the shared error envelope, code
 `document.deleted` to the outbox in one transaction; after the commit,
 background tasks publish the event, so ai-service removes the indexed
 chunks, and delete the stored file. A failed file delete only logs
-`document_orphan_cleanup_failed` and leaves an orphan object). The row
+`document_orphan_cleanup_failed` and leaves an orphan object; the nightly
+sweep removes it only once its owner is a deleted account, 3.15). The row
 delete and the outbox entry are one helper,
 `service.delete_document_row`, which the operator script
 `scripts/delete_documents.py` uses too, so both paths stay the same.
@@ -873,6 +885,7 @@ How a notification is made (`domains/notification/service.py`):
      v
  delivery_preferences(user)  -> auth-service /internal/users/{id}/notification-settings
      (defaults when unreachable: in_app on, websocket on, email off)
+ deleted account? -> nothing (log notification.skipped_deleted_user)
  in_app off? -> only the optional email, no row
  else: own session -> INSERT notification -> COMMIT
        deliver: websocket on -> push {"event": "notification", "payload": row}
@@ -886,7 +899,15 @@ The user's channels come from `user_settings.notification_preferences` in
 auth-service (keys `in_app`, `email`, `websocket`). `in_app` and
 `websocket` default to on (so a user who never opened their settings
 still gets live notifications); email is opt-in because it leaves the
-app. With `in_app` off no row is written and nothing is pushed; email
+app. The same answer carries `deleted`: for a deleted account
+`notify_user` creates no row, pushes nothing and sends no email (log
+`notification.skipped_deleted_user`). This one check covers every event,
+for example a `tier.cancelled` that ai sends after the user's
+portfolios were deleted. It needs no extra call. The Redis user-state
+mirror is not used here, because it does not tell a deleted account from
+a deactivated one, and a deactivated user still gets notifications. If
+the lookup fails, the defaults apply and the notification is created
+(fail open, log `notification_settings_lookup_failed`). With `in_app` off no row is written and nothing is pushed; email
 follows its own switch. The preferences are read without a cache (they
 can change and notifications are rare). Delivery runs only after the
 row is committed, so a client is never told about a row a failed commit
@@ -945,14 +966,16 @@ scheduler reports success:
                        gauge = that "tracked since" time
  Prometheus scrapes core /metrics; alert rules (group scheduled_jobs):
    DailyJobStale        backup|review-run|rag-ingest|logs-cleanup|
-                        purge-unverified|notification-retention > 26 h  (for 10m)
+                        purge-unverified|notification-retention|
+                        deleted-user-sweep-core|deleted-user-sweep-ai > 26 h  (for 10m)
    TradingDayJobStale   market-open|market-close|tier-monitoring    > 100 h (for 10m)
    MarketCloseSkippedPortfolios   alphamind_market_close_portfolios_skipped > 0
 ```
 
 `SCHEDULED_JOBS`: `market-open`, `market-close`, `tier-monitoring`,
 `review-run`, `rag-ingest`, `logs-cleanup`, `backup`, `purge-unverified`
-(auth-service), `notification-retention`. The trading-day
+(auth-service), `notification-retention`, `deleted-user-sweep-core`,
+`deleted-user-sweep-ai` (ai-service). The trading-day
 jobs still report success on a closed-market weekday (a holiday): the
 route answers "skipped" and the script sends the heartbeat. So the
 longest normal gap is a weekend (Friday 17:30 to Monday 17:30, 72 hours),
@@ -1008,6 +1031,7 @@ acting for a request it already authorized.
 | `POST /internal/scheduler/market-open` | scheduler 09:30 NY | analyses (3.6) |
 | `POST /internal/scheduler/heartbeat/{job}` | scheduler scripts | job health (3.12) |
 | `POST /internal/scheduler/notification-retention` | scheduler 04:20 NY | deletes read notifications older than 90 days (3.11) |
+| `POST /internal/scheduler/deleted-user-sweep` | scheduler 04:30 NY | runs `delete_private_user_data` and `delete_unreferenced_files` for every deleted account that still owns private core data or an unreferenced document file, then (always) `delete_organization_content` for every referenced organization auth no longer has (3.15); `{candidates, deleted, cleaned, failed, lookup_failed, refused, organizations: {same}}`; 500 when every deleted user or every missing organization failed, when either auth lookup failed, or when the organization safety brake refused |
 | `GET /internal/portfolios/{id}/holdings` | ai-service | holdings as floats |
 | `GET /internal/portfolios/{id}/owner` | ai-service access checks | owner, organization, visibility |
 | `GET /internal/portfolios/{id}/cash-balance` | ai-service position sizing | `{cash_balance}` |
@@ -1105,8 +1129,8 @@ dispatcher as the retry path):
 | Event | When | Consumer |
 |---|---|---|
 | `document.uploaded` | upload, failed-retry, stuck republish (`uploaded` unchanged for 10 minutes, `parsing`/`chunking`/`embedding` unchanged for 60 minutes) | ai-service ingestion |
-| `document.deleted` | document delete | ai-service removes chunks |
-| `portfolio.deleted` | portfolio delete | ai-service cancels not-yet-executed tiers |
+| `document.deleted` | document delete, or cleanup of a deleted user's private documents or a deleted organization's documents | ai-service removes chunks |
+| `portfolio.deleted` | portfolio delete, cleanup of a deleted user's private portfolios, or cleanup of a deleted organization's portfolios whose owner is a deleted account | ai-service cancels not-yet-executed tiers |
 
 **Consumed** (two subscribers started in `lifespan`):
 
@@ -1132,7 +1156,7 @@ dispatcher as the retry path):
 | `friend.requested`, `friend.accepted`, `friend.removed` | none | the actor; the other side for a request, an accept and an unfriend (`friend.removed` with `action` `removed`, or no `action`) |
 | `connection.blocked` | none | the actor only (never the blocked user) |
 | `user.updated`, `user.role.changed`, `user.deactivated`, `user.reactivated` | none | the user, and the admin or moderator who acted (when `actor_id` differs) |
-| `user.deleted` | none | the admin who deleted (the unverified-account purge, where the actor is the user: nobody, only logged) |
+| `user.deleted` | none | the admin who deleted (the unverified-account purge, where the actor is the user: nobody, only logged); the user's private data is deleted first (see below) |
 | `user.presence.changed` | `presence:<user_id>` | none |
 
 Before the notification work, the handlers of
@@ -1163,6 +1187,139 @@ with its own text. `friend.removed` with an `action` of `cancelled`,
 `declined`, `unblocked` (or an unknown value, with the text "Your
 connection with <name> changed.") notifies only the actor, so the other
 user never learns about an unblock or a declined request.
+
+**Deleted users** (`delete_private_user_data`). Policy: a deleted
+user's personal data is removed completely, in every service. Data that
+belongs to that user alone is deleted; content other people use
+(organization documents and notes, comments on organization notes) stays
+and shows the anonymized username. System data not keyed to a user
+stays. core's part runs on `user.deleted`; each step runs in its own
+session and commits:
+
+- private documents (`organization_id` is null), through
+  `delete_document_row`: the row goes, `document.deleted` is queued in
+  the outbox and published, and the S3 object is deleted (a failed S3
+  delete logs `document_orphan_cleanup_failed`; the nightly sweep below
+  deletes the file later);
+- private notes (`organization_id` is null); their comments and tags go
+  by cascade;
+- portfolios that no one else can read (no organization, or visibility
+  `private`), through `delete_portfolio_row`, which queues
+  `portfolio.deleted`; holdings, transactions and snapshots go by
+  cascade;
+- watchlists with their items, API keys and notifications.
+
+A failed step is logged (`user_data_cleanup_failed`, with the step
+name) and the other steps still run. The result is logged as
+`user_data_cleaned` with a count per step. The cleanup only deletes what
+is still there, so a repeated run does nothing. The step runner is
+`shared/deleted_users.py::run_cleanup_steps`, shared with ai-service,
+which deletes its own part on the same event (chapter 13, section 3.8).
+
+**Nightly deleted-user sweep** (`sweep_deleted_users`, job
+`deleted-user-sweep-core`, 04:30 New York, chapter 26). The event is the
+fast path; the sweep is the guarantee. It lists every user id that still
+owns private core data (the same filters as the steps above: private
+documents and notes, unshared portfolios, watchlists, API keys,
+notifications; the system document owner is left out), asks auth which
+of them are deleted (`POST /internal/users/deleted`, batches of 500),
+and runs `delete_private_user_data(..., strict=True)` for each one,
+then `delete_unreferenced_files`. Document files are stored under
+`documents/<owner_id>/` in the documents bucket. So the sweep also adds
+to its candidates every owner id with a file there that no document row
+references (`users_with_unreferenced_files`; a failed listing is logged
+as `document_file_owners_lookup_failed` and the sweep goes on with the
+database candidates). A deleted user whose folder holds only files of
+kept organization documents is therefore not a candidate, so it is not
+counted again every night. For each deleted user it deletes every object
+under that user's folder that no document row references any more (log
+`deleted_user_files_removed`). A file of a kept organization document
+is still referenced, so it stays. This repairs an S3 delete that failed
+during the event cleanup: the row was already gone, but the file is
+found again by its folder. A
+user with a failed step counts as failed (`deleted_user_sweep_item_failed`)
+and the others still run; the next night retries it, because its rows
+are still there. This catches a lost `user.deleted` (failed publish,
+core down) and a document or portfolio that an in-flight request
+committed after the cleanup. New requests of a deleted account are
+already refused by the live user-state check (chapter 29). If the
+candidate query or the auth lookup fails, nothing is deleted (`deleted_user_sweep_candidates_failed`
+or `deleted_user_sweep_lookup_failed`, `lookup_failed: true`, step `users_lookup`), and the organization sweep
+below still runs. The sweep logs `deleted_user_sweep_completed`.
+
+**Deleted organizations** (`delete_organization_content`). On
+`organization.deleted` (an owner delete, or auth deleting an
+organization whose sole owner was deleted), core cleans that
+organization's content with the same steps and rules, after the socket
+re-check and before the notifications:
+
+- its documents, through `delete_document_row` (S3 object and ai chunks
+  go too);
+- its notes, with all their comments and tags by cascade;
+- its portfolios. A portfolio always belongs to a user; the
+  organization only shares it. For each owner core asks auth
+  (`get_notification_settings`, field `deleted`). A portfolio whose
+  owner is a deleted account is deleted through `delete_portfolio_row`
+  (`portfolio.deleted`). Any other portfolio is made private again
+  (`organization_id` null, visibility `private`), so a live owner keeps
+  the ledger and history. If the lookup fails, the portfolio is made
+  private (data kept) and `organization_portfolio_owner_lookup_failed`
+  is logged.
+
+Documents and notes shared with an organization are organization
+content, written for the group, so they go with the organization. A
+portfolio is personal financial data that the organization only shares,
+so a living owner keeps it as a private portfolio.
+
+Logs: `organization_data_cleaned` and `organization_data_cleanup_failed`.
+auth deletes the organization's members and invitations itself, so
+nothing is done twice. The owner check also covers a user who was
+deleted earlier while the organization survived (a plain member, or an
+owner with a successor): their shared portfolios are deleted when the
+organization is deleted later.
+
+**Nightly organization sweep** (`sweep_deleted_organizations`, run by
+the same `deleted-user-sweep-core` job after the user sweep, whatever
+the user sweep's outcome). It
+lists every organization id still referenced by a document, note or
+portfolio, asks auth which of them no longer exist (`POST
+/internal/organizations/missing`, batches of 500), and runs
+`delete_organization_content(..., strict=True)` for each missing one.
+This repairs a lost `organization.deleted`. An id counts as missing only
+when auth answered successfully; if the lookup fails, nothing is deleted
+(log `deleted_organization_sweep_lookup_failed`), the route answers 500
+(step `organizations_lookup`) and the next night retries.
+**Safety brake:** an organization is hard-deleted in auth, so "missing"
+means "delete its content", and a wrong or reset auth would report every
+organization as missing. So if auth reports more missing organizations
+than `ORGANIZATION_SWEEP_MAX_MISSING` (default 5), or reports every
+referenced organization as missing while there is more than one (the
+typical sign of a wrong environment), the sweep deletes nothing, logs the error
+`deleted_organization_sweep_refused` with the counts, reports
+`refused: true` and the job answers 500 (step
+`organizations_safety_brake`), so the stale-job alert fires. An operator
+checks auth and, if the deletions are real, raises the setting for one
+run. When every referenced organization was really deleted, no setting
+passes the brake; the operator then runs
+`docker compose exec core-service python -m scripts.clean_organizations
+--id <org id> [--id ...]` (a preview), then the same with `--confirm`.
+The script asks auth first and cleans only the ids auth reports missing,
+with the same `delete_organization_content(..., strict=True)` as the
+sweep; an id auth still has is printed as skipped. On a small deployment a
+single lost event (for example 1 of 3 organizations) is still repaired.
+The brake cannot protect a deployment with exactly one referenced
+organization: a wrong auth there still deletes that organization's
+content, so check `AUTH_SERVICE_URL` before running the job by hand.
+One failing
+organization is logged (`deleted_organization_sweep_item_failed`) and the
+others still run. Log `deleted_organization_sweep_completed`.
+
+**Known limitations.**
+
+- Both cleanups run inline in the single pub/sub dispatch loop, with
+  sequential S3 deletes. While one runs, the other cross-service events
+  (socket re-checks, notifications) wait. This is acceptable at the
+  current scale.
 
 **Replica de-duplication** (`_claim_event`). With several core replicas,
 each one receives every pub/sub event. Pushes must happen on every
@@ -1322,8 +1479,10 @@ Head: `f1250c000001`. Bootstrap runs at start
 |---|---|---|
 | `PUBLIC_API_RATE_LIMIT_PER_MINUTE` | `60` | default and maximum per-key limit, and the per-owner budget |
 | `MAX_ACTIVE_API_KEYS_PER_USER` | `10` | non-revoked keys per user |
+| `FAILED_DOCUMENT_RETRY_DAYS` | `7` | nightly auto-ingestion resubmits a `failed` document only while its first upload is newer than this many days; `0` disables the retry |
 | `NOTIFICATION_READ_RETENTION_DAYS` | `90` | read notifications created longer ago are deleted by the nightly `notification-retention` job; unread ones are kept |
 | `NOTIFICATION_PURGE_BATCH_SIZE` | `1000` | rows per delete batch (one commit each) of that job |
+| `ORGANIZATION_SWEEP_MAX_MISSING` | `5` | safety brake of the nightly organization sweep: more missing organizations than this (or all of them, when more than one is referenced), and it deletes nothing and fails (3.15) |
 | `MAX_UPLOAD_SIZE_BYTES` | `20 * 1024 * 1024` | document size limit (gateway allows 25 MB) |
 | `ALLOWED_DOCUMENT_EXTENSIONS` | `.pdf`, `.txt`, `.md` | |
 | `ALLOWED_DOCUMENT_CATEGORIES` | all `DocumentCategory` values | `filing`, `analyst_report`, `earnings_call`, `news`, `macro_research`, `risk_analysis` |
@@ -1344,7 +1503,7 @@ Head: `f1250c000001`. Bootstrap runs at start
 | `_SENTIMENT_TIMEOUT` | `270.0` s (`clients/ai_client.py`) | sentiment (LLM) call |
 | `_CACHE_TTL_SECONDS` | `60` s (`clients/auth_client.py`), `10` s (`clients/ai_client.py`) | user-ref cache / latest-recommendation cache |
 | `DEFAULT_THRESHOLD` / `CASH_TOLERANCE` | `1.00` / `0.01` (`scripts/recompute_snapshots.py`) | recompute flags |
-| cron times | market-open `30 9 * * 1-5`, market-close `30 17 * * 1-5`, notification-retention `20 4 * * *` (New York) | `infra/scheduler/crontab` |
+| cron times | market-open `30 9 * * 1-5`, market-close `30 17 * * 1-5`, notification-retention `20 4 * * *`, deleted-user-sweep-core `30 4 * * *` (New York) | `infra/scheduler/crontab` |
 | `INTERNAL_API_TOKEN` | empty (`shared/config.py`) | `/internal/*` secret |
 
 ---
@@ -1440,6 +1599,7 @@ line and no alert.
 | holdings look wrong after old imports | holdings are a cache of the replay | `make snapshots` previews the replayed values per day; compare with `core.holdings` |
 | no snapshot for a trading day; alert `MarketCloseSkippedPortfolios` | a held ticker had no close for the session | `bash scripts/logs.sh core-service grep market_close_snapshot_skipped`; fill later: `bash scripts/snapshots.sh --portfolio <id> --to <YYYY-MM-DD>` (preview), then add `--confirm` (writes snapshots) |
 | alert `TradingDayJobStale` / `DailyJobStale` | a job did not report success | `make health`; `make service-logs S=scheduler`; was the machine awake at the scheduled time? |
+| `deleted-user-sweep-core` answers 500 with `all_units_failed: ["organizations_safety_brake"]` | auth reported too many organizations as missing (3.15) | core log `deleted_organization_sweep_refused` (counts); check `AUTH_SERVICE_URL`; if the deletions are real, `python -m scripts.clean_organizations --id <org id>` (preview, then `--confirm`) |
 | market-close answered `{"skipped": true, "reason": "market holiday"}` | NYSE closed | expected |
 | document stays `uploaded` (or stops at `parsing`, `chunking`, `embedding`) | event still in the outbox (Redis down), ai-service not consuming, or ai-service dead-lettered the entry mid-ingestion | `bash scripts/psql.sh -c "SELECT event_name, created_at, attempts, last_error FROM core.event_outbox WHERE published_at IS NULL ORDER BY created_at;"`; `bash scripts/redis-cli.sh -n 3 XINFO GROUPS stream:document.uploaded`; ai-service logs; re-upload the same file after the stuck limit (10 minutes for `uploaded`, 60 for the processing statuses; republish) |
 | alert `OutboxBacklog` | durable events waited in `core.event_outbox` for 15 minutes | core logs `outbox_publish_failed` (with `last_error`); is Redis up? The dispatcher publishes them once it is |
@@ -1719,7 +1879,7 @@ portfolio delete cascades to its transactions and holdings and publishes
    and returns the original transaction; the portfolio row lock serializes
    concurrent retries.
 6. It skips that portfolio, logs `market_close_snapshot_skipped`, sets the
-   skipped gauge (alert). Later `scripts/recompute_snapshots.py --to
+   skipped gauge (alert). Later `bash scripts/snapshots.sh --all --to
    <date>` adds the day (preview, then `--confirm`).
 7. The event is still waiting in `core.event_outbox` (Redis has been
    down; the dispatcher publishes it once Redis is back), or ai-service is
@@ -1746,14 +1906,15 @@ portfolio delete cascades to its transactions and holdings and publishes
 | File | What it holds |
 |---|---|
 | `services/core-service/main.py` | app, lifespan (schema, bucket, job health, background listeners, outbox dispatcher, Yjs save at shutdown), routers, `/health` |
-| `services/core-service/config.py` | core settings (API keys, uploads, Yjs) |
+| `services/core-service/config.py` | core settings (API keys, notification retention, organization sweep brake, failed-document retry, uploads, Yjs) |
 | `services/core-service/apikeys.py` | `ApiKey` model, hashing, create, revoke, cache key, the cache writes `mark_revoked_in_cache` and `forget_cached_key`; the public-API middleware: key check, owner state, rate limits, `last_used_at` throttle |
 | `services/core-service/api/public.py` | `/api/v1/public` routes and the `/api/v1/api-keys` routes (`apikeys_router`) |
 | `services/core-service/api/internal.py` | scheduler, portfolio, stats, tracked-tickers and system document internal routes |
 | `services/core-service/api/websocket.py` | JSON WebSocket endpoint and channel authorization, the Yjs endpoint, `recheck_user_sessions` |
 | `services/core-service/yjs_relay.py` | collaborative note editing, and the Yjs decode/validate layer (`validator`, `UpdateValidator` worker processes, `replace_text`, `seed_state`) (chapter 25) |
 | `services/core-service/websocket_manager.py` | channel registry, fan-out, per-user cap, presence task, `ws:fanout`; token check, close codes, accept-then-close, expiry timer |
-| `services/core-service/event_listener.py` | pub/sub and durable handlers, replica claims |
+| `services/core-service/event_listener.py` | pub/sub and durable handlers, replica claims, `delete_private_user_data`, `delete_organization_content`, `sweep_deleted_users` (with `delete_unreferenced_files`), `sweep_deleted_organizations` |
+| `shared/deleted_users.py` | `run_cleanup_steps`, `deleted_user_ids`, `missing_organization_ids`, `run_deleted_user_sweep`, `clean_each`, `sweep_steps` (job answer steps; `brake=True` adds the safety-brake step) (shared with ai) |
 | `services/core-service/job_health.py` | job success gauges, the "tracked since" start value for jobs without a success, market-close skip count, and their Redis persistence |
 | `services/core-service/outbox.py` | transactional outbox: `enqueue`, `publish_now`, `run_outbox_dispatcher`, table `core.event_outbox` |
 | `services/core-service/domains/portfolio/ledger.py` | replay, phases, cash rules, adjustment planning, snapshot day |
@@ -1763,6 +1924,7 @@ portfolio delete cascades to its transactions and holdings and publishes
 | `services/core-service/domains/notification/*` | notification rows, delivery, `notify_after_commit` |
 | `services/core-service/clients/ai_client.py`, `auth_client.py` | calls to the other services |
 | `services/core-service/scripts/recompute_snapshots.py` | snapshot check and repair |
+| `services/core-service/scripts/clean_organizations.py` | operator cleanup of organizations the sweep's safety brake refused: asks auth which ids are missing, previews, then with `--confirm` runs `delete_organization_content(..., strict=True)` for the missing ones only |
 | `services/core-service/scripts/delete_documents.py` | operator delete of documents by id (preview, `--confirm`); per document: delete the row and enqueue `document.deleted` in the outbox in one transaction (`service.delete_document_row`, shared with the API), commit, publish with `outbox.publish_now`, then delete the stored file (a failure is reported as an orphan object) |
 | `services/core-service/scripts/backfill_sentiment.py` | fill missing or outdated note/comment sentiment (preview, `--apply`) |
 | `services/core-service/scripts/e2e_check.py` | real-environment end-to-end check (`make e2e`) |

@@ -9,10 +9,12 @@
 > rooms (`/ws/yjs/{note_id}`) that let several people edit one research
 > note at the same time. This chapter explains both, how each connection is
 > authorized, what the messages look like, how edits are saved, and what
-> happens when core-service restarts. (The web app opens `user:`,
-> `analysis:` and Yjs sockets. The `document:` and `presence:` channels
-> are available to API clients; the documents page polls instead, and a
-> friend's online status reaches the web app over the `user:` channel.)
+> happens when core-service restarts. (The web app opens one `user:`
+> socket per tab, shared by every page, plus `analysis:` and Yjs sockets.
+> The `document:` and `presence:` channels are available to API clients;
+> the documents page polls instead (every 5 s, and it stops after 60
+> minutes without a status change of a pending document), and a friend's
+> online status reaches the web app over the `user:` channel.)
 
 ## 1. The big picture
 
@@ -279,9 +281,15 @@ in the task are logged as `presence_friend_push_failed`).
 
 In the web app, the sidebar's `user:` socket (`use-live-unread.ts`) passes
 every message on as a window event (`publishUserEvent`). The friends page
-listens (`LivePresence` in `friends/friend-forms.tsx`, `useUserEvents`)
-and re-renders, at most once a second, when a `user.presence.changed`
-arrives. No extra socket is opened. The page also refreshes every 60
+(`LivePresence` in `friends/friend-forms.tsx`), the notifications live
+feed (`notifications/live-feed.tsx`) and the analytics live refresh
+(`analytics/live-refresh.tsx`) listen with `useUserEvents`; the feed and
+analytics show the socket's status through `useUserChannelStatus`
+(published by the badge hook; it goes back to "connecting" when the
+hook unmounts, for example at sign-out). No extra socket is opened, so
+these pages reconnect with the badge's backoff (5 s base). The friends
+page re-renders, at most once a second, when a `user.presence.changed`
+arrives. It also refreshes every 60
 seconds, because a user who just goes quiet drops offline by time
 (`PRESENCE_ONLINE_THRESHOLD_MINUTES`), and that sends no event.
 
@@ -974,7 +982,7 @@ and isolates the risky decoding in child processes."
 | `services/core-service/domains/notification/service.py` | `deliver_notification` (push to `user:<id>`) |
 | `services/core-service/clients/auth_client.py` | `set_user_presence`, `are_users_connected`, `list_friend_ids` |
 | `services/auth-service/api/internal.py` | `POST /internal/users/{id}/presence`, `GET /internal/connections/check`, `GET /internal/users/{id}/friends` |
-| `frontend/app/lib/use-channel.ts` | the shared browser WebSocket hook (reconnect, close codes), `publishUserEvent` / `useUserEvents` |
+| `frontend/app/lib/use-channel.ts` | the shared browser WebSocket hook (reconnect, close codes), `publishUserEvent` / `useUserEvents`, `publishUserChannelStatus` / `useUserChannelStatus` |
 | `services/auth-service/domains/auth/service.py` | `set_presence`, `_mark_online`, `presence_event` |
 | `services/core-service/api/websocket.py` (`yjs_router`) | `/ws/yjs/{note_id}`, read-only handling, `_YjsSession` registry, `recheck_user_sessions` |
 | `services/core-service/yjs_relay.py` | `YjsRoom`, `YjsRelay` (`_in_use`, `flush_due_snapshots`, `persist_all_dirty`), snapshots, cross-replica listener, active-room markers; decoder worker pool (`UpdateValidator`, `validator`), `guarded`, `seed_state`, `replace_text` (REST body edits), `merge_states`, `extract_text` |

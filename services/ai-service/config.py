@@ -1,5 +1,19 @@
 from functools import lru_cache
+from typing import Literal
+from pydantic import ValidationInfo, field_validator
 from shared.config import BaseServiceSettings
+
+LLMProviderName = Literal["google", "mistral", "anthropic", "openai"]
+LLMTierName = Literal["cheap", "highest_accuracy"]
+AnthropicThinking = Literal["adaptive", "between_tools"]
+
+# Literal settings where an empty value (VAR= copied from .env.example)
+# means "use the default", as before they were validated.
+_BLANK_IS_DEFAULT = (
+    "LLM_DEFAULT_PROVIDER", "LLM_ANTHROPIC_THINKING_CHEAP",
+    "LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY",
+    "FILING_RECORDS_BACKFILL_LLM_TIER", "FILING_LLM_TIER",
+    "KG_EXTRACTION_LLM_TIER", "RAG_ASK_LLM_TIER")
 
 
 class AIServiceSettings(BaseServiceSettings):
@@ -17,7 +31,7 @@ class AIServiceSettings(BaseServiceSettings):
     GOOGLE_EMBEDDING_MODEL: str = "gemini-embedding-2"
     GOOGLE_EMBEDDING_DIMENSIONS: int = 1536
     EMBEDDING_REQUEST_TIMEOUT_SECONDS: float = 30.0
-    ARCHIVAL_NEAR_DUPLICATE_THRESHOLD: float | None = None
+    ARCHIVAL_NEAR_DUPLICATE_THRESHOLD: float = 0.85
     ARCHIVAL_RECYCLED_SHARE_MAX: float = 0.5
     PRIOR_NOTE_MAX_SIMILARITY: float = 0.9
 
@@ -41,11 +55,11 @@ class AIServiceSettings(BaseServiceSettings):
     MISTRAL_API_KEY_6: str = ""
     MISTRAL_API_KEY_7: str = ""
 
-    LLM_DEFAULT_PROVIDER: str = "google"
+    LLM_DEFAULT_PROVIDER: LLMProviderName = "google"
     LLM_OPENAI_MODEL_CHEAP: str = "gpt-5.6-luna"
     LLM_OPENAI_MODEL_HIGHEST_ACCURACY: str = "gpt-5.6-sol"
-    LLM_ANTHROPIC_MODEL_CHEAP: str = "claude-haiku-4-5-20251001"
-    LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY: str = "claude-opus-4-8"
+    LLM_ANTHROPIC_MODEL_CHEAP: str = "claude-haiku-5-5"
+    LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY: str = "claude-sonnet-5-5"
     LLM_GOOGLE_MODEL_CHEAP: str = "gemini-3.5-flash-lite"
     LLM_GOOGLE_MODEL_CHEAP_FALLBACK: str = "gemini-3.1-flash-lite"
     LLM_GOOGLE_MODEL_HIGHEST_ACCURACY: str = "gemini-3.8-flash"
@@ -75,10 +89,21 @@ class AIServiceSettings(BaseServiceSettings):
     LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS: float = 300.0
     LLM_GOOGLE_SERVER_ERROR_COOLDOWN_MAX_SECONDS: float = 300.0
 
+    LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS: float = 120.0
+    LLM_ANTHROPIC_EFFORT: Literal["", "low", "medium", "high", "xhigh",
+                                  "max"] = "low"
+    LLM_ANTHROPIC_THINKING_CHEAP: AnthropicThinking = "adaptive"
+    LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY: AnthropicThinking = (
+        "between_tools")
+    LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS: int = 2048
+    LLM_ANTHROPIC_SEND_TEMPERATURE: bool = False
+    LLM_ANTHROPIC_PROMPT_CACHING: bool = True
+
     SEC_EDGAR_USER_AGENT: str = ""
     SEC_EDGAR_MAX_REQUESTS_PER_SECOND: float = 8.0
     FILING_RECORDS_MAX_FILINGS: int = 5
-    FILING_RECORDS_BACKFILL_LLM_TIER: str = "cheap"
+    FILING_RECORDS_BACKFILL_LLM_TIER: LLMTierName = "cheap"
+    FILING_LLM_TIER: LLMTierName = "highest_accuracy"
     FRED_API_KEY: str = ""
     NEWSAPI_API_KEY: str = ""
     NEWSAPI_SEARCH_IN: str = "title,description"
@@ -90,7 +115,7 @@ class AIServiceSettings(BaseServiceSettings):
     NEWS_WEB_FALLBACK_DAYS: int = 7
     TAVILY_API_KEY: str = ""
 
-    KG_EXTRACTION_LLM_TIER: str = "cheap"
+    KG_EXTRACTION_LLM_TIER: LLMTierName = "cheap"
 
     RAG_TOP_K_RESULTS: int = 5
 
@@ -122,11 +147,20 @@ class AIServiceSettings(BaseServiceSettings):
 
     RAG_ASK_RATE_LIMIT_PER_MINUTE: int = 10
     RAG_ASK_RATE_LIMIT_PER_DAY: int = 200
-    RAG_ASK_LLM_TIER: str = "cheap"
+    DECISION_REVIEW_RATE_LIMIT_PER_MINUTE: int = 3
+    DECISION_REVIEW_RATE_LIMIT_PER_DAY: int = 20
+    RAG_ASK_LLM_TIER: LLMTierName = "cheap"
     RAG_ASK_MAX_OUTPUT_TOKENS: int = 1024
     RAG_ASK_SNIPPET_CHARS: int = 300
     RAG_ASK_STREAM_TIMEOUT_SECONDS: float = 120.0
     SENTIMENT_MAX_INPUT_CHARS: int = 6000
+
+    @field_validator(*_BLANK_IS_DEFAULT, mode="before")
+    @classmethod
+    def _blank_is_default(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, str) and not value.strip() and info.field_name:
+            return cls.model_fields[info.field_name].default
+        return value.strip() if isinstance(value, str) else value
 
     def assemble_qdrant_url(self) -> str:
         if self.QDRANT_URL:

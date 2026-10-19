@@ -22,6 +22,7 @@ from domains.auth.service import (EmailDispatch, avatar_or_default,
                                   change_username, copy_changed_fields,
                                   flush_unique, is_user_online, profile_read,
                                   verification_link)
+from domains.organization.model import Organization
 from domains.organization.repository import OrganizationRepository
 from shared.enums import OrganizationRole, SystemRole
 from shared.events import EventName
@@ -69,6 +70,14 @@ class UnverifiedPurgeResult:
     @property
     def attempted(self) -> int:
         return self.deleted + self.failed
+
+
+@dataclass
+class LeftoverCleanupResult:
+    candidates: int
+    cleaned: int = 0
+    failed: int = 0
+    lookup_failed: bool = False
 
 
 class AdminService:
@@ -240,6 +249,8 @@ class AdminService:
         await self._ensure_not_last_admin(user)
         previous_state = state_of(user)
         username = user.username
+        await self._remove_organization_ties_and_sessions(
+            user, actor_id, user.email if user.is_verified else None)
 
         user.deleted_at = datetime.now(UTC)
         user.is_active = False
@@ -255,14 +266,52 @@ class AdminService:
         await self.admin.delete_oauth_accounts(user.id)
         await self.admin.delete_two_factor_secret(user.id)
         await self.admin.delete_connections(user.id)
-        await self._transfer_owned_organizations(user, actor_id)
-        await self.orgs.remove_memberships_of_user(user.id)
-        await self.users.revoke_all_sessions(user.id)
         await commit_with_state(self._db, user, previous_state)
         self._user_event(
             EventName.USER_DELETED, user, actor_id,
             ["deleted_at", "email", "is_active", "username"],
             username=username)
+
+    async def _remove_organization_ties_and_sessions(
+            self, user: User, actor_id: UUID, email: str | None) -> None:
+        await self._revoke_sent_invitations(user)
+        await self.orgs.delete_invitations_of_user(user.id, email)
+        await self._transfer_owned_organizations(user, actor_id)
+        await self.orgs.remove_memberships_of_user(user.id)
+        await self.users.delete_sessions(user.id)
+
+    async def clean_deleted_account_leftovers(self) -> LeftoverCleanupResult:
+        try:
+            candidates = await self.admin.deleted_ids_with_leftovers()
+        except Exception as exc:
+            await self._db.rollback()
+            logger.error(
+                "deleted_account_leftovers_lookup_failed", error=str(exc))
+            return LeftoverCleanupResult(candidates=0, lookup_failed=True)
+        result = LeftoverCleanupResult(candidates=len(candidates))
+        for user_id in candidates:
+            events_before = len(self.pending_events)
+            try:
+                user = await self.users.lock(user_id)
+                if user is None or user.deleted_at is None:
+                    continue
+                await self._remove_organization_ties_and_sessions(
+                    user, user.id, None)
+                await self._db.commit()
+            except Exception as exc:
+                await self._db.rollback()
+                del self.pending_events[events_before:]
+                result.failed += 1
+                logger.error(
+                    "deleted_account_leftovers_failed", user_id=str(user_id),
+                    error=str(exc))
+                continue
+            result.cleaned += 1
+        logger.info(
+            "deleted_account_leftovers_cleaned",
+            candidates=result.candidates, cleaned=result.cleaned,
+            failed=result.failed)
+        return result
 
     async def _transfer_owned_organizations(
             self, user: User, actor_id: UUID) -> None:
@@ -270,12 +319,10 @@ class AdminService:
             successor = await self.orgs.successor_member(
                 org.id, excluding=user.id)
             if successor is None:
+                await self._delete_orphaned_organization(org, actor_id)
                 continue
             org.owner_id = successor.user_id
             successor.role = OrganizationRole.OWNER
-            old_row = await self.orgs.get_member(org.id, user.id)
-            if old_row is not None:
-                old_row.role = OrganizationRole.MEMBER
             await self._db.flush()
             member_ids = await self.orgs.list_member_ids(org.id)
             self.pending_events.append((
@@ -287,6 +334,37 @@ class AdminService:
             logger.info(
                 "organization_owner_transferred", organization_id=str(org.id),
                 from_user=str(user.id), to_user=str(successor.user_id))
+
+    async def _revoke_sent_invitations(self, user: User) -> None:
+        now = datetime.now(UTC)
+        for invitation in await self.orgs.list_open_invitations_sent_by(
+                user.id, now):
+            org = await self.orgs.get_by_id(invitation.organization_id)
+            if org is None:
+                continue
+            invitee = await self.users.get_by_email(invitation.email)
+            self.pending_events.append((
+                EventName.ORGANIZATION_INVITATION_REVOKED,
+                organization_event_payload(
+                    organization_id=org.id, organization_name=org.name,
+                    actor_id=user.id,
+                    user_id=invitee.id if invitee is not None else None,
+                    role=str(invitation.role),
+                    member_ids=await self.orgs.list_member_ids(org.id))))
+
+    async def _delete_orphaned_organization(
+            self, org: Organization, actor_id: UUID) -> None:
+        member_ids = await self.orgs.list_member_ids(org.id)
+        self.pending_events.append((
+            EventName.ORGANIZATION_DELETED,
+            organization_event_payload(
+                organization_id=org.id, organization_name=org.name,
+                actor_id=actor_id, user_id=None, role=None,
+                member_ids=member_ids)))
+        await self.orgs.delete(org)
+        logger.info(
+            "organization_deleted_without_successor",
+            organization_id=str(org.id))
 
     async def reset_two_factor(
             self, actor: CurrentUser, user_id: UUID) -> None:

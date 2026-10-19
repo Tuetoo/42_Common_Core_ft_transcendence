@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 import httpx
 import pyotp
@@ -226,6 +226,97 @@ class TestOrganizations:
         ]
         assert changed and changed[-1]["user_id"] == successor
         assert changed[-1]["role"] == "owner"
+
+    async def test_deleted_owner_prefers_an_active_successor(
+            self, client, mock_email, db_session):
+        from sqlalchemy import update
+        from domains.auth.model import User
+        from domains.organization.model import Organization, OrganizationMember
+
+        owner_h, org, members = await org_with_admins(
+            client, mock_email, "activeheir")
+        owner_id = await current_user_id(client, owner_h)
+        org_id = UUID(org["id"])
+        first, second = (UUID(members[name][1]) for name in ("adm", "adm2"))
+        for user_id, days in ((first, 2), (second, 1)):
+            await db_session.execute(
+                update(OrganizationMember).where(
+                    OrganizationMember.organization_id == org_id,
+                    OrganizationMember.user_id == user_id).values(
+                        joined_at=datetime.now(UTC) - timedelta(days=days)))
+        await db_session.execute(
+            update(User).where(User.id == first).values(is_active=False))
+        await db_session.flush()
+        admin = await make_user(
+            client, mock_email, db_session, role="admin", prefix="a")
+        deleted = await client.delete(
+            f"{ADMIN}/users/{owner_id}", headers=admin["headers"])
+        assert deleted.status_code == 204
+
+        stored = await db_session.get(Organization, org_id)
+        assert stored.owner_id == second
+
+    async def test_purge_job_cleans_leftovers_of_old_deleted_accounts(
+            self, client, mock_email, db_session, captured_events):
+        from sqlalchemy import func, select, update
+        from domains.admin.repository import AdminRepository
+        from domains.auth.model import User, UserSession
+        from domains.organization.model import (Organization,
+                                                OrganizationInvitation,
+                                                OrganizationMember)
+
+        old = await make_user(client, mock_email, db_session)
+        heir = await make_user(client, mock_email, db_session)
+        old_id, heir_id = UUID(old["id"]), UUID(heir["id"])
+        alone, shared = [
+            UUID((await client.post(
+                ORGS, json={"name": name},
+                headers=old["headers"])).json()["data"]["id"])
+            for name in ("Alone", "Shared")
+        ]
+        db_session.add(
+            OrganizationMember(
+                organization_id=shared, user_id=heir_id, role="member"))
+        db_session.add(
+            OrganizationInvitation(
+                organization_id=shared, email="later@example.com",
+                role="member", invited_by=old_id,
+                expires_at=datetime.now(UTC) + timedelta(days=7)))
+        await db_session.execute(
+            update(User).where(User.id == old_id).values(
+                deleted_at=datetime.now(UTC), is_active=False))
+        await db_session.flush()
+
+        async def count(model, *where):
+            return (
+                await db_session.execute(
+                    select(func.count()).select_from(model).where(*where)
+                )).scalar_one()
+
+        assert await count(UserSession, UserSession.user_id == old_id) > 0
+        r = await client.post("/internal/scheduler/purge-unverified")
+        assert r.status_code == 200, r.text
+        assert r.json()["deleted_account_leftovers"]["failed"] == 0
+
+        assert await count(UserSession, UserSession.user_id == old_id) == 0
+        assert await count(
+            OrganizationInvitation,
+            OrganizationInvitation.invited_by == old_id) == 0
+        assert await count(
+            OrganizationMember, OrganizationMember.user_id == old_id) == 0
+        assert await db_session.get(Organization, alone) is None
+        kept = await db_session.get(Organization, shared)
+        assert kept is not None and kept.owner_id == heir_id
+        deleted_orgs = events_named(captured_events, "organization.deleted")
+        assert [e["organization_id"] for e in deleted_orgs] == [str(alone)]
+        assert deleted_orgs[0]["actor_id"] == old["id"]
+
+        captured_events.clear()
+        assert old_id not in await AdminRepository(
+            db_session).deleted_ids_with_leftovers()
+        again = await client.post("/internal/scheduler/purge-unverified")
+        assert again.status_code == 200
+        assert events_named(captured_events, "organization.deleted") == []
 
 
 class TestInvitations:
@@ -824,7 +915,9 @@ class TestAdminUsers:
         from sqlalchemy import func, select
         from domains.auth.model import (OAuthAccount, TwoFactorSecret, User,
                                         UserSession)
-        from domains.organization.model import OrganizationMember
+        from domains.organization.model import (Organization,
+                                                OrganizationInvitation,
+                                                OrganizationMember)
         from domains.social.model import Connection
         from shared.user_state import get_user_state
 
@@ -848,6 +941,23 @@ class TestAdminUsers:
         own_org = await client.post(
             ORGS, json={"name": "Mine"}, headers=target["headers"])
         assert own_org.status_code == 201
+        keep_id = UUID(org["id"])
+        week = datetime.now(UTC) + timedelta(days=7)
+        invitations = {
+            name: OrganizationInvitation(
+                organization_id=keep_id, email=email, role="member",
+                invited_by=inviter, accepted_at=accepted,
+                expires_at=(datetime.now(UTC) - timedelta(days=1)
+                            if name == "sent_expired" else week))
+            for name, email, inviter, accepted in (
+                ("to_target", target["email"].upper(), UUID(friend["id"]),
+                 None),
+                ("sent_open", "someone@example.com", tid, None),
+                ("sent_expired", "late@example.com", tid, None),
+                ("sent_accepted", "joined@example.com", tid, week),
+                ("unrelated", "other@example.com", UUID(friend["id"]), None))
+        }
+        db_session.add_all(invitations.values())
         db_session.add(
             OAuthAccount(
                 user_id=tid, provider="google", provider_user_id=f"g-{uid()}"))
@@ -885,10 +995,24 @@ class TestAdminUsers:
         assert await count(OAuthAccount, OAuthAccount.user_id == tid) == 0
         assert (
             await count(TwoFactorSecret, TwoFactorSecret.user_id == tid) == 0)
-        assert (
-            await count(
-                UserSession, UserSession.user_id == tid,
-                UserSession.revoked_at.is_(None)) == 0)
+        assert await count(UserSession, UserSession.user_id == tid) == 0
+        left = set((
+            await db_session.execute(
+                select(OrganizationInvitation.id).where(
+                    OrganizationInvitation.organization_id == keep_id)
+            )).scalars().all())
+        assert left == {
+            invitations["sent_accepted"].id, invitations["unrelated"].id
+        }
+        assert events_named(
+            captured_events, "organization.invitation.revoked") == [{
+                "organization_id": str(keep_id),
+                "organization_name": "Keep",
+                "actor_id": target["id"],
+                "user_id": None,
+                "role": "member",
+                "member_ids": sorted([friend["id"], target["id"]])
+            }]
         assert (
             await count(
                 Connection, (Connection.requester_id == tid)
@@ -897,7 +1021,18 @@ class TestAdminUsers:
             await db_session.execute(
                 select(OrganizationMember.role).where(
                     OrganizationMember.user_id == tid))).scalars().all())
-        assert members == ["owner"]
+        assert members == []
+        mine_id = UUID(own_org.json()["data"]["id"])
+        assert await db_session.get(Organization, mine_id) is None
+        assert await db_session.get(Organization, keep_id) is not None
+        assert events_named(captured_events, "organization.deleted") == [{
+            "organization_id": str(mine_id),
+            "organization_name": "Mine",
+            "actor_id": admin["id"],
+            "user_id": None,
+            "role": None,
+            "member_ids": [target["id"]]
+        }]
 
         state = await get_user_state(settings, target["id"])
         assert state is not None and state.is_active is False
@@ -1102,6 +1237,7 @@ class TestNotificationSettings:
             await db_session.flush()
             body = (await client.get(url)).json()
             assert body["email"] is None, field
+            assert body["deleted"] is (field == "deleted_at"), field
             setattr(row, field, restore)
             await db_session.flush()
         assert (await client.get(url)).json()["email"] == user["email"]
@@ -1121,6 +1257,72 @@ class TestNotificationSettings:
 
         unknown = await client.get(f"/internal/users/{uuid4()}/state")
         assert unknown.status_code == 404
+
+    async def test_internal_deleted_users_returns_only_deleted_ids(
+            self, client, mock_email, db_session, monkeypatch):
+        import events_out
+        from domains.auth.repository import UserRepository
+        from shared.deleted_users import DELETED_USERS_BATCH_SIZE
+
+        live = await make_user(client, mock_email, db_session)
+        gone = await make_user(client, mock_email, db_session)
+        row = await UserRepository(db_session).get_by_id(UUID(gone["id"]))
+        row.deleted_at = datetime.now(UTC)
+        inactive = await make_user(client, mock_email, db_session)
+        inactive_row = await UserRepository(db_session).get_by_id(
+            UUID(inactive["id"]))
+        inactive_row.is_active = False
+        await db_session.flush()
+        unknown = str(uuid4())
+
+        url = "/internal/users/deleted"
+        r = await client.post(
+            url, json={
+                "user_ids": [live["id"], gone["id"], inactive["id"], unknown]
+            })
+        assert r.status_code == 200, r.text
+        assert r.json() == {"deleted_ids": [gone["id"]]}
+        assert (await client.post(url, json={"user_ids": []})).json() == {
+            "deleted_ids": []
+        }
+        too_many = [str(uuid4()) for _ in range(DELETED_USERS_BATCH_SIZE + 1)]
+        r = await client.post(url, json={"user_ids": too_many})
+        assert r.status_code == 422
+        wrong = await client.post(
+            url, json={"user_ids": [gone["id"]]},
+            headers={"X-Internal-Token": "wrong"})
+        assert wrong.status_code in (401, 403)
+        client.headers.pop("X-Internal-Token", None)
+        missing = await client.post(url, json={"user_ids": [gone["id"]]})
+        assert missing.status_code in (401, 403)
+
+        org = await client.post(
+            "/api/v1/organizations", json={"name": "Still here"},
+            headers=live["headers"])
+        live_org, gone_org = org.json()["data"]["id"], str(uuid4())
+        client.headers["X-Internal-Token"] = "test-internal-token"
+        r = await client.post(
+            "/internal/organizations/missing",
+            json={"organization_ids": [live_org, gone_org, gone_org]})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"missing_ids": [gone_org]}
+        client.headers.pop("X-Internal-Token", None)
+        denied = await client.post(
+            "/internal/organizations/missing",
+            json={"organization_ids": [gone_org]})
+        assert denied.status_code in (401, 403)
+
+        durable = []
+
+        async def _capture(settings, name, payload, **kw):
+            durable.append((str(name), payload))
+
+        monkeypatch.setattr(events_out, "publish_durable_event", _capture)
+        await events_out.publish_events([
+            (events_out.EventName.USER_DELETED, {"user_id": gone["id"]}),
+            (events_out.EventName.USER_UPDATED, {"user_id": live["id"]})
+        ])
+        assert durable == [("user.deleted", {"user_id": gone["id"]})]
 
 
 class TestUserState:
@@ -1579,16 +1781,16 @@ class TestAuthEvents:
         r = await client.patch(
             "/api/v1/auth/me", headers=h, json={
                 "bio": "secret bio",
-                "theme": "dark",
+                "country": "France",
                 "first_name": None
             })
         assert r.status_code == 200
         events = events_named(captured_events, "user.updated")
-        assert events == [expect(["bio", "theme"])]
+        assert events == [expect(["bio", "country"])]
         assert "secret bio" not in str(events)
 
         await client.patch(
-            "/api/v1/auth/me", headers=h, json={"theme": "dark"})
+            "/api/v1/auth/me", headers=h, json={"country": "France"})
         assert len(events_named(captured_events, "user.updated")) == 1
 
         monkeypatch.setattr(settings, "AVATAR_STORAGE_DIR", str(tmp_path))

@@ -66,6 +66,7 @@ _TECHNICAL_REPORTED_SCHEMA: dict[str, Any] = {
             "enum": list(_RSI_BAND_VALUES)
         }
     },
+    "required": list(_CATEGORICAL_CLAIMS),
     "additionalProperties": False
 }
 

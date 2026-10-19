@@ -5,7 +5,8 @@ import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
 import { changeUserRole, deleteUser, setUserActive } from "@/app/lib/actions/admin";
-import { Pager, pageParam } from "../../pager";
+import { SYSTEM_ROLES } from "@/app/lib/format";
+import { Pager, firstParam, pageParam } from "../../pager";
 import { ActionButton, SelectActionForm } from "../inline-actions";
 import { AccountByIdForm } from "./account-by-id-form";
 
@@ -34,16 +35,11 @@ type Stats = {
   ai: Record<string, number> | null;
 };
 
-const ROLES = ["guest", "user", "moderator", "admin"] as const;
 // Moderators may only deactivate/reactivate these roles (admin service).
 const MODERATABLE = new Set(["guest", "user"]);
 const PAGE_SIZE = 20;
 
 type SearchParams = Record<string, string | string[] | undefined>;
-
-function first(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value) ?? "";
-}
 
 export default async function AdminUsersPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const { me, accessToken } = await getMe();
@@ -52,10 +48,10 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
   if (!canManage && !canDeactivate) notFound();
 
   const sp = await searchParams;
-  const q = first(sp.q).slice(0, 254);
-  const role = ROLES.includes(first(sp.role) as (typeof ROLES)[number]) ? first(sp.role) : "";
-  const status = ["active", "inactive"].includes(first(sp.status)) ? first(sp.status) : "";
-  const deleted = first(sp.deleted) === "1" ? "1" : "";
+  const q = firstParam(sp.q).slice(0, 254);
+  const role = SYSTEM_ROLES.includes(firstParam(sp.role) as (typeof SYSTEM_ROLES)[number]) ? firstParam(sp.role) : "";
+  const status = ["active", "inactive"].includes(firstParam(sp.status)) ? firstParam(sp.status) : "";
+  const deleted = firstParam(sp.deleted) === "1" ? "1" : "";
   const page = pageParam(sp.page);
 
   let users: UserPage | null = null;
@@ -101,7 +97,7 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
               <label htmlFor="role">Role</label>
               <select id="role" name="role" autoComplete="off" defaultValue={role}>
                 <option value="">All</option>
-                {ROLES.map((r) => (
+                {SYSTEM_ROLES.map((r) => (
                   <option key={r} value={r}>
                     {r}
                   </option>
@@ -196,7 +192,7 @@ function UserRow({ user, meId, canManage }: { user: AdminUser; meId: string; can
             action={changeUserRole.bind(null, user.id)}
             name="role"
             label={`Role of ${user.username}`}
-            options={ROLES}
+            options={SYSTEM_ROLES}
             current={user.system_role}
             disabled={isSelf}
             title={isSelf ? "You cannot change your own role" : undefined}
@@ -250,7 +246,7 @@ function UserRow({ user, meId, canManage }: { user: AdminUser; meId: string; can
 
 function StatsTiles({ stats }: { stats: Stats }) {
   const { auth, core, ai } = stats;
-  const byRole = ROLES.map((r) => `${auth.users_by_role[r] ?? 0} ${r}`).join(" · ");
+  const byRole = SYSTEM_ROLES.map((r) => `${auth.users_by_role[r] ?? 0} ${r}`).join(" · ");
   return (
     <div className="stat-grid">
       <div className="stat-tile">

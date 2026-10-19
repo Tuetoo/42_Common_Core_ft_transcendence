@@ -8,9 +8,10 @@ from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, combine_context,
                             prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.knowledge.filing_records import (display_amounts, load_filing_records,
-                                         ordered_rows, period_months_value,
-                                         quote_evidence, record_by_id,
+from ai.knowledge.filing_records import (OWN_PERIOD_MONTHS, display_amounts,
+                                         load_filing_records, ordered_rows,
+                                         period_months_value, quote_evidence,
+                                         record_by_id, record_items,
                                          unusual_item_period)
 from ai.rag.visibility import visibility_for_state
 from ai.tools.filing_tool import SearchFilingsTool
@@ -116,12 +117,6 @@ def _text(item: dict[str, Any], name: str) -> str:
     return " ".join(str(item.get(name) or "").split())
 
 
-def _items(records: dict[str, Any], category: str) -> list[dict[str, Any]]:
-    items = (records or {}).get(category)
-    return ([i for i in items
-             if isinstance(i, dict)] if isinstance(items, list) else [])
-
-
 def _legal_key_line(item: dict[str, Any]) -> str | None:
     exposure = _text(item, "exposure_text")
     if not exposure:
@@ -163,11 +158,13 @@ def _guidance_key_line(item: dict[str, Any]) -> str:
 def key_record_lines(rows: Sequence[Any]) -> list[str]:
     if not rows:
         return []
-    records = ordered_rows(rows)[0].records or {}
+    records = ordered_rows(rows)[0].records
     lines: list[str | None] = [
-        *(_legal_key_line(i) for i in _items(records, "legal_matters")),
-        *(_transaction_key_line(i) for i in _items(records, "transactions")),
-        *(_guidance_key_line(i) for i in _items(records, "guidance"))
+        *(_legal_key_line(i)
+          for i in record_items(records, "legal_matters")),
+        *(_transaction_key_line(i)
+          for i in record_items(records, "transactions")),
+        *(_guidance_key_line(i) for i in record_items(records, "guidance"))
     ]
     return [display_amounts(line) for line in lines if line]
 
@@ -182,7 +179,6 @@ async def key_records_for(
 _PERIOD_TOLERANCE_DAYS = 7
 _YEAR_AGO_DAYS = 364
 _YEAR_AGO_TOLERANCE_DAYS = 10
-_OWN_PERIOD_MONTHS = {"10-Q": 3, "10-K": 12}
 
 
 def _iso_date(value: Any) -> date | None:
@@ -212,7 +208,7 @@ def _year_end_of(row: Any) -> date | None:
         report: date = row.report_date
         return report
     ends = [
-        end for item in _items(row.records or {}, "one_off_items")
+        end for item in record_items(row.records, "one_off_items")
         if period_months_value(item.get("period_months")) == 12 and (
             end := _iso_date(item.get("period_end"))) is not None
         and end < row.filing_date
@@ -243,7 +239,7 @@ def year_to_date_unusual_item_lines(rows: Sequence[Any]) -> list[str]:
     seen: set[tuple[str, str]] = set()
     from_record_periods = 0
     for row in ordered[1:]:
-        for item in _items(row.records or {}, "one_off_items"):
+        for item in record_items(row.records, "one_off_items"):
             period_end = _iso_date(item.get("period_end"))
             months = period_months_value(item.get("period_months"))
             if period_end is None or not start < period_end < end:
@@ -274,7 +270,7 @@ def prior_year_unusual_item_lines(rows: Sequence[Any]) -> list[str]:
     if newest.report_date is None:
         return []
     kind = _form_kind(newest.form)
-    own_months = _OWN_PERIOD_MONTHS.get(kind)
+    own_months = OWN_PERIOD_MONTHS.get(kind)
     if own_months is None:
         return []
 
@@ -293,7 +289,7 @@ def prior_year_unusual_item_lines(rows: Sequence[Any]) -> list[str]:
     year_ago = min(candidates, key=gap)
     lines: list[str] = []
     seen: set[tuple[str, str]] = set()
-    for item in _items(year_ago.records or {}, "one_off_items"):
+    for item in record_items(year_ago.records, "one_off_items"):
         if item.get("period_months") not in (None, "") and (
                 period_months_value(item.get("period_months")) != own_months):
             continue
@@ -339,8 +335,7 @@ class FilingAgent(BaseAgent):
                 self.role.value, once_checks=[(
                     OWN_EVIDENCE_CHECK,
                     own_evidence_figure_check(
-                        combine_context(
-                            state.fresh_filing_context, kg_context) or ""))]),
+                        state.fresh_filing_context or ""))]),
             finish_validation_suffix=_FILING_VALIDATION_SUFFIX)
         result = await loop.run(
             f"Extract key risk factors, recent results, and guidance from "

@@ -39,11 +39,15 @@ delete: the row stays so other services' plain-UUID references keep
 resolving, `is_active` is false, `email`/`username` are replaced by
 `deleted-<id>@deleted.alphamind.local` / `deleted_<id>`, the password by a
 random one, and the user's profile fields, OAuth accounts, 2FA secret,
-connections, organization memberships and sessions are removed. An
-organization the user owned passes to its longest-standing admin, else its
-longest-standing other member; it keeps the deleted user's owner row only
-when it has no other member.
-A deleted account can never log in again. The live `system_role` /
+connections, organization memberships, sessions, open sent invitations
+and (for a verified account) invitations addressed to the user's email are
+removed. An organization the user owned passes to its longest-standing
+active admin, else its longest-standing active member or viewer, else a
+deactivated member in the same order; an organization with no other
+member is deleted. The nightly `purge-unverified` job also removes these
+auth leftovers (except invitations to the old address, which is no
+longer known) for accounts deleted before this cleanup existed. A deleted
+account can never log in again. The live `system_role` /
 `is_active` of every user is mirrored in Redis (`auth:user_state:{id}`,
 `shared/user_state.py`) so every service applies changes at once.
 
@@ -51,7 +55,8 @@ A deleted account can never log in again. The live `system_role` /
 `last_name`, `avatar_url`, `bio`, `timezone`, `country`.
 
 **user_settings** — `id`, `user_id` (FK → users, 1:1), `preferred_currency`,
-`theme`, `default_model`, `notification_preferences` (JSONB).
+`theme`, `default_model` (unused, not exposed by the API),
+`notification_preferences` (JSONB).
 
 **user_sessions** — `id`, `user_id` (FK → users), `refresh_token_hash`
 (unique; the refresh token itself is never stored), `expires_at`,
@@ -72,8 +77,9 @@ expired more than 7 days ago.
 `enabled`, `last_used_step` (the last accepted TOTP step; a code of that
 step or earlier is rejected, so it cannot be replayed). `secret` holds the
 encrypted value (`fernet:<token>`, see
-`services/auth-service/security.py`); a value without the prefix is a
-plain-text secret, encrypted on the user's next successful 2FA check.
+`services/auth-service/security.py`); a value without that prefix, or
+one the current keys cannot decrypt, is refused (409), never read as
+plain text.
 
 **organizations** — `id`, `name`, `description`, `owner_id` (plain UUID →
 `users.id`, same-schema so this one *is* a real FK), timestamps.
@@ -412,7 +418,9 @@ request by the portfolio backtest.
 ### Market data cache
 
 **instruments** — `id`, `ticker` (unique), `name`, `asset_type`, `currency`
-(default `USD`), `sector`, `exchange`: ticker metadata cache.
+(default `USD`), `sector`, `exchange`: one row per cached ticker
+(`name`, `sector` and `exchange` are no longer filled and `asset_type` is
+always `equity`; nothing reads them).
 **price_bars** — `id`, `instrument_id` (FK), `interval`, `timestamp`,
 `open`, `high`, `low`, `close`, `volume` (NUMERIC), `fetched_at` (default
 `now()`, read by the cache's freshness check); unique on `(instrument_id,

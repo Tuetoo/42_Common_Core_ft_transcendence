@@ -9,6 +9,7 @@ from ai.providers.registry import get_market_data_provider
 from ai.tools.base import Tool
 from clients.core_client import (get_portfolio_cash_balance,
                                  get_portfolio_holdings)
+from config import settings
 from database import SessionLocal
 from domains.analysis.repository import RecommendationTierRepository
 from shared.exceptions import UpstreamServiceError
@@ -123,12 +124,19 @@ class GetPortfolioCompositionTool(Tool):
             real_total_net_value = total
             denom_label = (
                 " [cash unknown -- weight excludes it, likely overstated]")
+        cap = settings.MAX_POSITION_WEIGHT_PCT
+        above_cap: list[str] = []
         for h in sorted(priced, key=lambda x: x["market_value"] or 0,
                         reverse=True):
-            weight = (
-                f"{h['market_value'] / real_total_net_value * 100:.1f}%"
-                f"{denom_label}" if h["market_value"] and real_total_net_value
-                and not missing else "n/a")
+            weights = "weight=n/a"
+            if h["market_value"] and real_total_net_value and not missing:
+                net_pct = h["market_value"] / real_total_net_value * 100
+                weights = (
+                    f"weight_of_net_value={net_pct:.1f}%{denom_label} "
+                    f"weight_of_holdings_value="
+                    f"{h['market_value'] / total * 100:.1f}%")
+                if cash_balance is not None and net_pct > cap:
+                    above_cap.append(f"{h['ticker']} ({net_pct:.1f}%)")
             price_str = (
                 f"{h['price']:.2f}"
                 if h["price"] is not None else "unavailable")
@@ -138,7 +146,12 @@ class GetPortfolioCompositionTool(Tool):
             lines.append(
                 f"- {h['ticker']}: qty={h['quantity']} "
                 f"avg_cost={h['average_cost']} "
-                f"price={price_str} value={value_str} weight={weight}")
+                f"price={price_str} value={value_str} {weights}")
+        if cash_balance is not None and not missing:
+            lines.append(
+                f"Single-holding cap: {cap:g}% of net value (holdings + "
+                "cash). Holdings above the cap: " +
+                (", ".join(above_cap) or "none") + ".")
         return "\n".join(lines)
 
 

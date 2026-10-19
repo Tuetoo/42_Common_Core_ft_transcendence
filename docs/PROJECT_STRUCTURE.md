@@ -123,8 +123,8 @@ alphamind/
 │                            f1200c000001 event_outbox,
 │                            f1250c000001 status_changed_at)
 └── scripts/                 e2e_check.py (end to end through the gateway),
-                             backfill_sentiment.py, delete_documents.py,
-                             recompute_snapshots.py
+                             backfill_sentiment.py, clean_organizations.py,
+                             delete_documents.py, recompute_snapshots.py
 ```
 
 ## 4. `services/ai-service/`
@@ -134,8 +134,11 @@ alphamind/
 ├── main.py, config.py, deps.py
 ├── database.py              engine, sessions, schema bootstrap at startup
 ├── event_listener.py        durable: document uploaded/deleted, portfolio
-│                            deleted
+│                            deleted, user deleted
+├── user_cleanup.py          a deleted user's ai data; nightly sweep
 ├── ai_events.py             event payload builders + best-effort publisher
+├── rate_limit.py            per-user minute and day limits of the RAG
+│                            assistant and decision reviews (429)
 ├── observability.py         Prometheus metrics (analyses, queue, LLM errors)
 ├── qdrant.py                Qdrant client and collection check
 ├── api/                     internal.py (/internal/*)
@@ -203,7 +206,8 @@ alphamind/
                              (backfill_filing_records.py,
                              regenerate_filing_summaries.py),
                              verify_portfolio_backtest.py,
-                             probe_model_latency.py
+                             probe_model_latency.py,
+                             probe_anthropic_schemas.py
 ```
 
 ## 5. `shared/`
@@ -220,6 +224,8 @@ alphamind/
 │                            organization roles of a user, cached
 ├── scheduled_jobs.py        job_response: 500 when every unit of a step
 │                            failed
+├── deleted_users.py         cleanup steps and the nightly deleted-user
+│                            sweep (core and ai), auth lookup
 ├── events.py                pub/sub and durable events, event names and
 │                            owners
 ├── redis.py                 Redis client, fixed-window limiter and 429
@@ -275,10 +281,12 @@ process cannot import two of them.
 │                            certs/ (generated, only README.md tracked)
 ├── postgres/init-schemas.sql   the three schemas
 ├── scheduler/               Dockerfile, entrypoint.sh, crontab,
-│                            call-job.sh (the seven HTTP jobs:
+│                            call-job.sh (the nine HTTP jobs:
 │                            market-open, market-close, tier-monitoring,
 │                            review-run, rag-ingest, purge-unverified,
-│                            notification-retention), logs-cleanup.sh,
+│                            notification-retention,
+│                            deleted-user-sweep-core,
+│                            deleted-user-sweep-ai), logs-cleanup.sh,
 │                            heartbeat.sh, backup.sh, restore.sh,
 │                            s3-remote.sh (rclone remote for the
 │                            object storage's S3 API)
@@ -318,6 +326,10 @@ process cannot import two of them.
 ├── DEPLOYMENT.md            the cloud host and continuous deployment
 ├── MODULE_MAPPING.md        code mapped to the subject's modules
 ├── PROJECT_STRUCTURE.md     this file
+├── CHANGES_SINCE_EVALUATION.md  what changed after the 42 evaluation
+│                            (tag v1.0-42-evaluated)
+├── MODEL_COMPARISON.md      Google Gemini and Anthropic Claude compared
+│                            on the same batch runs
 └── handbook/                00-index.md and one chapter per part
                              (01-02 overview and operations, 10-19
                              services and AI, 20-32 data stores,
@@ -328,7 +340,8 @@ process cannot import two of them.
 
 ```
 ├── Dockerfile               Node 24, Next.js standalone build, port 3000
-├── package.json, package-lock.json   Next.js 16, React 19, yjs
+├── package.json, package-lock.json   Next.js 16, React 19, yjs, recharts
+├── README.md                frontend setup, checks and settings
 ├── next.config.ts, tsconfig.json, eslint.config.mjs, postcss.config.mjs
 ├── .env.example             settings for `npm run dev` (API through
 │                            https://localhost:8443)
@@ -344,6 +357,7 @@ process cannot import two of them.
     │   │                    signed-in user and permissions),
     │   │                    session-cookies.ts (cookie names for proxy.ts),
     │   │                    ws-url.ts (WebSocket URL and close helper),
+    │   │                    use-channel.ts (the shared WebSocket hook),
     │   │                    format.ts (display and form helpers)
     │   └── actions/         Server Actions per area (auth incl. OAuth,
     │                        email-links, profile incl. 2FA, portfolios,

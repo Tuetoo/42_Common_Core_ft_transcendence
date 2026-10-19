@@ -1,6 +1,6 @@
+import math
 import re
-from datetime import datetime
-from typing import Any, NamedTuple
+from typing import Any
 import structlog
 from ai.agents.debate_common import (FREE_CASH_FLOW_RULE, LEGAL_AMOUNT_RULE,
                                      OVERLAP_RULE, PERIOD_LABEL_RULE,
@@ -13,12 +13,14 @@ from ai.agents.evidence_grounding import non_english_reason
 from ai.graph.state import (LOW_PARTICIPATION_RATIO_THRESHOLD, AgentOutput,
                             AnalysisState, DebateArgument, JudgeVerdict)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, JsonObjectParse, LLMMessage,
-                         LLMResponse, LLMTier, parse_json_object)
-from ai.llm.router import LLMRouter
-from ai.recommendation.engine import position_limit_line
+                         LLMResponse, LLMTier, log_unparseable,
+                         parse_json_object)
+from ai.llm.router import (LLMRouter, fallback_call_count,
+                           recording_served_models)
+from ai.recommendation.engine import position_limit_line, previous_verdict
 from ai.tools.base import is_evidence_record
 from config import settings
-from shared.enums import (AgentRole, AgentStatus, AnalysisFailureReason,
+from shared.enums import (AgentRole, AnalysisFailureReason,
                           RecommendationAction)
 
 logger = structlog.get_logger(__name__)
@@ -217,51 +219,12 @@ def _trailing_and_forward_pe(
     return None
 
 
-class PreviousVerdict(NamedTuple):
-    issued_at: datetime
-    action: RecommendationAction
-    confidence: float
-    judge_own: bool
-
-
-def _candidate(
-        issued_at: datetime, final_action: RecommendationAction,
-        final_confidence: float, judge_leaning: RecommendationAction | None,
-        judge_confidence: float | None) -> PreviousVerdict:
-    if judge_leaning is not None and judge_confidence is not None:
-        return PreviousVerdict(
-            issued_at, judge_leaning, judge_confidence, True)
-    return PreviousVerdict(issued_at, final_action, final_confidence, False)
-
-
-def previous_verdict(state: AnalysisState) -> PreviousVerdict | None:
-    candidates: list[PreviousVerdict] = []
-    prior = state.prior_recommendation
-    if prior is not None:
-        candidates.append(
-            _candidate(
-                prior.issued_at, prior.action, prior.confidence,
-                prior.judge_leaning, prior.judge_confidence))
-    if state.episodic_context:
-        hit = max(state.episodic_context, key=lambda h: h.analyzed_at)
-        candidates.append(
-            _candidate(
-                hit.analyzed_at, hit.recommendation, hit.confidence,
-                hit.judge_leaning, hit.judge_confidence))
-    if not candidates:
-        return None
-    try:
-        return max(candidates, key=lambda c: c.issued_at)
-    except TypeError:
-        return candidates[0]
-
-
 def previous_verdict_line(
         state: AnalysisState) -> tuple[str, RecommendationAction | None]:
     previous = previous_verdict(state)
     if previous is None:
         return "", None
-    issued_at, action, confidence, judge_own = previous
+    issued_at, action, confidence, judge_own, _ = previous
     day = issued_at.date().isoformat()
     if judge_own:
         return (
@@ -392,7 +355,6 @@ def _track_record_block(state: AnalysisState) -> str:
         f"newest first (calibration only, not evidence about today):\n{lines}")
 
 
-_RAW_HEAD_CHARS = 500
 _RAW_TAIL_CHARS = 300
 _ERROR_CONTEXT_BEFORE = 300
 _ERROR_CONTEXT_AFTER = 200
@@ -417,10 +379,8 @@ def _parse_response(
 ) -> tuple[dict[str, Any] | None, JsonObjectParse]:
     result = parse_json_object(raw)
     if result.data is None:
-        logger.warning(
-            "judge.unparseable_response", attempt=attempt,
-            raw=raw[:_RAW_HEAD_CHARS], raw_tail=raw[-_RAW_TAIL_CHARS:],
-            raw_chars=len(raw),
+        log_unparseable(
+            "judge.unparseable_response", raw, attempt=attempt,
             model=response.model if response is not None else None,
             finish_reason=(
                 response.finish_reason if response is not None else None),
@@ -496,12 +456,13 @@ class JudgeAgent:
 
     async def _rewrite_ungrounded_figures(
             self, parsed: dict[str, Any], messages: list[LLMMessage],
-            raw_answer: str, reference: str) -> dict[str, Any]:
+            answer: LLMResponse,
+            reference: str) -> tuple[dict[str, Any], LLMResponse]:
         ungrounded = sorted(
             find_ungrounded_figures(
                 str(parsed.get("rationale", "")), reference))
         if not ungrounded:
-            return parsed
+            return parsed, answer
         logger.warning(
             "judge.ungrounded_figures", ungrounded_figures=ungrounded)
         request = (
@@ -513,13 +474,13 @@ class JudgeAgent:
         try:
             response = await self._complete([
                 *messages,
-                LLMMessage(role="assistant", content=raw_answer),
+                LLMMessage(role="assistant", content=answer.content),
                 LLMMessage(role="user", content=request)
             ])
         except Exception as exc:
             logger.warning(
                 "judge.ungrounded_rewrite_failed", error=str(exc)[:300])
-            return parsed
+            return parsed, answer
         rewritten, _ = _parse_response(response.content, response=response)
         rationale = str(rewritten.get("rationale") or "") if rewritten else ""
         if (rewritten is None or not rationale.strip()
@@ -527,27 +488,22 @@ class JudgeAgent:
             logger.warning(
                 "judge.ungrounded_rewrite_failed",
                 error="rewrite unparseable or without an English rationale")
-            return parsed
+            return parsed, answer
         still = sorted(find_ungrounded_figures(rationale, reference))
         if still:
             logger.warning(
                 "judge.ungrounded_figures_after_rewrite",
                 ungrounded_figures=still)
-        return rewritten
+        return rewritten, response
 
     async def assess_round(self, state: AnalysisState) -> JudgeVerdict:
-        round_number = state.debate.round_number + 1
+        with recording_served_models() as served:
+            verdict = await self._assess_round(state)
+        return verdict.model_copy(
+            update={"fallback_calls": fallback_call_count(served)})
 
-        if state.agent_outputs and all(
-                out.status == AgentStatus.FAILED
-                for out in state.agent_outputs.values()):
-            return JudgeVerdict(
-                round_number=round_number, converged=False,
-                leaning=RecommendationAction.HOLD, confidence=0.0, rationale=(
-                    "Judge skipped: every research agent failed for this "
-                    "ticker -- no evidence exists to assess, so no verdict "
-                    "was produced."), judge_failed=True,
-                failure_reason=AnalysisFailureReason.NO_EVIDENCE)
+    async def _assess_round(self, state: AnalysisState) -> JudgeVerdict:
+        round_number = state.debate.round_number + 1
 
         bull_arg = state.debate.latest_argument("bull")
         bear_arg = state.debate.latest_argument("bear")
@@ -608,8 +564,8 @@ class JudgeAgent:
             parsed, response = await self._reask_for_json(
                 messages, response, failure)
         if parsed is not None:
-            parsed = await self._rewrite_ungrounded_figures(
-                parsed, messages, response.content,
+            parsed, response = await self._rewrite_ungrounded_figures(
+                parsed, messages, response,
                 format_grounding_reference(state) + pending_context_line +
                 holding_line + track_record_line)
 
@@ -642,11 +598,13 @@ class JudgeAgent:
         except ValueError:
             leaning = RecommendationAction.HOLD
 
-        confidence = parsed.get("confidence", 0.0)
         try:
-            confidence = max(0.0, min(1.0, float(confidence)))
+            confidence = float(parsed.get("confidence", 0.0))
         except (TypeError, ValueError):
             confidence = 0.0
+        confidence = (
+            max(0.0, min(1.0, confidence)) if math.isfinite(confidence) else
+            0.0)
         _log_deciding_factor(
             parsed, leaning, previous_action, confidence=confidence,
             previous_confidence=previous_confidence,
@@ -655,7 +613,8 @@ class JudgeAgent:
         return JudgeVerdict(
             round_number=round_number,
             converged=_parse_converged(parsed.get("converged", False)),
-            leaning=leaning, confidence=confidence, rationale=rationale)
+            leaning=leaning, confidence=confidence, rationale=rationale,
+            model=response.model)
 
 
 _MIN_OPPOSING_POINTS = 2

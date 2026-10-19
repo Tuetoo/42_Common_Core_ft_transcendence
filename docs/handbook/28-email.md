@@ -178,7 +178,8 @@ wrong type, an expired one, or one whose `sub` is not a UUID.
   address.
 - **Password reset** (`create_password_reset_token`): `sub` = user id,
   plus `pwd` = the first 32 hex characters of SHA-256 of the current
-  password hash (`password_fingerprint`). When the password changes, the
+  password hash and the lower-case email (`password_fingerprint`). When
+  the password (or, through an admin, the email) changes, the
   fingerprint changes, so the link works **once**. A successful reset also
   revokes all of the user's sessions (`revoke_all_sessions`).
 - **Invitation** (`create_organization_invitation_token`): `sub` = the
@@ -251,6 +252,12 @@ account email and `user_settings.notification_preferences`):
 - `in_app` (default on): write the notification row.
 - `websocket` (default on): push it live.
 - `email` (default **off**, opt-in): also send `send_notification_email`.
+
+The answer also decides who gets nothing. Its `email` is `null` for a
+deactivated or unverified account (and for a deleted one), so no email is
+sent even with the channel on. For a deleted account it says
+`deleted: true`, and `notify_user` then writes no row, pushes nothing
+and sends no email (log `notification.skipped_deleted_user`).
 
 `notify_user` writes and commits the row in its own session first, then
 calls `deliver_notification`, which pushes and then starts the email as a
@@ -490,7 +497,9 @@ arrives through plain SMTP into MailHog.
    '
    ```
 
-   You see `['http://localhost:3000/reset-password?token=eyJ...']`. Say:
+   You see `['https://localhost:8443/reset-password?token=eyJ...']` (the
+   `FRONTEND_BASE_URL` of `.env.example`; the code default is
+   `http://localhost:3000`). Say:
    "The token is a signed JWT of type `password_reset`. It contains a
    fingerprint of the current password hash, so it works only once."
 

@@ -4,7 +4,8 @@ from uuid import UUID
 import structlog
 from config import settings
 from fastapi import BackgroundTasks
-from shared.events import EventName, publish_cross_service
+from shared.events import (EventName, publish_cross_service,
+                           publish_durable_event)
 from shared.user_state import invalidate_membership_cache
 
 logger = structlog.get_logger(__name__)
@@ -16,6 +17,8 @@ MEMBERSHIP_EVENTS = frozenset({
     EventName.ORGANIZATION_MEMBER_JOINED, EventName.ORGANIZATION_MEMBER_LEFT,
     EventName.ORGANIZATION_MEMBER_REMOVED, EventName.ORGANIZATION_ROLE_CHANGED
 })
+
+ALSO_DURABLE_EVENTS = frozenset({EventName.USER_DELETED})
 
 
 async def publish_events(events: Sequence[PendingEvent]) -> None:
@@ -35,6 +38,13 @@ async def publish_events(events: Sequence[PendingEvent]) -> None:
         except Exception as exc:
             logger.warning(
                 "event_publish_failed", event_name=str(name), error=str(exc))
+        if name in ALSO_DURABLE_EVENTS:
+            try:
+                await publish_durable_event(settings, name, payload)
+            except Exception as exc:
+                logger.warning(
+                    "durable_event_publish_failed", event_name=str(name),
+                    error=str(exc))
 
 
 def schedule_events(

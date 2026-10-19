@@ -55,12 +55,12 @@ async def list_holdings(
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> PaginatedResponse[HoldingRead]:
     owner_id = _owner_user_id(request)
-    holdings = await PortfolioService(db).list_holdings(portfolio_id, owner_id)
     pagination = PaginationParams(page=page, page_size=page_size)
-    page_items = holdings[pagination.offset:pagination.offset +
-                          pagination.limit]
+    page_items, total = await PortfolioService(db).list_holdings(
+        portfolio_id, owner_id,
+        slice(pagination.offset, pagination.offset + pagination.limit))
     return PaginatedResponse(
-        items=page_items, total=len(holdings), page=pagination.page,
+        items=page_items, total=total, page=pagination.page,
         page_size=pagination.page_size)
 
 

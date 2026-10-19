@@ -163,10 +163,10 @@ The web pages are the Next.js app in `frontend/`
 | [01 System architecture](01-architecture.md) | Every container and port, who owns which data, internal HTTP vs events, the path of a request, the life of an analysis, startup order, the development override, the tech stack and why. |
 | [02 Running and operating the stack](02-operations.md) | Setup on a Mac, `make` targets, every operator script, deploying a change (restart vs rebuild), health checks, real analyses, tokens, end-to-end checks, backups, logs, troubleshooting. |
 | [10 The gateway](10-gateway.md) | nginx routing, TLS and certificates, security headers and CSP, WebSocket upgrade, rate limits, the status page, why `/internal/*` is closed, the frontend at `/` and the internal listener for its server side. |
-| [11 auth-service](11-auth-service.md) | Registration and email verification, login, access and refresh tokens, sessions and reuse detection, 2FA, Google/GitHub sign-in, roles, organizations, friends, presence, rate limits. |
-| [12 core-service](12-core-service.md) | Portfolios and the transaction ledger, holdings and cash, NAV snapshots, watchlists, research notes and documents, notifications, API keys and the public API, WebSockets, job heartbeats. |
+| [11 auth-service](11-auth-service.md) | Registration and email verification, login, access and refresh tokens, sessions and reuse detection, 2FA, Google/GitHub sign-in, roles, organizations, friends, presence, rate limits, account deletion. |
+| [12 core-service](12-core-service.md) | Portfolios and the transaction ledger, holdings and cash, NAV snapshots, watchlists, research notes and documents, notifications, API keys and the public API, WebSockets, job heartbeats, cleanup of deleted users and organizations. |
 | [13 ai-service overview](13-ai-service.md) | Folder layout, public and internal API, the serial analysis queue, startup, data providers and caches, settings, scripts. |
-| [14 The LLM layer](14-ai-llm-layer.md) | Gemini models and their fallback models, the key pool, pacing, 503 and 429 handling, timeouts, retries, thinking budgets, JSON parsing, embeddings. |
+| [14 The LLM layer](14-ai-llm-layer.md) | The provider adapters (Google, Anthropic, Mistral, OpenAI), Gemini models and their fallback models, the key pool, pacing, 503 and 429 handling, timeouts, retries, thinking budgets, the Anthropic provider, JSON parsing, embeddings. |
 | [15 The agents](15-ai-agents.md) | The ReAct loop, each data agent with its tools and validators, Bull, Bear, Judge and Reflection, evidence grounding. |
 | [16 The analysis pipeline](16-ai-analysis-pipeline.md) | The LangGraph graph, the debate, the Judge, the recommendation engine's caps and penalties, position sizing, tiers, decisions. |
 | [17 RAG](17-ai-rag.md) | Parsing, chunking, embeddings, hybrid search (vectors + BM25 with RRF), visibility, the ask endpoint, ingestion and deletion, auto-ingestion, evaluation. |
@@ -178,7 +178,7 @@ The web pages are the Next.js app in `frontend/`
 | [23 Redis](23-redis.md) | Logical databases, caches, rate limits, the live user state, streams and pub/sub, persistence (AOF). |
 | [24 Events between services](24-events.md) | Every event with its payload, producer and consumers, pub/sub vs durable streams, the transactional outbox, deduplication, retries. |
 | [25 Real-time: WebSockets and Yjs](25-realtime-yjs.md) | Channels and their authorization, message shapes, collaborative editing with Yjs, persistence of rooms, open editors that follow access changes. |
-| [26 The scheduler and its jobs](26-scheduler-jobs.md) | The crontab, each job, when a run counts as failed, holidays, heartbeats and stale-job alerts, busy windows, backups. |
+| [26 The scheduler and its jobs](26-scheduler-jobs.md) | The crontab, each job (including the nightly deleted-user sweeps), when a run counts as failed, holidays, heartbeats and stale-job alerts, busy windows, backups, running one job by hand. |
 | [27 Logs, metrics, alerts and dashboards](27-observability.md) | structlog, vector, Prometheus and its metrics, alert rules and their tests, Alertmanager, Grafana. |
 | [28 Email](28-email.md) | The email module, every email the system sends, MailHog, production SMTP. |
 | [29 Security](29-security.md) | TLS, headers, tokens, hashing, permissions, internal tokens, rate limits, API keys, input validation, secrets, exposure, error-body shapes, known limitations. |
@@ -194,7 +194,11 @@ Reference documents next to this handbook:
 [MODULE_MAPPING](../MODULE_MAPPING.md) (the 42 subject modules and where
 each is implemented),
 [DESIGN](../DESIGN.md),
-[PROJECT_STRUCTURE](../PROJECT_STRUCTURE.md).
+[PROJECT_STRUCTURE](../PROJECT_STRUCTURE.md),
+[CHANGES_SINCE_EVALUATION](../CHANGES_SINCE_EVALUATION.md) (what changed
+after the 42 evaluation, tag `v1.0-42-evaluated`),
+[MODEL_COMPARISON](../MODEL_COMPARISON.md) (Gemini and Claude compared
+on the same batch runs).
 What is not built yet is listed in section 8.
 
 ## 5. A 30-minute demo plan
@@ -234,7 +238,7 @@ slot, show a finished run folder and start a new analysis only as a live
 | Tier monitoring | The daily job that executes accepted tiers whose price was reached and expires old ones. | [19](19-ai-workflows-backtest.md) |
 | Ledger | The list of a portfolio's transactions; holdings and cash are computed by replaying it. | [12](12-core-service.md) |
 | NAV snapshot | The portfolio's total value at the end of a trading day. | [12](12-core-service.md) |
-| HIGHEST / CHEAP tier | The two LLM quality levels: two Gemini Flash models (a primary and a fallback), and two Lite models. | [14](14-ai-llm-layer.md) |
+| HIGHEST / CHEAP tier | The two LLM quality levels. With Google: two Gemini Flash models (a primary and a fallback), and two Lite models; with Anthropic: Sonnet and Haiku, without a fallback. | [14](14-ai-llm-layer.md) |
 | RAG | Retrieval-augmented generation: search the document library first, then let the LLM answer from what was found. | [17](17-ai-rag.md) |
 | Embedding | A list of numbers that represents the meaning of a text; similar texts get similar lists. | [21](21-qdrant.md) |
 | BM25 | A classic keyword-ranking formula, used next to vectors for hybrid search. | [17](17-ai-rag.md) |
@@ -272,7 +276,7 @@ not finished; the chapters give the details.
 | Item | State | Chapter |
 |---|---|---|
 | Frontend | Built: the Next.js app in `frontend/`, served by the gateway at `/`; its server side calls the API on the gateway's internal listener (port 8080). The Privacy Policy and Terms of Service pages are written (`frontend/app/(legal)/privacy`, `terms`; linked from the footer). Every route can also be tried in Swagger (`/docs/<service>/`). | [01](01-architecture.md) section 3.11, [10](10-gateway.md) section 3.3 |
-| Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main` (the head of `main` is deployed only after every workflow run of that exact commit succeeded; per-service checks run only for the services a commit touches). The host keeps its scheduler stopped, so it makes no automatic backups and runs no scheduled jobs; backups are made on the local stack. | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
+| Cloud deployment | One AWS virtual machine runs the same Docker Compose stack at `https://alphamind-research.duckdns.org:8443`, with `APP_ENV=production` and continuous deployment from `main` (the head of `main` is deployed only after every workflow run of that exact commit succeeded; per-service checks run only for the services a commit touches). The host keeps its scheduler stopped, so it makes no automatic backups and runs no scheduled jobs; backups are made on the local stack, and the jobs that spend no quota (purge-unverified, notification-retention, the deleted-user sweeps) can be run there by hand from the scheduler image (DEPLOYMENT section 3). | [32](32-ci-cd.md), [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 | Top-level README | `README.md` at the repository root: the project, how to run it, the team, the modules and the use of AI. Other READMEs: `tests/README.md`, `infra/gateway/certs/README.md` and `frontend/README.md` (how to run the frontend, its environment variables and its structure). | - |
 | Calibration of the confidence rules | The penalties and caps in `ai/recommendation/engine.py`, the HOLD flat band of the accuracy score (`review_workflow.py::_HOLD_FLAT_BAND`) and the procedural-memory score bar (`_MIN_SCORE_TO_REMEMBER`) are fixed constants. Nothing derives them from scored outcomes yet; that needs enough rows in `ai.recommendation_metrics`. | [16](16-ai-analysis-pipeline.md) section 3.12, [19](19-ai-workflows-backtest.md) section 3.11 |
 | Debate and Reflection quality signals | Debate convergence and Reflection retries are stored per analysis but not aggregated into a metric. | [19](19-ai-workflows-backtest.md) section 3.11 |

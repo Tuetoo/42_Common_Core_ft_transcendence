@@ -10,7 +10,6 @@ from shared.schemas import BaseSchema, IDMixin
 
 USERNAME_PATTERN = r"^[A-Za-z0-9_.-]{3,32}$"
 
-Theme = Literal["system", "light", "dark"]
 PROFILE_FIELDS = ("first_name", "last_name", "bio", "timezone", "country")
 
 
@@ -149,9 +148,6 @@ class UserProfileRead(BaseSchema):
 
 
 class UserSettingsRead(BaseSchema):
-    preferred_currency: str
-    theme: str
-    default_model: str | None = None
     notification_preferences: dict[str, Any] | None = None
 
 
@@ -174,8 +170,7 @@ class MeUpdate(BaseModel):
             "description": (
                 "PATCH semantics: only fields present in the body change. An "
                 "explicit null clears a nullable field; null is rejected "
-                "(422) "
-                "for username, theme and preferred_currency.")
+                "(422) for username.")
         })
 
     username: str | None = Field(default=None, pattern=USERNAME_PATTERN)
@@ -184,17 +179,12 @@ class MeUpdate(BaseModel):
     bio: str | None = Field(default=None, max_length=500)
     timezone: TimezoneName | None = None
     country: str | None = Field(default=None, max_length=100)
-    preferred_currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
-    theme: Theme | None = None
-    default_model: str | None = Field(
-        default=None, max_length=64, pattern=r"^[A-Za-z0-9._:/-]+$")
     notification_preferences: dict[NotificationChannel, bool] | None = None
 
     @model_validator(mode="after")
     def _no_null_for_required(self) -> "MeUpdate":
-        for field in ("username", "theme", "preferred_currency"):
-            if field in self.model_fields_set and getattr(self, field) is None:
-                raise ValueError(f"{field} cannot be null")
+        if "username" in self.model_fields_set and self.username is None:
+            raise ValueError("username cannot be null")
         return self
 
 

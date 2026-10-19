@@ -4,9 +4,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { getAccessToken } from "@/app/lib/session";
 import { backendFetch, readApiError } from "@/app/lib/backend";
-import { ANALYSIS_TYPES, DECISION_ACTIONS, DECISION_NOTES_MAX_LENGTH, normalizeTicker } from "@/app/lib/format";
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import { ANALYSIS_TYPES, DECISION_ACTIONS, DECISION_NOTES_MAX_LENGTH, UUID_RE, normalizeTicker } from "@/app/lib/format";
 
 export type StartAnalysisState = {
   error?: string;
@@ -57,13 +55,6 @@ export async function startAnalysis(
 
   if (!res.ok) {
     const err = await readApiError(res, "Could not start the analysis");
-    // The backend's own messages for these are terse; say what to do instead.
-    if (res.status === 429) {
-      return { error: "You already have 3 analyses running. Wait for one to finish, then try again.", values };
-    }
-    if (res.status === 503) {
-      return { error: "The analysis queue is full right now. Try again in a minute.", values };
-    }
     return { error: err.message, values };
   }
 

@@ -14,7 +14,7 @@ from ai.agents import (filing, fundamental, macro, market, portfolio, risk,
                        sentiment, technical)
 from ai.agents.evidence_grounding import (non_english_reason,
                                           non_english_reason_in_output)
-from ai.agents.finish_checks import (InternalTokenValidator, RejectOnceBudget,
+from ai.agents.finish_checks import (InternalTokenValidator,
                                      own_evidence_figure_check)
 from ai.agents.loop import (MAX_FINISH_VALIDATION_RETRIES, AgentLoopResult,
                             ReActAgentLoop, ScratchpadEntry,
@@ -314,6 +314,36 @@ class TestParseResponse:
             assert step is not None, case_id
             assert step.finish_answer == expected, case_id
 
+    def test_non_string_action_and_non_object_input_are_dropped(self):
+        for case_id, action, action_input in (
+                ("list-action", ["search_news"], {"q": "x"}),
+                ("object-action", {"name": "search_news"}, None),
+                ("list-input", "get_price", ["AAPL"])):
+            step = self.parse(
+                json.dumps({
+                    "thought": "t", "action": action,
+                    "action_input": action_input}))
+            assert step is not None, case_id
+            if isinstance(action, str):
+                assert step.action == action, case_id
+            else:
+                assert step.action is None, case_id
+            assert step.action_input in (None, {"q": "x"}), case_id
+            if not isinstance(action_input, dict):
+                assert step.action_input is None, case_id
+
+    @pytest.mark.asyncio
+    async def test_list_action_gets_a_correction_turn_not_a_crash(self):
+        router = _ScriptedRouter([
+            json.dumps({"thought": "t", "action": ["get_price"]}),
+            _action("get_price", {"ticker": "AAPL"}),
+            _finish("AAPL last close 227.40.")
+        ])
+        result = await _loop(router, [_TickerOnlyTool()]).run("t")
+        assert result.final_answer == "AAPL last close 227.40."
+        assert result.scratchpad[-1].observation == (
+            "AAPL last close 227.40 on 2026-09-12")
+
 
 class TestCorrectionTurns:
 
@@ -326,6 +356,21 @@ class TestCorrectionTurns:
                     "MAX_TOKENS"), _PRICE_OBS,
                 ["cut off before it finished",
                  "single short sentence"], ["not valid JSON"]),
+            "google-enum-finish-reason-gets-the-nudge": (
+                _Truncated(
+                    '{"thought": "a very long thought that',
+                    "FinishReason.MAX_TOKENS"), _PRICE_OBS,
+                ["cut off before it finished"], ["not valid JSON"]),
+            "anthropic-lowercase-finish-reason-gets-the-nudge": (
+                _Truncated(
+                    '{"thought": "a very long thought that',
+                    "max_tokens"), _PRICE_OBS,
+                ["cut off before it finished"], ["not valid JSON"]),
+            "mistral-length-finish-reason-gets-no-nudge": (
+                _Truncated(
+                    '{"thought": "a very long thought that',
+                    "length"), _PRICE_OBS, ["not valid JSON"],
+                ["cut off before it finished"]),
             "non-english-reply-is-asked-again-in-english": (
                 LLMNonEnglishOutputError(
                     "rejected", reason="CYRILLIC letters",
@@ -632,7 +677,7 @@ class TestAgentQuality:
 
     def test_graded_score_spreads_and_keeps_the_contract(self):
         bare = loop_module.AgentLoopResult(final_answer="x")
-        assert derive_agent_quality(bare, is_retry=False) == (0.66, True)
+        assert derive_agent_quality(bare, is_retry=False) == (0.76, True)
         assert derive_agent_quality(bare, is_retry=False,
                                     no_evidence=True) == (0.35, False)
 
@@ -727,6 +772,16 @@ class TestAgentQuality:
         answer = (
             "Revenue was $13.4B; a $4.4B claim goes to trial in March 2027.")
         assert prior_note_only_claims(answer, [note, fresh]) == ["$4.4B"]
+        target_note = (
+            "- (UNH) [agent:news] (2026-10-18): average price target $480.")
+        target_fresh = (
+            "- (UNH) [web] (2026-10-14): Wall Street's average price target "
+            "is $480.60.")
+        assert prior_note_only_claims(
+            "The average target is $480.", [target_note, target_fresh]) == []
+        assert prior_note_only_claims(
+            "The average target is $480.",
+            [target_note, "- (UNH) [web]: target $490.00."]) == ["$480"]
         pad = [
             ScratchpadEntry("t", "search_prior_risk_notes", {}, note),
             ScratchpadEntry("t", "search_filings", {}, fresh)
@@ -1055,7 +1110,13 @@ class TestFinishChecks:
             "within-one-percent": (
                 ["volume 48720500 shares"], "Volume was 48,600,000.", []),
             "dollar-and-percent-unchanged": (
-                ["close 100.0"], "Closed at $100, up 25%.", ["25%"])
+                ["close 100.0"], "Closed at $100, up 25%.", ["25%"]),
+            "scaled-claim-of-plain-dollar-amount": (
+                ["a total transaction of $2,015,046.00"],
+                "The sale was worth $2.0 million.", []),
+            "scaled-claim-off-plain-dollar-amount": (
+                ["a total transaction of $2,015,046.00"],
+                "The sale was worth $2.1 million.", ["$2.1 million"])
         }
         for case_id, (observations, text, expected) in cases.items():
             pad = [_entry("search_news", o) for o in observations]
@@ -1100,27 +1161,18 @@ class TestFinishChecks:
             source = inspect.getsource(module)
             assert (needle in source) is wired, case_id
 
-        assert issubclass(_NewsFinishValidator, RejectOnceBudget)
-        assert issubclass(_CapturingRiskEventsValidator, RejectOnceBudget)
-        assert not hasattr(news_module, "_LOOP_FINISH_RETRIES")
-        assert not hasattr(loop_module, "_MAX_FINISH_VALIDATION_RETRIES")
         assert issubclass(_NewsFinishValidator, InternalTokenValidator)
         assert issubclass(
             _CapturingRiskEventsValidator, InternalTokenValidator)
-        for name in ("TOOL_LABEL_MESSAGE", "WEEKDAY_CHECK_MESSAGE"):
-            assert not hasattr(news_module, name), name
-        for name in ("RECORD_ID_MESSAGE", "PRIOR_NOTE_COPY_MESSAGE",
-                     "record_ids_in_prose"):
-            assert not hasattr(risk, name), name
 
     def test_once_checks_are_logged_only_after_the_budget(self):
         validator = _validator(_TSLA_ROWS)
         pad = _pad(_TSLA_FILINGS)
         hard_events = {
             "risk_events": [{
-                "entity": "Certain Derivative Lawsuits in Delaware",
+                "entity": "Federal Trade Commission inquiry",
                 "evidence_tool": "web_search",
-                "status": "appeal"
+                "status": "pending"
             }]
         }
         for _ in range(MAX_FINISH_VALIDATION_RETRIES):

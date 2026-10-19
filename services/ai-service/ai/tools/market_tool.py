@@ -1,3 +1,4 @@
+import math
 import re
 from collections.abc import Sequence
 from typing import Any, ClassVar
@@ -25,20 +26,20 @@ def describe_high_volume_sessions(
     start = max(len(bars) - shown, 0)
     rows: list[tuple[float, str]] = []
     for i in range(start, len(bars)):
-        if i == 0:
-            continue
         volume = float(bars[i].volume or 0)
-        prev_close = float(bars[i - 1].close)
+        base = float(bars[i - 1].close if i > 0 else bars[i].open)
         close = float(bars[i].close)
-        if volume <= 0 or prev_close == 0:
+        if volume <= 0 or base == 0 or not math.isfinite(base):
             continue
-        change_pct = (close - prev_close) / prev_close * 100
+        change_pct = (close - base) / base * 100
+        basis = (
+            "previous session" if i > 0 else
+            "no earlier session in the data; from this session's open")
         rows.append((
             volume, (
                 f"- {bars[i].timestamp.date()}: volume {volume:,.0f}, "
-                f"{_direction(change_pct)} ({change_pct:+.2f}%, previous "
-                f"session "
-                f"{prev_close:g} -> {close:g})")))
+                f"{_direction(change_pct)} ({change_pct:+.2f}%, {basis} "
+                f"{base:g} -> {close:g})")))
     if not rows:
         return []
     top = sorted(rows, key=lambda r: r[0], reverse=True)[:_TOP_VOLUME_SESSIONS]

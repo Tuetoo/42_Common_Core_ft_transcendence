@@ -990,7 +990,6 @@ def fake_core(monkeypatch):
 
     async def _publish(name, payload):
         events.append((str(name), payload))
-        return True
 
     monkeypatch.setattr(core_client, "record_transaction", _record)
     monkeypatch.setattr(ai_events, "publish_event", _publish)

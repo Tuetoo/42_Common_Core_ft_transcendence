@@ -1253,9 +1253,47 @@ class TestE2eCheckScript:
         assert sections == ["auth", "org", "yjs", "cleanup"]
         assert added == ["auth", "org"]
         everything, none_added = e2e.resolve_sections(None)
-        assert everything == list(e2e.SECTIONS) and none_added == []
+        assert none_added == []
+        assert "deletion" not in everything
+        assert everything == [s for s in e2e.SECTIONS if s != "deletion"]
+        assert everything[-1] == "cleanup"
+        assert e2e.resolve_sections(["deletion"]) == (
+            ["deletion", "cleanup"], [])
         with pytest.raises(ValueError):
             e2e.resolve_sections(["nope"])
+
+        clean = {
+            "candidates": 4,
+            "deleted": 2,
+            "cleaned": 2,
+            "failed": 0,
+            "lookup_failed": False,
+            "refused": False
+        }
+        assert e2e.sweep_problem(clean) is None
+        assert e2e.sweep_summary(clean) == (
+            "candidates=4 deleted=2 cleaned=2 failed=0")
+        assert e2e.sweep_problem({**clean, "lookup_failed": True}) == (
+            "lookup_failed=True")
+        assert "safety brake" in e2e.sweep_problem({**clean, "refused": True})
+        assert e2e.sweep_problem({
+            **clean, "cleaned": 1,
+            "failed": 1
+        }) == "failed=1"
+        assert "!= deleted" in e2e.sweep_problem({**clean, "cleaned": 1})
+        assert "> candidates" in e2e.sweep_problem({
+            **clean, "candidates": 1
+        })
+        assert "is not a count" in e2e.sweep_problem({
+            **clean, "failed": None
+        })
+        assert "is not a count" in e2e.sweep_problem({
+            **clean, "deleted": True
+        })
+        assert "not a sweep result" in e2e.sweep_problem(None)
+        no_flags = dict(clean)
+        del no_flags["refused"]
+        assert e2e.sweep_problem(no_flags) == "refused=None (safety brake)"
 
         before = {
             "auth": {
@@ -1366,6 +1404,34 @@ class TestE2eCheckScript:
         await release(settings, "run-c")
         assert await acquire(settings, "run-d") is None
         await release(settings, "run-d")
+
+    async def test_cleanup_skips_data_of_an_already_deleted_account(self):
+        out = io.StringIO()
+        runner = e2e.E2E(e2e.parse_args([]), out)
+        runner.admin_token = "admin-token-for-test"
+        alice = runner.users["alice"]
+        alice.user_id, alice.deleted = str(uuid4()), True
+        runner.track("note", "alice", "note-1")
+        runner.track("organization", "alice", "org-1")
+        runner.track(
+            "user", "alice", alice.email, alice.username,
+            user_id=alice.user_id)
+
+        async def no_http(*args, **kwargs):
+            raise AssertionError("no request for a deleted account's data")
+
+        runner.req = no_http
+        try:
+            await runner.s_cleanup()
+        finally:
+            await runner.close()
+        assert runner.created == []
+        assert all(r.status == e2e.OK for r in runner.results.values())
+        assert "1 already removed with a deleted account" in (
+            runner.results["cleanup.notes"].detail)
+        assert set(runner.results) == {
+            "cleanup.notes", "cleanup.organizations", "cleanup.users"
+        }
 
     def test_admin_token_help_and_main_refusals(self, monkeypatch, capsys):
         assert "_create_token('<ADMIN_USER_ID>', timedelta(hours=2)" in (

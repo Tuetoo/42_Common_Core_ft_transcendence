@@ -10,6 +10,7 @@ import clients.auth_client as auth_client
 import structlog
 from config import settings
 from deps import day_start
+from outbox import OutboxEntry, enqueue
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +34,7 @@ from domains.portfolio.schema import (CASH_TICKER, HoldingAdjustmentRead,
                                       WatchlistItemCreate, WatchlistItemRead,
                                       WatchlistRead, WatchlistUpdate)
 from shared.enums import Currency, TransactionType
+from shared.events import EventName
 from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
 from shared.http_client import gather_bounded
@@ -46,6 +48,16 @@ _SHARE_MOVING_TYPES = frozenset({
     TransactionType.BUY, TransactionType.SELL, TransactionType.STOCK_SPLIT,
     TransactionType.ADJUSTMENT
 })
+
+
+async def delete_portfolio_row(session: AsyncSession,
+                               portfolio: Portfolio) -> OutboxEntry:
+    await PortfolioRepository(session).delete(portfolio)
+    return await enqueue(
+        session, EventName.PORTFOLIO_DELETED, {
+            "portfolio_id": str(portfolio.id),
+            "user_id": str(portfolio.owner_id)
+        })
 
 
 @dataclass(frozen=True)
@@ -196,17 +208,19 @@ class PortfolioService:
         return await self._to_read(portfolio)
 
     async def delete(
-            self, portfolio_id: UUID, requester_id: UUID) -> Portfolio:
+            self, portfolio_id: UUID,
+            requester_id: UUID) -> tuple[Portfolio, OutboxEntry]:
         portfolio = await self._require_owner(portfolio_id, requester_id)
-        await self.portfolios.delete(portfolio)
-        return portfolio
+        return portfolio, await delete_portfolio_row(self._db, portfolio)
 
-    async def list_holdings(self, portfolio_id: UUID,
-                            requester_id: UUID) -> list[HoldingRead]:
+    async def list_holdings(
+            self, portfolio_id: UUID, requester_id: UUID,
+            window: slice = slice(None)) -> tuple[list[HoldingRead], int]:
         await self._require_readable(portfolio_id, requester_id)
         holdings = await self.holdings.list_for_portfolio(portfolio_id)
         return await gather_bounded(
-            (self._holding_to_read(h) for h in holdings), limit=20)
+            (self._holding_to_read(h) for h in holdings[window]),
+            limit=20), len(holdings)
 
     async def add_holding(
             self, portfolio_id: UUID, requester_id: UUID,

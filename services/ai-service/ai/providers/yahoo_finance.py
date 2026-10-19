@@ -6,9 +6,9 @@ from typing import Any
 import structlog
 import yfinance as yf  # type: ignore[import-untyped]
 from ai.providers.base import (FundamentalDataProvider, FundamentalsSnapshot,
-                               InstrumentMetadata, MarketDataProvider,
-                               PriceBar, PriceQuote, ProviderRequestError,
-                               call_with_retry, retry_everything)
+                               MarketDataProvider, PriceBar, PriceQuote,
+                               ProviderRequestError, call_with_retry,
+                               retry_everything)
 
 logger = structlog.get_logger(__name__)
 
@@ -161,23 +161,6 @@ class YahooFinanceProvider(MarketDataProvider, FundamentalDataProvider):
             raise ProviderRequestError(
                 f"yfinance history lookup failed for {ticker}") from exc
         return _dataframe_to_bars(history, ticker=ticker, interval=interval)
-
-    async def get_instrument_metadata(
-            self, ticker: str) -> InstrumentMetadata | None:
-        try:
-            info = await call_with_retry(
-                lambda: asyncio.to_thread(_sync_get_info, ticker),
-                op_name=f"yahoo_finance.get_info[{ticker}]",
-                should_retry=retry_everything)
-        except Exception as exc:
-            raise ProviderRequestError(
-                f"yfinance info lookup failed for {ticker}") from exc
-        if not info:
-            return None
-        return InstrumentMetadata(
-            name=info.get("longName") or info.get("shortName"),
-            sector=info.get("sector"), exchange=info.get("fullExchangeName")
-            or info.get("exchange"), asset_type=info.get("quoteType"))
 
     async def get_fundamentals(self, ticker: str) -> FundamentalsSnapshot:
         try:

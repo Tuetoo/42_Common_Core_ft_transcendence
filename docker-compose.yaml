@@ -372,8 +372,9 @@ services:
   # /internal/scheduler/market-open and /market-close and ai-service's
   # /internal/scheduler/tier-monitoring; every day ai-service's
   # /internal/review/run and /internal/scheduler/rag-ingest, auth-service's
-  # /internal/scheduler/purge-unverified and core-service's
-  # /internal/scheduler/notification-retention, plus
+  # /internal/scheduler/purge-unverified, core-service's
+  # /internal/scheduler/notification-retention, and the
+  # /internal/scheduler/deleted-user-sweep of core- and ai-service, plus
   # backup.sh and logs-cleanup.sh. See infra/scheduler/crontab for exact
   # times (the trading-day jobs themselves skip NYSE holidays).
   scheduler:

@@ -5,9 +5,10 @@
 > layer in `services/ai-service/ai/llm/` turns "give me a cheap answer"
 > or "give me the best answer" into a concrete model and a concrete API
 > key, and it decides what to do when Google says "too many requests"
-> (429), "overloaded" (503), or says nothing at all (timeout). The live
+> (429), "overloaded" (503), or says nothing at all (timeout). The default
 > provider is Google Gemini on free-tier quotas, which are small and
-> shared. Most of the code in this chapter exists because those quotas
+> shared; Anthropic Claude can be selected with `LLM_DEFAULT_PROVIDER`
+> (section 3.16). Most of the code in this chapter exists because those quotas
 > and Google's peak-hour overloads made whole analyses fail in September
 > 2026. This chapter explains the moving parts, then follows one call
 > through all of them.
@@ -79,10 +80,10 @@ one model; only when it gives up does the router move to another model.
 
 | Adapter | File | Status |
 |---|---|---|
-| `GoogleAdapter` | `ai/llm/google_provider.py` | **Live provider.** `LLM_DEFAULT_PROVIDER = "google"` (`config.py`). Key pool, pacing, 429/503/timeout handling, thinking config. Its key pool is also used for Gemini embeddings (section 3.14). |
+| `GoogleAdapter` | `ai/llm/google_provider.py` | **Default provider.** `LLM_DEFAULT_PROVIDER = "google"` (`config.py`). Key pool, pacing, 429/503/timeout handling, thinking config. Its key pool is also used for Gemini embeddings (section 3.14). |
 | `MistralAdapter` | `ai/llm/mistral_provider.py` | Complete and selectable (`LLM_DEFAULT_PROVIDER=mistral`). Own pool of up to 7 keys (`MISTRAL_API_KEY`, `_2` .. `_7`) with round-robin and paced by the router. The owner keeps this file unchanged; it is the one file `make lint` excludes from flake8. |
-| `OpenAIAdapter` | `ai/llm/openai_provider.py` | Simple single-key adapter (Chat Completions). Wraps every error as a plain `LLMRequestError`. Not used by default. |
-| `AnthropicAdapter` | `ai/llm/anthropic_provider.py` | Simple single-key adapter. Not used by default. |
+| `OpenAIAdapter` | `ai/llm/openai_provider.py` | Simple single-key adapter (Chat Completions). Maps errors like the Anthropic adapter: 429 with code `insufficient_quota` -> `LLMCreditExhaustedError` (never retried), other 429 -> `LLMRateLimitError`, 5xx -> `LLMServerOverloadedError`, timeout -> `LLMProviderTimeoutError`, other 4xx -> `LLMInvalidRequestError` (never retried), anything else -> `LLMRequestError`. Not used by default. |
+| `AnthropicAdapter` | `ai/llm/anthropic_provider.py` | Complete and selectable (`LLM_DEFAULT_PROVIDER=anthropic`). One key (`ANTHROPIC_API_KEY`), structured outputs, error mapping, usage logs (section 3.16). |
 
 All adapters implement `LLMProviderAdapter` (`ai/llm/base.py`): a list of
 `LLMMessage` (`system`/`user`/`assistant`) in, one `LLMResponse` out.
@@ -125,10 +126,12 @@ Who uses which tier (from the call sites):
   tier `FILING_RECORDS_BACKFILL_LLM_TIER`, `cheap` by default, overridable
   with `--tier`).
 - `HIGHEST_ACCURACY` (Flash models): Bull and Bear arguments, the Judge,
-  Reflection's citation review, position sizing's first try, and the two
-  filing calls made at ingestion (`ai/ingestion/sec_edgar_filings.py`):
-  the filing summary and the separate records-only call
-  (`ai/knowledge/filing_summary.py`, chapter 18).
+  Reflection's citation review, position sizing's first try, and, by
+  default, the two filing calls made at ingestion
+  (`ai/ingestion/sec_edgar_filings.py`): the filing summary and the
+  separate records-only call (`ai/knowledge/filing_summary.py`, chapter
+  18). `FILING_LLM_TIER` (`highest_accuracy` or `cheap`) sets the tier of
+  both.
 
 How much can we send? The quotas are not set by AlphaMind. They are
 Google's published free-tier limits as shown on the Google AI Studio
@@ -420,9 +423,10 @@ retry, but every agent and debate call passes
 
 | Error | Same-model retries |
 |---|---|
-| `LLMInvalidRequestError` (400/404) | 0 |
+| `LLMInvalidRequestError` (400/404), including `LLMCreditExhaustedError` | 0 |
+| `LLMOutputExhaustedError` (Anthropic: thinking used all of `max_tokens`, no text) | at most 1 (`_OUTPUT_EXHAUSTED_RETRIES`) |
 | Google Lite `LLMRateLimitError` (a 429, or a 503 give-up, because `LLMServerOverloadedError` is a subclass of it) | 0 (the fallback model and the cooldown retry take over) |
-| Google `LLMProviderTimeoutError` (Lite, or a caller-supplied timeout on Flash) | at most 1 (`_GOOGLE_TIMEOUT_RETRIES`) |
+| `LLMProviderTimeoutError` from Google (Lite, or a caller-supplied timeout on Flash) , Anthropic (after `LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS`) or OpenAI; the Mistral adapter raises a plain `LLMRequestError` on a timeout, so it falls under the last row | at most 1 (`_TIMEOUT_RETRIES`) |
 | Everything else | the caller's `retries` |
 
 The wait before a retry is `rate_limit_backoff_seconds(attempt)` for
@@ -471,6 +475,15 @@ the router calls the fallback model **once**:
   both are day-exhausted, the fallback is still tried once.
 - It gets JSON mode without the schema (section 3.12), and its answer
   has `rate_limited=True`.
+- Which model answered is recorded for the caller when it asks:
+  inside `with recording_served_models() as served:` every successful
+  router call appends `(response.model, served_by_fallback)` to `served`
+  (a context variable, so concurrent Bull and Bear calls keep separate
+  lists; `fallback_call_count(served)` counts the fallback answers). The
+  debate sides, the Judge and Reflection use it to store
+  `fallback_calls` (and the Judge its `model`); the recommendation note
+  then names the backup model (chapter 16). It works the same for every
+  provider; a provider without a fallback model never records one.
 
 If the fallback also fails, the router makes the Lite cooldown retry
 (CHEAP only, section 3.7) or raises the fallback's error, chained to the
@@ -630,6 +643,43 @@ it first, because Gemini sometimes wraps even a JSON-mode answer such as
 `parse_json_list` accepts either a bare list or an object with a
 `relevant`, `results` or `items` list.
 
+**Wrapped JSON.** Some models write a sentence or a short explanation
+around the JSON even when the prompt asks for JSON only (Sonnet 5.5 did
+this for position sizing). `parse_json_dict` therefore has a fallback
+that runs only when the strict parse (fence stripped, then `json.loads`)
+fails: `recover_wrapped_json` takes the span from the first `{` to the
+last `}` (first in the fence content, then in the whole reply) and
+accepts it only when `json.loads` returns an object. KG extraction
+(`ai/knowledge/archival.py`) uses the same helper for its list, with
+`[` and `]`. A recovery logs `llm_json.recovered_from_wrapped_text`
+(`shape`, `chars_dropped`); the event name is the same for every caller,
+and the structlog context (analysis, ticker) shows where it happened. A
+reply that is already valid JSON is parsed exactly as before. Every
+caller still checks the shape of what it gets (ReAct step, sentiment
+label, Reflection review, position sizing), so a recovered object with
+the wrong fields is rejected the same way as before.
+
+**Trailing commas.** Even with a JSON schema sent, Haiku 5.5 twice ended a
+ReAct step with `...",}` (BA fundamental, two batches), which both the
+strict parse and the span recovery reject. Only after both have failed,
+`parse_json_dict` removes every comma that directly precedes `}` or `]`
+outside a JSON string (`_without_trailing_commas`, the same string-aware
+repair the Judge's `parse_json_object` uses) and parses again (then the
+span recovery on the repaired text). A repair logs
+`llm_json.repaired_trailing_comma` (`chars`, `chars_removed`). Valid JSON
+never reaches this step, and a comma inside a string value is kept.
+
+Reflection treats an
+object that has neither `checked_claims` nor `issues` as unparseable
+(`reflection.unparseable_response`, round not verified).
+
+When a reply still cannot be parsed, `log_unparseable` logs the caller's
+event (for example `position_sizing.unparseable_response`,
+`react_loop.unparseable_response`, `kg_extraction.unparseable_response`,
+`judge.unparseable_response`)
+with the first 500 characters (`raw`), the last 300 (`raw_tail`) and the
+length (`raw_chars`).
+
 **Schemas.** A caller can pass `response_schema` together with
 `response_format="json_object"`; the adapter sends it as
 `response_json_schema`. Today only the ReAct loop does this. It builds
@@ -753,6 +803,195 @@ about 155 s: 3.8 waits and times out (about 43.5 s), then 3.6 meets two
 503s (about 37 s) and then times out after its own wait (about 73.5 s).
 A 3.8 timeout followed by a quick 3.6 answer takes about 35 s.
 
+### 3.16 The Anthropic provider
+
+`LLM_DEFAULT_PROVIDER` selects the provider for every call that names
+only a tier: `google`, `mistral` or `anthropic` (`openai` is also
+accepted, for the dormant adapter; a blank value means `google`, and any
+other value stops ai-service at startup). With `anthropic`:
+
+| Tier | Model (setting) |
+|---|---|
+| `CHEAP` | `claude-haiku-5-5` (`LLM_ANTHROPIC_MODEL_CHEAP`) |
+| `HIGHEST_ACCURACY` | `claude-sonnet-5-5` (`LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY`) |
+
+Anthropic has no fallback model, no key pool, no pacing, no Lite
+concurrency gate and no capacity markers. Those parts of the router run
+only for `google` (or `mistral`), so the Google and Mistral paths are the
+same whichever provider is selected. Embeddings stay on Google
+(`EMBEDDING_PROVIDER=google`): Anthropic has no embedding model, so
+`GOOGLE_API_KEY` is still needed for RAG ingestion and search.
+
+**Request.** `AnthropicAdapter` keeps one `AsyncAnthropic` client with
+`max_retries=0`, so the router alone decides retries. Each call sends:
+
+- the system messages joined into `system` (left out when empty), the
+  other messages as turns. With `LLM_ANTHROPIC_PROMPT_CACHING=true` (the
+  default) `system` is sent as one text block with `cache_control:
+  {"type": "ephemeral"}` (prompt caching, 5-minute lifetime). Every ReAct
+  turn of an agent, and the agent's retries, resend the same system
+  prompt, so later turns read it from the cache. Only the system prompt
+  is marked: each call has a single user message that grows every turn
+  (the scratchpad), so there is no stable message prefix to mark, and
+  automatic caching (a top-level `cache_control`) would write the whole
+  prompt at the write price on every turn without a later read. Prompts
+  under the model's minimum (512 tokens for Haiku 5.5 and Sonnet 5.5) are
+  not cached and cost the same as before. A cache write costs 1.25x the
+  input price; a read costs 0.1x (Haiku 5.5) or 0.05x (Sonnet 5.5);
+- `thinking`, chosen per tier: the requested model is compared (exact
+  equality) with `LLM_ANTHROPIC_MODEL_CHEAP`, then with
+  `LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY`, and the matching
+  `LLM_ANTHROPIC_THINKING_CHEAP` (`adaptive`) or
+  `LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY` (`between_tools`) is sent;
+  any other model gets `adaptive`. With `between_tools` the model does
+  not think before it answers (Sonnet 5.5 cannot turn thinking off
+  otherwise, and `between_tools` is accepted only at effort `low`,
+  `medium` or `high`). With `adaptive` the model decides; Haiku 5.5 has
+  no off switch and may skip thinking at a low effort. A 400 that rejects
+  the thinking type raises `LLMInvalidRequestError` naming the setting to
+  change. The router passes `thinking_budget` to Google only;
+- `max_tokens` from the caller. Thinking tokens count toward
+  `max_tokens` and are billed as output, so with `adaptive` the adapter
+  adds `LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS` (2048). A small caller
+  value (128 in `ai/user_sentiment.py`) therefore cannot be used up by
+  thinking alone. If an answer still stops at `max_tokens` with no text,
+  the adapter logs `anthropic.thinking_exhausted_max_tokens` (thinking
+  and output counts) and raises `LLMOutputExhaustedError`, which the
+  router retries at most once (`_OUTPUT_EXHAUSTED_RETRIES`);
+- `output_config.effort` = `LLM_ANTHROPIC_EFFORT` (`low`; empty leaves
+  it out);
+- no `temperature`: Claude 5.5 models answer 400 to a non-default value.
+  `LLM_ANTHROPIC_SEND_TEMPERATURE=true` sends the caller's value for
+  models that accept it;
+- `timeout` = the caller's `timeout_seconds`, or
+  `LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS` (120 s).
+
+**Structured outputs.** When a caller passes `response_schema` with
+`response_format="json_object"` (the ReAct loop), the adapter sends
+`output_config.format = {"type": "json_schema", "schema": ...}` after a
+generic conversion (`anthropic_output_schema`):
+
+- every object gets `additionalProperties: false`;
+- `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+  `multipleOf`, `minLength`, `maxLength`, `maxItems`, `pattern`,
+  `minProperties`, `maxProperties`, `uniqueItems`, `patternProperties`
+  and `propertyNames` are removed, `minItems` is kept only when it is 0
+  or 1, and `format` only for the formats Anthropic supports;
+- a recursive schema, or one with more than 24 optional parameters or
+  more than 16 union parameters (Anthropic's limits), is not sent
+  (`anthropic.response_schema_not_sent`); the call then relies on the
+  prompt and the JSON parser;
+- when the API still answers 400 `invalid_request_error` with "Schema is
+  too complex" (its own grammar limit, which cannot be checked offline),
+  the adapter steps down through three levels, each sent once with the
+  same effort and thinking:
+  1. `full`: the converted schema;
+  2. `reduced` (`reduced_output_schema`): every `anyOf` with two or more
+     object arms becomes one object whose properties are the union of
+     the arms' properties, all optional, with `additionalProperties:
+     false`; the `null` arm and any other non-object arm stay. When two
+     arms define the same property differently, the merged property is
+     an `anyOf` of those definitions. In a ReAct step schema this merges
+     the `action_input` arms (one per tool). An `anyOf` with a single
+     object arm, such as `reported_metrics`, is left exactly as it is,
+     so its required fields and enums are still enforced. The level is
+     skipped when the reduction changes nothing;
+  3. `none`: no format; the reply goes through the JSON normalisation
+     below.
+
+  Each rejection logs `anthropic.schema_too_complex_fallback`
+  (`schema_hash`, `model`, `rejected_level`, `next_level`). The level
+  that worked is cached per schema hash for the life of the process, so
+  later calls with the same schema start there. Every call that sends no
+  schema because of this logs `anthropic.response_schema_skipped`
+  (`schema_hash`, `model`), and `anthropic.completion_succeeded` carries
+  `schema_sent` (true or false). A live run hit the 400 with Haiku 5.5 on
+  the Technical agent's schema.
+
+**Schema probe.** `services/ai-service/scripts/probe_anthropic_schemas.py`
+checks which level each agent's schema needs, with the real key. It
+builds every research agent's ReAct step schema exactly as the agent
+does (the agent's own tools and `reported_metrics` schema, captured from
+`ReActAgentLoop` with prefetching off, so no tool runs except Macro's
+live FRED readings), then sends the full and the reduced variant with a
+one-line prompt and `max_tokens=16`. It prints, per agent, whether the
+full and the reduced schema were accepted and the tokens used, then the
+total tokens. A run is about 18 small requests and costs cents. Run it
+inside the ai-service container:
+
+```bash
+docker compose --env-file .env.docker exec ai-service \
+    python -m scripts.probe_anthropic_schemas
+```
+
+`--model <id>` probes another model (default `LLM_ANTHROPIC_MODEL_CHEAP`,
+which runs the agents). Grammar limits are the server's, so rerun it
+after a model change.
+
+Every agent's ReAct schema converts within the explicit limits (at most
+21 optional and 6 union parameters), but that does not guarantee the
+server's grammar limit. Calls with only
+`response_format="json_object"` (Judge, Reflection, Sentiment label, news
+and web-search relevance, user sentiment) send no schema, so their JSON
+comes from the prompt and the parsers of section 3.12. For these calls the
+adapter normalises the text first: when it is not valid JSON, it tries
+the content of a surrounding code fence, then the span from the first
+`{` or `[` to the last `}` or `]` (the one that starts first), and uses
+the first candidate that `json.loads` accepts
+(`anthropic.json_normalized`, with `chars_dropped`). Otherwise the text
+is returned unchanged and the caller's own error path runs.
+
+**Errors.**
+
+| Anthropic answer | Raised | Router |
+|---|---|---|
+| 429 `rate_limit_error` | `LLMRateLimitError` | retried with the rate-limit backoff |
+| 529 `overloaded_error`, 5xx, `api_error` | `LLMServerOverloadedError` | retried with the rate-limit backoff |
+| `APITimeoutError` | `LLMProviderTimeoutError` | retried at most once (`_TIMEOUT_RETRIES`, section 3.9) |
+| credit balance too low (`billing_error`, or a 400 whose message names the credit balance) | `LLMCreditExhaustedError` | never retried |
+| other 400, 404, 413, 422 | `LLMInvalidRequestError` | never retried |
+| 401, 403 | `LLMConfigError` | never retried |
+| anything else | `LLMRequestError` | retried |
+
+A streamed answer maps its errors the same way, including an error event
+in the middle of the stream. Failures log `anthropic.request_failed` or
+`anthropic.stream_failed` with the status code and the API error type.
+
+**Credit used up.** `LLMCreditExhaustedError` says that the Anthropic
+API credit is used up. There is no fallback to another provider. An
+agent, debate side or Judge that fails with it gets the failure kind
+`credit_exhausted` (Reflection does not retry it), and an analysis that
+ends without a verdict is marked failed with the reason
+`llm_credit_exhausted` (`AnalysisFailureReason.LLM_CREDIT_EXHAUSTED`).
+The page and the notification show it as "llm credit exhausted".
+
+**Usage logs.** Each completion logs `anthropic.completion_succeeded`
+with `model`, `prompt_tokens`, `uncached_prompt_tokens`,
+`completion_tokens`, `thinking_tokens`, `finish_reason`, `latency_ms`,
+`cache_read_tokens`, `cache_creation_tokens` and `schema_sent`; a stream
+logs `anthropic.stream_completed` with the same fields (no
+`schema_sent`) from the final message. `prompt_tokens` is the whole
+input (`uncached_prompt_tokens + cache_read_tokens +
+cache_creation_tokens`), the same meaning as before caching and as for
+Gemini; `LLMUsage.prompt_tokens` holds the same total. The API's own
+`input_tokens` counts only the uncached part and is logged as
+`uncached_prompt_tokens`. To price a call: `uncached_prompt_tokens` at
+the input price, `cache_creation_tokens` at 1.25x, `cache_read_tokens` at
+0.1x (Haiku 5.5) or 0.05x (Sonnet 5.5), plus output. As for Gemini,
+`completion_tokens` excludes thinking and `thinking_tokens` holds it
+(both are billed as output tokens).
+
+**Switching.** Only ai-service reads the LLM settings (the scheduler
+calls ai-service over HTTP; core-service and the frontend do not read
+`LLM_DEFAULT_PROVIDER`). Settings are read at start, so:
+
+1. In `.env.docker`, set `LLM_DEFAULT_PROVIDER=anthropic` and
+   `ANTHROPIC_API_KEY=<key>` (keep `GOOGLE_API_KEY` for embeddings).
+2. Run `docker compose --env-file .env.docker up -d --force-recreate ai-service`.
+   Analyses still running are marked failed with `service_restart`.
+3. To go back, set `LLM_DEFAULT_PROVIDER=google` and run the same
+   command.
+
 ## 4. Configuration
 
 All in `services/ai-service/config.py` unless stated otherwise.
@@ -779,11 +1018,20 @@ All in `services/ai-service/config.py` unless stated otherwise.
 | `LLM_GOOGLE_TIMEOUT_COOLDOWN_SECONDS` | 300.0 | Skip a Flash model this long after a timeout (0 = off). |
 | `LLM_GOOGLE_LITE_COOLDOWN_RETRY_MAX_SECONDS` | 70.0 | Longest wait for the Lite cooldown retry (0 = off). |
 | `LLM_MISTRAL_*`, `MISTRAL_API_KEY*` | see `config.py` | Mistral models, fallbacks, pacing (15.0 / 22.0 s), 7-key pool. |
-| `LLM_OPENAI_*`, `LLM_ANTHROPIC_*`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | see `config.py` | Dormant providers. |
+| `ANTHROPIC_API_KEY` | empty | Key used when `LLM_DEFAULT_PROVIDER=anthropic`. |
+| `LLM_ANTHROPIC_MODEL_CHEAP`, `LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY` | `claude-haiku-5-5`, `claude-sonnet-5-5` | Anthropic models per tier (section 3.16). |
+| `LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS` | 120.0 | Timeout of an Anthropic call without a caller timeout. |
+| `LLM_ANTHROPIC_EFFORT` | `low` | `output_config.effort`; empty leaves it out. |
+| `LLM_ANTHROPIC_THINKING_CHEAP`, `LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY` | `adaptive`, `between_tools` | Thinking type per tier model (`adaptive` or `between_tools`). |
+| `LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS` | 2048 | Added to `max_tokens` when thinking is `adaptive`. |
+| `LLM_ANTHROPIC_SEND_TEMPERATURE` | false | Send `temperature` (Claude 5.5 models reject non-default values). |
+| `LLM_ANTHROPIC_PROMPT_CACHING` | true | Mark the system prompt for prompt caching (section 3.16). |
+| `LLM_OPENAI_*`, `OPENAI_API_KEY` | see `config.py` | Dormant provider. |
 | `EMBEDDING_PROVIDER`, `GOOGLE_EMBEDDING_MODEL`, `GOOGLE_EMBEDDING_DIMENSIONS` | `google`, `gemini-embedding-2`, 1536 | Embeddings. |
 | `EMBEDDING_REQUEST_TIMEOUT_SECONDS` | 30.0 | Limit of one embedding request (section 3.14). |
 | `RAG_ASK_LLM_TIER`, `RAG_ASK_MAX_OUTPUT_TOKENS` | `cheap`, 1024 | Tier and output budget of the RAG assistant. |
 | `FILING_RECORDS_BACKFILL_LLM_TIER` | `cheap` | Tier of the filing-records backfill script (chapter 18). |
+| `FILING_LLM_TIER` | `highest_accuracy` | Tier of the filing summary and records calls at ingestion (chapter 18). |
 
 Constants in code (not settings):
 
@@ -799,7 +1047,8 @@ Constants in code (not settings):
 | `RATE_LIMIT_BACKOFF_SCHEDULE` | `[1.0, 2.0, 4.0, 8.0, 60.0]`, +/-20% jitter | `ai/llm/base.py` |
 | `AGENT_LLM_CALL_RETRIES` | 4 | `ai/llm/base.py` |
 | `_RETRY_BACKOFF_SECONDS` | 0.5 | `ai/llm/router.py` |
-| `_GOOGLE_TIMEOUT_RETRIES` | 1 | `router.py` |
+| `_TIMEOUT_RETRIES` | 1 | `router.py` |
+| `_OUTPUT_EXHAUSTED_RETRIES` | 1 | `router.py` |
 | `GOOGLE_LITE_COOLDOWN_DEFAULT_WAIT_SECONDS` | 60.0 | `google_provider.py` (Lite cooldown retry wait when no cooldown is recorded) |
 | `_RUNAWAY_THINKING_SHARE` | 0.5 | `google_provider.py` |
 | `_REACT_LOOP_MAX_TOKENS` | 4096 | `ai/agents/loop.py` |
@@ -1051,11 +1300,12 @@ real requests and spends daily quota.
 
 | File | What it holds |
 |---|---|
-| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. JSON reply helpers: `strip_json_code_fence`, `parse_json_dict`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
+| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. JSON reply helpers: `strip_json_code_fence`, `recover_wrapped_json`, `log_unparseable`, `parse_json_dict`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
 | `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets); the capacity checks `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
 | `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config (and the caller's `thinking_budget` on Lite models), timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`); the `fallback` flag (60 s timeout, 3 keys on a 503). |
 | `services/ai-service/ai/llm/mistral_provider.py` | `MistralAdapter` and its key pool. |
-| `services/ai-service/ai/llm/openai_provider.py`, `anthropic_provider.py` | Dormant adapters. |
+| `services/ai-service/ai/llm/anthropic_provider.py` | `AnthropicAdapter`: request shape, prompt caching, `anthropic_output_schema` (schema conversion), `reduced_output_schema` and the schema levels, error mapping, usage logs. |
+| `services/ai-service/ai/llm/openai_provider.py` | Dormant adapter; `_mapped_error` (error mapping, section 3.1). |
 | `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
 | `services/ai-service/ai/providers/news_relevance.py` | `verify_with_cheap_tier` (the relevance classifiers' CHEAP call, fail-open and echo check) and `parsed_with_retry` (their JSON retry at 8192 tokens). |
 | `services/ai-service/ai/rag/embedding.py` | Gemini and Mistral embeddings, batching, key rotation. |
@@ -1064,6 +1314,7 @@ real requests and spends daily quota.
 | `services/ai-service/observability.py` | `alphamind_llm_errors_total`. |
 | `services/ai-service/scripts/probe_model_latency.py`, `scripts/probe.sh` | Latency probe. |
 | `services/ai-service/scripts/probe_model_latency.py --health` | Per-key and per-model health check of the Google keys. |
+| `services/ai-service/scripts/probe_anthropic_schemas.py` | Anthropic schema probe: full and reduced ReAct step schema per agent (section 3.16). |
 
 ## 10. Related chapters
 

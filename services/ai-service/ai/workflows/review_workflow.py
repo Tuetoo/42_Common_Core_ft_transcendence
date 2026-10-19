@@ -9,7 +9,6 @@ from ai_events import decision_outcome_event_payload, publish_event
 from config import settings
 from database import SessionLocal
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from domains.analysis.model import Recommendation
 from domains.analysis.repository import AnalysisRepository
 from domains.analytics.model import RecommendationMetric
 from domains.analytics.repository import AnalyticsRepository
@@ -50,7 +49,7 @@ async def _realized_return(
     return total_return(closes)
 
 
-def _directional_return(action: str | None, ticker_return: float) -> float:
+def _directional_return(action: str, ticker_return: float) -> float:
     if action == RecommendationAction.SELL.value:
         return -ticker_return
     return ticker_return
@@ -66,7 +65,7 @@ def _score_recommendation(action: str, realized_return: float) -> float:
 
 async def _score_one_recommendation(
         recommendation_id: UUID, analysis_id: UUID,
-        action: str) -> bool | None:
+        action: str) -> bool:
     async with SessionLocal() as session:
         analysis = await AnalysisRepository(session).get_by_id(analysis_id)
         ticker = analysis.ticker
@@ -78,7 +77,7 @@ async def _score_one_recommendation(
         logger.warning(
             "review.no_price_data", ticker=ticker,
             recommendation_id=str(recommendation_id))
-        return None
+        return False
 
     score = _score_recommendation(action, realized_return)
     async with SessionLocal() as session:
@@ -112,26 +111,25 @@ async def review_ai_accuracy() -> StepCounts:
     failed = 0
     for recommendation_id, analysis_id, action in pending_items:
         try:
-            result = await _score_one_recommendation(
+            ok = await _score_one_recommendation(
                 recommendation_id, analysis_id, action)
         except Exception:
             logger.exception(
                 "review.recommendation_failed",
                 recommendation_id=str(recommendation_id))
-            result = None
-        if result is None:
-            failed += 1
-        elif result:
+            ok = False
+        if ok:
             scored += 1
+        else:
+            failed += 1
 
     logger.info("review.ai_accuracy_complete", scored=scored, failed=failed)
     return StepCounts(scored, len(pending_items), failed)
 
 
 async def _evaluate_one_decision(
-        decision_id: UUID, ticker: str, decided_on: date, action: str | None,
-        window_days: int, *, user_id: UUID,
-        analysis_id: UUID | None) -> bool | None:
+        decision_id: UUID, ticker: str, decided_on: date, action: str,
+        window_days: int, *, user_id: UUID, analysis_id: UUID) -> bool | None:
     ticker_return = await _realized_return(ticker, decided_on, window_days)
     benchmark_return = await _realized_return(
         _DEFAULT_BENCHMARK, decided_on, window_days)
@@ -171,26 +169,16 @@ async def review_decision_outcomes() -> StepCounts:
                 session).list_pending_review(
                     min_age_days=window_days, max_age_days=(
                         window_days + settings.REVIEW_GIVE_UP_AFTER_DAYS))
-            pending_items: list[tuple[UUID, str, date, str | None, UUID,
-                                      UUID | None]] = []
-            for d in pending:
-                rec = await session.get(Recommendation, d.recommendation_id)
-                pending_items.append((
-                    d.id, d.ticker, d.created_at.date(),
-                    rec.recommendation if rec is not None else None, d.user_id,
-                    rec.analysis_id if rec is not None else None))
 
-        attempted += len(pending_items)
-        for item in pending_items:
-            decision_id, ticker, decided_on, action, user_id, analysis_id = (
-                item)
+        attempted += len(pending)
+        for d in pending:
             try:
                 written = await _evaluate_one_decision(
-                    decision_id, ticker, decided_on, action, window_days,
-                    user_id=user_id, analysis_id=analysis_id)
+                    d.id, d.ticker, d.created_at.date(), d.action, window_days,
+                    user_id=d.user_id, analysis_id=d.analysis_id)
             except Exception:
                 logger.exception(
-                    "review.decision_failed", decision_id=str(decision_id),
+                    "review.decision_failed", decision_id=str(d.id),
                     window_days=window_days)
                 written = None
             if written is None:

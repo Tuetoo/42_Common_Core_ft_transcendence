@@ -8,7 +8,7 @@ from database import get_db
 from deps import check_date_range, get_current_user
 from fastapi import (APIRouter, BackgroundTasks, Depends, Query, Response,
                      status)
-from outbox import enqueue, publish_now
+from outbox import publish_now
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.notification.service import notify_after_commit
 from domains.portfolio.schema import (HoldingAdjustmentRead, HoldingCreate,
@@ -21,7 +21,6 @@ from domains.portfolio.schema import (HoldingAdjustmentRead, HoldingCreate,
                                       WatchlistUpdate)
 from domains.portfolio.service import PortfolioService
 from shared.enums import NotificationType, TransactionType
-from shared.events import EventName
 from shared.permissions import Permission
 from shared.schemas import (MAX_PAGE, APIResponse, PaginatedResponse,
                             PaginationParams)
@@ -138,13 +137,8 @@ async def delete_portfolio(
     current_user: CurrentUser = Depends(portfolio_writer),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> None:
-    portfolio = await PortfolioService(db).delete(
+    portfolio, entry = await PortfolioService(db).delete(
         portfolio_id, current_user.user_id)
-    entry = await enqueue(
-        db, EventName.PORTFOLIO_DELETED, {
-            "portfolio_id": str(portfolio.id),
-            "user_id": str(portfolio.owner_id)
-        })
     background_tasks.add_task(publish_now, [entry])
     notify_after_commit(
         background_tasks, [current_user.user_id],
@@ -195,7 +189,7 @@ async def list_holdings(
     portfolio_id: UUID, current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db, scope="function")
 ) -> APIResponse[list[HoldingRead]]:
-    result = await PortfolioService(db).list_holdings(
+    result, _ = await PortfolioService(db).list_holdings(
         portfolio_id, current_user.user_id)
     return APIResponse(data=result)
 

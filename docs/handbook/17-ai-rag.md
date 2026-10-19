@@ -22,7 +22,7 @@ it (retrieval).
 ```
  INGESTION (asynchronous, event-driven)
 
- user upload                          auto-ingestion (03:00 New York)
+ user upload                          auto-ingestion (03:05 New York)
  POST /api/v1/research/documents      SEC EDGAR filings, NewsAPI digests,
         |                             monthly FRED macro report
         v                                        |
@@ -303,11 +303,11 @@ chunk count.
 started by `event_listener.py::_handle_document_uploaded` when the durable
 event `document.uploaded` arrives. The event payload carries
 `document_id`, `storage_bucket`, `storage_key`, `document_type`,
-`category`, `ticker`, `content_date`, `filename`, `owner_id`,
-`organization_id` and `is_system`. ai-service does not read `is_system`:
-`ChunkVisibility.from_upload_event` derives the system flag from
-`owner_id` (the system owner id, 3.8), so the two services cannot
-disagree about who owns a chunk.
+`category`, `ticker`, `content_date`, `filename`, `owner_id` and
+`organization_id`. There is no system flag in the event:
+`ChunkVisibility.from_upload_event` derives it from `owner_id` (the
+system owner id, 3.8), so the two services cannot disagree about who
+owns a chunk.
 
 Steps and status events (`document.status_changed`, published twice: as
 a durable event, which is stored in a Redis stream until it is
@@ -365,6 +365,13 @@ and the stored object and publishes `document.deleted`.
 `delete_document_completely` and commits. Without this chain, a
 document deleted through the API would stay searchable with all its
 chunks in Qdrant.
+
+When an account is deleted, core deletes the user's private documents
+and publishes `document.deleted` for each, so the same chain removes
+their chunks. The archived agent notes of the user's analyses are
+removed by ai-service's own user cleanup through
+`ai/knowledge/archival.py::delete_archived_report` (chapter 13, section
+3.8).
 
 ### 3.8 Visibility: system, own, organization
 
@@ -711,7 +718,9 @@ Both need the `rag:ask` permission (guests get 403). The request body
 
 Flow (`domains/rag/qa.py`):
 
-1. **Rate limit** (`check_rate_limit`): fixed windows in the Redis
+1. **Rate limit** (`check_rate_limit`, through the shared
+   `rate_limit.py::check_user_rate_limit` that the decision review also
+   uses): fixed windows in the Redis
    rate-limit database (DB 1), keys
    `ai:rag_ask:rate:<user>:m:<YYYYMMDDHHMM>` (TTL 120 s) and
    `...:d:<YYYYMMDD>` (TTL 2 days), each counted in one `MULTI`
@@ -770,7 +779,7 @@ The question text is never logged, only its length (`rag_ask.request`).
 ### 3.13 Auto-ingestion
 
 The scheduler calls `POST /internal/scheduler/rag-ingest` every day at
-03:00 New York time (08:00 London), via `call-job.sh rag-ingest`
+03:05 New York time (08:05 London), via `call-job.sh rag-ingest`
 (curl time limit 3600 s). The route (`api/internal.py::trigger_rag_ingest`)
 runs two workflows from `ai/workflows/auto_ingestion_workflow.py`:
 
@@ -796,7 +805,7 @@ holdings and watchlists, `clients/core_client.py::get_tracked_tickers`):
   can add the row later) and the ticker's SEC caches are cleared
   (`forget_filing_caches`), so the XBRL line sees the new filing
   (chapter 18, sections 3.10-3.12). A filing that could not be stored
-  makes the ticker count as failed, and its news step is skipped.
+  makes the ticker count as failed; its news step still runs.
 - *News:* `ai/ingestion/digests.py::generate_news_digest` builds at
   most one digest per ticker per day (`{TICKER}_news_{date}.txt`). It
   fetches up to 8 NewsAPI articles of the last 28 days, newest first
@@ -867,8 +876,9 @@ categories fresh.
 
 core-service's duplicate check on upload is per owner. So with
 `--as-system`, the script first asks core-service for the filenames of
-every owner (`GET /internal/documents/filenames?category=&ticker=`,
-failed documents excluded) and skips a file that is already there,
+every owner (`GET /internal/documents/filenames?category=&ticker=`;
+a failed document is left out while its first upload is newer than
+`FAILED_DOCUMENT_RETRY_DAYS`) and skips a file that is already there,
 printed as "SKIP <file> (already uploaded by another owner)", also in a
 dry run. Reason: without it, earnings calls that a user had already
 uploaded were added again as system copies. When that list cannot be
@@ -1253,6 +1263,7 @@ bash scripts/psql.sh -c "SELECT count(*) AS chunk_rows, count(DISTINCT document_
 | `services/ai-service/ai/tools/filing_tool.py`, `research_archive_tool.py` | agent search tools |
 | `services/ai-service/event_listener.py` | `document.uploaded` / `document.deleted` handlers |
 | `services/ai-service/domains/rag/` | ask API, schema, QA flow, repositories, models |
+| `services/ai-service/rate_limit.py` | `check_user_rate_limit`: the per-user minute and day limits of the ask endpoint (and of decision reviews, chapter 19) |
 | `services/ai-service/qdrant.py` | Qdrant client and collection check |
 | `services/ai-service/ai/evaluation/rag_recall.py` | golden set generation, recall |
 | `services/ai-service/scripts/measure_rag_recall.py` and siblings | evaluation and maintenance scripts |

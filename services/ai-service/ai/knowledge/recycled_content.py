@@ -1,8 +1,10 @@
+import dataclasses
 import difflib
 import re
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
-from ai.knowledge.filing_records import RawNumbers, stated_amounts
+from ai.knowledge.filing_records import (RawNumbers, StatedAmount,
+                                         stated_amounts)
 
 if TYPE_CHECKING:
     from ai.agents.loop import ScratchpadEntry
@@ -93,7 +95,7 @@ def note_and_source_passages(observation: str) -> tuple[list[str], list[str]]:
 def is_evidence_entry(entry: Any) -> bool:
     action = scratchpad_field(entry, "action")
     return (
-        bool(action) and action != "finish_answer"
+        bool(action)
         and isinstance(scratchpad_field(entry, "observation"), str)
         and scratchpad_field(entry, "is_tool_result", True) is not False
         and not scratchpad_field(entry, "tool_error", False))
@@ -191,10 +193,21 @@ def prior_note_only_claims(final_answer: str,
         amounts = stated_amounts(wording)
         if len(amounts) != 1 or wording in claims:
             continue
-        if note_numbers.contains(
-                amounts[0]) and not fresh_numbers.contains(amounts[0]):
+        if note_numbers.contains(amounts[0]) and not fresh_numbers.contains(
+                _within_rounding(amounts[0])):
             claims.append(wording)
     return claims
+
+
+_ROUNDING_REL_TOLERANCE = 0.005
+
+
+def _within_rounding(amount: StatedAmount) -> StatedAmount:
+    middle = (amount.low + amount.high) / 2
+    slack = abs(middle) * _ROUNDING_REL_TOLERANCE
+    return dataclasses.replace(
+        amount, low=min(amount.low, middle - slack),
+        high=max(amount.high, middle + slack))
 
 
 def prior_note_only_claims_in_run(

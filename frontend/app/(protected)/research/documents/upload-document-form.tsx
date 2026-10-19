@@ -8,12 +8,11 @@ import {
   DOCUMENT_EXTENSIONS,
   DOCUMENT_MAX_BYTES,
   DOCUMENT_TITLE_MAX,
-  TICKER_HINT,
-  TICKER_HTML_PATTERN,
   documentFileError,
   formatBytes,
   tickerError,
 } from "../limits";
+import { TICKER_PATTERN, TICKER_TITLE } from "@/app/lib/format";
 import type { Organization } from "../types";
 
 type Upload =
@@ -145,8 +144,8 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
           autoComplete="off"
           type="text"
           maxLength={10}
-          pattern={TICKER_HTML_PATTERN}
-          title={TICKER_HINT}
+          pattern={TICKER_PATTERN}
+          title={TICKER_TITLE}
           placeholder="e.g. AAPL"
           disabled={busy}
           className="uppercase"

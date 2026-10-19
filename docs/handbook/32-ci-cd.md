@@ -415,7 +415,7 @@ replace its `authorized_keys` line and the `DEPLOY_SSH_KEY` secret.
 | `APP_ENV` | `development` (weak secrets allowed, with a warning) | `production` (a weak or missing secret stops the service) |
 | Address | `https://localhost:8443` (self-signed) | `https://alphamind-research.duckdns.org:8443` (Let's Encrypt) |
 | Data | your local volumes | the host's volumes; replaced by restoring a local backup when wanted |
-| Scheduler | running: the cron jobs and the nightly backup | stopped: no scheduled job, no automatic backup |
+| Scheduler | running: the cron jobs and the nightly backup | stopped: no scheduled job, no automatic backup; single jobs run by hand from the scheduler image |
 
 The two never share data and can run at the same time. They do share the
 LLM and data-provider keys, so their quotas: do not run analysis batches
@@ -423,7 +423,13 @@ on both at once.
 
 The cloud host keeps the scheduler stopped, so it makes no backups and
 runs no scheduled jobs; its stale-job alerts fire (chapter
-[26](26-scheduler-jobs.md) section 3.11). Backups are made on the local
+[26](26-scheduler-jobs.md) section 3.11). The jobs that spend no LLM or
+news quota still matter there, because real accounts are deleted on the
+host: run purge-unverified, notification-retention and the two
+deleted-user sweeps by hand with `docker compose --env-file .env.docker
+run --rm --no-deps scheduler /scripts/call-job.sh <job>`. With
+arguments, the scheduler image runs that one command instead of cron
+([../DEPLOYMENT.md](../DEPLOYMENT.md) section 3). Backups are made on the local
 stack, nightly or by hand with `make backup` there. To show local data
 on the cloud, copy a local backup to the host's `backups/` and restore
 it there ([../DEPLOYMENT.md](../DEPLOYMENT.md) section 4).

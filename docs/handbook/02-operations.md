@@ -32,8 +32,9 @@ work. Instead you use three layers of tools, from high to low:
 A normal day looks like this (times in New York, London in brackets):
 
 ```
-02:00 (07:00) review-run      02:30 (07:30) backup     03:00 (08:00) rag-ingest
+02:00 (07:00) review-run      02:30 (07:30) backup     03:05 (08:05) rag-ingest
 04:00 (09:00) logs-cleanup    04:10 (09:10) purge-unverified  04:20 (09:20) notification-retention
+04:30 (09:30) deleted-user-sweep-core   04:40 (09:40) deleted-user-sweep-ai
 09:00-10:30 (14:00-15:30)  BUSY WINDOW  09:30 (14:30) market-open (Mon-Fri)
 16:55-17:50 (21:55-22:50)  BUSY WINDOW  17:00 (22:00) tier-monitoring, 17:30 (22:30) market-close (Mon-Fri)
 any other time: your own work -- analyses, e2e checks, restarts, demos
@@ -631,6 +632,7 @@ checks the clock.
 | `set_system_role --email E --role guest\|user\|moderator\|admin [--dry-run]` | auth | yes | Sets a user's system role in the database and in the live Redis mirror, so issued tokens get it at once. How the first admin is made. Refuses an unknown email, a deleted account and demoting the last active admin (exit 1). | 11 |
 | `delete_documents --id U [--id U ...] [--confirm]` | core | with `--confirm` | Deletes documents like the API does, but without the owner check (for documents owned by the ingestion user or the system): the row and a `document.deleted` outbox entry in one commit, the event published at once (or later by the outbox dispatcher), then the S3 object. Each document is committed on its own; ids already gone are reported as not found. | 12, 22 |
 | `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none, or whose label is older than the last edit (`sentiment_analyzed_at < updated_at`) (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
+| `clean_organizations --id U [--id U ...] [--confirm]` | core | with `--confirm` | Cleans the core content of organizations that auth no longer has, like the nightly organization sweep, when the sweep's safety brake refuses. Asks auth first (`POST /internal/organizations/missing`) and skips any id auth still has. | 12, 26 |
 | `recompute_snapshots` (through `scripts/snapshots.sh`) | core | with `--confirm` | Rebuilds NAV snapshots from the ledger and official closes; see section 3.5. | 12 |
 | `e2e_check` (through `scripts/e2e.sh`) | core | test data only, cleaned up | Whole-stack end-to-end check; see section 3.11. | 31 |
 | `analysis_cli create\|status\|get\|committed` | ai | `create` | Internal analysis client used by `run_analysis.sh` (see section 3.9); `committed <portfolio-uuid>` prints the BUY cash held by open tiers, used by `tiers.sh`. | 13 |
@@ -645,6 +647,7 @@ checks the clock.
 | `smoke_check` (through `scripts/smoke.sh`) | ai | small, cleaned up | See section 3.5. | 31 |
 | `e2e_tier_check` (through `scripts/e2e.sh tier`) | ai | synthetic rows, cleaned up | See section 3.11. | 19 |
 | `probe_model_latency` (through `scripts/probe.sh`) | ai | no (uses LLM quota) | See section 3.5. | 14 |
+| `probe_anthropic_schemas` | ai | no (a few cents of Anthropic credit) | Sends each research agent's ReAct step schema (full and reduced) to the Anthropic model with `max_tokens=16` and reports which one is accepted. | 14 |
 | `verify_portfolio_backtest --list` / `--portfolio U [--start D] [--end D] [--benchmark SPY] [--run [--keep]]` | ai | only with `--run` (row deleted unless `--keep`) | Recomputes a portfolio backtest independently in three layers: each snapshot against the ledger, the TWR metrics with its own code, and with `--run` the production backtest. | 19 |
 
 The output helpers of these scripts (`flatten`, `one_line`) live at the
@@ -723,10 +726,12 @@ saving automatically. The crontab is `infra/scheduler/crontab`:
 |---|---|---|---|---|---|
 | `review-run` | `0 2 * * *` | 02:00 daily | 07:00 | ai `POST /internal/review/run` | 1800 s |
 | `backup` | `30 2 * * *` | 02:30 daily | 07:30 | `/scripts/backup.sh` (local) | - |
-| `rag-ingest` | `0 3 * * *` | 03:00 daily | 08:00 | ai `POST /internal/scheduler/rag-ingest` | 3600 s |
+| `rag-ingest` | `5 3 * * *` | 03:05 daily | 08:05 | ai `POST /internal/scheduler/rag-ingest` | 3600 s |
 | `logs-cleanup` | `0 4 * * *` | 04:00 daily | 09:00 | `/scripts/logs-cleanup.sh` (local) | - |
 | `purge-unverified` | `10 4 * * *` | 04:10 daily | 09:10 | auth `POST /internal/scheduler/purge-unverified` (accounts never verified for 7 days) | 300 s |
 | `notification-retention` | `20 4 * * *` | 04:20 daily | 09:20 | core `POST /internal/scheduler/notification-retention` (read notifications older than 90 days) | 300 s |
+| `deleted-user-sweep-core` | `30 4 * * *` | 04:30 daily | 09:30 | core `POST /internal/scheduler/deleted-user-sweep` (leftover data of deleted accounts) | 900 s |
+| `deleted-user-sweep-ai` | `40 4 * * *` | 04:40 daily | 09:40 | ai `POST /internal/scheduler/deleted-user-sweep` (leftover data of deleted accounts) | 900 s |
 | `market-open` | `30 9 * * 1-5` | 09:30 Mon-Fri | 14:30 | core `POST /internal/scheduler/market-open` | 600 s |
 | `tier-monitoring` | `0 17 * * 1-5` | 17:00 Mon-Fri | 22:00 | ai `POST /internal/scheduler/tier-monitoring` | 900 s |
 | `market-close` | `30 17 * * 1-5` | 17:30 Mon-Fri | 22:30 | core `POST /internal/scheduler/market-close` | 600 s |
@@ -734,7 +739,7 @@ saving automatically. The crontab is `infra/scheduler/crontab`:
 Why these times: the review, backup, ingestion and log cleanup run every
 day, because nothing they do depends on the trading session (SEC posts
 filings on any day; on a day with nothing new ingestion is a no-op).
-The backup sits between review (02:00) and ingestion (03:00), the
+The backup sits between review (02:00) and ingestion (03:05), the
 quietest moment. Tier monitoring waits one hour after the 16:00 close,
 so the data provider's final daily bar is settled. Market close runs
 after tier monitoring (which ends within its 900 s limit), so trades the
@@ -752,14 +757,21 @@ How a job runs:
   `BACKUP_*`, `TZ`, ...) to `/scripts/env.sh` (readable by root only,
   because it holds secrets; every value single-quoted so any character
   survives), because cron does not pass its own environment to jobs.
-  Then it starts `crond -f -l 2` as a **child** and forwards `SIGTERM`
+  Started with arguments, it runs them instead of cron (`exec "$@"`),
+  so one job can be run by hand:
+  `docker compose run --rm --no-deps scheduler /scripts/call-job.sh <job>`.
+  This is how the cloud host, where the scheduler stays stopped, runs
+  purge-unverified, notification-retention and the two deleted-user
+  sweeps by hand ([chapter 26](26-scheduler-jobs.md), section 3.11).
+  Without arguments it starts `crond -f -l 2` as a **child** and forwards `SIGTERM`
   and `SIGINT` to it, so `docker compose stop` stops it cleanly. crond is
   not made PID 1 because dcron calls `setpgid()` at start, which fails
   for PID 1 (a session leader); crond then exits and the container
   restarts in a loop.
-- The seven HTTP jobs (market-open, market-close, tier-monitoring,
-  review-run, rag-ingest, purge-unverified, notification-retention) all
-  run through one script,
+- The nine HTTP jobs (market-open, market-close, tier-monitoring,
+  review-run, rag-ingest, purge-unverified, notification-retention,
+  deleted-user-sweep-core, deleted-user-sweep-ai) all run through one
+  script,
   `call-job.sh <job>`: it sources `env.sh`, looks up the job's route and
   time limit, calls the route with `--max-time <limit>` and the
   `X-Internal-Token` header, prints the answer, and on success calls
@@ -768,8 +780,9 @@ How a job runs:
   alert eventually fires. It uses `curl -sS --fail-with-body`, so a
   failed run prints the answer body with its counts.
 - A job counts as failed when its endpoint answers an HTTP error. The
-  rag-ingest, tier-monitoring, review-run, market-open, purge-unverified
-  and notification-retention endpoints answer `500`
+  rag-ingest, tier-monitoring, review-run, market-open, purge-unverified,
+  notification-retention and both deleted-user-sweep endpoints answer
+  `500`
   with their counts (plus `"all_units_failed": [<step names>]`) when a
   step tried at least one item and every item failed
   (`shared/scheduled_jobs.py::job_response`, log
@@ -796,7 +809,7 @@ How a job runs:
 |---|---|---|
 | 09:00-10:30 | 14:00-15:30 | market-open at 09:30 asks ai-service for an analysis of every held ticker of every portfolio with `auto_analyze_at_open`. They join the serial analysis queue. A restart of ai-service would fail them (`service_restart`); a restart of core-service during the request would break the job's HTTP call. |
 | 16:55-17:50 | 21:55-22:50 | tier monitoring (17:00, up to 900 s) executes tiers through core-service; market close (17:30, up to 600 s) writes the day's snapshots. A restart or an e2e run in between can break a job or disturb the e2e checks' counters. |
-| 01:55-04:30 (warning only) | 06:55-09:30 | the nightly jobs: review-run (02:00, up to 1800 s), backup (02:30), rag-ingest (03:00, up to 3600 s), logs-cleanup (04:00), purge-unverified (04:10), notification-retention (04:20). A restart of ai-service aborts review-run or rag-ingest, which then sends no heartbeat until the next night (`DailyJobStale` after 26 hours). |
+| 01:55-04:55 (warning only) | 06:55-09:55 | the nightly jobs: review-run (02:00, up to 1800 s), backup (02:30), rag-ingest (03:05, up to 3600 s), logs-cleanup (04:00), purge-unverified (04:10), notification-retention (04:20), deleted-user sweeps (core 04:30, ai 04:40). A restart of ai-service aborts review-run or rag-ingest, which then sends no heartbeat until the next night (`DailyJobStale` after 26 hours). |
 
 `rebuild.sh`, `e2e.sh` and `snapshots.sh` (and their make targets) call
 `guard_busy_window` and stop with `refused: the scheduler is busy now
@@ -868,7 +881,8 @@ and itself. Alert rules (`infra/prometheus/alert_rules.yml`):
 `HighLatencyP95`, `AnalysisFailureRateHigh`, `AnalysisQueueBacklog`,
 `LLMProviderErrorsHigh`, `DailyJobStale` (no success for over 26 hours:
 backup, review-run, rag-ingest, logs-cleanup, purge-unverified,
-notification-retention), `TradingDayJobStale` (over
+notification-retention, deleted-user-sweep-core, deleted-user-sweep-ai),
+`TradingDayJobStale` (over
 100 hours: market-open, market-close, tier-monitoring),
 `MarketCloseSkippedPortfolios` and `OutboxBacklog` (durable events
 waiting in `core.event_outbox` for 15 minutes). The two stale-job alerts
@@ -1023,7 +1037,11 @@ make e2e PART=core ARGS="--verbose"
   WebSockets through `wss://gateway/ws/...`, and reads verification and
   invitation emails from MailHog. Sections: `platform`, `auth`, `roles`,
   `org`, `portfolio`, `apikey`, `documents`, `research`, `realtime`,
-  `yjs`, `analytics`, `backtest`, `analysis`, `admin`, `cleanup`.
+  `yjs`, `analytics`, `backtest`, `analysis`, `admin`, `deletion`,
+  `cleanup`. `deletion` is opt-in: it runs only when named in `--only`
+  (`bash scripts/e2e.sh core --only deletion`); it deletes a throwaway
+  account and calls the two nightly deleted-user sweeps, so do not run it
+  during the nightly jobs.
   `--only` adds a section's prerequisites automatically. Output: one line
   per check (`OK`, `FAIL`, `SKIP`) and a `SUMMARY` line; exit code 1 if a
   check failed. Test data is named `e2e-<runid>-...` / `E2E <runid> ...`
@@ -1220,6 +1238,7 @@ events to search for:
 | `market_open_job_completed`, `market_open_analysis_request_failed`, `market_open_owner_inactive_skipped` | core | the 09:30 job (the last one: a portfolio skipped because its owner is deactivated or deleted) |
 | `tracked_tickers_inactive_owners_skipped` | core | the nightly ingestion's ticker list left out holdings and watchlists of inactive owners |
 | `scheduled_job_all_units_failed` | core, ai | a scheduled run tried at least one item and every item failed; the job answers 500 and gets no heartbeat |
+| `deleted_user_sweep_completed`, `deleted_organization_sweep_completed` | core, ai (organization: core) | a nightly sweep finished, with `candidates`, `deleted`, `cleaned`, `failed`, `lookup_failed`, `refused` |
 
 Example: `bash scripts/logs.sh ai-service grep analysis_marked_failed`.
 
@@ -1273,7 +1292,7 @@ disappears on a server.
 | `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | from `.env.docker` | the object storage's S3 API, used by `backup.sh` and `restore.sh` through rclone | `infra/scheduler/s3-remote.sh` |
 | `RETENTION_DAYS` (log cleanup) | `14` | days of `./logs` kept | `infra/scheduler/logs-cleanup.sh` |
 | `TZ` (scheduler) | `America/New_York` | cron time zone | `infra/scheduler/Dockerfile` |
-| `CORE_SERVICE_URL`, `AI_SERVICE_URL` (scheduler) | `http://core-service:8000`, `http://ai-service:8000` | job targets | `docker-compose.yaml` |
+| `CORE_SERVICE_URL`, `AI_SERVICE_URL`, `AUTH_SERVICE_URL` (scheduler) | `http://core-service:8000`, `http://ai-service:8000`, `http://auth-service:8000` | job targets | `docker-compose.yaml` |
 | Docker log limit | `max-size: 20m`, `max-file: 5` | per container | `docker-compose.yaml` |
 | `ANALYSIS_TIMEOUT_SECONDS` | `2700.0` | hard limit of one analysis | `services/ai-service/config.py` |
 | `ANALYSIS_QUEUE_MAX_PENDING` | `50` | global cap of pending analyses (503) | `services/ai-service/config.py` |
@@ -1339,7 +1358,7 @@ a gateway failure). Every command in this chapter stands alone.
 | A code change has no effect | No auto-reload. | `RESTART_ONLY=1 bash scripts/rebuild.sh <svc>`; then confirm a log line from the new code. |
 | A `.env.docker` change has no effect | `restart` keeps the old environment. | `docker compose --env-file .env.docker up -d --force-recreate <services>`, then read the value back inside the container. |
 | `401 Missing or invalid internal token` in logs, or scheduler jobs fail with curl exit 22 | Containers disagree on `INTERNAL_API_TOKEN` (some not recreated after a change). | Recreate the services and the scheduler together. |
-| A script stops with `refused: the scheduler is busy now` | Inside 09:00-10:30 or 16:55-17:50 New York (01:55-04:30 only warns). | Wait, or `FORCE=1` if you accept the risk. |
+| A script stops with `refused: the scheduler is busy now` | Inside 09:00-10:30 or 16:55-17:50 New York (01:55-04:55 only warns). | Wait, or `FORCE=1` if you accept the risk. |
 | Analyses are `failed` with `service_restart` or `cancelled` | ai-service was restarted or stopped while they were queued or running. | Re-run them; restart only when the queue is empty. |
 | An analysis stays `pending` for a long time | The queue is serial; others are ahead (up to 45 minutes each). | `bash scripts/psql.sh -c "SELECT id, ticker, status, created_at FROM ai.analyses WHERE status IN ('pending', 'running') ORDER BY created_at;"` |
 | Create returns 503 (queue full) or 429 | Global cap of 50 pending analyses, or 3 pending/running per user on the public route. | Wait for the queue to drain. |
@@ -1584,6 +1603,7 @@ one exporter for about two minutes; no data is touched):
 | `services/ai-service/scripts/smoke_check.py` | Smoke checks. |
 | `services/ai-service/scripts/e2e_tier_check.py` | Tier chain end-to-end check. |
 | `services/ai-service/scripts/probe_model_latency.py` | Gemini latency probe. |
+| `services/ai-service/scripts/probe_anthropic_schemas.py` | Anthropic structured-output schema probe (chapter 14). |
 | `services/*/scripts/*.py` | Every Python operator script (index in section 3.5b). |
 | `rag_seed_documents/` | Seed corpus for the RAG store (section 3.2 step 8). |
 | `shared/scheduled_jobs.py` | The 200/500 answer rule of the scheduler-triggered routes. |

@@ -6,7 +6,8 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, AgentOutput, AnalysisState,
                             DebateArgument, DebateSide)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
                          LLMTier)
-from ai.llm.router import LLMRouter
+from ai.llm.router import (LLMRouter, fallback_call_count,
+                           recording_served_models)
 from shared.enums import AgentRole, AgentStatus
 
 logger = structlog.get_logger(__name__)
@@ -18,20 +19,26 @@ def _is_flagged(out: AgentOutput) -> bool:
 
 
 def _evidence_lines(state: AnalysisState, *,
-                    exclude_flagged: bool) -> tuple[list[str], str | None]:
-    if not state.agent_outputs:
-        return [], "(no agent evidence available)"
-    if all(out.status == AgentStatus.FAILED
-           for out in state.agent_outputs.values()):
-        return [], (
-            "(every real research agent failed -- no real evidence "
-            "available; do not attempt to reason about this ticker "
-            "from this real material)")
+                    exclude_flagged: bool) -> list[str]:
+    quarter = latest_quarter(state)
     return [
-        f"- {out.role.value}: {out.summary}{_disclosure_suffix(out)}"
-        for out in state.agent_outputs.values()
+        f"- {out.role.value}: {_evidence_summary(out, quarter)}"
+        f"{_disclosure_suffix(out)}" for out in state.agent_outputs.values()
         if not (exclude_flagged and _is_flagged(out))
-    ], None
+    ]
+
+
+# Fundamental's summary carries the latest-quarter text for the UI and the
+# archived note; in the evidence the code-built line carries it once.
+def _evidence_summary(
+        out: AgentOutput, quarter: dict[str, Any] | None) -> str:
+    if out.role != AgentRole.FUNDAMENTAL or quarter is None:
+        return out.summary
+    text = str(quarter["text"])
+    for appended, rest in ((f"\n\n{text}\n", "\n\n"), (f"\n\n{text}", "")):
+        if appended in out.summary:
+            return out.summary.replace(appended, rest, 1)
+    return out.summary
 
 
 def _disclosure_suffix(out: AgentOutput) -> str:
@@ -47,9 +54,7 @@ def _disclosure_suffix(out: AgentOutput) -> str:
 
 
 def format_evidence(state: AnalysisState) -> str:
-    lines, placeholder = _evidence_lines(state, exclude_flagged=False)
-    if placeholder is not None:
-        return placeholder
+    lines = _evidence_lines(state, exclude_flagged=False)
     flagged_roles = sorted(
         out.role.value for out in state.agent_outputs.values()
         if _is_flagged(out))
@@ -64,9 +69,7 @@ def format_evidence(state: AnalysisState) -> str:
 
 
 def format_grounding_reference(state: AnalysisState) -> str:
-    lines, placeholder = _evidence_lines(state, exclude_flagged=True)
-    if placeholder is not None:
-        return placeholder
+    lines = _evidence_lines(state, exclude_flagged=True)
     lines.extend(_code_built_evidence_lines(state))
     return (
         "\n".join(lines)
@@ -124,7 +127,7 @@ _DOLLAR = r"\$(?:[ \u00a0](?=\d))?"
 _PAREN_AMOUNT = r"\$[ \u00a0]?\(\d[\d,]*(?:\.\d+)?\)"
 _FIGURE_RE = re.compile(
     rf"(?:{_PAREN_AMOUNT}|{_DOLLAR}[\d,]+(?:\.\d+)?)\s*(?:{_SCALE_WORDS})\b"
-    r"|\d+(?:\.\d+)? ?%"
+    r"|\d+(?:\.\d+)?(?: ?%| percent\b)"
     rf"|{_PAREN_AMOUNT}"
     rf"|{_DOLLAR}\d[\d,]*(?:\.\d+)?", re.IGNORECASE)
 _NUMBER = r"\d(?:[\d,]*\d)?(?:\.\d+)?"
@@ -135,6 +138,9 @@ _RANGE_RE = re.compile(
     rf"(?:\s*(?P<scale>{_SCALE_WORDS})\b)?(?!\s?%)"
     rf"|(?<![\w.$\-])(?P<pa>{_NUMBER})%?[-\u2013\u2014]"
     rf"(?P<pb>{_NUMBER})\s?%", re.IGNORECASE)
+
+
+_PERCENT_WORD_RE = re.compile(r" percent$", re.IGNORECASE)
 
 
 def _range_ends(match: re.Match[str]) -> tuple[str, str] | None:
@@ -158,7 +164,8 @@ def _figure_readings(text: str) -> list[tuple[str, str]]:
         readings.extend((match.group(0), end) for end in ends)
         rest[match.start():match.end()] = " " * (match.end() - match.start())
     readings.extend(
-        (m.group(0), m.group(0)) for m in _FIGURE_RE.finditer("".join(rest)))
+        (m.group(0), _PERCENT_WORD_RE.sub("%", m.group(0)))
+        for m in _FIGURE_RE.finditer("".join(rest)))
     return readings
 
 
@@ -314,6 +321,34 @@ def find_ungrounded_figures(argument_text: str,
     return {shown for shown, fig in argument_figures if not _is_grounded(fig)}
 
 
+def scaled_figures_matching_plain_dollars(
+        figures: set[str], evidence_text: str) -> set[str]:
+    dollars: list[_EvidenceNumber] = []
+    for _, figure in _figure_readings(evidence_text):
+        if _is_plain_dollar(figure):
+            try:
+                dollars.append((float(_numeral_core(figure)), 0.0))
+            except ValueError:
+                continue
+    matched: set[str] = set()
+    for shown in figures:
+        readings = _figure_readings(shown)
+        if len(readings) != 1:
+            continue
+        fig = readings[0][1]
+        if not fig.startswith("$") or _scale_multiplier(fig) is None:
+            continue
+        try:
+            value = float(_numeral_core(fig))
+        except ValueError:
+            continue
+        if any(
+                _figure_matches(fig, value, number, FIGURE_MATCH_REL_TOLERANCE)
+                for number in dollars):
+            matched.add(shown)
+    return matched
+
+
 _PLAIN_NUMBER_RE = re.compile(
     r"(?<![\w.\-])\d[\d,]*(?:\.\d+)?(?![\w%]|-\d|\.\d)")
 
@@ -360,6 +395,17 @@ def _ungrounded_issue(figures: set[str]) -> str:
 
 
 async def generate_debate_argument(
+        *, side: DebateSide, state: AnalysisState, llm_router: LLMRouter,
+        llm_tier: LLMTier, system_prompt: str) -> DebateArgument:
+    with recording_served_models() as served:
+        argument = await _generate_debate_argument(
+            side=side, state=state, llm_router=llm_router, llm_tier=llm_tier,
+            system_prompt=system_prompt)
+    return argument.model_copy(
+        update={"fallback_calls": fallback_call_count(served)})
+
+
+async def _generate_debate_argument(
         *, side: DebateSide, state: AnalysisState, llm_router: LLMRouter,
         llm_tier: LLMTier, system_prompt: str) -> DebateArgument:
     round_number = state.debate.round_number + 1

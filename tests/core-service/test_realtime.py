@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
+import httpx
 import pytest
 import yjs_relay
 from database import SessionLocal
@@ -1681,6 +1682,803 @@ class TestEventListener:
                     select(Notification).where(
                         Notification.user_id == UUID(real_user_id)))).one()
             assert notification.title == "A new recommendation is ready"
+
+    async def test_organization_deleted_removes_its_content(
+            self, _schema_ready, published_events, notified_user_calls,
+            monkeypatch):
+        import clients.auth_client as auth_client
+        import event_listener
+        from sqlalchemy import delete
+        from domains.portfolio.model import Portfolio
+        from domains.research.model import (NoteTag, ResearchComment,
+                                            ResearchNote, ResearchTag)
+
+        org, other_org, member = uuid4(), uuid4(), uuid4()
+        colleague, gone, unknown = uuid4(), uuid4(), uuid4()
+        removed_objects: list[str] = []
+
+        async def _settings(user_id):
+            if user_id == str(unknown):
+                raise RuntimeError("auth down")
+            return {"email": None, "deleted": user_id == str(gone)}
+
+        monkeypatch.setattr(
+            auth_client, "get_notification_settings", _settings)
+
+        async def _delete_object(settings, *, bucket, key):
+            removed_objects.append(key)
+
+        async def _recheck(user_id, *, reason, deactivated=False):
+            return 0
+
+        monkeypatch.setattr(event_listener, "delete_object", _delete_object)
+        monkeypatch.setattr(event_listener, "recheck_user_sessions", _recheck)
+
+        def _doc(org_id):
+            return Document(
+                owner_id=member, organization_id=org_id, document_type="txt",
+                filename=f"{uuid4()}.txt", category="news",
+                storage_url=f"k/{uuid4()}")
+
+        org_doc, other_doc, private_doc = (
+            _doc(org), _doc(other_org), _doc(None))
+        org_note = ResearchNote(
+            author_id=member, organization_id=org, title="o")
+        other_note = ResearchNote(
+            author_id=member, organization_id=other_org, title="x")
+        colleague_doc = Document(
+            owner_id=colleague, organization_id=org, document_type="txt",
+            filename=f"{uuid4()}.txt", category="news",
+            storage_url=f"k/{uuid4()}")
+        colleague_note = ResearchNote(
+            author_id=colleague, organization_id=org, title="c")
+        colleague_private = ResearchNote(author_id=colleague, title="p")
+        tag = ResearchTag(name=f"tag-{uuid4().hex[:8]}")
+        shared_pf = Portfolio(
+            owner_id=member, organization_id=org, name="s",
+            visibility="organization")
+        gone_pf = Portfolio(
+            owner_id=gone, organization_id=org, name="g",
+            visibility="organization")
+        unknown_pf = Portfolio(
+            owner_id=unknown, organization_id=org, name="u",
+            visibility="organization")
+        other_pf = Portfolio(
+            owner_id=member, organization_id=other_org, name="x",
+            visibility="organization")
+        async with SessionLocal() as session:
+            session.add_all([
+                org_doc, other_doc, private_doc, org_note, other_note, tag,
+                shared_pf, other_pf, colleague_doc, colleague_note,
+                colleague_private, gone_pf, unknown_pf
+            ])
+            await session.flush()
+            session.add_all([
+                ResearchComment(
+                    note_id=org_note.id, author_id=member, content="c"),
+                NoteTag(note_id=org_note.id, tag_id=tag.id)
+            ])
+            await session.commit()
+
+        payload = _org_payload(
+            organization_id=str(org), member_ids=[str(member)])
+        try:
+            await event_listener._handle_organization_deleted(payload)
+            async with SessionLocal() as session:
+                docs = set((
+                    await session.execute(
+                        select(Document.id).where(
+                            Document.owner_id == member))).scalars().all())
+                notes = set((
+                    await session.execute(
+                        select(ResearchNote.id).where(
+                            ResearchNote.author_id == member)
+                    )).scalars().all())
+                comments = (
+                    await session.execute(
+                        select(ResearchComment.id).where(
+                            ResearchComment.note_id == org_note.id)
+                    )).scalars().all()
+                colleague_docs = (
+                    await session.execute(
+                        select(Document.id).where(
+                            Document.owner_id == colleague))).scalars().all()
+                colleague_notes = (
+                    await session.execute(
+                        select(ResearchNote.id).where(
+                            ResearchNote.author_id == colleague)
+                    )).scalars().all()
+                unshared = [
+                    await session.get(Portfolio, pf.id)
+                    for pf in (shared_pf, unknown_pf)
+                ]
+                kept = await session.get(Portfolio, other_pf.id)
+                assert await session.get(Portfolio, gone_pf.id) is None
+            assert docs == {other_doc.id, private_doc.id}
+            assert notes == {other_note.id} and comments == []
+            assert colleague_docs == [] and colleague_notes == [
+                colleague_private.id
+            ]
+            for portfolio in unshared:
+                assert (portfolio.organization_id, portfolio.visibility) == (
+                    None, "private")
+            assert kept.organization_id == other_org
+            assert sorted(removed_objects) == sorted(
+                [org_doc.storage_url, colleague_doc.storage_url])
+            assert sorted(published_events, key=str) == sorted([
+                ("document.deleted", {
+                    "document_id": str(org_doc.id)
+                }), ("document.deleted", {
+                    "document_id": str(colleague_doc.id)
+                }), ("portfolio.deleted", {
+                    "portfolio_id": str(gone_pf.id),
+                    "user_id": str(gone)
+                })
+            ], key=str)
+            assert _types(notified_user_calls) == ["organization_deleted"]
+
+            published_events.clear()
+            await event_listener._handle_organization_deleted({
+                **payload, "event_id": str(uuid4())
+            })
+            await event_listener._handle_organization_deleted(
+                _org_payload(organization_id="bad"))
+            assert published_events == [] and len(removed_objects) == 2
+        finally:
+            async with SessionLocal() as session:
+                for model, column in ((Document, Document.owner_id),
+                                      (ResearchNote, ResearchNote.author_id),
+                                      (Portfolio, Portfolio.owner_id)):
+                    await session.execute(
+                        delete(model).where(
+                            column.in_([member, colleague, gone, unknown])))
+                await session.execute(
+                    delete(ResearchTag).where(ResearchTag.id == tag.id))
+                await session.commit()
+
+    async def test_no_notification_for_a_deleted_user(
+            self, _schema_ready, monkeypatch):
+        import clients.auth_client as auth_client
+        import domains.notification.service as notification_service
+
+        pushed: list[str] = []
+        answers: list[Any] = [{
+            "email": None,
+            "deleted": True,
+            "notification_preferences": None
+        }, RuntimeError("auth down")]
+
+        async def _settings(user_id):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        async def _broadcast(channel, envelope, **kwargs):
+            pushed.append(channel)
+
+        monkeypatch.setattr(
+            auth_client, "get_notification_settings", _settings)
+        monkeypatch.setattr(
+            notification_service.manager, "broadcast", _broadcast)
+        user_id = uuid4()
+
+        async def _rows():
+            async with SessionLocal() as session:
+                return (
+                    await session.execute(
+                        select(Notification.id).where(
+                            Notification.user_id == user_id)
+                    )).scalars().all()
+
+        await notification_service.notify_user(
+            user_id=user_id, type="tier_cancelled", title="t", content="c")
+        assert await _rows() == [] and pushed == []
+        await notification_service.notify_user(
+            user_id=user_id, type="tier_cancelled", title="t", content="c")
+        assert len(await _rows()) == 1 and pushed == [f"user:{user_id}"]
+        from sqlalchemy import delete
+
+        async with SessionLocal() as session:
+            await session.execute(
+                delete(Notification).where(Notification.user_id == user_id))
+            await session.commit()
+
+    async def test_user_deleted_removes_only_private_data(
+            self, _schema_ready, published_events, monkeypatch):
+        from decimal import Decimal
+        import event_listener
+        from apikeys import ApiKey
+        from sqlalchemy import delete
+        from domains.portfolio.model import (Holding, Portfolio, Watchlist,
+                                             WatchlistItem)
+        from domains.research.model import (NoteTag, ResearchComment,
+                                            ResearchNote, ResearchTag)
+
+        user, other, org = uuid4(), uuid4(), uuid4()
+        removed_objects: list[str] = []
+
+        async def _delete_object(settings, *, bucket, key):
+            removed_objects.append(key)
+
+        async def _recheck(user_id, *, reason, deactivated=False):
+            return 0
+
+        monkeypatch.setattr(event_listener, "delete_object", _delete_object)
+        monkeypatch.setattr(event_listener, "recheck_user_sessions", _recheck)
+
+        def _doc(org_id):
+            return Document(
+                owner_id=user, organization_id=org_id, document_type="txt",
+                filename=f"{uuid4()}.txt", category="news",
+                storage_url=f"k/{uuid4()}")
+
+        private_doc, org_doc = _doc(None), _doc(org)
+        private_note = ResearchNote(author_id=user, title="mine")
+        org_note = ResearchNote(author_id=user, organization_id=org, title="o")
+        others_note = ResearchNote(
+            author_id=other, organization_id=org, title="theirs")
+        tag = ResearchTag(name=f"tag-{uuid4().hex[:8]}")
+
+        def _portfolio(org_id, visibility):
+            return Portfolio(
+                owner_id=user, organization_id=org_id, name="p",
+                visibility=visibility)
+
+        private_pf = _portfolio(None, "private")
+        others_doc = Document(
+            owner_id=other, document_type="txt", filename=f"{uuid4()}.txt",
+            category="news", storage_url=f"k/{uuid4()}")
+        others_private_note = ResearchNote(author_id=other, title="private")
+        others_pf = Portfolio(owner_id=other, name="p", visibility="private")
+        hidden_org_pf = _portfolio(org, "private")
+        shared_pf = _portfolio(org, "organization")
+        watchlist = Watchlist(owner_id=user, name="w")
+        async with SessionLocal() as session:
+            session.add_all([
+                private_doc, org_doc, private_note, org_note, others_note, tag,
+                private_pf, hidden_org_pf, shared_pf, watchlist, others_doc,
+                others_private_note, others_pf
+            ])
+            await session.flush()
+            session.add_all([
+                ResearchComment(
+                    note_id=private_note.id, author_id=user, content="c"),
+                ResearchComment(
+                    note_id=others_note.id, author_id=user, content="kept"),
+                NoteTag(note_id=private_note.id, tag_id=tag.id),
+                Holding(
+                    portfolio_id=private_pf.id, ticker="AMD",
+                    quantity=Decimal(1), average_cost=Decimal(1)),
+                WatchlistItem(watchlist_id=watchlist.id, ticker="AMD"),
+                ApiKey(
+                    owner_user_id=user, name="k", key_hash=uuid4().hex,
+                    rate_limit_per_minute=10),
+                Notification(user_id=user, type="x", title="mine"),
+                Notification(user_id=other, type="x", title="theirs")
+            ])
+            await session.commit()
+
+        async def _ids(model, column, value):
+            async with SessionLocal() as session:
+                return set((
+                    await session.execute(
+                        select(model.id).where(column == value)
+                    )).scalars().all())
+
+        payload = {"user_id": str(user), "actor_id": str(user)}
+        try:
+            await event_listener._handle_user_deleted(payload)
+            assert await _ids(Document, Document.owner_id, user) == {
+                org_doc.id
+            }
+            assert await _ids(ResearchNote, ResearchNote.author_id, user) == {
+                org_note.id
+            }
+            assert len(await _ids(
+                ResearchComment, ResearchComment.author_id, user)) == 1
+            assert await _ids(Portfolio, Portfolio.owner_id, user) == {
+                shared_pf.id
+            }
+            for model, column in ((Watchlist, Watchlist.owner_id),
+                                  (ApiKey, ApiKey.owner_user_id),
+                                  (Notification, Notification.user_id)):
+                assert await _ids(model, column, user) == set(), model
+            assert len(await _ids(
+                Notification, Notification.user_id, other)) == 1
+            assert await _ids(Document, Document.owner_id, other) == {
+                others_doc.id
+            }
+            assert await _ids(
+                ResearchNote, ResearchNote.author_id,
+                other) == {others_note.id, others_private_note.id}
+            assert await _ids(Portfolio, Portfolio.owner_id, other) == {
+                others_pf.id
+            }
+            assert removed_objects == [private_doc.storage_url]
+            expected = [("document.deleted", {
+                "document_id": str(private_doc.id)
+            })] + [("portfolio.deleted", {
+                "portfolio_id": str(pf.id),
+                "user_id": str(user)
+            }) for pf in (private_pf, hidden_org_pf)]
+            assert sorted(published_events, key=str) == sorted(
+                expected, key=str)
+
+            published_events.clear()
+            await event_listener._handle_user_deleted(payload)
+            await event_listener._handle_user_deleted({"user_id": "bad"})
+            assert published_events == [] and removed_objects == [
+                private_doc.storage_url
+            ]
+        finally:
+            async with SessionLocal() as session:
+                for model, column in (
+                        (Document, Document.owner_id),
+                        (ResearchNote, ResearchNote.author_id),
+                        (Portfolio, Portfolio.owner_id)):
+                    for owner in (user, other):
+                        await session.execute(
+                            delete(model).where(column == owner))
+                await session.execute(
+                    delete(Notification).where(Notification.user_id == other))
+                await session.execute(
+                    delete(ResearchTag).where(ResearchTag.id == tag.id))
+                await session.commit()
+
+    async def test_deleted_user_sweep_cleans_leftovers_of_deleted_users(
+            self, client, published_events, monkeypatch):
+        import event_listener
+        import shared.deleted_users as deleted_users
+        from sqlalchemy import delete
+        from domains.portfolio.model import Portfolio, Watchlist
+        from domains.research.model import ResearchNote
+
+        failing, deleted, live, org_only = uuid4(), uuid4(), uuid4(), uuid4()
+        org = uuid4()
+        live_rows = [
+            ResearchNote(author_id=live, title="kept"),
+            Document(
+                owner_id=live, document_type="txt",
+                filename=f"{uuid4()}.txt", category="news",
+                storage_url=f"k/{uuid4()}"),
+            Portfolio(owner_id=live, name="p", visibility="private"),
+            Watchlist(owner_id=live, name="w")
+        ]
+        async with SessionLocal() as session:
+            session.add_all([
+                ResearchNote(author_id=failing, title="left"),
+                ResearchNote(author_id=deleted, title="left"),
+                Notification(user_id=deleted, type="x", title="late"),
+                ResearchNote(author_id=org_only, organization_id=org,
+                             title="org"), *live_rows
+            ])
+            await session.commit()
+
+        async def _live_rows_left():
+            async with SessionLocal() as session:
+                return [
+                    await session.get(type(row), row.id) is not None
+                    for row in live_rows
+                ]
+
+        asked: list[set[UUID]] = []
+
+        async def _deleted_ids(settings, user_ids):
+            candidates = set(user_ids)
+            asked.append(candidates)
+            return candidates & {failing, deleted, org_only}
+
+        real_delete_watchlists = event_listener._delete_watchlists
+
+        async def _delete_watchlists(session, user_id):
+            if user_id == failing:
+                raise RuntimeError("database hiccup")
+            return await real_delete_watchlists(session, user_id)
+
+        monkeypatch.setattr(deleted_users, "deleted_user_ids", _deleted_ids)
+        monkeypatch.setattr(
+            event_listener, "_delete_watchlists", _delete_watchlists)
+
+        async def _no_missing_organizations(settings, organization_ids):
+            return set()
+
+        monkeypatch.setattr(
+            event_listener, "missing_organization_ids",
+            _no_missing_organizations)
+
+        async def _notes(author):
+            async with SessionLocal() as session:
+                return (await session.execute(
+                    select(ResearchNote.title).where(
+                        ResearchNote.author_id == author))).scalars().all()
+
+        url = "/internal/scheduler/deleted-user-sweep"
+        try:
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert {key: body[key]
+                    for key in ("candidates", "deleted", "cleaned", "failed")
+                    } == {
+                        "candidates": len(asked[0]),
+                        "deleted": 2,
+                        "cleaned": 1,
+                        "failed": 1
+                    }
+            assert body["organizations"]["deleted"] == 0
+            assert {failing, deleted, live} <= asked[0]
+            assert org_only not in asked[0]
+            assert await _notes(failing) == []
+            assert await _notes(deleted) == []
+            assert await _notes(live) == ["kept"]
+            assert await _live_rows_left() == [True] * 4
+            assert await _notes(org_only) == ["org"]
+            async with SessionLocal() as session:
+                assert (await session.execute(
+                    select(Notification.id).where(
+                        Notification.user_id == deleted))).first() is None
+
+            monkeypatch.setattr(
+                event_listener, "_delete_watchlists", real_delete_watchlists)
+            asked.clear()
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            assert r.json()["deleted"] == 0
+            assert not {failing, deleted} & asked[0]
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ResearchNote).where(
+                        ResearchNote.author_id.in_([live, org_only])))
+                for model in (Document, Portfolio, Watchlist):
+                    await session.execute(
+                        delete(model).where(model.owner_id == live))
+                await session.commit()
+
+    async def test_user_lookup_error_deletes_nothing_and_fails_the_job(
+            self, client, published_events, monkeypatch):
+        import event_listener
+        import shared.deleted_users as deleted_users
+        from sqlalchemy import delete
+        from domains.research.model import ResearchNote
+
+        user = uuid4()
+        async with SessionLocal() as session:
+            session.add(ResearchNote(author_id=user, title="left"))
+            await session.commit()
+
+        async def _auth_down(settings, ids):
+            raise httpx.ConnectError("auth down")
+
+        organization_lookups: list[int] = []
+
+        async def _no_missing_organizations(settings, organization_ids):
+            organization_lookups.append(1)
+            return set()
+
+        monkeypatch.setattr(deleted_users, "deleted_user_ids", _auth_down)
+        monkeypatch.setattr(
+            event_listener, "missing_organization_ids",
+            _no_missing_organizations)
+        try:
+            r = await client.post("/internal/scheduler/deleted-user-sweep")
+            assert r.status_code == 500
+            body = r.json()
+            assert body["all_units_failed"] == ["users_lookup"]
+            assert body["lookup_failed"] is True and body["deleted"] == 0
+            assert body["organizations"]["lookup_failed"] is False
+            assert organization_lookups == [1]
+            async with SessionLocal() as session:
+                assert (await session.execute(
+                    select(ResearchNote.id).where(
+                        ResearchNote.author_id == user))).first()
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ResearchNote).where(ResearchNote.author_id == user))
+                await session.commit()
+
+    async def test_organization_sweep_safety_brake_deletes_nothing(
+            self, client, published_events, monkeypatch):
+        import event_listener
+        import shared.deleted_users as deleted_users
+        from config import settings
+        from sqlalchemy import delete
+        from domains.research.model import ResearchNote
+
+        author, orgs = uuid4(), [uuid4() for _ in range(3)]
+        async with SessionLocal() as session:
+            session.add_all([
+                ResearchNote(author_id=author, organization_id=org, title="n")
+                for org in orgs
+            ])
+            await session.commit()
+
+        async def _no_deleted_users(settings, user_ids):
+            return set()
+
+        async def _all_missing(settings, organization_ids):
+            return set(organization_ids)
+
+        monkeypatch.setattr(
+            deleted_users, "deleted_user_ids", _no_deleted_users)
+        monkeypatch.setattr(
+            event_listener, "missing_organization_ids", _all_missing)
+        monkeypatch.setattr(settings, "ORGANIZATION_SWEEP_MAX_MISSING", 1000)
+
+        async def _notes_left():
+            async with SessionLocal() as session:
+                return len((await session.execute(
+                    select(ResearchNote.id).where(
+                        ResearchNote.author_id == author))).all())
+
+        url = "/internal/scheduler/deleted-user-sweep"
+        try:
+            r = await client.post(url)
+            assert r.status_code == 500
+            assert r.json()["all_units_failed"] == [
+                "organizations_safety_brake"
+            ]
+            orgs_body = r.json()["organizations"]
+            assert orgs_body["refused"] is True
+            assert orgs_body["cleaned"] == 0
+            assert await _notes_left() == 3
+
+            async def _all_but_one_missing(settings, organization_ids):
+                return set(organization_ids) - {orgs[0]}
+
+            monkeypatch.setattr(
+                event_listener, "missing_organization_ids",
+                _all_but_one_missing)
+            monkeypatch.setattr(settings, "ORGANIZATION_SWEEP_MAX_MISSING", 1)
+            r = await client.post(url)
+            assert r.status_code == 500
+            assert r.json()["organizations"]["refused"] is True
+            assert await _notes_left() == 3
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ResearchNote).where(
+                        ResearchNote.author_id == author))
+                await session.commit()
+
+    async def test_organization_safety_brake_rule(self, monkeypatch):
+        import event_listener
+        from config import settings
+
+        monkeypatch.setattr(settings, "ORGANIZATION_SWEEP_MAX_MISSING", 5)
+        brake = event_listener._too_many_missing
+        assert not brake(1, 3)
+        assert not brake(1, 1)
+        assert not brake(5, 100)
+        assert brake(3, 3)
+        assert brake(6, 100)
+
+    async def test_sweep_cleans_content_of_deleted_organizations(
+            self, client, published_events, monkeypatch):
+        import event_listener
+        from sqlalchemy import delete
+        from domains.research.model import ResearchNote
+
+        gone_org, live_org, author = uuid4(), uuid4(), uuid4()
+        async with SessionLocal() as session:
+            session.add_all([
+                ResearchNote(
+                    author_id=author, organization_id=org, title="n")
+                for org in (gone_org, live_org)
+            ])
+            await session.commit()
+
+        asked: list[set[UUID]] = []
+        answer: dict[str, Any] = {"missing": {gone_org}}
+
+        async def _missing(settings, organization_ids):
+            asked.append(set(organization_ids))
+            if answer["missing"] is None:
+                raise httpx.ConnectError("auth down")
+            return set(organization_ids) & answer["missing"]
+
+        async def _no_deleted_users(settings, user_ids):
+            return set()
+
+        import shared.deleted_users as deleted_users
+
+        monkeypatch.setattr(
+            deleted_users, "deleted_user_ids", _no_deleted_users)
+        monkeypatch.setattr(event_listener, "missing_organization_ids",
+                            _missing)
+
+        async def _org_notes(org):
+            async with SessionLocal() as session:
+                return (await session.execute(
+                    select(ResearchNote.id).where(
+                        ResearchNote.organization_id == org))).all()
+
+        url = "/internal/scheduler/deleted-user-sweep"
+        try:
+            answer["missing"] = None
+            r = await client.post(url)
+            assert r.status_code == 500
+            assert r.json()["all_units_failed"] == ["organizations_lookup"]
+            assert r.json()["organizations"]["lookup_failed"] is True
+            assert len(await _org_notes(gone_org)) == 1
+
+            answer["missing"] = {gone_org}
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            orgs = r.json()["organizations"]
+            assert (orgs["deleted"], orgs["cleaned"], orgs["failed"]) == (
+                1, 1, 0)
+            assert {gone_org, live_org} <= asked[-1]
+            assert await _org_notes(gone_org) == []
+            assert len(await _org_notes(live_org)) == 1
+
+            r = await client.post(url)
+            assert r.json()["organizations"]["deleted"] == 0
+            assert gone_org not in asked[-1]
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ResearchNote).where(
+                        ResearchNote.author_id == author))
+                await session.commit()
+
+    async def test_missing_organization_ids_skips_on_auth_error(
+            self, monkeypatch):
+        import shared.deleted_users as deleted_users
+        from config import settings
+
+        class _Http:
+
+            async def post(self, url, json):
+                assert url.endswith("/internal/organizations/missing")
+                return httpx.Response(
+                    503, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(
+            deleted_users, "get_http_client", lambda timeout: _Http())
+        with pytest.raises(httpx.HTTPStatusError):
+            await deleted_users.missing_organization_ids(settings, [uuid4()])
+
+    async def test_sweep_deletes_unreferenced_files_of_deleted_users(
+            self, client, published_events, monkeypatch):
+        import event_listener
+        import shared.deleted_users as deleted_users
+        from sqlalchemy import delete
+        from domains.research.service import document_key_prefix
+
+        gone, kept_only, live = uuid4(), uuid4(), uuid4()
+        kept_key = f"{document_key_prefix(gone)}shared.txt"
+        kept_only_key = f"{document_key_prefix(kept_only)}shared.txt"
+        live_key = f"{document_key_prefix(live)}mine.txt"
+        files = {
+            f"{document_key_prefix(gone)}lost.pdf", kept_key, kept_only_key,
+            live_key, "documents/not-a-user/x.txt"
+        }
+        kept = files - {f"{document_key_prefix(gone)}lost.pdf"}
+        async with SessionLocal() as session:
+            session.add_all([
+                Document(
+                    owner_id=owner, organization_id=uuid4(),
+                    document_type="txt", filename=f"{uuid4()}.txt",
+                    category="news", storage_url=key)
+                for owner, key in ((gone, kept_key),
+                                   (kept_only, kept_only_key))
+            ])
+            await session.commit()
+
+        async def _list(settings, *, bucket, prefix):
+            return sorted(key for key in files if key.startswith(prefix))
+
+        async def _delete_object(settings, *, bucket, key):
+            files.discard(key)
+
+        asked: list[set[UUID]] = []
+
+        async def _deleted_ids(settings, user_ids):
+            asked.append(set(user_ids))
+            return set(user_ids) & {gone, kept_only}
+
+        async def _no_missing_organizations(settings, organization_ids):
+            return set()
+
+        monkeypatch.setattr(event_listener, "list_object_keys", _list)
+        monkeypatch.setattr(event_listener, "delete_object", _delete_object)
+        monkeypatch.setattr(deleted_users, "deleted_user_ids", _deleted_ids)
+        monkeypatch.setattr(
+            event_listener, "missing_organization_ids",
+            _no_missing_organizations)
+        url = "/internal/scheduler/deleted-user-sweep"
+        try:
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            assert {gone, live} <= asked[0] and kept_only not in asked[0]
+            assert r.json()["failed"] == 0
+            assert files == kept
+            asked.clear()
+            r = await client.post(url)
+            assert r.status_code == 200, r.text
+            assert not {gone, kept_only} & asked[0]
+            assert files == kept
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(Document).where(
+                        Document.owner_id.in_([gone, kept_only])))
+                await session.commit()
+
+    async def test_clean_organizations_script_touches_only_missing_ones(
+            self, monkeypatch, capsys):
+        import scripts.clean_organizations as script
+
+        gone, alive = uuid4(), uuid4()
+        cleaned: list[UUID] = []
+
+        async def _missing(settings, organization_ids):
+            return set(organization_ids) - {alive}
+
+        async def _clean(organization_id, *, strict=False):
+            assert strict is True
+            cleaned.append(organization_id)
+            return {"documents": 1}
+
+        monkeypatch.setattr(script, "missing_organization_ids", _missing)
+        monkeypatch.setattr(script, "delete_organization_content", _clean)
+        assert await script.clean([gone, alive], confirm=False) == 0
+        assert cleaned == []
+        assert await script.clean([gone, alive], confirm=True) == 0
+        assert cleaned == [gone]
+        out = capsys.readouterr().out
+        assert f"{alive}: still exists in auth, skipped" in out
+
+    async def test_failed_candidate_query_still_runs_organization_sweep(
+            self, client, published_events, monkeypatch):
+        import event_listener
+
+        async def _broken():
+            raise RuntimeError("database hiccup")
+
+        organization_lookups: list[int] = []
+
+        async def _no_missing_organizations(settings, organization_ids):
+            organization_lookups.append(1)
+            return set()
+
+        monkeypatch.setattr(event_listener, "users_with_private_data", _broken)
+        monkeypatch.setattr(
+            event_listener, "missing_organization_ids",
+            _no_missing_organizations)
+        r = await client.post("/internal/scheduler/deleted-user-sweep")
+        assert r.status_code == 500
+        body = r.json()
+        assert body["all_units_failed"] == ["users_lookup"]
+        assert body["lookup_failed"] is True
+        assert "users_safety_brake" not in str(body)
+        assert organization_lookups == [1]
+
+    async def test_deleted_user_ids_asks_auth_in_batches(self, monkeypatch):
+        import shared.deleted_users as deleted_users
+        from config import settings
+
+        sent: list[list[str]] = []
+
+        class _Http:
+
+            async def post(self, url, json):
+                assert url.endswith("/internal/users/deleted")
+                sent.append(json["user_ids"])
+                return httpx.Response(
+                    200, json={"deleted_ids": json["user_ids"][:1]},
+                    request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(deleted_users, "DELETED_USERS_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            deleted_users, "get_http_client", lambda timeout: _Http())
+        ids = [uuid4() for _ in range(5)]
+        found = await deleted_users.deleted_user_ids(settings, ids + ids[:1])
+        assert [len(batch) for batch in sent] == [2, 2, 1]
+        assert found == {UUID(batch[0]) for batch in sent}
 
 
 class TestCrossServiceEvents:

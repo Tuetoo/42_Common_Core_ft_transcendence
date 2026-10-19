@@ -3,7 +3,7 @@ from typing import Any
 import structlog
 from ai.agents.finish_checks import InternalTokenValidator
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            is_thin_evidence)
+                            is_thin_evidence, tool_reported_error)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier,
                          parse_json_dict)
@@ -142,6 +142,16 @@ _SENTIMENT_VALIDATION_SUFFIX = (
     "then set finish_answer again.")
 
 
+def _own_searches_all_failed(scratchpad: list[ScratchpadEntry]) -> bool:
+    searches = [
+        e for e in scratchpad
+        if e.action == SearchNewsTool.name and e.is_tool_result
+    ]
+    return bool(searches) and all(
+        e.tool_error or tool_reported_error(str(e.observation or ""))
+        for e in searches)
+
+
 def _news_fallback_unverified(news_output: AgentOutput | None) -> bool:
     raw = news_output.raw_output if news_output is not None else None
     return isinstance(raw, dict) and bool(
@@ -247,7 +257,12 @@ class SentimentAgent(BaseAgent):
         sentiment_label = (
             None if no_evidence else _extract_sentiment_label(
                 result.final_answer))
-        if sentiment_label is None and not no_evidence:
+        if (sentiment_label is None and not no_evidence
+                and _own_searches_all_failed(result.scratchpad)):
+            logger.info(
+                "sentiment.no_label_after_failed_searches",
+                ticker=state.ticker)
+        elif sentiment_label is None and not no_evidence:
             sentiment_label = await _classify_sentiment_label(
                 self.llm_router, result.final_answer, state.ticker)
             if sentiment_label is not None:

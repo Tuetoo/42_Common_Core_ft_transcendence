@@ -5,7 +5,9 @@ import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
 import { moderateContent } from "@/app/lib/actions/admin";
-import { Pager, pageParam } from "../../pager";
+import { UUID_RE } from "@/app/lib/format";
+import type { Paginated } from "@/app/(protected)/research/types";
+import { Pager, firstParam, pageParam } from "../../pager";
 import { ActionButton } from "../inline-actions";
 import { ModerateByIdForm } from "./moderate-by-id-form";
 
@@ -28,16 +30,9 @@ type Comment = {
   is_hidden: boolean;
 };
 
-type Paginated<T> = { items: T[]; total: number; page: number; page_size: number };
-
 type SearchParams = Record<string, string | string[] | undefined>;
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PAGE_SIZE = 20;
-
-function first(value: string | string[] | undefined): string {
-  return (Array.isArray(value) ? value[0] : value) ?? "";
-}
 
 function HiddenPill({ hidden }: { hidden: boolean }) {
   return hidden ? <span className="pill pill-down">hidden</span> : <span className="pill pill-up">visible</span>;
@@ -69,9 +64,9 @@ export default async function ModerationPage({ searchParams }: { searchParams: P
   if (!can(me, "content:moderate")) notFound();
 
   const sp = await searchParams;
-  const q = first(sp.q).slice(0, 200);
+  const q = firstParam(sp.q).slice(0, 200);
   const page = pageParam(sp.page);
-  const noteId = UUID_RE.test(first(sp.note)) ? first(sp.note) : "";
+  const noteId = UUID_RE.test(firstParam(sp.note)) ? firstParam(sp.note) : "";
 
   const query = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
   if (q) query.set("q", q);

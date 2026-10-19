@@ -1,17 +1,19 @@
 import asyncio
 import contextlib
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextvars import ContextVar
 from typing import Any
 import structlog
 from ai.agents.evidence_grounding import non_english_reason_in_output
 from ai.llm.anthropic_provider import AnthropicAdapter
 from ai.llm.base import (ConcurrencyGate, LLMConfigError, LLMError,
                          LLMInvalidRequestError, LLMMessage,
-                         LLMNonEnglishOutputError, LLMProviderAdapter,
-                         LLMProviderTimeoutError, LLMRateLimitError,
-                         LLMRequestError, LLMRequestTimeoutError,
-                         LLMResponse, LLMServerOverloadedError, LLMTier,
+                         LLMNonEnglishOutputError, LLMOutputExhaustedError,
+                         LLMProviderAdapter, LLMProviderTimeoutError,
+                         LLMRateLimitError, LLMRequestError,
+                         LLMRequestTimeoutError, LLMResponse,
+                         LLMServerOverloadedError, LLMTier,
                          rate_limit_backoff_seconds, request_pacer)
 from ai.llm.google_provider import (GOOGLE_LITE_COOLDOWN_DEFAULT_WAIT_SECONDS,
                                     GoogleAdapter, google_is_lite_model,
@@ -30,7 +32,8 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_SECONDS = 0.5
 
-_GOOGLE_TIMEOUT_RETRIES = 1
+_TIMEOUT_RETRIES = 1
+_OUTPUT_EXHAUSTED_RETRIES = 1
 _GOOGLE_LITE_COOLDOWN_JITTER_SECONDS = 3.0
 
 
@@ -39,10 +42,12 @@ def router_retry_limit(
         retries: int) -> int:
     if isinstance(exc, LLMInvalidRequestError):
         return 0
+    if isinstance(exc, LLMOutputExhaustedError):
+        return min(retries, _OUTPUT_EXHAUSTED_RETRIES)
+    if isinstance(exc, LLMProviderTimeoutError):
+        return min(retries, _TIMEOUT_RETRIES)
     if provider_name != "google":
         return retries
-    if isinstance(exc, LLMProviderTimeoutError):
-        return min(retries, _GOOGLE_TIMEOUT_RETRIES)
     if google_is_lite_model(model) and isinstance(exc, LLMRateLimitError):
         return 0
     return retries
@@ -65,6 +70,25 @@ async def _google_lite_cooldown_wait(model: str) -> float | None:
     if wait > max_wait:
         return None
     return wait + random.uniform(0.0, _GOOGLE_LITE_COOLDOWN_JITTER_SECONDS)
+
+
+ServedCall = tuple[str, bool]
+_served_calls: ContextVar[list[ServedCall] | None] = ContextVar(
+    "llm_served_calls", default=None)
+
+
+@contextlib.contextmanager
+def recording_served_models() -> Iterator[list[ServedCall]]:
+    calls: list[ServedCall] = []
+    token = _served_calls.set(calls)
+    try:
+        yield calls
+    finally:
+        _served_calls.reset(token)
+
+
+def fallback_call_count(calls: list[ServedCall]) -> int:
+    return sum(1 for _, by_fallback in calls if by_fallback)
 
 
 def _sent_nothing(exc: LLMRequestError) -> bool:
@@ -184,8 +208,8 @@ def _fallback_model(provider_name: str, tier: LLMTier,
     return fallback if fallback and fallback != primary else None
 
 
-def tier_model_chain(tier: LLMTier, provider: str | None = None) -> list[str]:
-    provider_name = provider or settings.LLM_DEFAULT_PROVIDER
+def tier_model_chain(tier: LLMTier) -> list[str]:
+    provider_name = settings.LLM_DEFAULT_PROVIDER
     primary = _tier_model_map().get(provider_name, {}).get(tier)
     if not primary:
         return []
@@ -246,9 +270,8 @@ class LLMRouter:
         self._providers = (
             providers if providers is not None else _DEFAULT_PROVIDERS)
 
-    def _resolve(self, tier: LLMTier,
-                 provider: str | None) -> tuple[LLMProviderAdapter, str]:
-        provider_name = provider or settings.LLM_DEFAULT_PROVIDER
+    def _resolve(self, tier: LLMTier) -> tuple[LLMProviderAdapter, str]:
+        provider_name = settings.LLM_DEFAULT_PROVIDER
         adapter = self._providers.get(provider_name)
         if adapter is None:
             raise LLMConfigError(
@@ -264,14 +287,14 @@ class LLMRouter:
 
     async def complete(
             self, tier: LLMTier, messages: list[LLMMessage], *,
-            provider: str | None = None, temperature: float = 0.2,
-            max_tokens: int = 1024, retries: int = 1,
+            temperature: float = 0.2, max_tokens: int = 1024,
+            retries: int = 1,
             response_format: str | None = None,
             timeout_seconds: float | None = None,
             response_schema: dict[str, Any] | None = None,
             thinking_budget: int | None = None) -> LLMResponse:
-        provider_name = provider or settings.LLM_DEFAULT_PROVIDER
-        adapter, model = self._resolve(tier, provider)
+        provider_name = settings.LLM_DEFAULT_PROVIDER
+        adapter, model = self._resolve(tier)
         fallback = _fallback_model(provider_name, tier, model)
         is_google = provider_name == "google"
 
@@ -295,6 +318,9 @@ class LLMRouter:
                     response.rate_limited = True
                 _reject_non_english(
                     response, provider_name=provider_name, tier=tier)
+                served = _served_calls.get()
+                if served is not None:
+                    served.append((response.model, is_fallback))
                 return response
 
             async def _lite_cooldown_retry(
@@ -414,9 +440,9 @@ class LLMRouter:
 
     async def stream(
             self, tier: LLMTier, messages: list[LLMMessage], *,
-            provider: str | None = None, temperature: float = 0.2,
+            temperature: float = 0.2,
             max_tokens: int = 1024) -> AsyncIterator[str]:
-        adapter, model = self._resolve(tier, provider)
+        adapter, model = self._resolve(tier)
         stream = adapter.stream(
             messages, model=model, temperature=temperature,
             max_tokens=max_tokens)
@@ -426,7 +452,8 @@ class LLMRouter:
         except LLMError:
             raise
         except Exception as exc:
-            adapter_name = getattr(adapter, "name", provider)
+            adapter_name = getattr(
+                adapter, "name", settings.LLM_DEFAULT_PROVIDER)
             raise LLMRequestError(
                 f"{adapter_name} streaming failed for model {model!r}: "
                 f"{type(exc).__name__}: {str(exc)[:200]}") from exc
@@ -436,5 +463,5 @@ class LLMRouter:
                 with contextlib.suppress(Exception):
                     await close()
 
-    def resolve_model(self, tier: LLMTier, provider: str | None = None) -> str:
-        return self._resolve(tier, provider)[1]
+    def resolve_model(self, tier: LLMTier) -> str:
+        return self._resolve(tier)[1]

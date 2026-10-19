@@ -102,7 +102,7 @@ class SocialService:
             raise PermissionDeniedError(
                 "You are not a participant in this connection.")
         if (connection.status == ConnectionStatus.BLOCKED
-                and connection.blocked_by not in (None, current_user_id)):
+                and connection.blocked_by != current_user_id):
             raise PermissionDeniedError("This connection is blocked.")
         was_blocked = connection.status == ConnectionStatus.BLOCKED
         connection.status = ConnectionStatus.BLOCKED
@@ -126,7 +126,6 @@ class SocialService:
             raise PermissionDeniedError(
                 "You are not a participant in this connection.")
         if (connection.status == ConnectionStatus.BLOCKED
-                and connection.blocked_by is not None
                 and connection.blocked_by != current_user_id):
             raise PermissionDeniedError(
                 "Only the user who blocked this connection can remove it.")

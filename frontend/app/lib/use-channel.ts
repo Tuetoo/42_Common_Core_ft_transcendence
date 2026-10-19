@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState, useSyncExternalStore } from "react";
 import { closeSocket, wsUrl } from "./ws-url";
 
 // Close codes from services/core-service/websocket_manager.py.
@@ -207,4 +207,23 @@ export function useUserEvents(handler: (envelope: ChannelEnvelope) => void): voi
     window.addEventListener(USER_EVENT, listener);
     return () => window.removeEventListener(USER_EVENT, listener);
   }, []);
+}
+
+// The badge socket's status, kept here so a page can show a live
+// indicator for the user: channel without opening a socket of its own.
+const USER_STATUS_EVENT = "alphamind:user-status";
+let userChannelStatus: ChannelStatus = "connecting";
+
+export function publishUserChannelStatus(status: ChannelStatus): void {
+  userChannelStatus = status;
+  window.dispatchEvent(new Event(USER_STATUS_EVENT));
+}
+
+function subscribeUserStatus(onChange: () => void): () => void {
+  window.addEventListener(USER_STATUS_EVENT, onChange);
+  return () => window.removeEventListener(USER_STATUS_EVENT, onChange);
+}
+
+export function useUserChannelStatus(): ChannelStatus {
+  return useSyncExternalStore(subscribeUserStatus, () => userChannelStatus, () => "connecting");
 }

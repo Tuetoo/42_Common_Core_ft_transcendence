@@ -9,9 +9,9 @@
 # 200 {"skipped": true, "reason": ...} without doing any work, and
 # call-job.sh logs that answer. Early-close days (13:00 close) are treated
 # as normal trading days: the after-close jobs simply run later than
-# needed. review-run, rag-ingest, backup, logs-cleanup, purge-unverified
-# and notification-retention run every day on purpose (see their comments
-# below).
+# needed. review-run, rag-ingest, backup, logs-cleanup, purge-unverified,
+# notification-retention and the two deleted-user sweeps run every day on
+# purpose (see their comments below).
 #
 # Output: every job writes to the container's own
 # stdout/stderr (/proc/1/fd/1, /proc/1/fd/2 -- PID 1 is entrypoint.sh,
@@ -27,14 +27,15 @@
 # tier monitoring (5:00 PM, below), because tier monitoring can execute
 # triggered recommendation tiers into the portfolios' transaction ledger,
 # and those trades must be in the day's snapshot. By 5:30 PM the provider's final end-of-day bar is also
-# settled. Tier monitoring has a 900 s time limit
-# (call-job.sh), so it has finished before this starts.
+# settled. call-job.sh gives up on tier monitoring after 900 s (5:15 PM),
+# well before this starts; the service may still finish that run on its own.
 30 17 * * 1-5 /scripts/call-job.sh market-close >/proc/1/fd/1 2>/proc/1/fd/2
 
 # Tier monitoring: checks every accepted (or still-acceptable) recommendation
 # tier for a real trigger (today's actual high/low crossing the target price)
 # or expiry (past its window) -- Workflow C phase 2/3 (the tier state
-# machine is described in shared/enums.py). 5:00 PM ET, Monday-Friday only (no new price data
+# machine is described in docs/handbook/16-ai-analysis-pipeline.md, section
+# 3.15). 5:00 PM ET, Monday-Friday only (no new price data
 # on a closed market day, so nothing to check; holidays are skipped by
 # ai-service itself, see the top of this file). One hour after the 4:00 PM
 # market close: the data provider's final EOD bar for the day isn't
@@ -57,12 +58,15 @@
 # watchlists) for new SEC filings AND recent news, adding both to the RAG
 # corpus automatically. See ai/workflows/auto_ingestion_workflow.py for
 # exactly what's covered (filing/SEC EDGAR and news/NewsAPI; the same
-# endpoint also runs the macro_research auto-ingestion). 3:00 AM ET: after review-run,
-# every day (SEC EDGAR itself has no concept of "market closed" -- filings
+# endpoint also runs the macro_research auto-ingestion). It spends LLM
+# quota (filing summaries and records, the news relevance classifier, the
+# monthly macro report), NewsAPI requests and embedding calls.
+# 3:05 AM ET, not 3:00: Google keys out of daily quota stay benched to 3:01.
+# After review-run, every day (SEC EDGAR itself has no concept of "market closed" -- filings
 # get posted any day, and checking on a day with nothing new is a harmless
 # no-op, not a bug, same reasoning as market-open/close's holiday-handling
 # note at the top).
-0 3 * * * /scripts/call-job.sh rag-ingest >/proc/1/fd/1 2>/proc/1/fd/2
+5 3 * * * /scripts/call-job.sh rag-ingest >/proc/1/fd/1 2>/proc/1/fd/2
 
 # Log retention: deletes ./logs/<service>/*.log files (written
 # by the `vector` service) older than 14 days, plus empty directories.
@@ -76,7 +80,7 @@
 # the object storage (SeaweedFS, through its S3 API) + avatars into
 # /backups/<YYYY-MM-DD_HHMM>/ (host ./backups), then prunes backups older
 # than BACKUP_RETENTION_DAYS (default 7). 2:30 AM ET daily: between
-# review-run (2:00) and rag-ingest (3:00), the quietest window -- no
+# review-run (2:00) and rag-ingest (3:05), the quietest window -- no
 # market job and no ingestion writes documents at that time. See
 # docs/DISASTER_RECOVERY.md.
 30 2 * * * /scripts/backup.sh >/proc/1/fd/1 2>/proc/1/fd/2
@@ -85,11 +89,28 @@
 # as an admin deletion (anonymized row, user.deleted event), every account
 # that registered more than UNVERIFIED_ACCOUNT_RETENTION_DAYS (default 7)
 # days ago, never verified its email, never signed in and has no OAuth
-# link. 04:10 AM ET daily: after the backup, so a purged account is still
-# in the previous night's backup.
+# link. Then it cleans the auth leftovers (sessions, open sent
+# invitations, memberships, owned organizations) of accounts deleted
+# before the full deletion existed. 04:10 AM ET daily: after the backup,
+# so a purged account is still in the previous night's backup.
 10 4 * * * /scripts/call-job.sh purge-unverified >/proc/1/fd/1 2>/proc/1/fd/2
 
 # Notification retention (core-service): deletes READ notifications
 # created more than NOTIFICATION_READ_RETENTION_DAYS (default 90) days
 # ago; unread ones are kept whatever their age. 04:20 AM ET daily.
 20 4 * * * /scripts/call-job.sh notification-retention >/proc/1/fd/1 2>/proc/1/fd/2
+
+# Deleted-user sweeps (core-service, then ai-service): the guarantee behind
+# the user.deleted event. Each service lists the user ids that still own
+# private data in its own tables, asks auth-service which of them are
+# deleted accounts (POST /internal/users/deleted), and runs the same
+# idempotent cleanup as its user.deleted handler for each one. This catches
+# a lost event and data written while a deletion ran. core also deletes
+# a deleted user's document files that no row references any more, then
+# runs the organization sweep: it cleans the content of organizations
+# auth no longer has (organization.deleted lost). 04:30 and 04:40 AM ET
+# daily: after purge-unverified (04:10), so an account purged tonight is
+# swept tonight; long after the Gemini quota reset (03:00) and rag-ingest
+# (03:05). Neither spends LLM quota.
+30 4 * * * /scripts/call-job.sh deleted-user-sweep-core >/proc/1/fd/1 2>/proc/1/fd/2
+40 4 * * * /scripts/call-job.sh deleted-user-sweep-ai >/proc/1/fd/1 2>/proc/1/fd/2

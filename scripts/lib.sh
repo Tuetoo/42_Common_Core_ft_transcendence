@@ -89,10 +89,11 @@ make_token() {
 #   16:55-17:50  tier monitoring (17:00) and the market-close snapshot (17:30)
 # A restart of ai-service or core-service, or an end-to-end run, inside
 # them can break a job. guard_busy_window refuses unless FORCE=1.
-#   01:55-04:30  the nightly jobs: review-run (02:00, up to 30 minutes),
-#                backup (02:30), rag-ingest (03:00, up to 60 minutes),
-#                logs-cleanup (04:00), purge-unverified (04:10) and
-#                notification-retention (04:20)
+#   01:55-04:55  the nightly jobs: review-run (02:00, up to 30 minutes),
+#                backup (02:30), rag-ingest (03:05, up to 60 minutes),
+#                logs-cleanup (04:00), purge-unverified (04:10),
+#                notification-retention (04:20) and the deleted-user
+#                sweeps (core 04:30, ai 04:40)
 # A restart there aborts the running nightly job, which then reports no
 # success until the next night (DailyJobStale after 26 hours).
 # guard_busy_window only warns for this window: it is the morning in
@@ -117,7 +118,7 @@ in_nightly_window() {
   local now
   now=$(TZ=America/New_York date +%H%M)
   now=$((10#$now))
-  [ "$now" -ge 155 ] && [ "$now" -lt 430 ]
+  [ "$now" -ge 155 ] && [ "$now" -lt 455 ]
 }
 
 guard_busy_window() {
@@ -129,6 +130,6 @@ guard_busy_window() {
     echo "warning: $what inside the busy window ($window), FORCE=1 given" >&2
   fi
   if in_nightly_window; then
-    echo "warning: $what during the nightly jobs (01:55-04:30 New York: review-run, backup, rag-ingest, logs-cleanup, purge-unverified, notification-retention); a job it interrupts must be run again by hand" >&2
+    echo "warning: $what during the nightly jobs (01:55-04:55 New York: review-run, backup, rag-ingest, logs-cleanup, purge-unverified, notification-retention, deleted-user sweeps); a job it interrupts must be run again by hand" >&2
   fi
 }

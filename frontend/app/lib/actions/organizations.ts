@@ -2,45 +2,17 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
+import { UUID_RE } from "@/app/lib/format";
+import { EMAIL_MAX, EMAIL_RE } from "@/app/(public)/field-rules";
 import type { ActionResult } from "./admin";
 
 // Limits match OrganizationCreate / OrganizationUpdate / InvitationCreate in
 // services/auth-service/domains/organization/schema.py.
 const NAME_MAX = 128;
 const DESCRIPTION_MAX = 1000;
-const EMAIL_MAX = 254;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // The owner role can never be assigned (MemberRoleUpdate, InvitationCreate).
 const ASSIGNABLE_ROLES = ["admin", "member", "viewer"];
-
-type CallResult = { ok: true; res: Response } | { ok: false; error: string };
-
-async function call(path: string, init: RequestInit, fallback: string): Promise<CallResult> {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { ok: false, error: "You're not logged in" };
-  }
-  let res: Response;
-  try {
-    res = await backendFetch(path, accessToken, init);
-  } catch {
-    return { ok: false, error: "Could not reach the server. Is the backend running?" };
-  }
-  if (res.status === 401) {
-    return { ok: false, error: "Your session expired. Please log in again." };
-  }
-  if (!res.ok) {
-    return { ok: false, error: await extractErrorMessage(res, fallback) };
-  }
-  return { ok: true, res };
-}
-
-function jsonInit(method: string, body: unknown): RequestInit {
-  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-}
 
 function validateDetails(name: string, description: string): string | null {
   if (!name) return "Please enter an organization name";

@@ -237,8 +237,6 @@ _WEEKDAY_DATE_RES = tuple(
 @dataclass(frozen=True)
 class WeekdayMismatch:
     written: str
-    day: date
-    written_weekday: str
     actual_weekday: str
 
 
@@ -286,8 +284,7 @@ def weekday_date_mismatches(text: str,
             if written_index == day.weekday():
                 continue
             found[span] = WeekdayMismatch(
-                written=match.group(0), day=day,
-                written_weekday=_WEEKDAY_NAMES[written_index],
+                written=match.group(0),
                 actual_weekday=_WEEKDAY_NAMES[day.weekday()])
     return [found[span] for span in sorted(found)]
 
@@ -365,8 +362,9 @@ class NewsAgent(BaseAgent):
                 "not as a current development, unless a fresh "
                 "search shows it has genuinely moved since."),
             category=DocumentCategory.NEWS, ticker=state.ticker)
-        news_tool = SearchNewsTool(ticker=state.ticker)
         web_tool = WebSearchTool(ticker=state.ticker)
+        news_tool = SearchNewsTool(
+            ticker=state.ticker, fallback_tool=web_tool.name)
         fallback_web_tool = WebSearchTool(
             ticker=state.ticker, news_days=settings.NEWS_WEB_FALLBACK_DAYS)
         prefetched = await prefetch_tool_calls([

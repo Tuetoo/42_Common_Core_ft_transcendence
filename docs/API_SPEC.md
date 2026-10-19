@@ -240,7 +240,8 @@ reset request is silently ignored, a reset link already sent is refused
 with 422).
 
 2FA secrets are stored encrypted. If a stored secret cannot be
-decrypted (the encryption keys changed), every 2FA check (login,
+decrypted (the encryption keys changed, or the value is not encrypted),
+every 2FA check (login,
 `/auth/oauth/2fa`, `/2fa/verify`, `/2fa/disable`) answers **409** "Your 2FA
 settings cannot be read. Ask an administrator to reset your 2FA, then set
 it up again." The frontend should show that message; an admin fixes it
@@ -262,7 +263,11 @@ ai-service's RAG ingestion.
 `guest`) and `permissions`, the sorted list of permission strings of that
 role (`shared.permissions.sorted_permissions`, e.g. `["analysis:create",
 "api_key:manage", ...]`; `[]` for a guest), so the frontend shows only the
-actions the user may take. `PATCH /me`, avatar upload, password reset and
+actions the user may take. Its `settings` object holds only
+`notification_preferences`. `PATCH /me` changes `username`, the profile
+fields (`first_name`, `last_name`, `bio`, `timezone`, `country`) and
+`notification_preferences`; other fields (for example the old `theme`,
+`preferred_currency` or `default_model`) are ignored. `PATCH /me`, avatar upload, password reset and
 2FA enable/disable publish `user.updated` (field names only) after the
 commit, which gives the user an `account_updated` notification (§6).
 
@@ -319,7 +324,7 @@ DELETE /api/v1/connections/{connection_id}
 A block records who blocked; only the blocker can remove it, and
 the blocked user can neither delete it nor send a new request. `GET` hides
 a block from the user who was blocked: only the blocker sees the `blocked`
-row (a row without `blocked_by` stays visible to both). Online status
+row. Online status
 is shown only for accepted connections. Sending and accepting need
 `connection:write` (a guest gets 403); blocking and `DELETE` (remove,
 decline, cancel, unblock) stay open to guests.
@@ -392,12 +397,17 @@ Rules (`domains/admin/service.py`):
   still resolve. `deleted_at` is set, `is_active` becomes false, the email
   becomes `deleted-<id>@deleted.alphamind.local`, the username
   `deleted_<id>`, the password is replaced by a random one, profile fields
-  and the avatar file are removed, OAuth links, the 2FA secret and friend
-  connections are deleted, organization memberships are removed, and every
-  session is revoked. An organization the user owned passes to its
-  longest-standing admin, else its longest-standing other member
-  (`organization.role.changed` for the new owner); it keeps the deleted
-  user's owner row only when it has no other member.
+  and the avatar file are removed, OAuth links, the 2FA secret, friend
+  connections, organization memberships and every session row are
+  deleted. Open invitations the user sent are deleted
+  (`organization.invitation.revoked` for each unexpired one), and so are
+  invitations to the old address of a verified account. An organization
+  the user owned passes to its longest-standing active admin, else its
+  longest-standing active member or viewer, else a deactivated member in
+  the same order (`organization.role.changed` for the new owner); an organization with
+  no other member is deleted (`organization.deleted`). core and ai then
+  delete the user's private data on `user.deleted`, and their nightly
+  sweeps catch what an event missed (handbook chapters 12 and 13).
 - Every role/active/delete change is written to the live-state mirror in
   Redis before the commit (a mirror failure rolls the change back), so it
   applies to existing tokens at once. The route then publishes
@@ -428,6 +438,8 @@ GET    /internal/users/{user_id}/notification-settings
 GET    /internal/connections/check
 GET    /internal/users/{user_id}/friends        {"friend_ids": [uuid, ...]}, accepted connections only
 POST   /internal/users/{user_id}/presence      body {"online": bool} (called by core-service WebSockets)
+POST   /internal/organizations/missing   body {"organization_ids": [uuid, ...]} (at most 500) -> {"missing_ids": [...]} (core's nightly sweep)
+POST   /internal/users/deleted               body {"user_ids": [uuid, ...]} (at most 500) -> {"deleted_ids": [...]}, the deleted accounts among them (the nightly deleted-user sweeps)
 POST   /internal/scheduler/purge-unverified     (scheduler, daily 04:10 New York)
 ```
 
@@ -438,9 +450,18 @@ has no OAuth link. Each account goes through the same path as
 `DELETE /api/v1/admin/users/{id}` (soft delete: anonymized email and
 username, sessions revoked, `user.deleted` published after the commit,
 with the user as `actor_id`, so nobody is notified), one account per
-transaction, so the email can register again. Answer `{"retention_days", "candidates", "deleted",
-"skipped", "failed"}`; 500 with `"all_units_failed": ["accounts"]` when
-accounts were attempted and every one failed (`shared/scheduled_jobs.py`).
+transaction, so the email can register again. Then it cleans the auth
+leftovers of accounts deleted before the full deletion existed: for each
+deleted account that still has sessions, open sent invitations,
+memberships or owned organizations, it removes them as a delete does
+(owned organizations pass to a successor or are deleted), one account per
+transaction. Answer `{"retention_days", "candidates", "deleted",
+"skipped", "failed", "deleted_account_leftovers": {"candidates",
+"cleaned", "failed", "lookup_failed"}}`; 500 with `"all_units_failed"`
+naming the step (`accounts`, `deleted_account_leftovers`, or
+`deleted_account_leftovers_lookup` when the leftover query failed) when
+every unit of that step failed (`shared/scheduled_jobs.py`); the events
+of the accounts purged in the same run are still published.
 `skipped` counts an account that changed meanwhile (verified, signed in)
 and the last active admin, which is never deleted.
 
@@ -780,6 +801,7 @@ Channels follow the user's `notification_preferences` (user settings,
 - `email` (default off): an email with the same title and text,
   independent of `in_app`.
 If auth-service cannot be reached, the defaults apply (nothing is lost).
+A deleted account gets no new notification (no row, push or email).
 
 | Domain | Type | When |
 |---|---|---|
@@ -860,7 +882,9 @@ one analysis), `user:{user_id}` (a user's own stream: each new in-app
 notification, and `user.presence.changed` when one of the user's accepted
 friends comes online or goes offline), `presence:{user_id}` (online/offline
 status changes for a user's connections), `document:{document_id}`
-(ingestion status). The web app opens `user:` and `analysis:` sockets;
+(ingestion status). The web app opens `user:` sockets (one per browser
+tab, shared by the unread badge, the notifications feed, the analytics
+page and the friends page) and `analysis:` sockets;
 `presence:` and `document:` are used only by API clients (the web app
 gets presence over `user:` and polls the documents table).
 
@@ -944,6 +968,7 @@ POST   /internal/scheduler/market-open
 POST   /internal/scheduler/market-close
 POST   /internal/scheduler/heartbeat/{job}
 POST   /internal/scheduler/notification-retention
+POST   /internal/scheduler/deleted-user-sweep               (daily 04:30 New York)
 GET    /internal/tracked-tickers
 GET    /internal/documents/filenames
 POST   /internal/documents
@@ -1000,7 +1025,8 @@ close runs at 17:30 ET, after tier execution at 17:00.
 script reports that it succeeded (`infra/scheduler/heartbeat.sh`); `job` is
 one of `market-open`, `market-close`, `tier-monitoring`, `review-run`,
 `rag-ingest`, `logs-cleanup`, `backup`, `purge-unverified`,
-`notification-retention` (404 otherwise). Answers `{"job",
+`notification-retention`, `deleted-user-sweep-core`,
+`deleted-user-sweep-ai` (404 otherwise). Answers `{"job",
 "recorded_at"}`; the time is exported on core-service's `/metrics` as
 `alphamind_job_last_success_timestamp_seconds{scheduled_job}` for the
 `scheduled_jobs` alerts (the label is not `job`, which Prometheus sets to
@@ -1019,6 +1045,26 @@ on its own. Answer `{"retention_days", "deleted", "batches",
 "failed_batches"}`; a failed batch stops the run, and the answer is 500
 with `"all_units_failed": ["batches"]` only when every attempted batch
 failed (in practice: the first one).
+
+`POST /internal/scheduler/deleted-user-sweep` (core, daily 04:30 New
+York) repeats the `user.deleted` cleanup for every deleted account that
+still owns private data in core: it lists the owners of private
+documents, notes and portfolios, watchlists, API keys and notifications,
+plus the owners of files under `documents/<owner_id>/` that no document
+row references, asks auth `POST /internal/users/deleted` which of them are
+deleted, and for each one deletes that data and the unreferenced files.
+Then it runs the organization sweep: it asks auth
+`POST /internal/organizations/missing` about every organization that
+still has documents, notes or portfolios in core and cleans the content
+of the missing ones as `organization.deleted` does. As a safety brake it
+cleans nothing and fails when more than `ORGANIZATION_SWEEP_MAX_MISSING`
+(5) organizations, or every one of at least two, are missing
+(`python -m scripts.clean_organizations --id <org id> [--confirm]` cleans
+named ones by hand). Answer `{"candidates", "deleted", "cleaned",
+"failed", "lookup_failed", "refused", "organizations": {same fields}}`;
+500 with `"all_units_failed"` naming the step (`users`, `users_lookup`,
+`organizations`, `organizations_lookup`, `organizations_safety_brake`)
+when every unit of that step failed.
 
 `POST /internal/portfolios/{id}/transactions` accepts
 `transaction_type: "adjustment"` with the same rules as the public route
@@ -1130,7 +1176,11 @@ nothing (an earlier review stays). A stored review publishes
 `decision.reviewed` (notification `decision_reviewed`, §6).
 
 `POST .../review` needs `analysis:create` (an LLM call and a
-write; a guest gets 403).
+write; a guest gets 403). It is limited per user: at most
+`DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` (3) per clock minute and
+`DECISION_REVIEW_RATE_LIMIT_PER_DAY` (20) per UTC day; over the limit the
+answer is **429** with `Retry-After` and no LLM call is made (a Redis
+outage lets requests through).
 
 ### Backtests
 ```
@@ -1333,6 +1383,7 @@ GET    /internal/market/instruments/{ticker}/prices
 POST   /internal/review/run
 POST   /internal/scheduler/tier-monitoring
 POST   /internal/scheduler/rag-ingest
+POST   /internal/scheduler/deleted-user-sweep               (daily 04:40 New York)
 GET    /internal/fx-rate?from_currency=...&to_currency=...
 GET    /internal/stats
 POST   /internal/sentiment
@@ -1373,6 +1424,16 @@ the score is taken from the model (clamped), and the label is derived from
 it (>= 0.15 positive, <= -0.15 negative, else neutral). Texts are cut to
 `SENTIMENT_MAX_INPUT_CHARS` (6000) at a word boundary; the text is treated
 as data and never logged (`ai/user_sentiment.py`).
+
+`POST /internal/scheduler/deleted-user-sweep` (ai, daily 04:40 New
+York) lists the users that still own analyses, decisions, backtests or
+memories in ai, asks auth `POST /internal/users/deleted` which of them
+are deleted, and runs the `user.deleted` cleanup for each one (analyses
+with their recommendations and tiers, decisions, backtests, agent
+memories and archived reports). Answer `{"candidates", "deleted",
+"cleaned", "failed", "lookup_failed", "refused"}` (`refused` is always
+false here); 500 with `"all_units_failed"` (`users` or `users_lookup`)
+when every unit of that step failed.
 
 `GET /internal/stats` returns ai's part of the admin site
 statistics: `analyses_total`, `analyses_completed`, `analyses_failed`,
@@ -1503,7 +1564,8 @@ are published via `shared/events.py::publish_cross_service` and consumed via
 `CrossServiceSubscriber` (fire-and-forget: a subscriber that is down misses
 the event). **Durable** events go through `publish_durable_event` (Redis
 Streams, consumer groups, redelivered until acked) and are consumed via
-`DurableEventSubscriber`. core-service's durable events
+`DurableEventSubscriber`. auth-service publishes `user.deleted` both
+over pub/sub (core) and to a stream (ai). core-service's durable events
 (`document.uploaded`, `document.deleted`, `portfolio.deleted`) are first
 written to the outbox table `core.event_outbox` in the request's
 transaction (`services/core-service/outbox.py`), published right after the
@@ -1538,7 +1600,7 @@ of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pu
 | `backtest.completed` / `backtest.failed` | ai-service | pub/sub | core-service | `backtest_completed` / `backtest_failed` notification |
 | `backtest.deleted` | ai-service | pub/sub | core-service | `backtest_deleted` notification to the owner |
 | `decision.outcome.evaluated` | ai-service | pub/sub | core-service | `decision_evaluated` notification to the deciding user |
-| `organization.created` / `.updated` / `.deleted` | auth-service | pub/sub | core-service | `organization_created` / `_updated` / `_deleted` for every id in `member_ids` |
+| `organization.created` / `.updated` / `.deleted` | auth-service | pub/sub | core-service | `organization_created` / `_updated` / `_deleted` for every id in `member_ids`; on `.deleted` core also deletes the organization's documents and notes and makes its shared portfolios private to their owners (deleted when the owner's account is deleted) |
 | `organization.member.joined` | auth-service | pub/sub | core-service | welcome notification to the new member and `organization_member_joined` to the other members; published after the commit |
 | `organization.member.left` / `.member.removed` / `.role.changed` | auth-service | pub/sub | core-service | the affected member (own wording) and the other members, `organization_member_left` / `_member_removed` / `organization_role_changed` |
 | `organization.invitation.created` | auth-service | pub/sub | core-service | `organization_invite` to the actor, and to the invitee when the email already has an account |
@@ -1548,7 +1610,7 @@ of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pu
 | `user.updated` | auth-service | pub/sub | core-service | `account_updated` (lists the changed field names) to the user, and to the actor when another user acted |
 | `user.role.changed` | auth-service | pub/sub | core-service | `account_role_changed` to the user, and to the actor |
 | `user.deactivated` / `user.reactivated` | auth-service | pub/sub | core-service | `account_updated` ("deactivated" / "reactivated") to the user, and to the actor |
-| `user.deleted` | auth-service | pub/sub | core-service | `account_updated` to the admin who deleted; the unverified-account purge (actor = user) is only logged; access is already blocked by the live user state |
+| `user.deleted` | auth-service | pub/sub + durable | core-service (pub/sub), ai-service (durable) | core closes the user's sockets, deletes their private documents, notes, portfolios, watchlists, API keys and notifications, and sends `account_updated` to the admin who deleted (the unverified-account purge, actor = user, notifies nobody); ai deletes the user's analyses, recommendations, decisions, backtests, memories and archived reports. The nightly deleted-user sweeps repeat both cleanups |
 | `user.presence.changed` | auth-service | pub/sub | core-service | WebSocket relay to `presence:{user_id}` and to `user:{friend_id}` of each accepted friend |
 
 Payloads (built by `services/auth-service/events_out.py`,

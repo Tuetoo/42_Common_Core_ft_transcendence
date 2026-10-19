@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 from uuid import UUID
 import clients.auth_client as auth_client
@@ -9,15 +10,31 @@ import structlog
 from api.websocket import recheck_user_sessions
 from config import settings
 from database import SessionLocal
-from sqlalchemy import select
+from apikeys import ApiKey
+from outbox import publish_now
+from sqlalchemy import delete, or_, select, union
+from sqlalchemy.ext.asyncio import AsyncSession
 from websocket_manager import WebSocketEnvelope, manager
 import domains.notification.service as notifications
-from domains.research.repository import DocumentRepository
+from domains.notification.model import Notification
+from domains.portfolio.model import Portfolio, Watchlist
+from domains.portfolio.repository import WatchlistRepository
+from domains.portfolio.service import delete_portfolio_row
+from domains.research.model import Document, ResearchNote
+from domains.research.repository import (DocumentRepository,
+                                         ResearchNoteRepository)
+from domains.research.service import (DOCUMENT_KEY_ROOT,
+                                      delete_document_row,
+                                      document_key_prefix)
+from shared.deleted_users import (CleanupStep, SweepResult, clean_each,
+                                  log_sweep, missing_organization_ids,
+                                  run_cleanup_steps, run_deleted_user_sweep)
 from shared.enums import NotificationType
 from shared.events import (CrossServiceSubscriber, DurableEventSubscriber,
                            EventName)
 from shared.redis import get_events_client
 from shared.schemas import SYSTEM_DOCUMENT_OWNER_ID
+from shared.storage import delete_object, list_object_keys
 
 logger = structlog.get_logger(__name__)
 
@@ -227,6 +244,12 @@ async def _handle_organization_updated(payload: dict[str, Any]) -> None:
 async def _handle_organization_deleted(payload: dict[str, Any]) -> None:
     await _recheck_sessions(
         _member_ids(payload), reason=EventName.ORGANIZATION_DELETED)
+    try:
+        organization_id = UUID(str(payload.get("organization_id")))
+    except ValueError:
+        logger.warning("organization_deleted_bad_id", payload=payload)
+    else:
+        await delete_organization_content(organization_id)
     org = _org_name(payload)
     await _notify_organization(
         payload, EventName.ORGANIZATION_DELETED,
@@ -444,11 +467,295 @@ async def _handle_user_reactivated(payload: dict[str, Any]) -> None:
         actor_content=f"You reactivated the account of {_target(payload)}.")
 
 
+async def _delete_documents(
+        session: AsyncSession, *, where: list[Any]) -> int:
+    documents = (
+        await session.execute(select(Document).where(*where))).scalars().all()
+    deleted = [
+        await delete_document_row(session, document) for document in documents
+    ]
+    await session.commit()
+    await publish_now([entry for _, entry in deleted])
+    for storage_key, _ in deleted:
+        try:
+            await delete_object(
+                settings, bucket=settings.S3_BUCKET_DOCUMENTS, key=storage_key)
+        except Exception:
+            logger.warning(
+                "document_orphan_cleanup_failed", storage_key=storage_key)
+    return len(deleted)
+
+
+async def _delete_notes(
+        session: AsyncSession, *, where: list[Any]) -> int:
+    notes = (
+        await session.execute(select(ResearchNote).where(*where)
+                              )).scalars().all()
+    for note in notes:
+        await ResearchNoteRepository(session).delete(note)
+    await session.commit()
+    return len(notes)
+
+
+async def _delete_portfolios(
+        session: AsyncSession, *, where: list[Any]) -> int:
+    portfolios = (
+        await session.execute(select(Portfolio).where(*where)
+                              )).scalars().all()
+    entries = [
+        await delete_portfolio_row(session, portfolio)
+        for portfolio in portfolios
+    ]
+    await session.commit()
+    await publish_now(entries)
+    return len(entries)
+
+
+async def _owner_is_deleted(owner_id: UUID) -> bool:
+    try:
+        info = await auth_client.get_notification_settings(str(owner_id))
+    except Exception:
+        logger.warning(
+            "organization_portfolio_owner_lookup_failed",
+            owner_id=str(owner_id))
+        return False
+    return bool(info.get("deleted"))
+
+
+async def _release_portfolios(
+        session: AsyncSession, organization_id: UUID) -> int:
+    portfolios = (
+        await session.execute(
+            select(Portfolio).where(
+                Portfolio.organization_id == organization_id)
+        )).scalars().all()
+    deleted_owners = {
+        owner_id
+        for owner_id in {portfolio.owner_id for portfolio in portfolios}
+        if await _owner_is_deleted(owner_id)
+    }
+    entries = []
+    for portfolio in portfolios:
+        if portfolio.owner_id in deleted_owners:
+            entries.append(await delete_portfolio_row(session, portfolio))
+        else:
+            portfolio.organization_id = None
+            portfolio.visibility = "private"
+    await session.commit()
+    await publish_now(entries)
+    return len(portfolios)
+
+
+async def _delete_watchlists(session: AsyncSession, user_id: UUID) -> int:
+    repository = WatchlistRepository(session)
+    watchlists = await repository.list_for_user(user_id)
+    for watchlist in watchlists:
+        await repository.delete(watchlist)
+    await session.commit()
+    return len(watchlists)
+
+
+async def _delete_rows(session: AsyncSession, statement: Any) -> int:
+    result = await session.execute(statement)
+    await session.commit()
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def _run_cleanup(
+        scope: str, scope_id: UUID, steps: dict[str, CleanupStep], *,
+        strict: bool = False) -> dict[str, int]:
+    return await run_cleanup_steps(
+        SessionLocal, scope, scope_id, steps, strict=strict)
+
+
+_PRIVATE_PORTFOLIO = or_(
+    Portfolio.organization_id.is_(None), Portfolio.visibility == "private")
+_PRIVATE_DOCUMENT = Document.organization_id.is_(None)
+_PRIVATE_NOTE = ResearchNote.organization_id.is_(None)
+
+
+async def delete_private_user_data(
+        user_id: UUID, *, strict: bool = False) -> dict[str, int]:
+    return await _run_cleanup(
+        "user", user_id, {
+            "documents": partial(
+                _delete_documents,
+                where=[Document.owner_id == user_id, _PRIVATE_DOCUMENT]),
+            "notes": partial(
+                _delete_notes,
+                where=[ResearchNote.author_id == user_id, _PRIVATE_NOTE]),
+            "portfolios": partial(
+                _delete_portfolios,
+                where=[Portfolio.owner_id == user_id, _PRIVATE_PORTFOLIO]),
+            "watchlists": partial(_delete_watchlists, user_id=user_id),
+            "api_keys": partial(
+                _delete_rows, statement=delete(ApiKey).where(
+                    ApiKey.owner_user_id == user_id)),
+            "notifications": partial(
+                _delete_rows, statement=delete(Notification).where(
+                    Notification.user_id == user_id))
+        }, strict=strict)
+
+
+async def users_with_private_data() -> set[UUID]:
+    owner_columns = (
+        select(Document.owner_id).where(_PRIVATE_DOCUMENT),
+        select(ResearchNote.author_id).where(_PRIVATE_NOTE),
+        select(Portfolio.owner_id).where(_PRIVATE_PORTFOLIO),
+        select(Watchlist.owner_id), select(ApiKey.owner_user_id),
+        select(Notification.user_id))
+    async with SessionLocal() as session:
+        rows = await session.execute(union(*owner_columns))
+    return {row[0]
+            for row in rows if row[0] is not None} - {SYSTEM_DOCUMENT_OWNER_ID}
+
+
+async def _unreferenced_document_files(prefix: str) -> list[str]:
+    keys = await list_object_keys(
+        settings, bucket=settings.S3_BUCKET_DOCUMENTS, prefix=prefix)
+    if not keys:
+        return []
+    async with SessionLocal() as session:
+        referenced = set((
+            await session.execute(
+                select(Document.storage_url).where(
+                    Document.storage_url.like(f"{prefix}%")))).scalars().all())
+    return [key for key in keys if key not in referenced]
+
+
+async def users_with_unreferenced_files() -> set[UUID]:
+    try:
+        orphans = await _unreferenced_document_files(DOCUMENT_KEY_ROOT)
+    except Exception:
+        logger.exception("document_file_owners_lookup_failed")
+        return set()
+    owners = set()
+    for key in orphans:
+        try:
+            owners.add(UUID(key[len(DOCUMENT_KEY_ROOT):].split("/")[0]))
+        except ValueError:
+            continue
+    return owners
+
+
+async def delete_unreferenced_files(user_id: UUID) -> int:
+    orphans = await _unreferenced_document_files(
+        document_key_prefix(user_id))
+    for key in orphans:
+        await delete_object(
+            settings, bucket=settings.S3_BUCKET_DOCUMENTS, key=key)
+    if orphans:
+        logger.info(
+            "deleted_user_files_removed", user_id=str(user_id),
+            count=len(orphans))
+    return len(orphans)
+
+
+async def _clean_deleted_user(user_id: UUID) -> None:
+    await delete_private_user_data(user_id, strict=True)
+    await delete_unreferenced_files(user_id)
+
+
+async def sweep_deleted_users() -> SweepResult:
+    try:
+        candidates = await users_with_private_data()
+        candidates |= (
+            await users_with_unreferenced_files()
+            - {SYSTEM_DOCUMENT_OWNER_ID})
+    except Exception:
+        logger.exception("deleted_user_sweep_candidates_failed")
+        return log_sweep(
+            "user",
+            SweepResult(
+                candidates=0, deleted=0, cleaned=0, failed=0,
+                lookup_failed=True))
+    return await run_deleted_user_sweep(
+        settings, candidates, _clean_deleted_user)
+
+
+async def delete_organization_content(
+        organization_id: UUID, *, strict: bool = False) -> dict[str, int]:
+    return await _run_cleanup(
+        "organization", organization_id, {
+            "documents": partial(
+                _delete_documents,
+                where=[Document.organization_id == organization_id]),
+            "notes": partial(
+                _delete_notes,
+                where=[ResearchNote.organization_id == organization_id]),
+            "portfolios": partial(
+                _release_portfolios, organization_id=organization_id)
+        }, strict=strict)
+
+
+async def organizations_with_content() -> set[UUID]:
+    columns = (
+        select(Document.organization_id), select(ResearchNote.organization_id),
+        select(Portfolio.organization_id))
+    async with SessionLocal() as session:
+        rows = await session.execute(union(*columns))
+    return {row[0] for row in rows if row[0] is not None}
+
+
+def _too_many_missing(missing: int, candidates: int) -> bool:
+    every_one_missing = candidates > 1 and missing == candidates
+    return (
+        missing > settings.ORGANIZATION_SWEEP_MAX_MISSING
+        or every_one_missing)
+
+
+async def sweep_deleted_organizations() -> SweepResult:
+    try:
+        candidates = await organizations_with_content()
+    except Exception:
+        logger.exception("deleted_organization_sweep_candidates_failed")
+        return log_sweep(
+            "organization",
+            SweepResult(
+                candidates=0, deleted=0, cleaned=0, failed=0,
+                lookup_failed=True))
+    try:
+        missing = await missing_organization_ids(settings, candidates)
+    except Exception:
+        logger.exception(
+            "deleted_organization_sweep_lookup_failed",
+            candidates=len(candidates))
+        return log_sweep(
+            "organization",
+            SweepResult(
+                candidates=len(candidates), deleted=0, cleaned=0, failed=0,
+                lookup_failed=True))
+    if _too_many_missing(len(missing), len(candidates)):
+        logger.error(
+            "deleted_organization_sweep_refused", missing=len(missing),
+            candidates=len(candidates),
+            max_missing=settings.ORGANIZATION_SWEEP_MAX_MISSING)
+        return log_sweep(
+            "organization",
+            SweepResult(
+                candidates=len(candidates), deleted=len(missing), cleaned=0,
+                failed=0, refused=True))
+    cleaned, failed = await clean_each(
+        missing, partial(delete_organization_content, strict=True),
+        scope="organization")
+    return log_sweep(
+        "organization",
+        SweepResult(
+            candidates=len(candidates), deleted=len(missing),
+            cleaned=cleaned, failed=failed))
+
+
 async def _handle_user_deleted(payload: dict[str, Any]) -> None:
     await _recheck_sessions([payload.get("user_id")],
                             reason=EventName.USER_DELETED,
                             deactivated=True)
     logger.info("user_deleted_received", user_id=payload.get("user_id"))
+    try:
+        user_id = UUID(str(payload.get("user_id")))
+    except ValueError:
+        logger.warning("user_deleted_bad_user_id", payload=payload)
+    else:
+        await delete_private_user_data(user_id)
     if str(payload.get("actor_id")) == str(payload.get("user_id")):
         return
     await _notify_actor(
@@ -533,8 +840,6 @@ async def _handle_decision_outcome_evaluated(payload: dict[str, Any]) -> None:
 
 
 async def _portfolio_owner(portfolio_id: Any) -> UUID | None:
-    from domains.portfolio.model import Portfolio
-
     try:
         portfolio_uuid = UUID(str(portfolio_id))
     except ValueError:

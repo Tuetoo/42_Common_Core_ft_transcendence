@@ -1,5 +1,4 @@
 from typing import cast
-import structlog
 from ai.providers.base import MarketDataProvider, PriceBar, ProviderError
 from ai.providers.registry import get_market_data_provider
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,23 +7,9 @@ from domains.market.schema import PriceBarRead
 from shared.enums import AssetType
 from shared.exceptions import NotFoundError
 
-logger = structlog.get_logger(__name__)
-
-_PROVIDER_ASSET_TYPE_MAP = {
-    "EQUITY": AssetType.EQUITY,
-    "ETF": AssetType.ETF,
-    "CRYPTOCURRENCY": AssetType.CRYPTO
-}
-
 
 class NoPriceDataError(ProviderError):
     pass
-
-
-def _map_provider_asset_type(raw: str | None) -> str:
-    if raw is None:
-        return AssetType.EQUITY.value
-    return _PROVIDER_ASSET_TYPE_MAP.get(raw.upper(), AssetType.EQUITY).value
 
 
 class MarketService:
@@ -59,25 +44,6 @@ class MarketService:
         except NotFoundError:
             instrument = await self.instruments.upsert(
                 ticker, asset_type=AssetType.EQUITY.value)
-
-        if instrument.name is None:
-            try:
-                metadata = await provider.get_instrument_metadata(ticker)
-            except ProviderError as exc:
-                logger.info(
-                    "market.instrument_metadata_lookup_failed", ticker=ticker,
-                    error=str(exc))
-                metadata = None
-            if metadata is not None:
-                fields = {
-                    k: v
-                    for k, v in metadata.model_dump().items() if v is not None
-                }
-                if fields:
-                    fields["asset_type"] = _map_provider_asset_type(
-                        metadata.asset_type)
-                    instrument = await self.instruments.upsert(
-                        ticker, **fields)
 
         if interval == "1d":
             import ai.tools.market_data_cache as cache

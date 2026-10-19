@@ -36,13 +36,6 @@ class PriceQuote(BaseModel):
     source: str
 
 
-class InstrumentMetadata(BaseModel):
-    name: str | None = None
-    sector: str | None = None
-    exchange: str | None = None
-    asset_type: str | None = None
-
-
 class PriceBar(BaseModel):
     ticker: str
     interval: str
@@ -110,11 +103,6 @@ class MarketDataProvider(ABC):
     async def get_price_history_range(
             self, ticker: str, *, start: date, end: date,
             interval: str = "1d") -> list[PriceBar]:
-        ...
-
-    @abstractmethod
-    async def get_instrument_metadata(
-            self, ticker: str) -> InstrumentMetadata | None:
         ...
 
 

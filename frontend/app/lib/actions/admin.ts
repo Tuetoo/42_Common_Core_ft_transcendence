@@ -2,8 +2,10 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getAccessToken } from "@/app/lib/session";
+import { call, getAccessToken, jsonInit } from "@/app/lib/session";
 import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
+import { SYSTEM_ROLES, UUID_RE } from "@/app/lib/format";
+import { EMAIL_RE, USERNAME_RE, isTimezone } from "@/app/(public)/field-rules";
 
 // Result of a one-click action (a button or a small select form).
 // Only types may be shared from a "use server" file; every exported
@@ -13,38 +15,6 @@ export type ActionResult = {
   message?: string;
 };
 
-// Same values as SystemRole in shared/enums.py.
-const SYSTEM_ROLES = ["guest", "user", "moderator", "admin"];
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Same limits as AdminUserUpdate / MeUpdate in the auth service.
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-type CallResult = { ok: true; res: Response } | { ok: false; error: string };
-
-async function call(path: string, init: RequestInit, fallback: string): Promise<CallResult> {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { ok: false, error: "You're not logged in" };
-  }
-  let res: Response;
-  try {
-    res = await backendFetch(path, accessToken, init);
-  } catch {
-    return { ok: false, error: "Could not reach the server. Is the backend running?" };
-  }
-  if (res.status === 401) {
-    return { ok: false, error: "Your session expired. Please log in again." };
-  }
-  if (!res.ok) {
-    return { ok: false, error: await extractErrorMessage(res, fallback) };
-  }
-  return { ok: true, res };
-}
-
-function jsonInit(method: string, body: unknown): RequestInit {
-  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-}
 
 function refresh(userId: string) {
   revalidatePath("/admin/users");
@@ -59,7 +29,7 @@ export async function changeUserRole(
 ): Promise<ActionResult> {
   const role = formData.get("role");
   if (!UUID_RE.test(userId)) return { error: "Invalid user id" };
-  if (typeof role !== "string" || !SYSTEM_ROLES.includes(role)) {
+  if (typeof role !== "string" || !(SYSTEM_ROLES as readonly string[]).includes(role)) {
     return { error: "Choose one of: guest, user, moderator, admin" };
   }
   const result = await call(`/admin/users/${userId}`, jsonInit("PATCH", { role }), "Could not change the role");
@@ -137,15 +107,6 @@ export type EditUserState = {
   success?: boolean;
   values?: EditUserValues;
 };
-
-function isTimezone(value: string): boolean {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: value });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // PATCH /admin/users/{id} (user:manage) with the account and profile
 // fields. Username, email and is_verified are only sent when they changed:

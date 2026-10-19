@@ -132,7 +132,7 @@ def backtest_deleted_payload(
 
 
 async def publish_event(
-        event_name: EventName, payload: dict[str, Any]) -> bool:
+        event_name: EventName, payload: dict[str, Any]) -> None:
     try:
         await shared_events.publish_cross_service(
             settings, event_name, payload)
@@ -140,8 +140,6 @@ async def publish_event(
         logger.warning(
             "ai_event_publish_failed", event_name=str(event_name),
             error=f"{type(exc).__name__}: {str(exc)[:200]}")
-        return False
-    return True
 
 
 async def publish_events(

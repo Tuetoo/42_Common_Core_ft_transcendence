@@ -14,9 +14,8 @@ from ai.agents.portfolio import _SYSTEM_PROMPT as PORTFOLIO_PROMPT
 from ai.agents.portfolio import _prefetch_scenarios
 from ai.ingestion import sec_edgar_filings
 from ai.providers import fred, newsapi, sec_edgar, tavily, yahoo_finance
-from ai.providers.base import (InstrumentMetadata, MarketDataProvider,
-                               PriceBar, PriceQuote, ProviderError,
-                               ProviderRequestError, ProviderUnavailableError)
+from ai.providers.base import (ProviderError, ProviderRequestError,
+                               ProviderUnavailableError)
 from ai.providers.fred import FredProvider
 from ai.providers.newsapi import NewsApiProvider
 from ai.providers.sec_edgar import SecEdgarProvider, _latest_two_annual_values
@@ -28,8 +27,7 @@ from structlog.testing import capture_logs
 from domains.analysis.repository import AnalysisRepository
 from domains.knowledge.model import AgentReport, KgRelation
 from domains.knowledge.repository import KnowledgeGraphRepository
-from domains.market.service import MarketService
-from shared.enums import AgentRole, AssetType, DocumentCategory
+from shared.enums import AgentRole, DocumentCategory
 from shared.exceptions import NotFoundError
 
 _SEC_USER_AGENT = "Test test@example.com"
@@ -625,43 +623,6 @@ class TestMissingMarketSession:
         assert cache_module.bar_session_date(bars[-1]) == date(2026, 9, 29)
 
 
-class _FixedAssetTypeProvider(MarketDataProvider):
-
-    def __init__(self, *, quote_type: str | None) -> None:
-        self._quote_type = quote_type
-
-    async def get_current_price(self, ticker: str) -> PriceQuote:
-        raise NotImplementedError
-
-    async def get_recent_price_history(
-            self, ticker: str, *, interval: str = "1d",
-            lookback_days: int = 30) -> list[PriceBar]:
-        return [
-            PriceBar(
-                ticker=ticker, interval=interval, timestamp=datetime.now(UTC),
-                open=100.0, high=101.0, low=99.0, close=100.5, volume=1000,
-                source="fake")
-        ]
-
-    async def get_price_history_range(
-            self, ticker: str, *, start: date, end: date,
-            interval: str = "1d") -> list[PriceBar]:
-        raise NotImplementedError
-
-    async def get_instrument_metadata(
-            self, ticker: str) -> InstrumentMetadata | None:
-        return InstrumentMetadata(
-            name=f"{ticker} Inc.", asset_type=self._quote_type)
-
-
-async def test_refresh_sets_real_asset_type_from_provider(db_session):
-    service = MarketService(db_session)
-    provider = _FixedAssetTypeProvider(quote_type="ETF")
-    await service.refresh_from_external_provider("SPY", provider=provider)
-    instrument = await service.instruments.get_by_ticker("SPY")
-    assert instrument.asset_type == AssetType.ETF.value
-
-
 def _scenario_tool(
         market: _FlakyMarket | None = None) -> RecomputeScenarioTool:
     provider: Any = market or _FlakyMarket()
@@ -897,9 +858,6 @@ class TestMarketValidation:
                     self, ticker, *, interval, lookback_days):
                 return self._bars
 
-            async def get_instrument_metadata(self, ticker):
-                return None
-
         wed_open = datetime(2026, 9, 30, 14, 0, tzinfo=UTC)
         monkeypatch.setattr(cache, "_utcnow", lambda: wed_open)
         ticker = "P" + uuid4().hex[:5].upper()
@@ -944,9 +902,6 @@ class TestMarketValidation:
             async def get_recent_price_history(
                     self, ticker, *, interval, lookback_days):
                 return bars
-
-            async def get_instrument_metadata(self, ticker):
-                return None
 
         monkeypatch.setattr(
             cache, "_utcnow", lambda: datetime(2026, 9, 30, 14, tzinfo=UTC))

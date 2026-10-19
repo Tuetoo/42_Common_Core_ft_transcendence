@@ -8,9 +8,9 @@ import {
   COMMENT_MAX,
   NOTE_CONTENT_MAX,
   NOTE_TITLE_MAX,
-  UUID_RE,
   parseTags,
 } from "@/app/(protected)/research/limits";
+import { UUID_RE } from "@/app/lib/format";
 
 export type CreateNoteState = {
   error?: string;
@@ -138,8 +138,6 @@ export async function addComment(
   return { posted: Date.now() };
 }
 
-const NOTE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 // Deletes a note (only its author may; the backend checks again) and goes
 // back to the notes list. Bound to the note id; used with ActionButton.
 export async function deleteNote(
@@ -147,7 +145,7 @@ export async function deleteNote(
   _prevState: { error?: string; message?: string },
   _formData: FormData
 ): Promise<{ error?: string; message?: string }> {
-  if (!NOTE_ID_RE.test(noteId)) return { error: "Invalid note id" };
+  if (!UUID_RE.test(noteId)) return { error: "Invalid note id" };
   const accessToken = await getAccessToken();
   if (!accessToken) redirect("/login");
   let res: Response;

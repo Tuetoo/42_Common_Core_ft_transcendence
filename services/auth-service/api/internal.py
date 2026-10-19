@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from typing import Any
 from uuid import UUID
 from config import settings
@@ -5,7 +6,7 @@ from database import get_db
 from events_out import schedule_events
 from fastapi import APIRouter, BackgroundTasks, Depends, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from user_state_sync import state_of
 from domains.admin.service import AdminService
@@ -14,6 +15,7 @@ from domains.auth.service import (AuthService, avatar_or_default,
                                   is_user_online)
 from domains.organization.repository import OrganizationRepository
 from domains.social.repository import ConnectionRepository
+from shared.deleted_users import DELETED_USERS_BATCH_SIZE
 from shared.enums import ConnectionStatus
 from shared.scheduled_jobs import job_response
 from shared.schemas import OrganizationRef, UserRef
@@ -26,6 +28,41 @@ router = APIRouter(
 
 class PresenceUpdate(BaseModel):
     online: bool
+
+
+class UserIdsQuery(BaseModel):
+    user_ids: list[UUID] = Field(max_length=DELETED_USERS_BATCH_SIZE)
+
+
+class DeletedUserIdsRead(BaseModel):
+    deleted_ids: list[UUID]
+
+
+@router.post("/users/deleted", response_model=DeletedUserIdsRead)
+async def list_deleted_user_ids(
+    data: UserIdsQuery, db: AsyncSession = Depends(get_db, scope="function")
+) -> DeletedUserIdsRead:
+    deleted = await UserRepository(db).list_deleted_ids(data.user_ids)
+    return DeletedUserIdsRead(deleted_ids=sorted(deleted, key=str))
+
+
+class OrganizationIdsQuery(BaseModel):
+    organization_ids: list[UUID] = Field(max_length=DELETED_USERS_BATCH_SIZE)
+
+
+class MissingOrganizationIdsRead(BaseModel):
+    missing_ids: list[UUID]
+
+
+@router.post(
+    "/organizations/missing", response_model=MissingOrganizationIdsRead)
+async def list_missing_organization_ids(
+    data: OrganizationIdsQuery,
+    db: AsyncSession = Depends(get_db, scope="function")
+) -> MissingOrganizationIdsRead:
+    missing = await OrganizationRepository(db).list_missing_ids(
+        data.organization_ids)
+    return MissingOrganizationIdsRead(missing_ids=sorted(missing, key=str))
 
 
 @router.get("/users/{user_id}", response_model=UserRef)
@@ -117,6 +154,7 @@ async def get_notification_settings(
         user.deleted_at is None and user.is_active and user.is_verified)
     return {
         "email": user.email if deliverable else None,
+        "deleted": user.deleted_at is not None,
         "notification_preferences": (
             settings_row.notification_preferences if settings_row else None)
     }
@@ -129,6 +167,7 @@ async def purge_unverified_accounts(
 ) -> JSONResponse:
     service = AdminService(db)
     result = await service.purge_unverified_accounts()
+    leftovers = await service.clean_deleted_account_leftovers()
     schedule_events(background_tasks, service.pending_events)
     return job_response(
         "purge-unverified", {
@@ -136,5 +175,12 @@ async def purge_unverified_accounts(
             "candidates": result.candidates,
             "deleted": result.deleted,
             "skipped": result.skipped,
-            "failed": result.failed
-        }, steps={"accounts": (result.attempted, result.failed)})
+            "failed": result.failed,
+            "deleted_account_leftovers": asdict(leftovers)
+        }, steps={
+            "accounts": (result.attempted, result.failed),
+            "deleted_account_leftovers": (leftovers.candidates,
+                                          leftovers.failed),
+            "deleted_account_leftovers_lookup": (
+                1, int(leftovers.lookup_failed))
+        })

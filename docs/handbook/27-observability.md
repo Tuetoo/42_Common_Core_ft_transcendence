@@ -323,7 +323,7 @@ Details:
 
 | Metric | Type | Labels | Set by |
 |---|---|---|---|
-| `alphamind_job_last_success_timestamp_seconds` | gauge | `scheduled_job` (the seven scheduler jobs; see below) | `record_job_success` on each heartbeat; reloaded from Redis `core:job_last_success` at startup; a job with no success yet gets its tracking start from `core:job_tracked_since` |
+| `alphamind_job_last_success_timestamp_seconds` | gauge | `scheduled_job` (the eleven scheduler jobs of `SCHEDULED_JOBS`; see below) | `record_job_success` on each heartbeat; reloaded from Redis `core:job_last_success` at startup; a job with no success yet gets its tracking start from `core:job_tracked_since` |
 | `alphamind_market_close_portfolios_skipped` | gauge | none | `record_market_close_skipped`, called by the `market_close` endpoint after each trading-day run; stored in Redis `core:market_close_skipped` and reloaded at startup |
 
 `services/core-service/outbox.py`:
@@ -441,7 +441,7 @@ next evaluation.
 
 | Alert | Expression (summary) | For | Severity |
 |---|---|---|---|
-| `DailyJobStale` | `time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup\|review-run\|rag-ingest\|logs-cleanup\|purge-unverified\|notification-retention"} > 26 * 3600` | 10m | warning (`service: scheduler`) |
+| `DailyJobStale` | `time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup\|review-run\|rag-ingest\|logs-cleanup\|purge-unverified\|notification-retention\|deleted-user-sweep-core\|deleted-user-sweep-ai"} > 26 * 3600` | 10m | warning (`service: scheduler`) |
 | `TradingDayJobStale` | same for `market-open\|market-close\|tier-monitoring`, `> 100 * 3600` | 10m | warning (`service: scheduler`) |
 | `MarketCloseSkippedPortfolios` | `alphamind_market_close_portfolios_skipped > 0` | none | warning (`service: core-service`) |
 
@@ -488,8 +488,9 @@ expected ones. The file (`evaluation_interval: 1m`) has seven test groups:
    excluded handlers do not change the value).
 5. 3 jobs pending, nothing finished -> no `AnalysisQueueBacklog` at 20m
    (still within `for: 30m`), firing at 65m.
-6. Job gauges stuck at time 0: `DailyJobStale` for `backup` silent at 20h
-   and firing at 30h ("last succeeded 1d 6h 0m 0s ago");
+6. Job gauges stuck at time 0: `DailyJobStale` for `backup` and
+   `deleted-user-sweep-ai` silent at 20h and firing at 30h ("last
+   succeeded 1d 6h 0m 0s ago");
    `TradingDayJobStale` for `market-close` silent at 30h (below 100h);
    `MarketCloseSkippedPortfolios` firing at 100m with value 2. The input
    series carry the labels a real scrape stores: `job="core-service"` and

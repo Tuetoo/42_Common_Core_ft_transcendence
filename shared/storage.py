@@ -77,6 +77,22 @@ async def delete_object(
     await asyncio.to_thread(_delete)
 
 
+async def list_object_keys(
+        settings: BaseServiceSettings, *, bucket: str,
+        prefix: str) -> list[str]:
+    client = _get_client(settings)
+
+    def _list() -> list[str]:
+        paginator = client.get_paginator("list_objects_v2")
+        return [
+            item["Key"]
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for item in page.get("Contents", [])
+        ]
+
+    return await asyncio.to_thread(_list)
+
+
 async def check_storage_connection(settings: BaseServiceSettings) -> bool:
     client = _get_client(settings)
 

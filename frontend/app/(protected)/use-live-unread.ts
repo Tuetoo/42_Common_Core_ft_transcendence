@@ -1,9 +1,9 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getUnreadCount } from "@/app/lib/actions/notifications";
-import { parseEnvelope, publishUserEvent, useChannel } from "@/app/lib/use-channel";
+import { parseEnvelope, publishUserChannelStatus, publishUserEvent, useChannel } from "@/app/lib/use-channel";
 
 // One WebSocket for as long as any signed-in page is open. It does three
 // jobs: the backend counts a user as online while they have an open socket
@@ -35,7 +35,7 @@ export function useLiveUnread({
     setExtra(0);
   }
 
-  useChannel({
+  const { status } = useChannel({
     path: `/user:${userId}`,
     token: accessToken,
     onMessage: (event) => {
@@ -69,6 +69,11 @@ export function useLiveUnread({
     // error page while the backend is down.
     onUnauthorized: () => router.refresh(),
   });
+
+  useEffect(() => publishUserChannelStatus(status), [status]);
+  // Back to the initial value on sign-out, so a later sign-in does not
+  // show the old "Live" for one render.
+  useEffect(() => () => publishUserChannelStatus("connecting"), []);
 
   return snapshot.base + extra;
 }

@@ -50,7 +50,7 @@ in [chapter 16](16-ai-analysis-pipeline.md).
 
 | Term | Meaning |
 |---|---|
-| Agent | Here: one role with its own system prompt, tools and checks. The nine data agents subclass `BaseAgent` (`ai/agents/loop.py`) and return an `AgentOutput`. Bull, Bear, Judge and Reflection are plain classes: no ReAct loop and no tools. The Judge and Reflection's review make one main LLM call; Bull and Bear may rewrite their argument (section 3.15). |
+| Agent | Here: one role with its own system prompt, tools and checks. The nine data agents subclass `BaseAgent` (`ai/agents/loop.py`) and return an `AgentOutput`. Bull, Bear, Judge and Reflection are plain classes: no ReAct loop and no tools. The Judge and Reflection's review make one main LLM call; Bull and Bear may rewrite their argument (section 3.16). |
 | ReAct | "Reason + Act": the model alternates between a thought, an action (a tool call) and reading the observation (the tool's result), until it gives a final answer. |
 | Scratchpad | The list of steps so far in one agent run (`ScratchpadEntry`: `thought`, `action`, `action_input`, `observation`, `is_tool_result`, `tool_error`, `prefetched`, `peer_ticker`). It is sent back to the model every turn and saved in the result. |
 | Tool | A Python class with a `name`, a `description`, a JSON-schema `parameters` and an async `run(**kwargs) -> str` (`ai/tools/base.py`). Provider failures come back as text, not exceptions. |
@@ -147,6 +147,8 @@ response
   |-- not valid JSON                          -> correction turn
   |      (finish_reason MAX_TOKENS -> "you were cut off, keep thought to one sentence")
   |-- neither action nor finish_answer        -> correction turn
+  |      (an `action` that is not a non-empty string, e.g. a list, counts as no action;
+  |       an `action_input` that is not a non-empty object counts as none)
   |-- finish_answer set:
   |      gate 1 no_tool_evidence     (up to 2 rejections)
   |      gate 2 evidence_anchor      (1 rejection)
@@ -280,7 +282,8 @@ logs `react_loop.finish_gate_rejected` with the `gate` name, or
    this scratchpad, then set finish_answer again with the corrected
    value."; Filing, News, Sentiment and Risk use "Fix only what the check
    above names ...", because their checks are about wording or sources,
-   not arithmetic).
+   not arithmetic; Portfolio uses its own suffix, which asks for
+   `recompute_scenario` or for the scenario's number to be removed).
 
 When a check is still failing after its budget, the answer is accepted
 anyway, but the issue is stored in
@@ -305,8 +308,7 @@ tool with usable data (`_SCORE_ONE_EVIDENCE_TOOL`), +0.04 per further
 distinct evidence tool (up to 3 more), or 0.76 with no own tool evidence;
 then subtract 0.05 per tool error (max 0.15), 0.04 per correction entry
 (a rejected finish, a malformed turn or a blocked duplicate; max 0.12),
-0.08 per verification warning (max 0.16), 0.10 when there was no accepted
-turn (best-effort result), 0.05 when the accepted turn stopped on the
+0.08 per verification warning (max 0.16), 0.05 when the accepted turn stopped on the
 token limit, 0.03 when the accepted turn was not served cleanly by the
 primary model (`rate_limited`), and 0.10 for recycled content (the agent's
 own reuse flag). Floor 0.40 (`_SCORE_WELL_SUPPORTED_FLOOR`, always above
@@ -349,10 +351,11 @@ Every agent with checks uses ONE validator class,
    other checks do not run on that attempt.
 2. **Reject-once checks**, run in order when `base` passes: the
    internal-token check (always), then the agent's `once_checks`. Each one
-   sends the answer back at most once per run; all that fire on the same
+   sends the answer back at most once per run;
+   all that fire on the same
    attempt go back in ONE message (one correction turn); every send-back
    logs `finish_checks.once_check_rejected` (`role`, `check`, `issue`).
-3. **The budget** (`RejectOnceBudget`): every rejection of the validator
+3. **The budget** (kept on the validator): every rejection of the validator
    (base or once) is counted. A reject-once check fires only while the
    loop still has a correction turn left (`rejections < 2`); after that the
    finding is only logged (`finish_checks.once_check_logged_only`) and the
@@ -398,10 +401,16 @@ figures and percentages, 1% for plain dollar amounts; a figure with three
 or more significant digits must instead match at its own precision (3.16). With no evidence at
 all the check is silent (the zero-evidence gate handles it); an internal
 error is logged (`finish_checks.own_evidence_check_failed`) and never
-rejects. Wired for Market, Technical, Fundamental (extra: fresh filing and
-KG context), Filing (same extra), Macro, Risk (its injected context), News
-and Portfolio (portfolio KG context); not for Sentiment (it builds on
-News's summary). Why in the loop: as a Reflection check, one hit would
+rejects. Wired for Market, Technical, Fundamental (extra: this run's
+fresh filing text), Filing (same extra), Macro, Risk (same extra), News
+and Portfolio; not for Sentiment (it builds on News's summary).
+Knowledge-graph context (`kg_context`, `portfolio_kg_context`) is never
+extra reference: its facts were extracted from earlier runs' agent
+reports (each line carries its date, "dated YYYY-MM-DD" or a first-to-last
+date range, and "[agent-derived, not independently sourced]"), so a
+figure found only there is not this run's evidence. Before this, UNH's
+Filing agent restated a stale EPS guidance range that existed only in a
+knowledge-graph fact written by an earlier run. Why in the loop: as a Reflection check, one hit would
 cost a data-agent rerun plus a whole new debate round; in the loop it
 costs one Lite correction turn. Replayed on 616 stored final answers of
 five batches, the check produced no false positive.
@@ -424,13 +433,16 @@ the tolerance of one allowed value.
   sign, scale unit or percent sign) an answer states that appear in a
   prior `[agent:...]` note returned this run and in no other tool result of
   this run, compared by value at the printed precision
-  (`filing_records.RawNumbers`). Only News uses it, as a reject-once check
+  (`filing_records.RawNumbers`); a fresh value within 0.5% (relative)
+  also counts, so "$480" is not flagged when this run's result says
+  "$480.60". Only News uses it, as a reject-once check
   (3.11). Dates are not checked; there is no score penalty.
 - **Evidence grounding** (`ai/agents/evidence_grounding.py`).
   `extract_reported_percentages(*texts)` collects every `12.3%` token
   from the trusted texts; `final_answer_has_unverifiable_percentages`
-  lists every percentage in an answer that is not in that set (exact
-  string match, so a misquote like 49.7% -> 99.4% is caught; Portfolio);
+  lists every percentage in an answer whose value is not in that set
+  (numeric equality, so "10%" equals the tool's "10.0%" but a misquote
+  like 49.7% -> 99.4% is caught; Portfolio);
   `wrap_verification_warning` builds the banner; `non_english_reason`
   is the English-only detector (chapter 14).
 - **Recycled content** (`ai/knowledge/recycled_content.py`, chapter 18,
@@ -455,6 +467,14 @@ the tolerance of one allowed value.
   finishing, fill `reported_metrics` with exactly `latest_close`,
   `period_high`, `period_low`; describe volume with the up/down/flat
   direction the tool printed for each high-volume session.
+- **High-volume sessions** (`describe_high_volume_sessions`): the history
+  tool lists the 3 highest-volume sessions of the shown window with a
+  code-computed direction against the previous session's close. The first
+  bar of the data has no previous session, so it is ranked too and its
+  change is measured from that session's own open ("no earlier session in
+  the data; from this session's open"). Before this it was skipped, and a
+  window of exactly the shown bars lost its largest session (INTC
+  2026-09-21, QCOM 2026-09-21).
 - **Validator:** base `_market_claims_disagree_with_prices`. Each reported
   value must equal (within 0.005, float formatting only) a value the price
   tools printed this run: the last close of a history window (or a
@@ -563,7 +583,7 @@ the tolerance of one allowed value.
      `get_fundamentals` labels the figure with (log
      `fundamental.revenue_growth_period_rejected`). The prose is not read.
   Plus the reject-once checks (tokens; own-evidence figures with the
-  fresh-filing and KG context as extra reference).
+  fresh filing text as extra reference).
 - **After the run:** an unresolved issue becomes a warning
   (`fundamental.unresolved_finish_issue_after_retries`);
   `get_fundamentals`' soft "note: ..." flags are appended as "Data caveat
@@ -571,10 +591,14 @@ the tolerance of one allowed value.
   (data context, not warnings, so they do not block archival). The
   operating-below-net-margin note names its period ("for the fiscal year
   ended <date>"): without it the AMD Judge (October 2026) tied FY2025
-  margins to 2026 investment gains. The SEC
-  XBRL latest-quarter text and "Revenue growth YoY (get_fundamentals,
-  <label>): <value>%" are appended to the summary; the three margins are
-  exported as `key_facts` (the Judge's valuation note reads them).
+  margins to 2026 investment gains. The SEC XBRL latest-quarter text and
+  "Revenue growth YoY (get_fundamentals, <label>): <value>%" are appended
+  to the summary (the Fundamental card and the archived note show them).
+  The debate, Judge and Reflection evidence leaves the quarter text out of
+  this summary, so it appears there once, as the code-built
+  `fundamental (computed in code ...)` line (section on code-built lines
+  below). The three margins are exported as `key_facts` (the Judge's
+  valuation note reads them).
 - **raw_output:** `latest_quarter` (the `quarter_results_payload` dict,
   chapter 18 section 3.12: text, periods, the three metrics with prior
   values and `*_yoy_pct`, `net_minus_operating`, `newer_filing`,
@@ -614,8 +638,8 @@ the tolerance of one allowed value.
   from the passage's own labels ("Six Months Ended" is never annual);
   never combine a quarterly and an annual figure; never write a record id.
 - **Validator:** no base check (the loop's generic gates apply); the
-  reject-once checks (tokens; own-evidence figures with the fresh-filing
-  and KG context as extra reference). Correction suffix: "Fix only what
+  reject-once checks (tokens; own-evidence figures with the fresh filing
+  text as extra reference). Correction suffix: "Fix only what
   the check above names" (the default "recompute the figures" does not fit
   a wording check).
 - **raw_output (all built in code from `ai.filing_records`, never from
@@ -674,7 +698,20 @@ the tolerance of one allowed value.
   that `search_news` failed (tool error format), code also runs
   `web_search("<Company> company news", limit=5)` in Tavily's news mode
   for the last `NEWS_WEB_FALLBACK_DAYS` (7) days (`prefetch_web_fallback`,
-  log `news.web_search_fallback`). A query like "<TICKER> stock news
+  log `news.web_search_fallback`). While NewsAPI is in its quota
+  cooldown, `search_news` returns the failure text with a hint that
+  depends on the caller's tools (`SearchNewsTool(fallback_tool=...)`):
+  News gets "use web_search for news instead"; Sentiment, which has no
+  `web_search`, gets "NewsAPI is unavailable this run; do not call
+  search_news again, proceed with the evidence you have" (the old hint
+  sent Sentiment after a tool it does not have, 21 wasted calls in one
+  batch). When `NEWSAPI_API_KEY` is not set (`ProviderUnavailableError`),
+  the failure text says "the news provider is not configured for this
+  run; do not call search_news again" plus the same caller-dependent next
+  step (the developer text "register a free key ..." made News and
+  Sentiment call it again: 22 wasted calls in one Claude batch). Both a
+  prefetched `web_search` and such a failed `search_news` satisfy the
+  live-search finish check below. A query like "<TICKER> stock news
   <Month YYYY>" found only price-forecast pages; when NewsAPI's quota ran
   out mid-batch, agents did not switch to web search by themselves.
 - **Prompt essentials:** prior notes first, then always `search_news`
@@ -723,7 +760,11 @@ the tolerance of one allowed value.
   thin evidence. When no `search_news` succeeded and the web results
   include no catalog outlet (`fallback_sources_unverified`, read from the
   result header; an unknown catalog never flags), the run is thin evidence
-  with a verification warning (`news.fallback_sources_unverified`).
+  with a verification warning (`news.fallback_sources_unverified`). Without
+  a NewsAPI key there is no catalog, so the flag stays off: a flag on every
+  web-only run would also drop News from the grounding reference of the
+  debate, Judge and Reflection (`format_grounding_reference`), which removed
+  correct first-tier figures in the 2026-10-18 batch.
 - **raw_output:** `verification_warnings`, `no_evidence`, `evidence_yield`
   (`None` when no live search ran), `fallback_sources_unverified`,
   `reused_prior_note`, `finish_meta`.
@@ -773,7 +814,12 @@ the tolerance of one allowed value.
   check.
 - **After the run:** the label is read with a regex; if missing, a Lite
   classifier call (`_classify_sentiment_label`, JSON mode) recovers it,
-  or it stays visibly missing (`None`, never a default "neutral"). With no
+  or it stays visibly missing (`None`, never a default "neutral"). When
+  the line is missing and every `search_news` call Sentiment made returned
+  a tool error (for example NewsAPI's quota cooldown), no classifier call
+  is made and the label stays `None` (`sentiment.no_label_after_failed_searches`):
+  the classifier must pick one of six labels and stored "neutral" for
+  write-ups that said no reading was possible. With no
   evidence at all, no classifier call is made, the label is `None`, a
   `[NO EVIDENCE: ...]` banner is added and the score is 0.35; a label line
   the model still wrote is kept as written and logged
@@ -878,12 +924,25 @@ the tolerance of one allowed value.
   1. shape: a list of objects with non-empty entity and tool and a status
      from the enum;
   2. sourcing (`_risk_event_issue`): `evidence_tool` must not be
-     `query_knowledge_graph` (its facts come from earlier agent reports);
-     that tool must have a successful result this run (background context
-     does not count); the entity must appear (case-insensitive) in that
-     output, and outside earlier agent notes (`_independent_text` removes
-     every `[agent:...]` passage, so a matter that exists only in an
-     earlier agent note cannot pass);
+     `query_knowledge_graph` (its facts come from earlier agent reports).
+     An event whose `source_id` is a legal-matter or transaction record id
+     that resolves against the records shown this run is sourced by that
+     record, and so is one whose entity a shown record's name matches
+     (`_names_match`, below). Otherwise the cited tool must have a
+     successful result this run (background context does not count) that
+     is not only earlier agent notes (`_independent_text` removes every
+     `[agent:...]` passage, so `search_prior_risk_notes` alone never
+     sources an event). The answer is not rejected when the entity's
+     wording is missing from the tool output: in five October 2026 batches
+     all 17 such rejections (13 matters, e.g. "U.S. export controls on AI
+     chips shipped to China" against the filing's "export controls on
+     MI308 and MI325 AI chips to China") were real matters in the cited
+     output in other words, and one of them exhausted the agent, flagged it
+     not well supported and cost a reflection retry. The event is then
+     simply left out of the sourced list: `_sourced_risk_events` keeps an
+     event only when a record sources it or the cited tool's output
+     (outside `[agent:...]` passages) names it (`_text_names`), so an
+     event no tool output names is never shown as sourced;
   3. source lookup (`_cited_filing`): a `search_filings` event with a legal
      or deal status needs a `source_id`; a filing label must name a filing
      listed this run (`risk.filing_label_resolved`); a record id must
@@ -891,28 +950,53 @@ the tolerance of one allowed value.
      run; a file name must appear in a `search_filings` result this run.
   Reject-once checks: internal tokens; `record_name` (one message for every
   event that cites a record of ANOTHER matter); own-evidence figures (with
-  its injected context as extra reference); `empty_risk_events`: the list
+  this run's fresh filing text as extra reference, never the
+  knowledge-graph context); `empty_risk_events`: the list
   is empty although the filing records shown to Risk this run
   (`FilingRecordsCache.shown`) hold at least one legal matter
   (`filing_records.legal_record_count`, a structural count of the
   rendered records; the prose is not read). The message gives the count
-  and asks for one object per named event the answer mentions; a second
-  empty list is accepted. Logged `risk.empty_events_with_legal_records`
+  and asks for one object per named event the answer mentions. Like every
+  reject-once check it sends the answer back once; a second empty list is
+  accepted and the events line is then built from the records (below). A
+  ticker with no shown legal records (or none ingested) is never checked.
+  Logged `risk.empty_events_with_legal_records`
   (field `legal_records`) and `finish_checks.once_check_rejected`
-  (`check=empty_risk_events`). Replayed on 125 stored Risk runs (8
+  (`check=empty_risk_events`). When the stored list is still empty after this
+  correction turn, `risk.events_empty_after_correction` records why:
+  `reason` is `model_returned_empty`, `model_omitted_list` (the accepted
+  answer had no list, or no `reported_metrics` at all, which the loop
+  stores as `None`), `no_accepted_finish` (no accepted answer: iteration
+  cap or no finish) or `all_events_dropped`, with `received` (items the
+  model sent) and `dropped` (counts by check: `malformed`, `unsourced`,
+  `filing_citation`; `_sourced_risk_events(dropped=...)`). In the
+  2026-10-19 Claude batches the empty lists were the model's: on the
+  accepted correction turn Haiku sent no `reported_metrics` at all (7 of
+  7 in the second batch; `model_omitted_list`), and no
+  `risk.event_rejected` was logged. Replayed on 125 stored Risk runs (8
   batches): it would have fired twice (INTC 2026-10-05 with 54 shown legal
   records, BA 2026-10-03 with 12), both runs whose answer named legal
   matters but listed none.
 - **Record match** (`_record_is_of_entity`; case, spacing and inner
   punctuation ignored, whole words): a cited legal-matter or transaction
   record is the event's record when the entity appears in its name, quote
-  or detail; or the first party of a caption "A v. B" does; or another
+  or detail, or the shorter of the two names is an in-order word
+  subsequence (at least 2 words) of the other (`_names_match`: "Reyes v.
+  Costco (California wage-and-hour class action)" matches "Reyes v. Costco
+  Wholesale Corporation (California wage-and-hour class action and related
+  PAGA action)"), also after dropping one trailing lowercase word of
+  either name of at least 3 words ("China antitrust investigation"
+  matches "China antitrust"; "In Re NVIDIA Corporation Securities
+  Litigation" does not match the Consolidated Derivative Litigation,
+  because capitalized words are never dropped); or the first party of a
+  caption "A v. B" does; or another
   record of the same category with the same name names the entity (the
   newer record of the same matter under a shorter name). Otherwise
   `risk.record_name_mismatch` is logged and the answer goes back once with
   a hint listing the records of the newest filing that names the matter,
-  saying when that filing is older than F1. After that the citation is
-  accepted and the events line shows only the filing.
+  saying when that filing is older than F1. After that the answer is
+  accepted, but the event is left out of the sourced list (it cites
+  another matter's record).
 - **Logged, never rejected:** a stated status that differs from the cited
   record (`risk.record_status_mismatch`): the extracted statuses were found
   wrong or stale too often to enforce, and enforcing a wrong record forced
@@ -921,8 +1005,32 @@ the tolerance of one allowed value.
 - **After the run:** the code appends `Named risk events (sourced): ...`
   built only from events that pass the sourcing and lookup checks (a
   malformed event drops only itself), each "<entity> (status <s>; source:
-  10-Q filed 2026-07-23, legal matter: <name>)", in plain words (ids stay
-  in `raw_output["risk_events"]`; no tool names). An unresolved
+  10-Q filed 2026-07-23)", in plain words (ids stay in
+  `raw_output["risk_events"]`; no tool names). An event that cites the
+  record of its own matter is stored and shown under the record's name
+  (`_canonical_event`), not the model's wording; events that end with the
+  same name are kept once. An event that cites the record of another
+  matter is always left out. When no event survives but the records shown
+  this run hold legal matters, the line is built from those records
+  instead (`_record_events_line`): "none confirmed by the risk agent this
+  run; taken from the filing records shown this run: <name> (status
+  <record status> as of <date>; source: 10-Q filed ...); ...",
+  newest filing first, one entry per matter name (`_names_match`, so the
+  same matter in several filings keeps only its newest record). Records
+  from filings older than the newest 10-K that holds legal records are
+  left out: that annual report restates the open matters, and older
+  10-Q records repeated them under other names (MSFT "IRS Tax Audit" next
+  to "IRS transfer pricing audit", BA's 2025 MAX and door-plug records).
+  Open matters come first, those the risk prose names (`_text_names`)
+  before the rest; matters whose record status is `settled`, `dismissed`
+  or `judgment` follow in a separate sentence, "Closed in those records
+  (settled, dismissed or decided): ...". At most 8 entries in all, plus
+  "and N more legal matter(s) in those records" at the end; "no
+  open matter" when every listed record is closed. `raw_output["risk_events"]`
+  stays empty in that case. Only when no legal record was shown does the
+  line say "none reported with a tool source this run". The line always
+  starts with `Named risk events (sourced):`, so
+  `recycled_content` removes it from prior notes. An unresolved
   risk-events issue becomes a warning (`risk.evidence_validator_exhausted`);
   a run without any successful tool gets a warning
   (`risk.finished_without_any_evidence`). An answer whose
@@ -946,6 +1054,16 @@ the tolerance of one allowed value.
   (`ai/tools/portfolio_tool.py`; data from core-service through
   `clients/core_client.py`, live prices from Yahoo).
   `MAX_ITERATIONS = 7`.
+- **What `get_portfolio_composition` returns:** one line per holding with
+  `weight_of_net_value=X%` (of holdings plus cash, the base of the
+  single-position limit) and `weight_of_holdings_value=Y%` (of the
+  holdings' total market value), then, when cash and every price are
+  known, a code-computed line "Single-holding cap: 50% of net value
+  (holdings + cash). Holdings above the cap: MSFT (50.6%)." (or "none";
+  the cap is `MAX_POSITION_WEIGHT_PCT`, the setting position sizing uses).
+  Added after every agent called MSFT's 50.6% of net value "50.6% of
+  holdings" and none saw that it was above the cap. With a missing price
+  the weights are `weight=n/a` and there is no cap line.
 - **Prefetch:** `get_portfolio_composition()`, then two
   `recompute_scenario` calls for the ticker, run one after the other
   (the second reuses the first's cached holdings and cash):
@@ -982,8 +1100,8 @@ the tolerance of one allowed value.
      rejected figure quoted back to the model cannot "prove" itself.
   The rejection lists the scenarios actually computed, and the suffix
   says: call `recompute_scenario` for that share count or describe it in
-  words. Plus the reject-once checks (tokens; own-evidence figures with the
-  portfolio KG context).
+  words. Plus the reject-once checks (tokens; own-evidence figures, with
+  no extra reference).
 - **After the run:** any remaining unverified percentage -> warning
   (`portfolio.unverified_percentage_in_final_answer`), score capped at
   0.35, not well supported. Portfolio's report is never archived.
@@ -1038,8 +1156,8 @@ the tolerance of one allowed value.
   not be flagged, and only "free cash flow covered (or funded) capital
   spending" is wrong (the first wording, "never say free cash flow covered
   capital spending", made Reflection flag correct operating-cash-flow
-  sentences for AMD, TSLA and UNH in October 2026 and cost AMD and UNH 0.15
-  confidence); with a positive free cash flow, debt issued is not presented
+  sentences for AMD, TSLA and UNH in October 2026, which at the time cost
+  AMD and UNH 0.15 confidence); with a positive free cash flow, debt issued is not presented
   as funding capex, operations or a gap; when the
   after-returns value (or free cash flow, with no return line) is positive
   there is no funding gap, and a fall in cash reflects other uses the line
@@ -1083,7 +1201,8 @@ the tolerance of one allowed value.
   calls per batch and gave more false than true positives when measured.
   Citations are the bracketed roles that
   really ran (`extract_citations`).
-- **`find_ungrounded_figures(text, evidence)`:** reads figures with "%",
+- **`find_ungrounded_figures(text, evidence)`:** reads figures with "%"
+  or the word "percent" ("13.0 percent" reads as "13.0%", on both sides),
   "$" amounts with a scale word (trillion, billion, million, bn, mn, mln,
   tn, trn, B, M, K, T), plain "$" amounts, "$ 68 million" with a space, and
   accounting negatives "$(1,180) million". A range ("$165-169 billion",
@@ -1094,7 +1213,7 @@ the tolerance of one allowed value.
   is reported as the whole range. Scaled figures and percentages match by
   value after scale normalization or within 1.5% relative; plain "$" amounts match any number in the evidence within 1%
   (`NUMBER_MATCH_REL_TOLERANCE`; "close=151.23" grounds "$151.23"), and a
-  plain "$7.46" never grounds "7.46%". These relative tolerances apply only
+  plain "$7.46" never grounds "7.46%". In the data agents' own-evidence check only (`own_evidence_ungrounded_figures`), a scaled "$" figure also matches a plain "$" amount of the evidence under the same tolerances (`scaled_figures_matching_plain_dollars`: "$2.0 million" and "$2.02 million" match "$2,015,046.00", "$2.00 million" and "$2.1 million" do not); the debate, Judge and Reflection checks are unchanged. These relative tolerances apply only
   to rounded figures (one or two significant digits, such as "$600 million"
   or "$2.3B"). A precise figure (three or more significant digits) must
   agree with an evidence number to within one unit in the last digit of
@@ -1111,11 +1230,11 @@ the tolerance of one allowed value.
 
 Bull, Bear, the Judge and Reflection all read `format_evidence(state)`:
 one line per data agent (`- <role>: <summary>` plus any disclosure as
-"(System note, not part of the agent's text: ...)"), then lines built in
-code from structured data. When any agent carries verification warnings, a
+"(System note, not part of the agent's text: ...)"; Fundamental's line
+leaves out the latest-quarter text, which line 1 below carries), then
+lines built in code from structured data. When any agent carries verification warnings, a
 first line "UNVERIFIED CLAIMS FLAGGED this run by: <roles>" names them
-(a banner inside a summary would otherwise be repeated as fact). When every agent
-failed, a fixed placeholder replaces all lines. Each code-built line starts
+(a banner inside a summary would otherwise be repeated as fact). Each code-built line starts
 with the role a claim from it is tagged with and says how it was checked;
 the shared rule `CODE_BUILT_LINES_ARE_EVIDENCE` tells every reader that
 such lines are evidence as reliable as the filing, not metadata (an LLM
@@ -1171,9 +1290,10 @@ quotes, tool values), never from re-parsed model prose.
   same primary and fallback model as every HIGHEST call (chapter 14).
   One call path, `JudgeAgent._complete`, used by both calls
   below.
-- **Short-cuts without an LLM call:** every agent failed -> `judge_failed`
-  with `no_evidence`; both latest debate sides unavailable ->
-  `judge_failed` with `debate_unavailable`. The Judge reads each side's
+- **Short-cut without an LLM call:** both latest debate sides
+  unavailable -> `judge_failed` with `debate_unavailable`. (The Judge never
+  runs when every agent failed: that state goes straight to Reflection and
+  ends with `no_evidence`.) The Judge reads each side's
   LATEST argument, whatever its round (a one-side correction pass re-argues
   one side only); an unavailable side is shown as "(UNAVAILABLE -- do not
   infer what it would have argued)".
@@ -1207,8 +1327,9 @@ quotes, tool values), never from re-parsed model prose.
   `reweighting`, empty when there is no change to explain);
   `opposing_points` (at least the two strongest points of the side the
   verdict goes against, each `{point, response}`).
-- **Earlier verdict and the change rules.** `previous_verdict(state)` takes
-  the most recent of the open prior recommendation and the newest
+- **Earlier verdict and the change rules.** `previous_verdict(state)`
+  (`ai/recommendation/engine.py`, shared with the stored-confidence note)
+  takes the most recent of the open prior recommendation and the newest
   track-record call. When that analysis stored the Judge's own final-round
   verdict (`ai.recommendations.judge_leaning`, `judge_confidence`, written
   before penalties, caps and the position-limit HOLD), the comparison is
@@ -1245,7 +1366,9 @@ quotes, tool values), never from re-parsed model prose.
   $36,915 million), 0 false positives; cost about one extra HIGHEST call
   per 16-32 analyses.
 - **What is stored:** only `converged`, `leaning`, `confidence` and
-  `rationale` (`ai/graph/state.py::JudgeVerdict`). The audit fields are
+  `rationale` (`ai/graph/state.py::JudgeVerdict`), plus the `model` that
+  wrote the kept answer (the rewrite's model when the figure rewrite was
+  accepted) and `fallback_calls` for the recommendation note. The audit fields are
   checked and written to the log, never stored and never a reason for
   another call (the only Judge retry would be a whole new debate round of
   HIGHEST calls). Log events: `judge.deciding_factor` (always; with
@@ -1281,7 +1404,8 @@ quotes, tool values), never from re-parsed model prose.
   the cause is not known yet; each forced a full Bull/Bear/Judge round
   (12-39 s each);
   a non-English rationale is `judge_failed`
-  (`judge.non_english_rationale`). The confidence is clamped to 0-1, an
+  (`judge.non_english_rationale`). The confidence is clamped to 0-1 (a
+  value that is not a finite number, such as NaN or Infinity, becomes 0.0), an
   unknown leaning becomes HOLD, and `converged` counts only a real boolean
   or the string "true" (so the string `"false"` cannot end a debate). The graph's
   availability retries and no-verdict handling are in chapter 16.
@@ -1329,8 +1453,17 @@ quotes, tool values), never from re-parsed model prose.
   description}` with `kind` one of `unsupported`, `wrong_period`, `stale`,
   `not_engaged`, `inconsistent`. Code keeps an issue only when it is an
   object with a description and its quote is found (whitespace and case
-  normalized) in the agent evidence, or in the debate transcript for
-  `not_engaged` (`reflection.issue_quote_not_grounded`); an `unsupported`
+  normalized) in the agent evidence, or, for `not_engaged`, in the OTHER
+  side's arguments from rounds earlier than the criticised side's latest
+  available round (`_earlier_other_side_text`, from the side and round of
+  each argument; an unavailable placeholder does not count as a round).
+  Bull and Bear write each round in parallel, so a side cannot
+  answer the other side's same-round point: a `not_engaged` issue in
+  round 1, on a side that was not re-run after the point was made, or
+  quoting agent evidence or the side's own text is dropped. Accepting
+  agent-evidence quotes for this kind kept 21 issues in one batch that
+  the debate could not have answered, and left 8 runs unverified
+  (`reflection.issue_quote_not_grounded`); an `unsupported`
   Bull/Bear issue whose figure IS in the grounding reference is discarded
   (`reflection.mechanical_false_positive_discarded`); an unknown kind is
   kept as `None` (`reflection.issue_unknown_kind`); a role that is unknown,
@@ -1385,12 +1518,12 @@ quotes, tool values), never from re-parsed model prose.
 |---|---|---|---|
 | `AGENT_PREFETCH_ENABLED` | True | `config.py` | Run each agent's fixed first calls in code. |
 | `ARCHIVAL_RECYCLED_SHARE_MAX` | 0.5 | `config.py` | Skip archiving a note at least this recycled. |
-| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | None (0.90) | `config.py` | Cosine similarity for superseding an older note. |
+| `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | 0.85 | `config.py` | Cosine similarity for superseding an older note. |
 | `MIN_USABLE_AGENTS_FOR_DEBATE` | 4 | `config.py` | Fewer usable agents: no debate (chapter 16). |
 | `_REACT_LOOP_MAX_TOKENS` | 4096 | `ai/agents/loop.py` | Output budget of one ReAct turn. |
 | `_MAX_CORRECTION_RETRIES` | 2 | `loop.py` | Bad-response corrections before giving up. |
 | `_MAX_ZERO_EVIDENCE_RETRIES` | 2 | `loop.py` | `no_tool_evidence` rejections. |
-| `MAX_FINISH_VALIDATION_RETRIES` | 2 | `loop.py` | Validator rejections; also the budget of every reject-once check (`finish_checks.RejectOnceBudget`). |
+| `MAX_FINISH_VALIDATION_RETRIES` | 2 | `loop.py` | Validator rejections; also the budget of every reject-once check (`finish_checks.InternalTokenValidator`). |
 | `_MAX_DUPLICATE_BLOCK_RETRIES` | 2 | `loop.py` | Blocked repeated calls. |
 | `_NEAR_DUPLICATE_OBSERVATION_THRESHOLD` | 0.85 | `loop.py` | Near-duplicate observation nudge. |
 | `NUMBER_MATCH_REL_TOLERANCE` | 0.01 | `loop.py` | Relative tolerance for number grounding (also used by debate checks). |
@@ -1499,7 +1632,7 @@ portfolio details.
 | `macro.live_fred_lookup_failed` | FRED failed; check `FRED_API_KEY` and FRED availability. |
 | `risk.evidence_validator_exhausted` | A named risk event could not be sourced; see the warning in the summary. |
 | `risk.record_name_mismatch`, `risk.record_status_mismatch` | A cited record names another matter (rejected once, then accepted), or the stated status differs from the record (log only). |
-| `finish_checks.once_check_rejected` | A reject-once check sent the answer back (`check`: internal_tokens, own_evidence_figures, prior_note_copy, prior_note_claims, record_name, label_without_evidence). |
+| `finish_checks.once_check_rejected` | A reject-once check sent the answer back (`check`: internal_tokens, own_evidence_figures, prior_note_copy, prior_note_claims, record_name, empty_risk_events, label_without_evidence). |
 | `finish_checks.once_check_logged_only` | The same finding after the correction budget was spent: the answer was accepted. |
 | `finish_checks.internal_tokens_in_answer` | Record ids or tool labels in an answer (`rejected` says whether it went back). |
 | `bull.ungrounded_figures` / `bear.ungrounded_figures`, `*.final_draft_still_flagged` | A side's draft had figures with no match in the evidence; still flagged after the one regeneration. |
@@ -1684,7 +1817,7 @@ creating one writes data). Everything below is read-only.
 | File | What it holds |
 |---|---|
 | `services/ai-service/ai/agents/loop.py` | `BaseAgent`, `ReActAgentLoop`, `ScratchpadEntry`, prefetch, finish gates, peer-ticker tagging, `is_successful_tool_entry`, `tool_reported_error`, `derive_agent_quality`, `SCORE_UNRESOLVED`, `evidence_reference_text`. |
-| `services/ai-service/ai/agents/finish_checks.py` | `InternalTokenValidator`, `RejectOnceBudget`, the internal-token and own-evidence figure checks (`primary_reference_text`, `ungrounded_counts`), `reported_number_issue`. |
+| `services/ai-service/ai/agents/finish_checks.py` | `InternalTokenValidator` (with its reject-once budget), the internal-token and own-evidence figure checks (`primary_reference_text`, `ungrounded_counts`), `reported_number_issue`. |
 | `services/ai-service/ai/graph/nodes.py` | `AGENT_REGISTRY` (eight generic roles), `select_agents`, `DEFAULT_AGENTS_BY_TYPE`, `make_agent_node`. |
 | `services/ai-service/ai/agents/market.py` ... `portfolio.py` | The nine data agents with prompts and validators. |
 | `services/ai-service/ai/agents/debate_common.py` | Debate sides (`DebateSideAgent`), the shared prompt rules, `format_evidence` and the code-built lines, `find_ungrounded_figures`. |

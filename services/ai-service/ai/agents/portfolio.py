@@ -9,12 +9,12 @@ from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      own_evidence_figure_check)
 from ai.agents.loop import (SCORE_UNRESOLVED, BaseAgent, ReActAgentLoop,
                             ScratchpadEntry, combine_context,
-                            derive_agent_quality, is_successful_tool_entry,
+                            is_successful_tool_entry,
                             prefetch_tool_call, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.tools.portfolio_tool import (GetPortfolioCompositionTool,
                                      RecomputeScenarioTool)
-from shared.enums import AgentRole, AgentStatus
+from shared.enums import AgentRole
 
 logger = structlog.get_logger(__name__)
 
@@ -257,9 +257,7 @@ class PortfolioAgent(BaseAgent):
                 self.role.value,
                 _portfolio_finish_validator(
                     state.ticker, state.portfolio_kg_context), once_checks=[(
-                        OWN_EVIDENCE_CHECK,
-                        own_evidence_figure_check(
-                            state.portfolio_kg_context or ""))]),
+                        OWN_EVIDENCE_CHECK, own_evidence_figure_check())]),
             finish_validation_suffix=_PORTFOLIO_VALIDATION_SUFFIX)
         result = await loop.run(
             f"Assess how acting on {state.ticker} (e.g. buying more) would "
@@ -269,7 +267,6 @@ class PortfolioAgent(BaseAgent):
                 state.portfolio_kg_context, prior_fabrication_note),
             prefetched_evidence=prefetched)
 
-        scratchpad_dicts = [vars(e) for e in result.scratchpad]
         trusted_percentages = _trusted_percentages(
             result.scratchpad, state.portfolio_kg_context)
         mismatches = final_answer_has_unverifiable_percentages(
@@ -294,21 +291,15 @@ class PortfolioAgent(BaseAgent):
             summary = wrap_verification_warning(reason, result.final_answer)
             verification_warnings.append(reason)
 
-        agent_score, agent_is_well_supported = derive_agent_quality(
-            result, is_retry=feedback is not None,
-            verification_warnings=verification_warnings)
-        if mismatches:
-            agent_score, agent_is_well_supported = (
-                min(agent_score, SCORE_UNRESOLVED), False)
-        return AgentOutput(
-            role=self.role, status=AgentStatus.COMPLETED, summary=summary,
-            score=agent_score, is_well_supported=agent_is_well_supported,
-            iterations_used=result.iterations_used,
-            hit_iteration_cap=result.hit_iteration_cap,
-            retry_of_feedback=feedback, raw_output={
-                "scratchpad": scratchpad_dicts,
-                "verification_warnings": verification_warnings,
+        output = self.completed_output(
+            result, feedback=feedback, summary=summary,
+            verification_warnings=verification_warnings, raw_output={
                 "final_answer": result.final_answer,
-                "injected_context": state.portfolio_kg_context,
-                "finish_meta": result.finish_meta
+                "injected_context": state.portfolio_kg_context
             })
+        if mismatches:
+            output = output.model_copy(update={
+                "score": min(output.score, SCORE_UNRESOLVED),
+                "is_well_supported": False
+            })
+        return output

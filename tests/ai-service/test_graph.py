@@ -417,7 +417,8 @@ class TestRetryCapacityGate:
             LLMTier.HIGHEST_ACCURACY) == "fallback"
         assert await router_module.capacity_aware_delay(
             LLMTier.HIGHEST_ACCURACY, 60.0) == (0.0, "fallback")
-        monkeypatch.setattr(config.settings, "LLM_DEFAULT_PROVIDER", "other")
+        monkeypatch.setattr(
+            config.settings, "LLM_DEFAULT_PROVIDER", "anthropic")
         assert await router_module.capacity_aware_delay(
             LLMTier.HIGHEST_ACCURACY, 60.0) == (60.0, None)
 
@@ -816,12 +817,24 @@ class TestReflectionNode:
             _bull_correction(
                 2, "Bull cited another unsupported figure",
                 "still unsupported"))
+        real_gate = nodes_module._rate_limit_gate_for_retry
+        gated: list[dict[AgentRole, str]] = []
+
+        async def _spy_gate(retry_now):
+            gated.append(dict(retry_now))
+            return retry_now, []
+
+        monkeypatch.setattr(
+            nodes_module, "_rate_limit_gate_for_retry", _spy_gate)
         state = _state(
             debate=DebateState(
                 mutual_rounds_completed=1, correction_used_for_round=1))
         update = await reflection_node(state)
         assert update["pending_retry_agents"] == []
         assert "debate" not in update
+        assert gated == []
+        monkeypatch.setattr(
+            nodes_module, "_rate_limit_gate_for_retry", real_gate)
 
         async def _boom(self, state):
             raise RuntimeError("bug")
@@ -884,6 +897,34 @@ async def test_recommendation_node_returns_a_json_serializable_dict():
     assert final["action"] == "sell"
     assert final["confidence"] == pytest.approx(0.4)
     assert update.get("no_verdict_reason") is None
+
+
+@pytest.mark.usefixtures("no_memory_io")
+@pytest.mark.asyncio
+async def test_failed_later_judge_pass_keeps_earlier_valid_verdict():
+    valid = JudgeVerdict(
+        round_number=1, converged=True, leaning=RecommendationAction.SELL,
+        confidence=0.62, rationale="weak fundamentals")
+    failed = JudgeVerdict(
+        round_number=2, converged=False, leaning=RecommendationAction.HOLD,
+        confidence=0.0, rationale="Judge unavailable: 529",
+        judge_failed=True, failure_reason="judge_unavailable")
+    update = await recommendation_node(
+        _state(
+            debate=DebateState(round_number=2, verdicts=[valid, failed])))
+    final = update["final_recommendation"]
+    assert update.get("no_verdict_reason") is None
+    assert final["action"] == "sell"
+    assert final["reasoning"] == "weak fundamentals"
+    assert ("last Judge pass failed (judge unavailable)"
+            in final["confidence_adjustment_note"])
+    assert "earlier valid verdict from round 1" in (
+        final["confidence_adjustment_note"])
+
+    only_failed = await recommendation_node(
+        _state(debate=DebateState(round_number=2, verdicts=[failed])))
+    assert only_failed["final_recommendation"] is None
+    assert only_failed["no_verdict_reason"] == "judge_unavailable"
 
 
 def _hit(
@@ -1243,7 +1284,7 @@ class TestAnalysisWorkflow:
 
         wf, events = workflow_env
         pf = uuid4()
-        _, old_rec, _ = await rows.recommendation(
+        old_analysis, old_rec, _ = await rows.recommendation(
             ticker="AMD", portfolio_id=pf, action="buy", confidence=0.72,
             tiers=[(_BUY, "587.37", "6", _P), (_BUY, "575.5", "7", _P)])
 
@@ -1282,7 +1323,7 @@ class TestAnalysisWorkflow:
             str(analysis_id), analysis_type=AnalysisType.FULL)
 
         state = seen["state"]
-        assert state.prior_recommendation.recommendation_id == str(old_rec)
+        assert state.prior_recommendation.analysis_id == str(old_analysis)
         assert state.prior_recommendation.well_supported_count is None
         assert "old reasoning text" not in (
             state.pending_recommendation_context)

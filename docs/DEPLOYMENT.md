@@ -145,6 +145,22 @@ These steps were done once; repeat them only for a new host.
   `scheduler was not running before the deploy: kept stopped`. To start
   it: `docker compose --env-file .env.docker up -d scheduler`. When it was
   running, it is restarted like any other service.
+- The jobs that spend no LLM or news quota still matter on the host,
+  because real accounts are deleted there: purge-unverified,
+  notification-retention and the two deleted-user sweeps (they remove
+  what a lost deletion event left behind). Run them by hand, for
+  example once a week, while the scheduler stays stopped:
+
+  ```bash
+  for job in purge-unverified notification-retention \
+      deleted-user-sweep-core deleted-user-sweep-ai; do
+    docker compose --env-file .env.docker run --rm --no-deps scheduler \
+      /scripts/call-job.sh "$job"
+  done
+  ```
+
+  With arguments, the scheduler image runs that one command instead of
+  cron (handbook chapter 26, sections 3.2 and 3.11).
 - Quick check after a deploy, from any machine:
   `curl -sk https://alphamind-research.duckdns.org:8443/healthz`. It
   answers `{"status":"ok"}` only when the frontend runs and its server
@@ -223,6 +239,7 @@ using the other address:
 | Deploy by hand | `bash scripts/deploy.sh` |
 | Logs | `bash scripts/logs.sh <service>` or `logs/<service>/` |
 | Mail (MailHog, Prometheus, Qdrant UIs listen on the host's 127.0.0.1 only) | from your machine: `ssh -i <key> -L 8025:127.0.0.1:8025 ubuntu@<host>`, then open `http://127.0.0.1:8025` |
+| Organization sweep refused by its safety brake (`ORGANIZATION_SWEEP_MAX_MISSING`) | `docker compose --env-file .env.docker exec core-service python -m scripts.clean_organizations --id <org id>` (preview), then the same with `--confirm`; it skips any id auth still has (handbook chapter 26, section 6) |
 | Certificate status | `sudo certbot certificates` |
 | Free space | `df -h /` and `docker system df` |
 
