@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Any, ClassVar
 from uuid import UUID
 import structlog
+from ai.experiment_isolation import isolation_skips
 from ai.providers.base import MarketDataProvider, ProviderError
 from ai.providers.registry import get_market_data_provider
 from ai.tools.base import Tool
@@ -47,6 +48,8 @@ async def priced_holdings(
 
 async def committed_buy_cash_elsewhere(
         portfolio_id: str, ticker: str) -> Decimal | None:
+    if isolation_skips("committed_buy_cash_read", ticker=ticker):
+        return Decimal(0)
     try:
         portfolio_uuid = UUID(portfolio_id)
         async with SessionLocal() as session:

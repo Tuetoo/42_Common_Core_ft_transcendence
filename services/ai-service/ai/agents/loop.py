@@ -974,16 +974,22 @@ class ReActAgentLoop:
                 "satisfied -- do not repeat them with the same input; go on "
                 "with the next step your instructions describe, or finish "
                 "if the evidence is already sufficient.")
+        segments = ["\n\n".join(parts)]
         if scratchpad:
-            history = "\n".join(
+            entries = [
                 f"Thought: {e.thought}\nAction: {e.action}\n"
                 f"Action Input: {e.action_input}\nObservation: {e.observation}"
-                for e in scratchpad)
-            parts.append(f"Scratchpad so far:\n{history}")
+                for e in scratchpad
+            ]
+            parts.append("Scratchpad so far:\n" + "\n".join(entries))
+            segments.append("\n\nScratchpad so far:\n" + entries[0])
+            segments.extend("\n" + entry for entry in entries[1:])
 
         return [
             LLMMessage(role="system", content=system),
-            LLMMessage(role="user", content="\n\n".join(parts))
+            LLMMessage(
+                role="user", content="\n\n".join(parts),
+                cache_segments=None if is_final_turn else tuple(segments))
         ]
 
     @staticmethod

@@ -428,7 +428,9 @@ async def _generate_debate_argument(
         response = await llm_router.complete(
             llm_tier, [
                 LLMMessage(role="system", content=system_prompt),
-                LLMMessage(role="user", content=user_content)
+                LLMMessage(
+                    role="user", content=user_content,
+                    shared_evidence=evidence_text)
             ], retries=AGENT_LLM_CALL_RETRIES)
         return response.content.strip()
 

@@ -48,6 +48,9 @@ def is_archivable_role(role: AgentRole) -> bool:
 
 
 _UNKNOWN_OWNER = object()
+# The analysis row no longer exists: its owner's account (or the analysis)
+# was deleted while the analysis was finishing. Nothing is archived.
+_ANALYSIS_GONE = object()
 
 
 async def _analysis_owners(
@@ -71,9 +74,7 @@ async def _archive_owner(analysis_id: UUID) -> object:
             "archival.owner_lookup_failed", analysis_id=str(analysis_id))
         return _UNKNOWN_OWNER
     if analysis_id not in owners:
-        logger.warning(
-            "archival.owner_analysis_not_found", analysis_id=str(analysis_id))
-        return _UNKNOWN_OWNER
+        return _ANALYSIS_GONE
     return owners[analysis_id]
 
 
@@ -199,6 +200,11 @@ async def archive_agent_report(
 
     category = _CATEGORY_BY_ROLE[role]
     owner = await _archive_owner(analysis_id)
+    if owner is _ANALYSIS_GONE:
+        logger.info(
+            "archival.skipped_analysis_deleted", role=role.value,
+            analysis_id=str(analysis_id))
+        return
     visibility = _archive_visibility(owner)
 
     duplicate = (
@@ -251,8 +257,21 @@ async def archive_agent_report(
         await _extract_and_store_kg(
             report_id=report_id, content=content, ticker=ticker)
     except Exception:
+        if not await _report_exists(report_id):
+            logger.info(
+                "archival.kg_skipped_report_deleted",
+                report_id=str(report_id))
+            return
         logger.exception(
             "archival.kg_extraction_failed", report_id=str(report_id))
+
+
+async def _report_exists(report_id: UUID) -> bool:
+    try:
+        async with SessionLocal() as session:
+            return await session.get(AgentReport, report_id) is not None
+    except Exception:
+        return True
 
 
 async def _extract_and_store_kg(

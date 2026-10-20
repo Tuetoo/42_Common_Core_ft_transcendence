@@ -821,6 +821,71 @@ async def _run_judge(
     return verdict, logs
 
 
+class TestSharedEvidence:
+
+    @pytest.mark.asyncio
+    async def test_debate_judge_and_reflection_mark_the_same_evidence(
+            self, monkeypatch):
+        import ai.llm.anthropic_provider as anthropic_module
+        import config
+
+        state = _googl_state()
+        evidence = dc.format_evidence(state)
+        users = []
+        for side in ("bull", "bear"):
+            router = _Router("Revenue rose [fundamental].")
+            monkeypatch.setattr(dc, "LLMRouter", lambda router=router: router)
+            await dc.DebateSideAgent(side).make_argument(state)
+            users.append(router.calls[0][-1])
+        judge_router = _Router(_answer(_UNIT_SLIP), _answer(_UNIT_FIXED))
+        await _run_judge(judge_router, monkeypatch)
+        assert len(judge_router.calls) == 2
+        users.append(judge_router.calls[0][1])
+        assert judge_router.calls[1][1] == judge_router.calls[0][1]
+        users.append(ReflectionAgent()._build_messages(state)[1])
+
+        assert users[0].content.startswith(
+            "Ticker: GOOGL\n\nResearch agent evidence:\n" + evidence +
+            "\n\n")
+        assert users[2].content.startswith(
+            "Ticker: GOOGL\nRound: 2\n\nResearch agent evidence:\n" +
+            evidence + "\n\n")
+        assert users[3].content.startswith(
+            "Ticker: GOOGL\n\nAgent evidence:\n" + evidence +
+            "\n\nDebate so far:\n")
+        for user in users:
+            assert user.shared_evidence == evidence
+            assert user.content.count(evidence) == 1
+
+        monkeypatch.setattr(
+            config.settings, "LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST", True)
+        firsts = []
+        for user, system in zip(users, (
+                dc._BULL_SYSTEM_PROMPT, dc._BEAR_SYSTEM_PROMPT,
+                judge_router.calls[0][0].content,
+                reflection_module._SYSTEM_PROMPT)):
+            hoisted, moved = anthropic_module._hoisted_evidence([
+                judge_router.calls[0][0].model_copy(
+                    update={"content": system}), user
+            ])
+            sent = anthropic_module._request_kwargs(
+                moved, evidence=hoisted, model="claude-sonnet-5-5",
+                temperature=0.2, max_tokens=64,
+                timeout_seconds=None, output_config=None,
+                thinking="between_tools")
+            assert [b["text"] for b in sent["system"]] == [
+                anthropic_module._EVIDENCE_BLOCK_LABEL + evidence, system
+            ]
+            assert all("cache_control" in b for b in sent["system"])
+            assert sent["messages"] == [{
+                "role": "user",
+                "content": user.content.replace(
+                    evidence, anthropic_module._EVIDENCE_POINTER, 1)
+            }]
+            firsts.append(sent["system"][0])
+        assert all(block == firsts[0] for block in firsts)
+
+
 class TestJudgeFigureRewrite:
 
     @pytest.mark.asyncio

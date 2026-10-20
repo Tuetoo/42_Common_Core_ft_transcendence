@@ -1275,6 +1275,64 @@ class TestAnalysisWorkflow:
         assert events[1][1]["failure_reason"] == "no_evidence"
 
     @pytest.mark.asyncio
+    async def test_experiment_isolation_ignores_other_analyses_tiers(
+            self, rows, workflow_env, monkeypatch):
+        from ai.recommendation.position_sizing import (PositionSizingResult,
+                                                       TierSuggestion)
+        from ai.tools.portfolio_tool import committed_buy_cash_elsewhere
+        from database import SessionLocal
+        from domains.analysis.model import Recommendation
+
+        wf, events = workflow_env
+        pf = uuid4()
+        _, old_amd, _ = await rows.recommendation(
+            ticker="AMD", portfolio_id=pf, action="buy",
+            tiers=[(_BUY, "587.37", "6", _P), (_BUY, "575.5", "7", _P)])
+        _, old_nvda, _ = await rows.recommendation(
+            ticker="NVDA", portfolio_id=pf, action="buy",
+            tiers=[(_BUY, "150", "10", _P)])
+        assert await committed_buy_cash_elsewhere(str(pf), "AMD") > 0
+        monkeypatch.setattr(config.settings, "ANALYSIS_EXPERIMENT_ISOLATION",
+                            True)
+        assert await committed_buy_cash_elsewhere(str(pf), "AMD") == 0
+        seen: dict[str, Any] = {}
+
+        async def _fake_sizing(**kwargs):
+            seen.update(kwargs)
+            return (
+                PositionSizingResult(
+                    window_days=14, tiers=[
+                        TierSuggestion(
+                            target_price=Decimal("600"),
+                            quantity=Decimal("2"))
+                    ]), None)
+
+        monkeypatch.setattr(wf, "generate_position_sizing", _fake_sizing)
+        monkeypatch.setattr(
+            wf, "build_analysis_graph", lambda: _StubGraph({
+                "agent_outputs": {},
+                "debate": DebateState(),
+                "reflection_history": [],
+                "final_recommendation": _final_payload("buy", 0.7)
+            }))
+        analysis_id = await rows.analysis(
+            ticker="AMD", portfolio_id=pf, status="pending")
+        await wf.run_analysis_workflow(
+            str(analysis_id), analysis_type=AnalysisType.FULL)
+
+        assert seen["committed_buy_cash"] == Decimal(0)
+        assert await rows.tier_statuses(old_amd) == [_P, _P]
+        assert await rows.tier_statuses(old_nvda) == [_P]
+        async with SessionLocal() as s:
+            new = (
+                await s.execute(
+                    select(Recommendation).where(
+                        Recommendation.analysis_id == analysis_id)
+                )).scalar_one()
+        assert await rows.tier_statuses(new.id) == [_P]
+        assert "tier.cancelled" not in [n for n, _ in events]
+
+    @pytest.mark.asyncio
     async def test_new_buy_replaces_earlier_tiers_and_records_why(
             self, rows, workflow_env, monkeypatch):
         from ai.recommendation.position_sizing import (PositionSizingResult,
@@ -1455,6 +1513,106 @@ class TestAnalysisWorkflow:
         assert AgentRole.MACRO in calls["archive"]
         assert AgentRole.NEWS not in calls["archive"]
         assert len(calls["memory"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_experiment_isolation_skips_memory_and_prior_context(
+            self, rows, workflow_env, monkeypatch):
+        import ai.knowledge.kg_context as kg_module
+        from ai.graph.nodes import _procedural_hints
+        from database import SessionLocal
+        from domains.analysis.model import Analysis
+
+        wf, _events = workflow_env
+        calls: list[str] = []
+
+        async def _remember(**kwargs):
+            calls.append("memory")
+            return True
+
+        async def _archive(**kwargs):
+            calls.append("archive")
+
+        # The code under test catches errors from these reads, so they
+        # record each call instead of raising.
+        reads: list[str] = []
+
+        async def _hints(*args, **kwargs):
+            reads.append("procedural_hints")
+
+        async def _episodes(*args, **kwargs):
+            reads.append("episodic_context")
+            return []
+
+        def _session(*args, **kwargs):
+            reads.append("prior_recommendation")
+            return SessionLocal()
+
+        monkeypatch.setattr(config.settings, "ANALYSIS_EXPERIMENT_ISOLATION",
+                            True)
+        monkeypatch.setattr(config.settings, "EPISODIC_CONTEXT_LIMIT", 3)
+        monkeypatch.setattr(wf, "maybe_remember_trajectory", _remember)
+        monkeypatch.setattr(wf, "archive_agent_report", _archive)
+        monkeypatch.setattr(
+            memory_module, "retrieve_procedural_hints", _hints)
+        monkeypatch.setattr(
+            memory_module, "retrieve_episodic_context", _episodes)
+        monkeypatch.setattr(wf, "SessionLocal", _session)
+        with capture_logs() as logs:
+            assert await wf._resolve_prior_recommendation(
+                str(uuid4()), "AMD") is None
+            assert await _procedural_hints([AgentRole.MACRO], "AMD",
+                                           str(uuid4())) == {}
+            assert await kg_module.fetch_kg_relations(
+                "AMD", "AMD", None) == []
+            assert await episodic_memory_node(_amd(user_id=str(
+                uuid4()))) == {"episodic_context": []}
+        assert reads == []
+        assert sorted(e["path"] for e in logs
+                      if e["event"] == "experiment_isolation.skipped") == [
+                          "episodic_memory_read", "knowledge_graph_read",
+                          "prior_recommendation_read",
+                          "procedural_memory_read"
+                      ]
+        monkeypatch.setattr(config.settings, "ANALYSIS_EXPERIMENT_ISOLATION",
+                            False)
+        await episodic_memory_node(_amd(user_id=str(uuid4())))
+        await _procedural_hints([AgentRole.MACRO], "AMD", str(uuid4()))
+        assert reads == ["episodic_context", "procedural_hints"]
+        monkeypatch.setattr(config.settings, "ANALYSIS_EXPERIMENT_ISOLATION",
+                            True)
+        monkeypatch.setattr(wf, "SessionLocal", SessionLocal)
+        monkeypatch.setattr(
+            wf, "build_analysis_graph", lambda: _StubGraph({
+                "agent_outputs": {
+                    AgentRole.MACRO: _ok(
+                        AgentRole.MACRO, summary="rates " * 50)
+                },
+                "debate": DebateState(),
+                "reflection_history": [],
+                "final_recommendation": _final_payload("hold", 0.5)
+            }))
+        analysis_id = await rows.analysis(
+            ticker="AMD", portfolio_id=None, status="pending")
+        with capture_logs() as logs:
+            await wf.run_analysis_workflow(
+                str(analysis_id), analysis_type=AnalysisType.FULL)
+        assert calls == []
+        assert sorted(e["path"] for e in logs
+                      if e["event"] == "experiment_isolation.skipped") == [
+                          "episodic_memory_write",
+                          "procedural_memory_and_archival_write"
+                      ]
+        async with SessionLocal() as s:
+            assert (await s.get(Analysis, analysis_id)).status == "completed"
+            for table, expected in (("recommendations", 1),
+                                    ("episodic_memories", 0)):
+                count = (
+                    await s.execute(
+                        text(
+                            f"SELECT count(*) FROM ai.{table} "
+                            "WHERE analysis_id = :a"),
+                        {"a": analysis_id})).scalar_one()
+                assert count == expected, table
 
     @pytest.mark.asyncio
     async def test_learning_still_runs_when_publishing_fails(

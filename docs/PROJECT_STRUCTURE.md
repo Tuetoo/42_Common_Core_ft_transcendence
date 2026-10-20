@@ -190,6 +190,8 @@ alphamind/
 │   │                        position_sizing.py
 │   ├── evaluation/          rag_recall.py (golden set and recall)
 │   ├── user_sentiment.py    sentiment of notes and comments
+│   ├── experiment_isolation.py  the ANALYSIS_EXPERIMENT_ISOLATION check
+│   │                        and its log event (isolation_skips)
 │   └── workflows/           analysis, RAG ingestion, auto ingestion, tier
 │                            monitoring, review, and the three backtests
 │                            (backtest_workflow.py)
@@ -207,7 +209,9 @@ alphamind/
                              regenerate_filing_summaries.py),
                              verify_portfolio_backtest.py,
                              probe_model_latency.py,
-                             probe_anthropic_schemas.py
+                             probe_anthropic_schemas.py,
+                             probe_anthropic_cache.py,
+                             llm_usage_report.py
 ```
 
 ## 5. `shared/`

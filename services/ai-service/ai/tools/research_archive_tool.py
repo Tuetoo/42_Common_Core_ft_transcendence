@@ -1,6 +1,7 @@
 from typing import Any, ClassVar
 import structlog
 from ai.agents.evidence_grounding import non_english_reason
+from ai.experiment_isolation import isolation_skips
 from ai.rag.retriever import BaseRetriever, RetrievedChunk
 from ai.rag.visibility import SYSTEM_ONLY_SCOPE, RetrievalVisibility
 from ai.tools.base import Tool, age_in_days
@@ -121,6 +122,11 @@ class SearchResearchArchiveTool(Tool):
                 query, ticker=effective_ticker)
         except Exception as exc:
             return f"Research archive search failed for {query!r}: {exc}"
+
+        notes = sum(1 for c in chunks if _is_agent_note(c))
+        if notes and isolation_skips(
+                "archived_agent_notes_read", tool=self.name, dropped=notes):
+            chunks = [c for c in chunks if not _is_agent_note(c)]
 
         english_chunks = [
             c for c in chunks if non_english_reason(c.text) is None

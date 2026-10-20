@@ -165,7 +165,7 @@ what a service covers. Where things live:
 | Smoke and `e2e_tier_check` scripts, operator scripts | `tests/ai-service/test_scripts.py` |
 | Analysis repository, service and queue, create and read routes, backtest routes, analytics, internal routes, events, user deletion and the nightly sweep, migrations | `tests/ai-service/test_api.py` |
 
-Size (collected tests: 558 test functions in the 21 unit-test files,
+Size (collected tests: 570 test functions in the 21 unit-test files,
 plus the 4 `alembic_contract.py` checks that every suite collects; no
 test is parametrized):
 
@@ -173,7 +173,7 @@ test is parametrized):
 |---|---|---|---|
 | `tests/auth-service` | 3 | 54 | 75% |
 | `tests/core-service` | 4 | 102 | 66% |
-| `tests/ai-service` | 14 | 414 | 90% |
+| `tests/ai-service` | 14 | 426 | 90% |
 | `tests/integration` | 1 | 1 | not measured |
 
 The suite was reduced by removing tests that covered no code line or

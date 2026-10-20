@@ -537,10 +537,11 @@ class JudgeAgent:
         previous_is_final = previous is None or not previous.judge_own
         holding_line += verdict_line
         track_record_line = _track_record_block(state)
+        evidence_text = format_evidence(state)
         user_content = (
             f"Ticker: {state.ticker}\n"
             f"Round: {round_number}\n\n"
-            f"Research agent evidence:\n{format_evidence(state)}\n\n"
+            f"Research agent evidence:\n{evidence_text}\n\n"
             f"Bull argument: {_argument_text(bull_arg, 'Bull')}\n\n"
             f"Bear argument: {_argument_text(bear_arg, 'Bear')}"
             f"{pending_context_line}{holding_line}{track_record_line}")
@@ -556,7 +557,9 @@ class JudgeAgent:
             has_track_record=bool(track_record_line))
         messages = [
             LLMMessage(role="system", content=system_prompt),
-            LLMMessage(role="user", content=user_content)
+            LLMMessage(
+                role="user", content=user_content,
+                shared_evidence=evidence_text)
         ]
         response = await self._complete(messages)
         parsed, failure = _parse_response(response.content, response=response)

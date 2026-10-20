@@ -2521,15 +2521,17 @@ class E2E:
                 raise CheckFailed(
                     f"no message on analysis:<id> "
                     f"{state.get('listen_error', '')}")
-            if events[0] != "analysis.status":
+            # The server subscribes the socket before it sends the snapshot,
+            # so a live event published meanwhile may arrive first.
+            if "analysis.status" not in events:
                 raise CheckFailed(
-                    f"first message {events[0]!r}, expected "
-                    f"analysis.status; events seen: {events}")
+                    f"no analysis.status snapshot; events seen: {events}")
+            position = events.index("analysis.status") + 1
             started = (
                 "; analysis.started also received"
                 if "analysis.started" in events else "")
             return (
-                f"first message analysis.status (status "
+                f"analysis.status snapshot as message {position} (status "
                 f"{state.get('connected_status')!r} at connect){started}")
 
         async def ws_final() -> str:

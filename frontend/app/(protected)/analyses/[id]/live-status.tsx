@@ -40,9 +40,10 @@ export function LiveStatus({
     onMessage: (event) => {
       const envelope = parseEnvelope(event.data);
       if (!envelope) return;
-      // The first message is a snapshot of the current status: the analysis
-      // may have started or finished between the page loading and the
-      // socket opening, so its events were sent before this subscription.
+      // One message is a snapshot of the current status (usually the first;
+      // a live event can arrive before it): the analysis may have started or
+      // finished between the page loading and the socket opening, so its
+      // events were sent before this subscription.
       const changedBeforeSubscribe =
         envelope.event === "analysis.status" && envelope.payload.status !== shownStatus;
       if (REFRESH_EVENTS.has(envelope.event) || changedBeforeSubscribe) {

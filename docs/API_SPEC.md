@@ -916,12 +916,13 @@ carries `analysis.started`, `analysis.completed`, `analysis.failed`,
 `recommendation.ready`, `decision.recorded`, `tier.executed`,
 `tier.execution_failed` and `tier.cancelled` (payloads in §6).
 
-The first message on an `analysis:{analysis_id}` socket is
+The first message on an `analysis:{analysis_id}` socket is normally
 `{"event": "analysis.status", "payload": {"analysis_id", "ticker", "status",
 "portfolio_id"}}` -- the analysis state when the socket subscribed. A client
 learns the id only from the POST response, and `analysis.started` is usually
 published before it can subscribe, so the live event alone would nearly
-always be missed. Live events follow the snapshot; a client may see a state twice and
+always be missed. Live events follow the snapshot, except that one published
+while the status is read can arrive just before it; a client may see a state twice and
 should treat `analysis.completed` / `analysis.failed` as final.
 
 `/ws/yjs/{note_id}` -- collaborative editing contract:

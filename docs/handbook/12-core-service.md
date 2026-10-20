@@ -1366,7 +1366,7 @@ check means deny.
    |                               |   POST auth /internal/users/{id}/presence online
    |<------ accept ----------------| (refusals also accept first, then close
    |                               |  with the code, so the browser sees it)
-   | analysis channel: first frame {"event": "analysis.status", payload: {...}}
+   | analysis channel: snapshot {"event": "analysis.status", payload: {...}}
    |<------ pushes: {"event", "payload", "emitted_at"} ---------------------
    | (client sends only text frames; a binary frame -> close 1003)
    |                               | token exp reached -> close 4401 "token expired"
@@ -1376,9 +1376,10 @@ check means deny.
 Close codes: 1003 unsupported data, 1008 policy violation (Yjs), 1011
 internal error, 4400 bad channel, 4401 unauthorized or token expired,
 4403 forbidden, 4429 too many connections (`websocket_manager.py`). The
-`analysis.status` first message exists because ai-service usually
+`analysis.status` snapshot exists because ai-service usually
 publishes `analysis.started` before the client has subscribed; the
-snapshot makes sure the client is not left without a state.
+snapshot makes sure the client is not left without a state. It is sent
+after the socket joins the channel, so a live event can precede it.
 
 Open channel sockets follow access changes too: on the same events as
 the Yjs re-check (section 3.9), `recheck_user_sessions` runs the channel

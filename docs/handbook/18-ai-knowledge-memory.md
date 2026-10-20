@@ -285,6 +285,7 @@ clean in the last round is archived.
 | hit the iteration cap | `archival.skipped_hit_iteration_cap` |
 | not English | `archival.skipped_non_english` |
 | fewer than 40 words (`_MIN_WORDS_TO_ARCHIVE`) | `archival.skipped_too_short` |
+| the analysis row no longer exists (its owner's account or the analysis was deleted while it finished) | `archival.skipped_analysis_deleted` |
 
 Each gate stops a real contamination loop. Example: a News summary with a
 "[VERIFICATION WARNING: ...]" banner was archived, a later run's
@@ -302,7 +303,13 @@ catches them (below).
 note only that user (and analyses run by that user) can retrieve; a system
 analysis produces a system note. If the owner cannot be read, the note is
 visible to nobody (fail closed). Reason: an agent's note may paraphrase
-the user's private uploads that its searches found.
+the user's private uploads that its searches found. When the analysis
+row is already gone (the account was deleted while the analysis was
+finishing), nothing is archived. A deletion that lands during the writes
+still fails the insert (foreign key on `agent_reports.analysis_id`), and
+the chunks already indexed for that report are removed. If the report
+is deleted while its graph facts are extracted, the failure is logged as
+`archival.kg_skipped_report_deleted` (info), not as an error.
 
 **Near-duplicate superseding.** For all four archived categories,
 before archiving:
@@ -406,7 +413,8 @@ notes". A calibration over 51 archived answers set the 0.5 bar.
 
 After the report is stored, `_extract_and_store_kg` runs (its own
 try/except; a failure logs `archival.kg_extraction_failed` and leaves the
-note in place):
+note in place, or logs `archival.kg_skipped_report_deleted` (info) when
+the report row was deleted meanwhile (section 3.5)):
 
 1. `resolve_ticker_name` (`ai/knowledge/kg_context.py`) gives the
    official company name, cached in `ai.ticker_names` and fetched once
@@ -1245,6 +1253,7 @@ not ok.
 |---|---|---|---|
 | `EPISODIC_CONTEXT_LIMIT` | 3 | `services/ai-service/config.py` | earlier calls shown to the Judge; 0 = off |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | same | review window for outcomes |
+| `ANALYSIS_EXPERIMENT_ISOLATION` | false | same | experiment switch: no memory, archived note or knowledge-graph fact is read or written (chapter 16, section 3.2) |
 | `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | 0.85 | same | cosine bar for superseding (calibrated for `gemini-embedding-2`; use 0.90 with `mistral-embed`) |
 | `ARCHIVAL_RECYCLED_SHARE_MAX` | 0.5 | same | recycled share that blocks archival |
 | `KG_EXTRACTION_LLM_TIER` | `cheap` | same | tier of the triple extraction call |

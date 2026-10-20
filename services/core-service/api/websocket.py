@@ -246,6 +246,9 @@ async def websocket_endpoint(
             logger.info(
                 "websocket_opened", channel=channel, user_id=requester_id)
         if prefix == "analysis":
+            # Subscribed first so no event is lost; an event published while
+            # the status is fetched can therefore reach the client before
+            # this snapshot.
             await send_analysis_status(websocket, target)
 
         async def _receive_loop() -> None:

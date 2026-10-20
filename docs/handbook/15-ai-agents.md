@@ -108,7 +108,12 @@ be explained. Each agent builds one loop with:
 **One turn.** `_build_messages` builds a system message (today's date as
 ground truth, the agent's prompt, the JSON contract, a rule that
 `thought` stays short, the tool list) and a user message (the task, extra
-context, a note about prefetched calls, the scratchpad so far). The router
+context, a note about prefetched calls, the scratchpad so far). The user
+message also carries `cache_segments` (the same text cut after the
+fixed head and after each scratchpad entry; none on the last allowed
+turn), so the Anthropic adapter can read the previous turn's prompt
+from the prompt cache without changing the text the model sees (chapter
+14, section 3.16). The router
 call is:
 
 ```

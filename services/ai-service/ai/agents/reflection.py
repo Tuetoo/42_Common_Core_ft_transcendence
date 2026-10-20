@@ -556,11 +556,14 @@ class ReflectionAgent:
 
     def _build_messages(self, state: AnalysisState) -> list[LLMMessage]:
         debate_text = self._debate_transcript(state)
+        evidence_text = format_evidence(state)
         user_content = (
             f"Ticker: {state.ticker}\n\n"
-            f"Agent evidence:\n{format_evidence(state)}\n\n"
+            f"Agent evidence:\n{evidence_text}\n\n"
             f"Debate so far:\n" + (debate_text or "(no debate yet)"))
         return [
             LLMMessage(role="system", content=_SYSTEM_PROMPT),
-            LLMMessage(role="user", content=user_content)
+            LLMMessage(
+                role="user", content=user_content,
+                shared_evidence=evidence_text)
         ]

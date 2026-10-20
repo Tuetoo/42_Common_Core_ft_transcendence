@@ -17,6 +17,7 @@ from ai.agents.reflection import ReflectionAgent
 from ai.agents.risk import RiskAgent
 from ai.agents.sentiment import SentimentAgent
 from ai.agents.technical import TechnicalAgent
+from ai.experiment_isolation import isolation_skips
 from ai.graph.state import (AVAILABILITY_FAILURE_KINDS,
                             ISSUE_REFLECTION_CRASHED,
                             ISSUE_RETRY_DELAYED_CAPACITY,
@@ -193,7 +194,8 @@ def make_agent_node(role: AgentRole) -> _StateNode:
 async def episodic_memory_node(state: AnalysisState) -> dict[str, Any]:
     from ai.memory.agent_memory import retrieve_episodic_context
 
-    if settings.EPISODIC_CONTEXT_LIMIT <= 0:
+    if settings.EPISODIC_CONTEXT_LIMIT <= 0 or isolation_skips(
+            "episodic_memory_read", ticker=state.ticker):
         return {"episodic_context": []}
     try:
         context = await retrieve_episodic_context(
@@ -216,6 +218,8 @@ async def _procedural_hints(
     from ai.memory.agent_memory import (owner_uuid,
                                         retrieve_procedural_hints)
 
+    if isolation_skips("procedural_memory_read", ticker=ticker):
+        return {}
     owner_id = owner_uuid(user_id)
     hints: dict[AgentRole, str] = {}
     for role in selected:

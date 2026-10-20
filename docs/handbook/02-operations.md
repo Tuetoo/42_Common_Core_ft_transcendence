@@ -648,6 +648,8 @@ checks the clock.
 | `e2e_tier_check` (through `scripts/e2e.sh tier`) | ai | synthetic rows, cleaned up | See section 3.11. | 19 |
 | `probe_model_latency` (through `scripts/probe.sh`) | ai | no (uses LLM quota) | See section 3.5. | 14 |
 | `probe_anthropic_schemas` | ai | no (a few cents of Anthropic credit) | Sends each research agent's ReAct step schema (full and reduced) to the Anthropic model with `max_tokens=16` and reports which one is accepted. | 14 |
+| `probe_anthropic_cache` | ai | no (a few cents of Anthropic credit) | Sends a 3-turn ReAct prompt twice per turn to both Anthropic tiers with `max_tokens=16` and reports the prompt-cache writes and reads per call. | 14 |
+| `llm_usage_report` | ai (or host `python3`) | no (read-only) | Anthropic calls, tokens, cache use, wall time and cost per analysis and per group, from the ai-service log lines of a run folder or a daily log. | 14 |
 | `verify_portfolio_backtest --list` / `--portfolio U [--start D] [--end D] [--benchmark SPY] [--run [--keep]]` | ai | only with `--run` (row deleted unless `--keep`) | Recomputes a portfolio backtest independently in three layers: each snapshot against the ledger, the TWR metrics with its own code, and with `--run` the production backtest. | 19 |
 
 The output helpers of these scripts (`flatten`, `one_line`) live at the
@@ -1234,6 +1236,7 @@ events to search for:
 | `analysis_queue_job_started`, `analysis_queue_job_finished`, `analysis_queue_job_cancelled` | ai | queue worker progress |
 | `analysis_marked_failed` | ai | an analysis failed, with `failure_reason` |
 | `analysis_queue_full` | ai | a create was refused (queue cap) |
+| `experiment_isolation.skipped` | ai | with `ANALYSIS_EXPERIMENT_ISOLATION=true`, an analysis skipped one memory or context read or write, named by `path` (chapter 16, section 3.2) |
 | `analysis_queue_job_skipped_owner_inactive` | ai | a queued analysis of a deactivated or deleted user was not run (marked `failed` / `cancelled`) |
 | `market_open_job_completed`, `market_open_analysis_request_failed`, `market_open_owner_inactive_skipped` | core | the 09:30 job (the last one: a portfolio skipped because its owner is deactivated or deleted) |
 | `tracked_tickers_inactive_owners_skipped` | core | the nightly ingestion's ticker list left out holdings and watchlists of inactive owners |
@@ -1604,6 +1607,8 @@ one exporter for about two minutes; no data is touched):
 | `services/ai-service/scripts/e2e_tier_check.py` | Tier chain end-to-end check. |
 | `services/ai-service/scripts/probe_model_latency.py` | Gemini latency probe. |
 | `services/ai-service/scripts/probe_anthropic_schemas.py` | Anthropic structured-output schema probe (chapter 14). |
+| `services/ai-service/scripts/probe_anthropic_cache.py` | Anthropic prompt-cache probe (chapter 14). |
+| `services/ai-service/scripts/llm_usage_report.py` | LLM usage and cost report from the logs (chapter 14). |
 | `services/*/scripts/*.py` | Every Python operator script (index in section 3.5b). |
 | `rag_seed_documents/` | Seed corpus for the RAG store (section 3.2 step 8). |
 | `shared/scheduled_jobs.py` | The 200/500 answer rule of the scheduler-triggered routes. |
