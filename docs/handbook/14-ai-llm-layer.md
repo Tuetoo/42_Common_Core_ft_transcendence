@@ -830,14 +830,68 @@ same whichever provider is selected. Embeddings stay on Google
   default) `system` is sent as one text block with `cache_control:
   {"type": "ephemeral"}` (prompt caching, 5-minute lifetime). Every ReAct
   turn of an agent, and the agent's retries, resend the same system
-  prompt, so later turns read it from the cache. Only the system prompt
-  is marked: each call has a single user message that grows every turn
-  (the scratchpad), so there is no stable message prefix to mark, and
-  automatic caching (a top-level `cache_control`) would write the whole
-  prompt at the write price on every turn without a later read. Prompts
-  under the model's minimum (512 tokens for Haiku 5.5 and Sonnet 5.5) are
-  not cached and cost the same as before. A cache write costs 1.25x the
-  input price; a read costs 0.1x (Haiku 5.5) or 0.05x (Sonnet 5.5);
+  prompt, so later turns read it from the cache. The ReAct scratchpad is
+  cached too. `LLMMessage.cache_segments` is an optional hint: the
+  message's `content` cut into pieces that join back to exactly
+  `content` (a validator enforces it), where every piece but the last
+  ends a prefix that the next call will send again. The ReAct loop sets
+  it on its user message (the task, context and prefetch note as one
+  piece, then one piece per scratchpad entry; chapter 15, section 3.2).
+  With caching on, the adapter sends such a message as one text block per
+  non-empty piece and marks the last block with `cache_control`. The API
+  looks back from that breakpoint, block by block (up to 20 blocks), for
+  the longest prefix an earlier call wrote, so turn N reads the whole
+  prompt of turn N-1 from the cache and writes only the newest entry.
+  At most the last three hinted messages get a breakpoint, so a request
+  never has more than four (the API limit). Messages without the hint
+  (Judge, Reflection, debate and all other single calls, and the Judge's
+  JSON re-ask) are sent as plain strings as before: the re-ask's earlier
+  turns were never written to the cache by the first call, so a
+  breakpoint there would only add write cost. Google, Mistral and OpenAI
+  ignore the hint. With `LLM_ANTHROPIC_PROMPT_CACHING=false` nothing is
+  marked and every message is a plain string. The API documentation does
+  not say how several text blocks of one message are joined for the
+  model; `scripts/probe_anthropic_cache.py` (below) compares
+  `count_tokens` for the string and the block form. On the agent's last
+  allowed turn the system prompt gets the "This is your LAST turn"
+  paragraph, so that call cannot read the cache (the system prompt is
+  the start of the cached prefix); the loop sends no `cache_segments` on
+  that turn, so it writes only the new system prompt, not the whole
+  scratchpad at the write price.
+  `LLM_ANTHROPIC_CACHE_SCRATCHPAD=false` turns off only the scratchpad
+  part: hinted messages are sent as plain strings again and only the
+  system prompt is cached (the behaviour before scratchpad caching);
+  it has no effect while `LLM_ANTHROPIC_PROMPT_CACHING=false`.
+  **Shared evidence first (experiment switch).** Bull, Bear, the Judge
+  and Reflection all paste the same evidence block
+  (`format_evidence(state)`, built from the agent outputs) into their
+  user message, after a different system prompt each, so by default none of
+  them can read another's copy from the cache. They mark it with the
+  hint `LLMMessage.shared_evidence` (the exact text, which a validator
+  requires to be part of `content`; it cannot be combined with
+  `cache_segments`). With `LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST=true` and
+  caching on, the adapter sends that text, after the fixed label
+  "Evidence for this analysis:", as the first `system` block with its
+  own `cache_control`, then the role's system prompt as a second cached
+  block, and the user message with the evidence text replaced by a fixed
+  pointer to that block (its label, such as "Research agent evidence:",
+  stays). The label and the pointer are the only added words. Without
+  the pointer the models read the label as empty evidence and refused
+  to argue (a measured run, `docs/MODEL_COMPARISON.md`). Prompt wording
+  such as the sides' "the evidence below" still points at text that now
+  comes earlier. The calls of one round with the same agent outputs (both
+  sides, their regenerations, the Judge and its re-ask or rewrite, and
+  Reflection) can then read the evidence from the cache, but the role's
+  system prompt sits behind the evidence and is no longer read across
+  analyses or rounds whose evidence differs. The message breakpoints
+  are reduced so a request never has more than four. The success log
+  line carries `evidence_first: true` for such a call. The switch is off
+  by default (requests are byte-identical to before) and exists to
+  measure the trade-off; other providers ignore the hint.
+  Prompts under the model's minimum (512 tokens for Haiku 5.5 and Sonnet
+  5.5) are not cached and cost the same as before. A cache write costs
+  1.25x the input price; a read costs 0.1x (Haiku 5.5) or 0.05x (Sonnet
+  5.5);
 - `thinking`, chosen per tier: the requested model is compared (exact
   equality) with `LLM_ANTHROPIC_MODEL_CHEAP`, then with
   `LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY`, and the matching
@@ -928,6 +982,58 @@ docker compose --env-file .env.docker exec ai-service \
 which runs the agents). Grammar limits are the server's, so rerun it
 after a model change.
 
+**Cache probe.** `services/ai-service/scripts/probe_anthropic_cache.py`
+checks the scratchpad caching with the real key. It builds a ReAct
+prompt with the loop's own `_build_messages` (a stand-in price tool and
+synthetic observations of over 1,000 tokens each, with a random run id
+in the system prompt so no earlier run's cache is reused) for turns 1
+to 3, and sends each turn twice through `AnthropicAdapter` with the
+step schema, `max_tokens=16` and no thinking headroom, first to
+`LLM_ANTHROPIC_MODEL_CHEAP`, then to
+`LLM_ANTHROPIC_MODEL_HIGHEST_ACCURACY`. It asserts that the blocks join
+to the original text, and prints per call the uncached input, cache
+write and cache read tokens with OK or UNEXPECTED: the first call of
+turn 1 writes; each repeat writes nothing and reads the whole prompt;
+the first call of turns 2 and 3 reads at least the previous turn's
+prompt and writes the new entry. Then it compares `count_tokens` for the
+user message as one string and as blocks ("same" or "DIFFERENT"). A run
+is 12 small requests (plus 2 free `count_tokens` calls per model) and
+costs cents. It needs `ANTHROPIC_API_KEY` and both caching switches on
+(the defaults); when `LLM_ANTHROPIC_PROMPT_CACHING` or
+`LLM_ANTHROPIC_CACHE_SCRATCHPAD` is false, it prints that there is
+nothing to probe and exits with code 1. The block comparison uses the
+adapter's own block builder (`_segmented_content`):
+
+```bash
+docker compose --env-file .env.docker exec ai-service \
+    python -m scripts.probe_anthropic_cache
+```
+
+**Usage report.** `services/ai-service/scripts/llm_usage_report.py` is
+read-only and uses the standard library only. It reads the
+`anthropic.completion_succeeded` and `anthropic.stream_completed` lines
+of the given analyses (a `runs/run_<ts>` folder: ids from
+`_summary.txt`, lines from its `<T>_ai-service.log` files; or analysis
+ids with `--log logs/ai-service/<date>.log`, or `--log -` for stdin)
+and prints, per analysis and per group, the calls by model, prompt,
+uncached, cache-write, cache-read, output and thinking tokens, the
+number of evidence-first calls, the wall time (from
+`analysis_queue_job_started` to `analysis_queue_job_finished` or
+`analysis_queue_job_errored`; without them, from the first to the last
+log line, marked "(first-last line)"), a note
+when a new filing was ingested inside the analysis, and the
+cost at the list prices of `docs/MODEL_COMPARISON.md` (cache read 0.1x,
+write 1.25x, thinking billed as output; `--sonnet-cache-read 0.05`
+applies Anthropic's Sonnet 5.5 read price). Each log file is read once,
+even when a run folder names it twice. A run folder that lists a ticker
+twice gets a warning on stderr, because that ticker's log holds only the
+last run:
+
+```bash
+python3 services/ai-service/scripts/llm_usage_report.py \
+    --group A=runs/run_<ts> --group B=runs/run_<ts>
+```
+
 Every agent's ReAct schema converts within the explicit limits (at most
 21 optional and 6 union parameters), but that does not guarantee the
 server's grammar limit. Calls with only
@@ -968,9 +1074,12 @@ The page and the notification show it as "llm credit exhausted".
 **Usage logs.** Each completion logs `anthropic.completion_succeeded`
 with `model`, `prompt_tokens`, `uncached_prompt_tokens`,
 `completion_tokens`, `thinking_tokens`, `finish_reason`, `latency_ms`,
-`cache_read_tokens`, `cache_creation_tokens` and `schema_sent`; a stream
+`cache_read_tokens`, `cache_creation_tokens` and `schema_sent` (and
+`evidence_first: true` on a call sent with
+`LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST`); a stream
 logs `anthropic.stream_completed` with the same fields (no
-`schema_sent`) from the final message. `prompt_tokens` is the whole
+`schema_sent`) from the final message. Inside an analysis, every line also carries
+`analysis_id`, which `llm_usage_report.py` uses. `prompt_tokens` is the whole
 input (`uncached_prompt_tokens + cache_read_tokens +
 cache_creation_tokens`), the same meaning as before caching and as for
 Gemini; `LLMUsage.prompt_tokens` holds the same total. The API's own
@@ -1025,7 +1134,9 @@ All in `services/ai-service/config.py` unless stated otherwise.
 | `LLM_ANTHROPIC_THINKING_CHEAP`, `LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY` | `adaptive`, `between_tools` | Thinking type per tier model (`adaptive` or `between_tools`). |
 | `LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS` | 2048 | Added to `max_tokens` when thinking is `adaptive`. |
 | `LLM_ANTHROPIC_SEND_TEMPERATURE` | false | Send `temperature` (Claude 5.5 models reject non-default values). |
-| `LLM_ANTHROPIC_PROMPT_CACHING` | true | Mark the system prompt for prompt caching (section 3.16). |
+| `LLM_ANTHROPIC_PROMPT_CACHING` | true | Mark the system prompt and the ReAct scratchpad prefix for prompt caching (section 3.16). |
+| `LLM_ANTHROPIC_CACHE_SCRATCHPAD` | true | With caching on, also cache the ReAct scratchpad prefix; false caches only the system prompt (section 3.16). |
+| `LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST` | false | Experiment switch: with caching on, send the debate evidence shared by Bull, Bear, Judge and Reflection as the first cached system block (section 3.16). |
 | `LLM_OPENAI_*`, `OPENAI_API_KEY` | see `config.py` | Dormant provider. |
 | `EMBEDDING_PROVIDER`, `GOOGLE_EMBEDDING_MODEL`, `GOOGLE_EMBEDDING_DIMENSIONS` | `google`, `gemini-embedding-2`, 1536 | Embeddings. |
 | `EMBEDDING_REQUEST_TIMEOUT_SECONDS` | 30.0 | Limit of one embedding request (section 3.14). |
@@ -1300,13 +1411,13 @@ real requests and spends daily quota.
 
 | File | What it holds |
 |---|---|
-| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage`, `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. JSON reply helpers: `strip_json_code_fence`, `recover_wrapped_json`, `log_unparseable`, `parse_json_dict`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
+| `services/ai-service/ai/llm/base.py` | `LLMTier`, `LLMMessage` (with the Anthropic cache hints `cache_segments` and `shared_evidence` and their validator), `LLMResponse`, the exception family, `RATE_LIMIT_BACKOFF_SCHEDULE`, `AGENT_LLM_CALL_RETRIES`, `RequestPacer` and `request_pacer`; `ConcurrencyGate` (holds a Lite slot only while a request is in flight; `released()`), the context variable with the running call's gate, `released_while_waiting()` for waits inside the adapter. JSON reply helpers: `strip_json_code_fence`, `recover_wrapped_json`, `log_unparseable`, `parse_json_dict`, `parse_json_list`, `parse_json_object` (the Judge's reader: first JSON object, surrounding text and control characters in strings tolerated and reported). |
 | `services/ai-service/ai/llm/router.py` | `LLMRouter.complete`/`stream`, tier and fallback model maps, `router_retry_limit`, skip logic (`_known_unavailable`), the one fallback call, Lite cooldown retry, the per-request helper `_call` with the non-English rejection, `_concurrency_gate` (which gate a call gets); the capacity checks `chain_model_wait`, `chain_capacity` (Reflection retry gate, Judge retry wait), `free_chain_model` (late side repair) and `capacity_aware_delay` (side repair, citation-review retry): whether a model of a tier's chain is free now (no daily-quota exhaustion, no 429 pool, 503 or timeout cooldown). |
 | `services/ai-service/ai/llm/google_provider.py` | `GoogleAdapter`, `_GoogleKeyPool`, `_reserve_or_fail_fast` (slot reservation and fail-fast log for `complete` and `stream`), thinking config (and the caller's `thinking_budget` on Lite models), timeouts, 429/503/timeout handling, pool and marker queries (`google_model_pool_exhausted`, `google_model_confirmed_overloaded`, `google_pool_cooldown`, `google_model_recently_timed_out`); the `fallback` flag (60 s timeout, 3 keys on a 503). |
 | `services/ai-service/ai/llm/mistral_provider.py` | `MistralAdapter` and its key pool. |
 | `services/ai-service/ai/llm/anthropic_provider.py` | `AnthropicAdapter`: request shape, prompt caching, `anthropic_output_schema` (schema conversion), `reduced_output_schema` and the schema levels, error mapping, usage logs. |
 | `services/ai-service/ai/llm/openai_provider.py` | Dormant adapter; `_mapped_error` (error mapping, section 3.1). |
-| `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
+| `services/ai-service/ai/agents/loop.py` | `_build_react_step_schema` (the ReAct JSON schema), `_build_messages` (the turn's messages and their `cache_segments`), `_REACT_LOOP_MAX_TOKENS`, the loop's `thinking_budget` (passed to every router call). |
 | `services/ai-service/ai/providers/news_relevance.py` | `verify_with_cheap_tier` (the relevance classifiers' CHEAP call, fail-open and echo check) and `parsed_with_retry` (their JSON retry at 8192 tokens). |
 | `services/ai-service/ai/rag/embedding.py` | Gemini and Mistral embeddings, batching, key rotation. |
 | `services/ai-service/ai/agents/evidence_grounding.py` | `non_english_reason`, `non_english_reason_in_output`. |
@@ -1315,6 +1426,8 @@ real requests and spends daily quota.
 | `services/ai-service/scripts/probe_model_latency.py`, `scripts/probe.sh` | Latency probe. |
 | `services/ai-service/scripts/probe_model_latency.py --health` | Per-key and per-model health check of the Google keys. |
 | `services/ai-service/scripts/probe_anthropic_schemas.py` | Anthropic schema probe: full and reduced ReAct step schema per agent (section 3.16). |
+| `services/ai-service/scripts/probe_anthropic_cache.py` | Anthropic cache probe: cache reads and writes of a 3-turn ReAct prompt on both tiers (section 3.16). |
+| `services/ai-service/scripts/llm_usage_report.py` | Read-only usage and cost report per analysis and per group of analyses, from the ai-service log lines (section 3.16). |
 
 ## 10. Related chapters
 

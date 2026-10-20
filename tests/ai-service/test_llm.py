@@ -686,6 +686,134 @@ def _install_anthropic(monkeypatch, messages: Any) -> None:
         anthropic_module, "_client", SimpleNamespace(messages=messages))
 
 
+_SEGMENTS = ("Task: t", "\n\nScratchpad so far:\nThought: a",
+             "\nThought: b", "\nThought: c", "\nThought: d")
+
+
+def _hinted_messages(count: int) -> list[LLMMessage]:
+    return [
+        LLMMessage(role="system", content="Be brief."),
+        LLMMessage(
+            role="user", content="".join(_SEGMENTS[:count]),
+            cache_segments=_SEGMENTS[:count])
+    ]
+
+
+_EVIDENCE = "- market: price 100\n- fundamental: revenue up 5%"
+
+
+def _evidence_messages() -> list[LLMMessage]:
+    return [
+        LLMMessage(role="system", content="You are the Bull."),
+        LLMMessage(
+            role="user", content=(
+                f"Ticker: X\n\nResearch agent evidence:\n{_EVIDENCE}\n\n"
+                "Bull argument: a"), shared_evidence=_EVIDENCE)
+    ]
+
+
+def _judge_follow_up() -> list[LLMMessage]:
+    return [
+        LLMMessage(role="system", content="You are the Judge."),
+        LLMMessage(
+            role="user", content=(
+                "Ticker: X\nRound: 1\n\nResearch agent evidence:\n"
+                f"{_EVIDENCE}\n\nBull: a"), shared_evidence=_EVIDENCE),
+        LLMMessage(role="assistant", content="{bad"),
+        LLMMessage(role="user", content="Return valid JSON.")
+    ]
+
+
+def _breakpoints(kwargs: dict[str, Any]) -> int:
+    return json.dumps([
+        kwargs["system"] if kwargs["system"] is not anthropic.omit else None,
+        kwargs["messages"]
+    ]).count('"cache_control"')
+
+
+class _PrefixCacheClient:
+
+    def __init__(self) -> None:
+        self.written: set[tuple[str, ...]] = set()
+        self.messages = self
+
+    async def create(self, **kwargs: Any) -> SimpleNamespace:
+        system = kwargs["system"]
+        blocks = [*system, *kwargs["messages"][-1]["content"]]
+        texts = tuple(b["text"] for b in blocks)
+        marks = [i for i, b in enumerate(blocks) if "cache_control" in b]
+        read = 0
+        for end in range(marks[-1] + 1, max(0, marks[-1] - 19), -1):
+            if texts[:end] in self.written:
+                read = len("".join(texts[:end]))
+                break
+        cached = len("".join(texts[:marks[-1] + 1]))
+        self.written.update(texts[:i + 1] for i in marks)
+        message = _anthropic_message("{}")
+        message.usage = SimpleNamespace(
+            input_tokens=len("".join(texts)) - cached, output_tokens=2,
+            output_tokens_details=None, cache_read_input_tokens=read,
+            cache_creation_input_tokens=cached - read)
+        return message
+
+    async def count_tokens(self, **kwargs: Any) -> SimpleNamespace:
+        content = kwargs["messages"][0]["content"]
+        text = content if isinstance(content, str) else "".join(
+            b["text"] for b in content)
+        return SimpleNamespace(input_tokens=len(text))
+
+
+@pytest.mark.asyncio
+async def test_cache_probe_sees_the_previous_turn_read(capsys):
+    probe = importlib.import_module("scripts.probe_anthropic_cache")
+    client = _PrefixCacheClient()
+    spent = await probe._probe_model(client, "claude-haiku-5-5", "n1")
+    await probe._same_tokens_as_one_string(client, "claude-haiku-5-5", "n1")
+    out = capsys.readouterr().out
+    assert out.count(" OK: ") == 2 * probe._TURNS, out
+    assert "UNEXPECTED" not in out and "(same)" in out
+    assert spent > 0
+    messages, schema = probe.probe_request("n1", probe._TURNS)
+    assert len(messages[1].cache_segments) == probe._TURNS
+    assert schema["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_cache_probe_stops_when_the_scratchpad_is_not_cached(
+        monkeypatch, capsys):
+    probe = importlib.import_module("scripts.probe_anthropic_cache")
+    monkeypatch.setattr("sys.argv", ["probe_anthropic_cache.py"])
+    for switch in ("LLM_ANTHROPIC_PROMPT_CACHING",
+                   "LLM_ANTHROPIC_CACHE_SCRATCHPAD"):
+        with monkeypatch.context() as mp:
+            mp.setattr(config.settings, switch, False)
+            with pytest.raises(SystemExit) as exit_info:
+                await probe.main()
+        assert exit_info.value.code == 1
+        assert f"{switch} is false" in capsys.readouterr().err
+
+
+def test_cache_segments_are_only_an_anthropic_hint():
+    from ai.llm.google_provider import _split_system_and_contents
+    from ai.llm.mistral_provider import _to_mistral_messages
+    from ai.llm.openai_provider import _to_openai_messages
+
+    for hinted in (_hinted_messages(3), _evidence_messages(),
+                   _judge_follow_up()):
+        plain = [LLMMessage(role=m.role, content=m.content) for m in hinted]
+        for convert in (_split_system_and_contents, _to_mistral_messages,
+                        _to_openai_messages):
+            assert convert(hinted) == convert(plain)
+    with pytest.raises(ValidationError):
+        LLMMessage(role="user", content="ab", cache_segments=("a", "c"))
+    with pytest.raises(ValidationError):
+        LLMMessage(role="user", content="ab", shared_evidence="c")
+    with pytest.raises(ValidationError):
+        LLMMessage(
+            role="user", content="ab", cache_segments=("a", "b"),
+            shared_evidence="a")
+
+
 _REACT_LIKE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1281,12 +1409,247 @@ class TestAnthropicAdapter:
             model="m")
         assert create.kwargs[0]["system"] == "Be brief."
         assert "cache_control" not in create.kwargs[0]
+        await anthropic_module.AnthropicAdapter().complete(
+            _hinted_messages(3), model="m")
+        assert create.kwargs[1]["messages"] == [{
+            "role": "user",
+            "content": "".join(_SEGMENTS[:3])
+        }]
+        assert "cache_control" not in str(create.kwargs[1])
+
+    async def _hinted_message_is_sent_as_cached_blocks(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        adapter = anthropic_module.AnthropicAdapter()
+        for count in (1, 2, len(_SEGMENTS)):
+            await adapter.complete(_hinted_messages(count), model="m")
+            blocks = create.kwargs[-1]["messages"][0]["content"]
+            assert "".join(b["text"] for b in blocks) == "".join(
+                _SEGMENTS[:count])
+            assert [b["text"] for b in blocks] == list(_SEGMENTS[:count])
+            assert [("cache_control" in b) for b in blocks
+                    ] == [False] * (count - 1) + [True]
+            assert _breakpoints(create.kwargs[-1]) == 2
+        await adapter.complete(
+            [LLMMessage(
+                role="user", content="ab", cache_segments=("", "a", "", "b"))],
+            model="m")
+        assert create.kwargs[-1]["messages"][0]["content"] == [{
+            "type": "text",
+            "text": "a"
+        }, {
+            "type": "text",
+            "text": "b",
+            "cache_control": {
+                "type": "ephemeral"
+            }
+        }]
+        assert create.kwargs[-1]["system"] is anthropic.omit
+        await adapter.complete([
+            LLMMessage(
+                role="user", content="\n a\n\nb \n",
+                cache_segments=("\n ", "a", "\n\n", "b", " \n"))
+        ], model="m")
+        blocks = create.kwargs[-1]["messages"][0]["content"]
+        assert [b["text"] for b in blocks] == ["\n a\n\n", "b \n"]
+        assert "cache_control" in blocks[-1]
+        await adapter.complete(
+            [
+                LLMMessage(
+                    role="user", content=" \n", cache_segments=(" ", "\n"))
+            ], model="m")
+        assert create.kwargs[-1]["messages"][0]["content"] == " \n"
+
+    async def _unhinted_turns_stay_plain_strings(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        messages = [
+            LLMMessage(role="system", content="Judge."),
+            LLMMessage(role="user", content="evidence"),
+            LLMMessage(role="assistant", content="{bad"),
+            LLMMessage(role="user", content="Return valid JSON.")
+        ]
+        await anthropic_module.AnthropicAdapter().complete(
+            messages, model="m")
+        assert create.kwargs[0]["messages"] == [{
+            "role": m.role,
+            "content": m.content
+        } for m in messages[1:]]
+        assert _breakpoints(create.kwargs[0]) == 1
+
+    async def _never_more_than_four_breakpoints(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        hinted = [
+            LLMMessage(
+                role=role, content=f"{role} {i}",
+                cache_segments=(f"{role} ", f"{i}"))
+            for i in range(4) for role in ("user", "assistant")
+        ]
+        await anthropic_module.AnthropicAdapter().complete(
+            [LLMMessage(role="system", content="S"), *hinted], model="m")
+        sent = create.kwargs[0]
+        assert _breakpoints(sent) == 4
+        marked = [
+            i for i, turn in enumerate(sent["messages"])
+            if "cache_control" in str(turn["content"])
+        ]
+        assert marked == [5, 6, 7]
+        assert [
+            "".join(b["text"] for b in turn["content"])
+            for turn in sent["messages"]
+        ] == [m.content for m in hinted]
+
+    async def _stream_sends_the_same_cached_blocks(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        await anthropic_module.AnthropicAdapter().complete(
+            _hinted_messages(3), model="m")
+        streamed = _AnthropicStreamMessages(
+            _AnthropicStream(["ok"], _anthropic_message("ok")))
+        _install_anthropic(monkeypatch, streamed)
+        _ = [
+            c async for c in anthropic_module.AnthropicAdapter().stream(
+                _hinted_messages(3), model="m")
+        ]
+        assert streamed.kwargs[0]["messages"] == create.kwargs[0]["messages"]
+        assert streamed.kwargs[0]["system"] == create.kwargs[0]["system"]
+
+    async def _scratchpad_caching_can_be_turned_off(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        _set_settings(monkeypatch, {"LLM_ANTHROPIC_CACHE_SCRATCHPAD": False})
+        await anthropic_module.AnthropicAdapter().complete(
+            _hinted_messages(3), model="m")
+        sent = create.kwargs[0]
+        assert sent["messages"] == [{
+            "role": "user",
+            "content": "".join(_SEGMENTS[:3])
+        }]
+        assert sent["system"] == [{
+            "type": "text",
+            "text": "Be brief.",
+            "cache_control": {
+                "type": "ephemeral"
+            }
+        }]
+        assert _breakpoints(sent) == 1
+
+    async def _shared_evidence_hint_changes_nothing_when_off(
+            self, monkeypatch):
+        for caching, first in ((True, False), (False, True), (False, False)):
+            create = _AnthropicCreate(_anthropic_message("ok"))
+            _install_anthropic(monkeypatch, create)
+            _set_settings(
+                monkeypatch, {
+                    "LLM_ANTHROPIC_PROMPT_CACHING": caching,
+                    "LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST": first
+                })
+            adapter = anthropic_module.AnthropicAdapter()
+            for hinted in (_evidence_messages(), _judge_follow_up()):
+                plain = [
+                    LLMMessage(role=m.role, content=m.content)
+                    for m in hinted
+                ]
+                with capture_logs() as logs:
+                    await adapter.complete(hinted, model="m")
+                    await adapter.complete(plain, model="m")
+                assert create.kwargs[-2] == create.kwargs[-1]
+                assert not any("evidence_first" in e for e in logs)
+
+    async def _shared_evidence_goes_first_when_on(self, monkeypatch):
+        create = _AnthropicCreate(_anthropic_message("ok"))
+        _install_anthropic(monkeypatch, create)
+        _set_settings(
+            monkeypatch, {"LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST": True})
+        adapter = anthropic_module.AnthropicAdapter()
+        cached = {"type": "ephemeral"}
+        with capture_logs() as logs:
+            await adapter.complete(_evidence_messages(), model="m")
+        first = create.kwargs[-1]
+        assert first["system"] == [{
+            "type": "text",
+            "text": "Evidence for this analysis:\n" + _EVIDENCE,
+            "cache_control": cached
+        }, {
+            "type": "text",
+            "text": "You are the Bull.",
+            "cache_control": cached
+        }]
+        assert first["messages"] == [{
+            "role": "user",
+            "content": (
+                "Ticker: X\n\nResearch agent evidence:\n"
+                + anthropic_module._EVIDENCE_POINTER +
+                "\n\nBull argument: a")
+        }]
+        assert _breakpoints(first) == 2
+        assert [e.get("evidence_first") for e in logs
+                if e["event"] == "anthropic.completion_succeeded"] == [True]
+
+        await adapter.complete(_judge_follow_up(), model="m")
+        follow = create.kwargs[-1]
+        assert follow["system"][0] == first["system"][0]
+        assert [t["content"] for t in follow["messages"]] == [
+            "Ticker: X\nRound: 1\n\nResearch agent evidence:\n" +
+            anthropic_module._EVIDENCE_POINTER + "\n\nBull: a",
+            "{bad", "Return valid JSON."
+        ]
+        assert _breakpoints(follow) == 2
+
+        await adapter.complete([
+            LLMMessage(role="system", content="S"),
+            _evidence_messages()[1],
+            *[
+                LLMMessage(
+                    role=role, content=f"{role} {i}",
+                    cache_segments=(f"{role} ", f"{i}"))
+                for i in range(2) for role in ("assistant", "user")
+            ]
+        ], model="m")
+        mixed = create.kwargs[-1]
+        assert _breakpoints(mixed) == 4
+        assert [
+            i for i, turn in enumerate(mixed["messages"])
+            if "cache_control" in str(turn["content"])
+        ] == [3, 4]
+
+        await adapter.complete([_evidence_messages()[1]], model="m")
+        assert create.kwargs[-1]["system"] == [{
+            "type": "text",
+            "text": anthropic_module._EVIDENCE_BLOCK_LABEL + _EVIDENCE,
+            "cache_control": cached
+        }]
+
+        blank = [
+            LLMMessage(role="system", content="S"),
+            LLMMessage(role="user", content="Ticker: X\n", shared_evidence="")
+        ]
+        await adapter.complete(blank, model="m")
+        assert create.kwargs[-1]["messages"][0]["content"] == "Ticker: X\n"
+        assert len(create.kwargs[-1]["system"]) == 1
+
+        streamed = _AnthropicStreamMessages(
+            _AnthropicStream(["ok"], _anthropic_message("ok")))
+        _install_anthropic(monkeypatch, streamed)
+        _ = [
+            c async for c in adapter.stream(_evidence_messages(), model="m")
+        ]
+        assert streamed.kwargs[0]["system"] == first["system"]
+        assert streamed.kwargs[0]["messages"] == first["messages"]
 
     async def test_anthropic_adapter(self):
         await _run_steps(
             self._too_complex_schema_falls_back_to_plain_json,
             self._too_complex_schema_tries_the_reduced_schema,
             self._prompt_caching_can_be_turned_off,
+            self._scratchpad_caching_can_be_turned_off,
+            self._shared_evidence_hint_changes_nothing_when_off,
+            self._shared_evidence_goes_first_when_on,
+            self._hinted_message_is_sent_as_cached_blocks,
+            self._unhinted_turns_stay_plain_strings,
+            self._never_more_than_four_breakpoints,
+            self._stream_sends_the_same_cached_blocks,
             self._json_answers_are_normalized,
             self._thinking_mode_follows_the_tier_model,
             self._rejected_between_tools_is_explained,

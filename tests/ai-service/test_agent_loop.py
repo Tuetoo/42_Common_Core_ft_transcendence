@@ -611,6 +611,37 @@ class TestPromptAndFinishMeta:
         assert result.scratchpad[0].prefetched is True
         assert result.final_answer.startswith("MSFT closed at 100.0")
 
+    def test_user_message_carries_stable_cache_segments(self):
+        loop = _loop(_ScriptedRouter([]), [_FakeTool("get_x", "x")])
+        entries = [
+            ScratchpadEntry(
+                thought=f"t{i}", action="get_x", action_input={"q": i},
+                observation=f"obs {i}\nline")
+            for i in range(4)
+        ]
+        previous: tuple[str, ...] = ()
+        for count in range(len(entries) + 1):
+            pad = entries[:count]
+            user = loop._build_messages("task", "ctx", pad)[1]
+            parts = ["Task: task", "Additional context: ctx"]
+            if count:
+                history = "\n".join(
+                    f"Thought: {e.thought}\nAction: {e.action}\n"
+                    f"Action Input: {e.action_input}\n"
+                    f"Observation: {e.observation}" for e in pad)
+                parts.append(f"Scratchpad so far:\n{history}")
+            assert user.content == "\n\n".join(parts)
+            segments = user.cache_segments
+            assert segments is not None and "".join(segments) == user.content
+            assert len(segments) == 1 + count
+            if count:
+                assert segments[:-1] == previous
+            previous = segments
+        final = loop._build_messages(
+            "task", "ctx", entries, is_final_turn=True)[1]
+        assert final.cache_segments is None
+        assert final.content == "".join(previous)
+
 
 class TestAnswerAnchoring:
 

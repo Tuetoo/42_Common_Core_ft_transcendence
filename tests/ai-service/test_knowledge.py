@@ -8,6 +8,7 @@ import ai.knowledge.archival as archival_module
 import ai.workflows.auto_ingestion_workflow as auto_workflow
 import config
 import pytest
+from structlog.testing import capture_logs
 from ai.ingestion.sec_edgar_filings import NewFiling
 from ai.knowledge import filing_summary
 from ai.knowledge.kg_context import _tag_superseded_readings
@@ -166,12 +167,90 @@ class TestArchiveAgentReport:
 
         monkeypatch.setattr(archival_module, "chunk_document", _tracks_call)
 
+        async def _gone(analysis_id):
+            return archival_module._ANALYSIS_GONE
+
+        monkeypatch.setattr(archival_module, "_archive_owner", _gone)
+        with capture_logs() as logs:
+            await archival_module.archive_agent_report(
+                analysis_id=uuid4(), role=AgentRole.NEWS, ticker="AMD",
+                content=content)
+        assert not called["yes"], "a deleted analysis is not archived"
+        assert [e["event"] for e in logs] == [
+            "archival.skipped_analysis_deleted"
+        ]
+
+        async def _lookup_failed(analysis_id):
+            return archival_module._UNKNOWN_OWNER
+
+        monkeypatch.setattr(archival_module, "_archive_owner", _lookup_failed)
         with pytest.raises(RuntimeError):
             await archival_module.archive_agent_report(
                 analysis_id=uuid4(), role=AgentRole.NEWS, ticker="AMD",
                 content=content)
 
         assert called["yes"], "a normal report must still reach real work"
+
+    @pytest.mark.asyncio
+    async def test_kg_failure_after_the_report_was_deleted_is_not_an_error(
+            self, monkeypatch):
+
+        async def _none(*args, **kwargs):
+            return None
+
+        async def _embed(texts):
+            return [[0.0] for _ in texts]
+
+        async def _kg_fails(**kwargs):
+            raise RuntimeError("foreign key violation")
+
+        for name, value in (
+                ("_archive_owner", _none),
+                ("_find_near_duplicate_of_recent_report", _none),
+                ("embed_texts", _embed), ("index_chunks", _none),
+                ("_persist_report_rows", _none),
+                ("_extract_and_store_kg", _kg_fails)):
+            monkeypatch.setattr(archival_module, name, value)
+        for exists, event, level in (
+                (False, "archival.kg_skipped_report_deleted", "info"),
+                (True, "archival.kg_extraction_failed", "error")):
+
+            async def _exists(report_id, exists=exists):
+                return exists
+
+            monkeypatch.setattr(archival_module, "_report_exists", _exists)
+            with capture_logs() as logs:
+                await archival_module.archive_agent_report(
+                    analysis_id=uuid4(), role=AgentRole.NEWS, ticker="AMD",
+                    content=_LONG_REPORT)
+            kg = [e for e in logs if e["event"].startswith("archival.kg")]
+            assert [(e["event"], e["log_level"]) for e in kg] == [
+                (event, level)
+            ]
+
+    @pytest.mark.usefixtures("_schema_ready")
+    @pytest.mark.asyncio
+    async def test_report_exists_reads_the_row_and_fails_towards_true(
+            self, monkeypatch):
+        analysis_id = await _create_analysis("AMD")
+        report_id = uuid4()
+        async with SessionLocal() as session:
+            session.add(
+                AgentReport(
+                    id=report_id, analysis_id=analysis_id,
+                    agent_role=AgentRole.NEWS, ticker="AMD",
+                    category=DocumentCategory.NEWS.value,
+                    content="real test content, not empty"))
+            await session.commit()
+        assert await archival_module._report_exists(report_id) is True
+        assert await archival_module._report_exists(uuid4()) is False
+
+        def _db_down():
+            raise ConnectionError("database is down")
+
+        # Unknown is treated as "still there", so the KG error is logged.
+        monkeypatch.setattr(archival_module, "SessionLocal", _db_down)
+        assert await archival_module._report_exists(uuid4()) is True
 
     @pytest.mark.usefixtures("_schema_ready")
     @pytest.mark.asyncio
@@ -277,9 +356,10 @@ class TestArchiveAgentReport:
         owner = await archival_module._archive_owner(system.id)
         assert archival_module._archive_visibility(owner) == (
             ChunkVisibility.system())
-        owner = await archival_module._archive_owner(uuid4())
-        assert archival_module._archive_visibility(owner) == (
-            ChunkVisibility())
+        assert await archival_module._archive_owner(uuid4()) is (
+            archival_module._ANALYSIS_GONE)
+        assert archival_module._archive_visibility(
+            archival_module._UNKNOWN_OWNER) == ChunkVisibility()
 
         async with SessionLocal() as session:
             repo = AnalysisRepository(session)

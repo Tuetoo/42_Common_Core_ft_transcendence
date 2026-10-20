@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, NamedTuple
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 logger = structlog.get_logger(__name__)
 
@@ -24,6 +24,21 @@ class LLMTier(StrEnum):
 class LLMMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+    cache_segments: tuple[str, ...] | None = None
+    shared_evidence: str | None = None
+
+    @model_validator(mode="after")
+    def _segments_join_to_content(self) -> "LLMMessage":
+        if (self.cache_segments is not None
+                and "".join(self.cache_segments) != self.content):
+            raise ValueError("cache_segments must join to content exactly")
+        if self.shared_evidence is not None and (
+                self.cache_segments is not None
+                or self.shared_evidence not in self.content):
+            raise ValueError(
+                "shared_evidence must be a part of content, without "
+                "cache_segments")
+        return self
 
 
 class LLMUsage(BaseModel):

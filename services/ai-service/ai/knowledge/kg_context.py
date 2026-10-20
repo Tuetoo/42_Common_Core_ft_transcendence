@@ -2,6 +2,7 @@ import re
 from datetime import date
 import structlog
 from ai.agents.evidence_grounding import non_english_reason
+from ai.experiment_isolation import isolation_skips
 from ai.knowledge.filing_records import load_filing_records
 from database import SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -113,6 +114,8 @@ async def fetch_kg_relations(
         entity_name: str, ticker_filter: str | None, session: AsyncSession, *,
         viewer_user_id: str | None = None,
         events_expire_before: date | None = None) -> list[KgRelationTuple]:
+    if isolation_skips("knowledge_graph_read", entity_name=entity_name):
+        return []
     repo = KnowledgeGraphRepository(session)
     relations = await repo.find_relations_for_entity_name(
         entity_name, ticker_filter=ticker_filter,

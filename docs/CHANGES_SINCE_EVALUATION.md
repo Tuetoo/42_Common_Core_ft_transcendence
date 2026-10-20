@@ -5,29 +5,36 @@ ft_transcendence. That version is tagged
 [`v1.0-42-evaluated`](https://github.com/Tuetoo/42_Common_Core_ft_transcendence/tree/v1.0-42-evaluated),
 and the README still describes it. This file lists how the current code
 differs from that tag. The handbook (`docs/handbook/`) describes the
-current code in full; the Gemini and Claude comparison is in
-[MODEL_COMPARISON.md](MODEL_COMPARISON.md).
+current code in full; the Gemini and Claude comparison and the caching
+measurements are in [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
 
 ## LLM providers
 
 - **Anthropic Claude is fully supported.** `LLM_DEFAULT_PROVIDER` selects
   `google` (the code default), `anthropic` or `mistral` (`openai` is also
   accepted for a dormant adapter, whose errors are mapped like
-  Anthropic's). CHEAP uses Haiku 5.5 and
-  HIGHEST_ACCURACY uses Sonnet 5.5. Claude is the recommended provider
-  (see MODEL_COMPARISON.md).
+  Anthropic's). CHEAP uses Haiku 5.5 and HIGHEST_ACCURACY uses Sonnet
+  5.5. Claude is the recommended provider (see MODEL_COMPARISON.md).
 - **Embeddings stay on Gemini**, so `GOOGLE_API_KEY` is needed whichever
   provider runs the analyses.
 - **Anthropic details.** Structured output falls back to a reduced
-  schema, then to no schema, when the API calls a schema too complex.
-  The system prompt is cached (about 16% cheaper in the batch runs). A used-up credit
-  balance fails the analysis with `llm_credit_exhausted` and is not
-  retried. A timed-out call is retried once, as for Google.
+  schema, then to no schema, when the API calls a schema too complex. A
+  used-up credit balance fails the analysis with `llm_credit_exhausted`
+  and is not retried. A timed-out call is retried once, as for Google.
+- **Prompt caching on Anthropic.** The system prompt and the ReAct
+  scratchpad are cached by default: each ReAct turn after the first
+  (except the last allowed turn) reads the previous turn's prompt from
+  the cache. The text the model sees is unchanged. MODEL_COMPARISON.md,
+  section 11, measures the caching methods.
 - **Settings are checked at startup.** A typo in the provider, tier,
   effort or thinking settings stops ai-service with a clear error; a
   blank value means the default.
-- `services/ai-service/scripts/probe_anthropic_schemas.py` checks which
-  schema level each agent needs with the real key.
+- **Owner scripts** in `services/ai-service/scripts/`:
+  `probe_anthropic_schemas.py` (which schema level each agent needs) and
+  `probe_anthropic_cache.py` (cache reads and writes per ReAct turn),
+  both with the real key; `llm_usage_report.py` (read-only: calls,
+  tokens, cache use, wall time and cost per analysis and per group, from
+  the ai-service logs).
 
 ## AI analysis pipeline
 
@@ -36,15 +43,15 @@ current code in full; the Gemini and Claude comparison is in
   counts as unparseable, not as a clean review.
 - **SEC filings** are read from the SGML submission first (some 10-Ks
   could not be read before). `FILING_LLM_TIER` sets the tier of the
-  filing calls at ingestion. The latest-quarter figures reach the debate
-  once.
+  filing calls at ingestion. The latest-quarter figures appear once in
+  the debate evidence.
 - **Risk events.** The Risk agent's answer is not rejected because an
   event is worded differently from the tool output. Only events backed
   by a shown record or by the cited tool's output are listed as sourced.
   When none survive but legal records were shown, the events line is
   built from those records.
 - **Reflection** issues that claim a side ignored the other must quote
-  the ignored argument. An unresolved issue no longer lowers the
+  the ignored argument. An unresolved issue does not lower the
   confidence; it stays in the note and in the stored reflections.
 - **Confidence note.** `confidence_adjustment_note` explains every step
   that lowers the confidence, and names a backup model when one
@@ -70,14 +77,16 @@ current code in full; the Gemini and Claude comparison is in
   after an admin changes the email.
 - **Rate limits** also cover the public API (`/api/v1/public`) and
   decision reviews (3 per minute and 20 per day per user).
-- **Account deletion.** Deleting a user now also removes their sessions
+- **Account deletion.** Deleting a user also removes their sessions
   and invitations. An organization left with no member is deleted. core
   deletes the user's private documents, notes, portfolios, watchlists,
   API keys and notifications, and sends them no new notifications. ai
   deletes their analyses, recommendations, decisions, backtests,
-  memories and archived reports. A nightly sweep in core (04:30 New
-  York) and ai (04:40) repeats this for every deleted account that still
-  owns data, so a lost event or a late write is cleaned the next night;
+  memories and archived reports; an analysis that finishes after its
+  owner (or the analysis itself) was deleted archives nothing. A
+  nightly sweep in core (04:30 New York) and ai (04:40) repeats this for
+  every deleted account that still owns data, so a lost event or a late
+  write is cleaned the next night;
   the core sweep also cleans the content of organizations that no
   longer exist in auth, and leftover files of deleted users; when too
   many organizations look missing it stops, and
@@ -97,8 +106,8 @@ current code in full; the Gemini and Claude comparison is in
 - **Real time.** All WebSocket pages share one hook, and each tab keeps
   one shared live connection (`user:` channel) for the badge,
   notifications, analytics and friends; friends' online status is pushed
-  live. The Yjs editor no longer loses an edit when a
-  tab joins during a save.
+  live. The Yjs editor does not lose an edit when a tab joins during a
+  save.
 - **Research assistant.** A streamed answer always ends with `done` or
   `error` within one time limit. A duplicate file name answers 409.
 - **Documents.** A stuck upload is reset under a row lock before it is
@@ -113,6 +122,9 @@ current code in full; the Gemini and Claude comparison is in
 - **Email** sending has a 10 s time limit.
 - **Scheduler.** The nightly RAG ingestion runs at 03:05 New York. One
   job can be run by hand from the scheduler image (DEPLOYMENT.md).
+- **Deploy.** The deploy also waits for the newest run on `main` of
+  every other workflow, so a failing check on `main` blocks every deploy
+  until it passes.
 - **Phones.** Form fields use a 16 px font below 768 px, so iOS Safari
   does not zoom in.
 - **Scripts** read the admin, owner and portfolio ids from the
@@ -129,7 +141,10 @@ current code in full; the Gemini and Claude comparison is in
 | `LLM_ANTHROPIC_THINKING_HIGHEST_ACCURACY` | `between_tools` | Thinking mode of the HIGHEST_ACCURACY model. |
 | `LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS` | 2048 | Extra output room for adaptive thinking. |
 | `LLM_ANTHROPIC_SEND_TEMPERATURE` | false | Send a temperature (Claude 5.5 rejects non-default values). |
-| `LLM_ANTHROPIC_PROMPT_CACHING` | true | Cache the system prompt. |
+| `LLM_ANTHROPIC_PROMPT_CACHING` | true | Prompt caching on Anthropic (system prompt and ReAct scratchpad). |
+| `LLM_ANTHROPIC_CACHE_SCRATCHPAD` | true | With caching on, also cache the ReAct scratchpad; false caches only the system prompt. |
+| `LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST` | false | Experiment switch: send the debate evidence once, as the first cached system block, shared by Bull, Bear, Judge and Reflection. |
+| `ANALYSIS_EXPERIMENT_ISOLATION` | false | Experiment switch: analyses neither read nor write earlier analyses' context, memory, archived notes or knowledge-graph facts. |
 | `FILING_LLM_TIER` | `highest_accuracy` | Tier of the filing calls at ingestion. |
 | `FAILED_DOCUMENT_RETRY_DAYS` | 7 | Days after its first upload that a failed document is still retried nightly; 0 turns the retry off. |
 | `REVIEW_GIVE_UP_AFTER_DAYS` | 30 | Days after its window that an unscored item stays in the nightly review. |

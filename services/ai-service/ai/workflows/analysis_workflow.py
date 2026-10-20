@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 import structlog
+from ai.experiment_isolation import isolation_skips
 from ai.graph.builder import build_analysis_graph
 from ai.graph.state import (AgentOutput, AnalysisState, PriorRecommendation,
                             ReflectionVerdict, is_usable_evidence)
@@ -91,6 +92,8 @@ async def _resolve_position_weight(
 async def _resolve_prior_recommendation(
         portfolio_id: str | None, ticker: str) -> PriorRecommendation | None:
     if portfolio_id is None:
+        return None
+    if isolation_skips("prior_recommendation_read", ticker=ticker):
         return None
     try:
         async with SessionLocal() as session:
@@ -306,6 +309,10 @@ async def _run_and_persist(
             result["reflection_history"])
 
         async def _write_agent_learning() -> None:
+            if isolation_skips(
+                    "procedural_memory_and_archival_write",
+                    analysis_id=analysis_id):
+                return
             for role, output in result["agent_outputs"].items():
                 if role in flagged_roles:
                     logger.info(
@@ -363,12 +370,14 @@ async def _run_and_persist(
                 analysis_uuid=analysis_uuid, ticker=ticker,
                 portfolio_id=portfolio_id, final_rec=final_rec,
                 closed_out=superseded)
-            await EpisodicMemoryRepository(session).create(
-                user_id=UUID(user_id) if user_id else None,
-                analysis_id=analysis_uuid, ticker=ticker,
-                recommendation=final_rec["action"],
-                confidence=final_rec["confidence"],
-                summary=final_rec["reasoning"])
+            if not isolation_skips("episodic_memory_write",
+                                   analysis_id=analysis_id):
+                await EpisodicMemoryRepository(session).create(
+                    user_id=UUID(user_id) if user_id else None,
+                    analysis_id=analysis_uuid, ticker=ticker,
+                    recommendation=final_rec["action"],
+                    confidence=final_rec["confidence"],
+                    summary=final_rec["reasoning"])
 
             completed = await AnalysisRepository(
                 session).set_status_and_reason(
@@ -430,9 +439,13 @@ async def _save_recommendation_and_tiers(
 
     if action != RecommendationAction.HOLD and portfolio_uuid is not None:
         try:
-            holders = await tier_repo.committed_buy_holders(
-                portfolio_id=portfolio_uuid, exclude_ticker=ticker)
-            await session.commit()
+            if isolation_skips("committed_buy_cash_read",
+                               analysis_id=analysis_id):
+                holders = []
+            else:
+                holders = await tier_repo.committed_buy_holders(
+                    portfolio_id=portfolio_uuid, exclude_ticker=ticker)
+                await session.commit()
             sizing, sizing_note = await generate_position_sizing(
                 ticker=ticker, action=action,
                 confidence=final_rec["confidence"],
@@ -459,7 +472,10 @@ async def _save_recommendation_and_tiers(
                 "position sizing failed unexpectedly; see logs for this "
                 "analysis.")
 
-    if portfolio_uuid is not None and keep_note is not None:
+    if portfolio_uuid is not None and isolation_skips(
+            "earlier_tiers_supersede", analysis_id=analysis_id):
+        pass
+    elif portfolio_uuid is not None and keep_note is not None:
         kept = await tier_repo.unfilled_buy_tier_count(
             portfolio_id=portfolio_uuid, ticker=ticker)
         if kept:

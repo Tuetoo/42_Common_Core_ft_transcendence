@@ -48,6 +48,8 @@ _FULL_SCHEMA = "full"
 _REDUCED_SCHEMA = "reduced"
 _NO_SCHEMA = "none"
 _EPHEMERAL_CACHE = {"type": "ephemeral"}
+_MAX_MESSAGE_BREAKPOINTS = 3
+_MAX_BREAKPOINTS = 4
 
 
 def _get_client() -> AsyncAnthropic:
@@ -60,18 +62,95 @@ def _get_client() -> AsyncAnthropic:
     return _client
 
 
+def _segmented_content(
+        message: LLMMessage, *, breakpoint: bool) -> list[dict[str, Any]]:
+    texts: list[str] = []
+    pending = ""
+    for text in message.cache_segments or ():
+        if text.strip():
+            texts.append(pending + text)
+            pending = ""
+        elif texts:
+            texts[-1] += text
+        else:
+            pending += text
+    blocks: list[dict[str, Any]] = [{
+        "type": "text",
+        "text": text
+    } for text in texts]
+    if breakpoint:
+        blocks[-1]["cache_control"] = _EPHEMERAL_CACHE
+    return blocks
+
+
+def _turn_content(
+        message: LLMMessage, *,
+        breakpoint: bool) -> str | list[dict[str, Any]]:
+    if (not settings.LLM_ANTHROPIC_PROMPT_CACHING
+            or not settings.LLM_ANTHROPIC_CACHE_SCRATCHPAD
+            or message.cache_segments is None
+            or not message.content.strip()):
+        return message.content
+    return _segmented_content(message, breakpoint=breakpoint)
+
+
 def _split_system_and_turns(
-        messages: list[LLMMessage]) -> tuple[str, list[MessageParam]]:
+        messages: list[LLMMessage], *,
+        max_message_breakpoints: int = _MAX_MESSAGE_BREAKPOINTS
+) -> tuple[str, list[MessageParam]]:
     system_parts = [m.content for m in messages if m.role == "system"]
+    others = [m for m in messages if m.role != "system"]
+    hinted = [i for i, m in enumerate(others) if m.cache_segments is not None]
+    marked = (
+        set(hinted[-max_message_breakpoints:])
+        if max_message_breakpoints > 0 else set())
     turns = cast(
         "list[MessageParam]", [{
             "role": m.role,
-            "content": m.content
-        } for m in messages if m.role != "system"])
+            "content": _turn_content(m, breakpoint=i in marked)
+        } for i, m in enumerate(others)])
     return "\n\n".join(system_parts), turns
 
 
-def _system_param(system: str) -> Any:
+# With LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST, the evidence moves to the first
+# system block. Its heading stays in the user message, so the message points
+# there; without the pointer the model reads the heading as empty evidence.
+_EVIDENCE_BLOCK_LABEL = "Evidence for this analysis:\n"
+_EVIDENCE_POINTER = (
+    "(given in the first system block, under \"Evidence for this analysis\")")
+
+
+def _hoisted_evidence(
+        messages: list[LLMMessage]) -> tuple[str | None, list[LLMMessage]]:
+    if not (settings.LLM_ANTHROPIC_SHARED_EVIDENCE_FIRST
+            and settings.LLM_ANTHROPIC_PROMPT_CACHING):
+        return None, messages
+    for index, message in enumerate(messages):
+        evidence = message.shared_evidence
+        if message.role != "user" or evidence is None:
+            continue
+        if not evidence.strip() or not message.content.replace(
+                evidence, "", 1).strip():
+            return None, messages
+        rest = message.content.replace(evidence, _EVIDENCE_POINTER, 1)
+        moved = message.model_copy(
+            update={
+                "content": rest,
+                "shared_evidence": None
+            })
+        return _EVIDENCE_BLOCK_LABEL + evidence, [
+            *messages[:index], moved, *messages[index + 1:]
+        ]
+    return None, messages
+
+
+def _system_param(system: str, evidence: str | None = None) -> Any:
+    if evidence is not None:
+        return [{
+            "type": "text",
+            "text": text,
+            "cache_control": _EPHEMERAL_CACHE
+        } for text in (evidence, system) if text]
     if not system:
         return omit
     if not settings.LLM_ANTHROPIC_PROMPT_CACHING:
@@ -316,7 +395,9 @@ def _prompt_tokens(usage: Usage) -> int:
 
 def _log_success(
         event: str, *, model: str, message: Message, started: float,
-        **fields: object) -> None:
+        evidence_first: bool = False, **fields: object) -> None:
+    if evidence_first:
+        fields["evidence_first"] = True
     usage = message.usage
     thinking_tokens = _thinking_tokens(usage)
     logger.info(
@@ -449,14 +530,20 @@ def _is_schema_too_complex(exc: Exception) -> bool:
 
 
 def _request_kwargs(
-        messages: list[LLMMessage], *, model: str, temperature: float,
-        max_tokens: int, timeout_seconds: float | None,
+        messages: list[LLMMessage], *, evidence: str | None, model: str,
+        temperature: float, max_tokens: int, timeout_seconds: float | None,
         output_config: OutputConfigParam | None,
         thinking: str) -> dict[str, Any]:
-    system, turns = _split_system_and_turns(messages)
+    """Build the request; `messages` and `evidence` come from
+    `_hoisted_evidence`, which runs once per request."""
+    system, turns = _split_system_and_turns(
+        messages, max_message_breakpoints=min(
+            _MAX_MESSAGE_BREAKPOINTS,
+            _MAX_BREAKPOINTS - (evidence is not None) - any(
+                m.role == "system" and m.content for m in messages)))
     return {
         "model": model,
-        "system": _system_param(system),
+        "system": _system_param(system, evidence),
         "messages": turns,
         "max_tokens": max_tokens + (
             settings.LLM_ANTHROPIC_THINKING_HEADROOM_TOKENS
@@ -484,9 +571,11 @@ class AnthropicAdapter(LLMProviderAdapter):
             response_schema: dict[str, Any] | None = None) -> LLMResponse:
         client = _get_client()
         thinking = _thinking_mode(model)
+        evidence, messages = _hoisted_evidence(messages)
         kwargs = _request_kwargs(
-            messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, timeout_seconds=timeout_seconds,
+            messages, evidence=evidence, model=model,
+            temperature=temperature, max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
             output_config=_output_config(
                 response_schema
                 if response_format == "json_object" else None, model),
@@ -504,7 +593,8 @@ class AnthropicAdapter(LLMProviderAdapter):
         _log_success(
             "anthropic.completion_succeeded", model=model, message=resp,
             started=started,
-            schema_sent="format" in (kwargs["output_config"] or {}))
+            schema_sent="format" in (kwargs["output_config"] or {}),
+            evidence_first=evidence is not None)
         content = "".join(
             block.text for block in resp.content if block.type == "text")
         exhausted = _thinking_exhausted(
@@ -531,9 +621,11 @@ class AnthropicAdapter(LLMProviderAdapter):
             max_tokens: int = 1024) -> AsyncIterator[str]:
         client = _get_client()
         thinking = _thinking_mode(model)
+        evidence, messages = _hoisted_evidence(messages)
         kwargs = _request_kwargs(
-            messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, timeout_seconds=None,
+            messages, evidence=evidence, model=model,
+            temperature=temperature, max_tokens=max_tokens,
+            timeout_seconds=None,
             output_config=_output_config(None, model), thinking=thinking)
         started = time.monotonic()
         has_text = False
@@ -551,7 +643,7 @@ class AnthropicAdapter(LLMProviderAdapter):
             raise error from exc
         _log_success(
             "anthropic.stream_completed", model=model, message=final,
-            started=started)
+            started=started, evidence_first=evidence is not None)
         exhausted = _thinking_exhausted(
             final, model=model, has_text=has_text,
             max_tokens=kwargs["max_tokens"])

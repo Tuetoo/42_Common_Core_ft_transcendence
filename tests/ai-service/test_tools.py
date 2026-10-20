@@ -559,6 +559,36 @@ def _core(stored: dict[str, list[str]], seen: list[httpx.Request]):
     return _handler
 
 
+@pytest.mark.asyncio
+async def test_experiment_isolation_hides_prior_agent_notes(monkeypatch):
+    chunks = [
+        _chunk("c1", "d1", text="Prior note says margins fell.",
+               source="agent:risk"),
+        _chunk("c2", "d2", text="Seed research document on margins.",
+               source="seed:report.pdf")
+    ]
+    tool = _archive_tool(_FakeRetriever(chunks))
+    shown = await tool.run(query="margins")
+    assert "Prior note says" in shown and "Seed research" in shown
+
+    from config import settings
+    from structlog.testing import capture_logs
+
+    monkeypatch.setattr(settings, "ANALYSIS_EXPERIMENT_ISOLATION", True)
+    with capture_logs() as logs:
+        shown = await tool.run(query="margins")
+    assert "Prior note says" not in shown
+    assert "PRIOR AI-WRITTEN" not in shown
+    assert "Seed research document on margins." in shown
+    assert [(e["path"], e["dropped"]) for e in logs
+            if e["event"] == "experiment_isolation.skipped"] == [
+                ("archived_agent_notes_read", 1)
+            ]
+    tool = _archive_tool(_FakeRetriever(chunks[:1]))
+    assert "No prior risk note passages found" in await tool.run(
+        query="margins")
+
+
 class TestSearchFilingsTool:
 
     @pytest.mark.asyncio
@@ -1455,8 +1485,12 @@ class TestRetrievalAndArchive:
             captured.update(kwargs)
             raise _Stop
 
+        async def _system_owner(analysis_id):
+            return None
+
         monkeypatch.setattr(
             archival_module, "_find_near_duplicate_of_recent_report", _no_dup)
+        monkeypatch.setattr(archival_module, "_archive_owner", _system_owner)
         monkeypatch.setattr(archival_module, "embed_texts", _embed)
         monkeypatch.setattr(archival_module, "index_chunks", _index)
         with pytest.raises(_Stop):
@@ -1953,7 +1987,8 @@ class TestServiceScripts:
         for name in ("probe_model_latency.py", "measure_rag_recall.py",
                      "verify_portfolio_backtest.py",
                      "generate_rag_golden_set.py",
-                     "probe_anthropic_schemas.py"):
+                     "probe_anthropic_schemas.py",
+                     "probe_anthropic_cache.py", "llm_usage_report.py"):
             flat = tmp_path / name / "app" / "scripts"
             flat.mkdir(parents=True)
             shutil.copy(_SCRIPTS / name, flat / name)
@@ -1976,6 +2011,109 @@ class TestServiceScripts:
                 and "if len(" not in line
             ]
             assert not unguarded, name
+
+    def test_llm_usage_report_sums_one_analysis_from_its_log_lines(
+            self, tmp_path, monkeypatch):
+        report = importlib.import_module("scripts.llm_usage_report")
+        aid, other = str(uuid4()), str(uuid4())
+
+        def _line(prefix: str, **record: Any) -> str:
+            return prefix + json.dumps(record)
+
+        usage = {
+            "event": "anthropic.completion_succeeded",
+            "analysis_id": aid,
+            "ticker": "AAPL"
+        }
+        lines = [
+            _line(
+                "ai-service-1  | ", event="analysis_queue_job_started",
+                analysis_id=aid, timestamp="2026-10-21T09:00:00.000000Z"),
+            _line(
+                "2026-10-21T05:00:01.000-04:00 stdout ", **usage,
+                model="claude-haiku-5-5", prompt_tokens=1000,
+                uncached_prompt_tokens=100, cache_read_tokens=800,
+                cache_creation_tokens=100, completion_tokens=50,
+                thinking_tokens=20, timestamp="2026-10-21T09:00:10Z"),
+            _line(
+                "", **usage, model="claude-sonnet-5-5", prompt_tokens=5000,
+                uncached_prompt_tokens=1000, cache_read_tokens=0,
+                cache_creation_tokens=4000, completion_tokens=200,
+                thinking_tokens=None, evidence_first=True,
+                timestamp="2026-10-21T09:01:00Z"),
+            _line(
+                "", **{
+                    **usage, "analysis_id": other
+                }, model="claude-sonnet-5-5", prompt_tokens=9,
+                uncached_prompt_tokens=9, completion_tokens=9),
+            "uvicorn INFO not json {",
+            _line(
+                "", event="fresh_filing_check.found_new_content",
+                analysis_id=aid, ticker="AAPL", count=1),
+            _line(
+                "", event="analysis_queue_job_finished", analysis_id=aid,
+                timestamp="2026-10-21T09:01:30.000000Z")
+        ]
+        run = tmp_path / "run_1"
+        run.mkdir()
+        (run / "_summary.txt").write_text(
+            "Run started\n\n"
+            f"AAPL: analysis_id={aid} status=completed elapsed=95s\n")
+        (run / "AAPL_ai-service.log").write_text("\n".join(lines) + "\n")
+
+        out = io.StringIO()
+        assert report.main(["--group", f"C={run}"], out=out) == 0
+        text = out.getvalue()
+        haiku = (100 * 0.10 + 800 * 0.10 * 0.1 + 100 * 0.10 * 1.25 +
+                 70 * 0.50) / 1e6
+        sonnet = (1000 * 2.0 + 4000 * 2.0 * 1.25 + 200 * 10.0) / 1e6
+        cost = f"${haiku + sonnet:.4f}"
+        assert f"AAPL   {aid} wall 90s, 2 calls, cost {cost}" in text
+        assert f"TOTAL C: wall 90s, cost ${haiku + sonnet:.4f}" in text
+        assert "note: a new filing was ingested" in text
+        assert ("claude-sonnet-5-5        1       5000       1000      4000 "
+                "         0      200        0      1") in text
+
+        usages = report.collect([aid], [lines])
+        totals = usages[aid].models["claude-haiku-5-5"]
+        assert (totals["prompt"], totals["uncached"], totals["cache_read"],
+                totals["cache_write"], totals["output"],
+                totals["thinking"]) == (1000, 100, 800, 100, 50, 20)
+        assert usages[aid].ticker == "AAPL"
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(lines)))
+        out = io.StringIO()
+        assert report.main(
+            ["--log", "-", "--sonnet-cache-read", "0.05", aid],
+            out=out) == 0
+        assert f"TOTAL all: wall 90s, cost ${haiku + sonnet:.4f}" in (
+            out.getvalue())
+        assert report.main([aid], out=io.StringIO()) == 2
+
+    def test_llm_usage_report_reads_a_repeated_tickers_log_once(
+            self, tmp_path, capsys):
+        report = importlib.import_module("scripts.llm_usage_report")
+        first, second = str(uuid4()), str(uuid4())
+        run = tmp_path / "run_1"
+        run.mkdir()
+        (run / "_summary.txt").write_text(
+            f"AAPL: analysis_id={first} status=completed elapsed=9s\n"
+            f"AAPL: analysis_id={second} status=completed elapsed=9s\n")
+        (run / "AAPL_ai-service.log").write_text(
+            json.dumps({
+                "event": "anthropic.completion_succeeded",
+                "analysis_id": second,
+                "model": "claude-haiku-5-5",
+                "prompt_tokens": 100,
+                "uncached_prompt_tokens": 100,
+                "completion_tokens": 10
+            }) + "\n")
+        out = io.StringIO()
+        assert report.main([str(run), str(run)], out=out) == 0
+        text = out.getvalue()
+        assert f"AAPL   {second} wall n/a, 1 calls," in text
+        assert f"AAPL   {first} wall n/a, 0 calls," in text
+        assert "lists AAPL twice" in capsys.readouterr().err
 
     @pytest.mark.asyncio
     async def test_schema_probe_builds_every_agents_step_schema(self):

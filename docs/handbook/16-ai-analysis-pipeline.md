@@ -195,6 +195,36 @@ ticker's return over `AI_ACCURACY_EVALUATION_DAYS` (30). A database error
 gives an empty list, never a failure. Setting `EPISODIC_CONTEXT_LIMIT` to
 0 turns it off. Chapter 18 explains this memory in depth.
 
+**Experiment isolation.** `ANALYSIS_EXPERIMENT_ISOLATION=true` (default
+false) is a switch for cost and quality experiments that rerun the same
+tickers: no analysis then reads what an earlier one wrote, or writes
+what a later one reads. With it on, the episodic track record above is
+not read (the node returns an empty list, whatever
+`EPISODIC_CONTEXT_LIMIT` says); the prior open recommendation is not
+loaded (no pending-recommendation context, no previous verdict for the
+Judge); no procedural hints are read; knowledge-graph facts (all of
+them extracted from archived agent reports) are not read by the ticker
+and portfolio context, the `query_knowledge_graph` tool or the search
+query expansion; the research-archive search tools drop prior
+AI-written notes (`agent:*` passages) and keep every other passage
+(seed, system and uploaded documents); and after the verdict no
+procedural memory, archived note, knowledge-graph fact or episodic
+memory is written. The archive search drops prior agent notes after the
+retriever has already cut its results to RAG_TOP_K_RESULTS, so under
+isolation a search can return fewer passages than usual, or none, even
+when matching seed documents rank just below the cut. Every skipped
+path goes through one helper,
+`ai/experiment_isolation.py::isolation_skips`, which logs
+`experiment_isolation.skipped` with its `path` (for example
+`episodic_memory_read`). Market data, filings, filing records and
+summaries, system documents and the news caches stay shared. Open
+tiers of other analyses are ignored: position sizing and the portfolio
+tool count no cash committed by them, and the analysis supersedes or
+keeps no earlier tier. The analysis still writes its own
+recommendation and tiers; decline them before the next group
+(`make tiers-decline A="<ids>"`). While the switch is on, the
+knowledge-graph reads of the RAG assistant return nothing too.
+
 ### 3.3 supervisor_node: agent selection and shared context
 
 `supervisor_node` calls `ai/graph/nodes.py::select_agents`,
@@ -1124,6 +1154,7 @@ All settings are in `services/ai-service/config.py` (class
 | `ANALYSIS_MAX_ACTIVE_PER_USER` | 3 | pending/running analyses per user (429 above) |
 | `ANALYSIS_QUEUE_MAX_PENDING` | 50 | pending analyses in total (503 above) |
 | `EPISODIC_CONTEXT_LIMIT` | 3 | earlier calls shown to the Judge; 0 = off |
+| `ANALYSIS_EXPERIMENT_ISOLATION` | false | experiment switch: no analysis reads or writes prior-analysis context, memory, archived notes or knowledge-graph facts (section 3.2) |
 | `AI_ACCURACY_EVALUATION_DAYS` | 30 | review window named in the track record |
 | `MIN_USABLE_AGENTS_FOR_DEBATE` | 4 | usable agents needed for a debate; 0 = off |
 | `DEBATE_SIDE_REPAIR_DELAY_SECONDS` | 60.0 | pause before re-running an unavailable first-round side; skipped when a strong-chain model is free |
@@ -1421,6 +1452,7 @@ tier can only become a trade after the owner accepts it."
 | `services/ai-service/ai/recommendation/engine.py` | single-position limit helpers, `no_verdict_reason`, `build_final_recommendation` |
 | `services/ai-service/ai/recommendation/position_sizing.py` | budget, minimum size, sizing call, validation, note types |
 | `services/ai-service/ai/workflows/analysis_workflow.py` | context, graph run, persistence, tiers, events, learning writes |
+| `services/ai-service/ai/experiment_isolation.py` | `isolation_skips`: the `ANALYSIS_EXPERIMENT_ISOLATION` check and its `experiment_isolation.skipped` log (section 3.2) |
 | `services/ai-service/domains/analysis/repository.py` | tier queries, `UNFILLED_TIER_STATUSES`, `unfilled_tier_condition`, `acceptance_lapsed`, `committed_buy_cash`, `committed_buy_holders`, `accept_pending`, `decline_unfilled`, `invalidate_unfilled_tiers_for_new_recommendation` |
 | `services/ai-service/domains/analysis/queue.py` | serial queue and timeout |
 | `services/ai-service/domains/decision/service.py` | record decision, accept/decline tiers, decision review |

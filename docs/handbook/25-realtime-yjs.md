@@ -114,8 +114,8 @@ Step by step:
 6. For `analysis:` and `document:` sockets: log `websocket_opened` (and
    later `websocket_closed`). These are low-volume and help trace a missed
    live event.
-7. For `analysis:` only: `send_analysis_status` sends the first message
-   (section 3.3).
+7. For `analysis:` only: `send_analysis_status` sends the status snapshot,
+   normally the first message (section 3.3).
 8. Receive loop under `serve_until_expiry`: the server reads frames only to
    notice a disconnect. A binary frame closes with **1003** ("text frames
    only"). When the token's `exp` is reached, the socket is closed with
@@ -171,18 +171,18 @@ What arrives on each channel:
 |---|---|---|---|
 | `user:<id>` | `notification` | the notification row: `id, user_id, type, title, content, read_at, created_at` (pushed only when the user's WebSocket delivery preference is on) | `NotificationService.deliver_notification` |
 | `user:<id>` | `user.presence.changed` | `user_id, is_online, event_id` of one of the user's accepted friends | `_handle_user_presence_changed` |
-| `analysis:<id>` | `analysis.status` (first message), `analysis.started`, `analysis.completed`, `analysis.failed`, `recommendation.ready`, `decision.recorded`, `tier.executed`, `tier.execution_failed`, `tier.cancelled` | the event payload (see [24-events.md](24-events.md)), including `event_id` | `event_listener._broadcast_analysis` |
+| `analysis:<id>` | `analysis.status` (snapshot, normally first), `analysis.started`, `analysis.completed`, `analysis.failed`, `recommendation.ready`, `decision.recorded`, `tier.executed`, `tier.execution_failed`, `tier.cancelled` | the event payload (see [24-events.md](24-events.md)), including `event_id` | `event_listener._broadcast_analysis` |
 | `document:<id>` | `document.status_changed` | `document_id, status, event_id` | `_broadcast_document_status_changed` |
 | `presence:<id>` | `user.presence.changed` | `user_id, is_online, event_id` | `_handle_user_presence_changed` |
 
-### 3.3 The `analysis:<id>` channel: snapshot first, then live events
+### 3.3 The `analysis:<id>` channel: status snapshot and live events
 
 A client only learns the analysis id from the `POST /api/v1/analyses`
 response. By the time it opens the socket, ai-service has usually already
 published `analysis.started`. Pub/sub does not store events, so the client
 would miss it and show a stale state.
 
-So the first message on an `analysis:` socket is a **snapshot**:
+So, right after it subscribes, an `analysis:` socket gets a **snapshot**:
 
 ```json
 {"event": "analysis.status",
@@ -194,7 +194,10 @@ So the first message on an `analysis:` socket is a **snapshot**:
 `send_analysis_status` reads it from ai-service (`ai_client.get_analysis_ref`)
 **after** `manager.connect`. Order matters: once the socket is in the
 channel, no live event can fall in the gap between snapshot and stream. At
-worst the client sees one state twice. The client should treat
+worst the client sees one state twice, and an event published while the
+status is being read can arrive just before the snapshot (an analysis that
+starts at once, with an empty queue, sends `analysis.started` first).
+The client should treat
 `analysis.completed` and `analysis.failed` as final. If the lookup fails,
 the snapshot is skipped (log `websocket_analysis_status_skipped`) and live
 events still follow.
@@ -932,7 +935,7 @@ and isolates the risky decoding in child processes."
 3. **Why does an `analysis:` socket start with `analysis.status`?**
    The client usually subscribes after `analysis.started` was published,
    and pub/sub does not store events. The snapshot gives the current state;
-   live events follow.
+   live events follow (one sent while the status is read can come first).
 
 4. **Why does the server accept the handshake before refusing?**
    Closing before accept becomes a plain HTTP 403 and the client never
