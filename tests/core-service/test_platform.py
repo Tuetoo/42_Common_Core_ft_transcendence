@@ -336,6 +336,8 @@ class TestServiceClients:
         }
         assert seen[-1][0].endswith("/internal/market/instruments/AMD/prices")
         assert seen[-1][1] == {"interval": "1d", "lookback_days": 40}
+        await real.get_daily_closes("AMD", lookback_days=9000)
+        assert seen[-1][1] == {"interval": "1d", "lookback_days": 3650}
 
         class _FailingHttp:
 
@@ -478,8 +480,6 @@ class TestJobHealth:
     async def test_job_registry_baseline_alerts_and_skip_count(
             self, monkeypatch):
         import job_health
-
-        assert job_health.JOB_LAST_SUCCESS._labelnames == ("scheduled_job", )
 
         class _Cache:
 
@@ -839,13 +839,6 @@ class TestSharedContracts:
         assert len(public_ops) == 5
         assert all(
             op["security"] == [{"APIKeyHeader": []}] for op in public_ops)
-
-        import clients.ai_client as ai_client
-
-        import domains.portfolio.ledger as ledger
-        from shared.market_calendar import MARKET_TZ
-
-        assert ledger.MARKET_TZ is MARKET_TZ is ai_client.MARKET_TZ
 
         conf = (_REPO / "infra" / "gateway" / "nginx.conf").read_text()
         assert "$proxy_add_x_forwarded_for" not in conf

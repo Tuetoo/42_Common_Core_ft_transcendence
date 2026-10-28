@@ -2,8 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import {
   COMMENT_MAX,
   NOTE_CONTENT_MAX,
@@ -55,32 +54,19 @@ export async function createNote(
     organizationId = organizationRaw;
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { values, error: "You're not logged in" };
-  }
+  const result = await call(
+    "/research/notes",
+    jsonInit("POST", {
+      title: title.trim(),
+      content: content.trim() ? content : null,
+      tags,
+      organization_id: organizationId,
+    }),
+    "Could not create note"
+  );
+  if (!result.ok) return { values, error: result.error };
 
-  let res: Response;
-  try {
-    res = await backendFetch("/research/notes", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: title.trim(),
-        content: content.trim() ? content : null,
-        tags,
-        organization_id: organizationId,
-      }),
-    });
-  } catch {
-    return { values, error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { values, error: await extractErrorMessage(res, "Could not create note") };
-  }
-
-  const { data } = (await res.json()) as { data: { id: string } };
+  const { data } = (await result.res.json()) as { data: { id: string } };
   revalidatePath("/research");
   // Open the new note right away: that is where the live editor is.
   redirect(`/research/${data.id}`);
@@ -114,25 +100,8 @@ export async function addComment(
     return { values, error: "Invalid note" };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { values, error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch(`/research/notes/${noteId}/comments`, accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    });
-  } catch {
-    return { values, error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { values, error: await extractErrorMessage(res, "Could not add comment") };
-  }
+  const result = await call(`/research/notes/${noteId}/comments`, jsonInit("POST", { content }), "Could not add comment");
+  if (!result.ok) return { values, error: result.error };
 
   revalidatePath(`/research/${noteId}`);
   return { posted: Date.now() };
@@ -146,18 +115,9 @@ export async function deleteNote(
   _formData: FormData
 ): Promise<{ error?: string; message?: string }> {
   if (!UUID_RE.test(noteId)) return { error: "Invalid note id" };
-  const accessToken = await getAccessToken();
-  if (!accessToken) redirect("/login");
-  let res: Response;
-  try {
-    res = await backendFetch(`/research/notes/${noteId}`, accessToken, { method: "DELETE" });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-  if (res.status === 401) redirect("/login");
-  if (!res.ok && res.status !== 404) {
-    return { error: await extractErrorMessage(res, "Could not delete the note") };
-  }
+  const result = await call(`/research/notes/${noteId}`, { method: "DELETE" }, "Could not delete the note");
+  if (!result.ok && result.status === 401) redirect("/login");
+  if (!result.ok && result.status !== 404) return { error: result.error };
   revalidatePath("/research");
   redirect("/research");
 }
@@ -177,21 +137,8 @@ export async function deleteDocument(documentId: string): Promise<DeleteDocument
     return { error: "Invalid document" };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch(`/research/documents/${documentId}`, accessToken, { method: "DELETE" });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok && res.status !== 404) {
-    return { error: await extractErrorMessage(res, "Could not delete the document") };
-  }
+  const result = await call(`/research/documents/${documentId}`, { method: "DELETE" }, "Could not delete the document");
+  if (!result.ok && result.status !== 404) return { error: result.error };
 
   revalidatePath("/research/documents");
   return {};

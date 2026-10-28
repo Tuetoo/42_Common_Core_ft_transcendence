@@ -9,8 +9,6 @@ from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
                             combine_context, flag_unresolved_issue,
                             is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.tools.indicators import (PRICE_VS_LEVEL_BAND_PCT,
-                                 price_position_vs_level, rsi_band)
 from ai.tools.market_tool import GetRecentPriceHistoryTool
 from ai.tools.market_tool import \
     latest_close_from_price_history as _latest_close_from_price_history
@@ -78,16 +76,10 @@ _PRINTED_POSITION_RE = {
     "price_vs_sma50": re.compile(r"Price vs SMA\(50\): (above|below|at)")
 }
 
-_PRICE_VS_SMA20_BAND_PCT = PRICE_VS_LEVEL_BAND_PCT
-
 _MACD_TREND_EPSILON = 0.01
 _MACD_NEUTRAL_ATR_FRACTION = 0.05
 
 _RSI_BAND_RE = re.compile(r"RSI\(14\): -?\d+(?:\.\d+)? \(band: ([a-z]+)")
-
-
-def _rsi_band_name(band: str) -> str:
-    return band.split("-")[0].split(" ")[0]
 
 
 _SYSTEM_PROMPT = (
@@ -129,23 +121,7 @@ def _parse_fresh_technical(observation: str) -> dict[str, float]:
     return values
 
 
-def _actual_price_vs_sma20(latest_close: float, sma20: float) -> str:
-    return price_position_vs_level(
-        latest_close, sma20, _PRICE_VS_SMA20_BAND_PCT)
-
-
-def _actual_macd_trend(histogram: float) -> str:
-    if histogram > _MACD_TREND_EPSILON:
-        return "bullish"
-    if histogram < -_MACD_TREND_EPSILON:
-        return "bearish"
-    return "neutral"
-
-
-def _accepted_macd_trends(histogram: float,
-                          atr14: float | None) -> tuple[str, ...]:
-    if atr14 is None:
-        return (_actual_macd_trend(histogram), )
+def _accepted_macd_trends(histogram: float, atr14: float) -> tuple[str, ...]:
     band = max(_MACD_TREND_EPSILON, _MACD_NEUTRAL_ATR_FRACTION * abs(atr14))
     direction = (
         "bullish" if histogram > 0 else "bearish" if histogram < 0 else None)
@@ -190,8 +166,7 @@ def _technical_claims_disagree_with_indicators(
                     printed_positions[key] = match.group(1)
             printed_claims = set(printed_positions)
             band_match = _RSI_BAND_RE.search(observation)
-            printed_rsi_band = (
-                _rsi_band_name(band_match.group(1)) if band_match else None)
+            printed_rsi_band = band_match.group(1) if band_match else None
             if "macd_histogram" in fresh:
                 printed_claims.add("macd_trend")
             if printed_rsi_band is not None:
@@ -235,13 +210,9 @@ def _technical_claims_disagree_with_indicators(
         position_claim = reported_metrics.get(claim_key)
         if position_claim is None:
             continue
-        printed = printed_positions.get(claim_key)
-        if printed is not None:
-            actual = printed
-        elif latest_close is None or sma_key not in fresh:
+        actual = printed_positions.get(claim_key)
+        if actual is None:
             continue
-        else:
-            actual = _actual_price_vs_sma20(latest_close, fresh[sma_key])
         if position_claim != actual:
             period = sma_key.removeprefix("sma")
             return (
@@ -254,15 +225,13 @@ def _technical_claims_disagree_with_indicators(
     macd_trend_claim = reported_metrics.get("macd_trend")
     if macd_trend_claim is not None and "macd_histogram" in fresh:
         accepted = _accepted_macd_trends(
-            fresh["macd_histogram"], fresh.get("atr14"))
+            fresh["macd_histogram"], fresh.get("atr14", 0.0))
         if macd_trend_claim not in accepted:
             return (
                 f"reported_metrics.macd_trend={macd_trend_claim!r} "
                 "disagrees with this run's own MACD histogram of "
                 f"{fresh['macd_histogram']} from get_technical_indicators, "
                 f"which is {' or '.join(accepted)}, not {macd_trend_claim!r}.")
-    if printed_rsi_band is None and "rsi14" in fresh:
-        printed_rsi_band = _rsi_band_name(rsi_band(fresh["rsi14"]))
     rsi_band_claim = reported_metrics.get("rsi_band")
     if (rsi_band_claim is not None and printed_rsi_band is not None
             and str(rsi_band_claim).strip().lower() != printed_rsi_band):

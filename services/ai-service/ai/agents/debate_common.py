@@ -76,9 +76,6 @@ def format_grounding_reference(state: AnalysisState) -> str:
         if lines else "(no unflagged agent evidence available)")
 
 
-_SIDE_CLAIM_ISSUE_CODES = frozenset({ISSUE_LLM_REVIEW})
-
-
 def format_prior_reflection_issues(
         state: AnalysisState, side: DebateSide) -> str | None:
     if not state.reflection_history:
@@ -86,7 +83,7 @@ def format_prior_reflection_issues(
     problems: list[str] = []
     unanswered: list[str] = []
     for issue in state.reflection_history[-1].issue_details:
-        if issue.role != side or issue.code not in _SIDE_CLAIM_ISSUE_CODES:
+        if issue.role != side or issue.code != ISSUE_LLM_REVIEW:
             continue
         (unanswered if issue.kind == "not_engaged" else problems).append(
             issue.text)

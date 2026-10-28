@@ -116,17 +116,13 @@ _SYSTEM_PROMPT = (
     "reported.")
 
 
-def _successful(entry: ScratchpadEntry) -> bool:
-    return is_successful_tool_entry(entry)
-
-
 def _trusted_percentages(
         scratchpad: Sequence[ScratchpadEntry],
         portfolio_kg_context: str | None) -> set[str]:
     return extract_reported_percentages(
         *(
             str(entry.observation) for entry in scratchpad
-            if _successful(entry)), portfolio_kg_context)
+            if is_successful_tool_entry(entry)), portfolio_kg_context)
 
 
 _PORTFOLIO_VALIDATION_SUFFIX = (
@@ -140,7 +136,7 @@ def _computed_scenarios(scratchpad: list[ScratchpadEntry],
                         ticker: str) -> list[str]:
     lines: list[str] = []
     for entry in scratchpad:
-        if entry.action != "recompute_scenario" or not _successful(entry):
+        if not is_successful_tool_entry(entry, "recompute_scenario"):
             continue
         action_input = entry.action_input or {}
         if str(action_input.get("ticker", "")).strip().upper() != ticker:
@@ -164,14 +160,16 @@ def _portfolio_finish_validator(
             final_answer: str, reported_metrics: dict[str, Any] | None,
             scratchpad: list[ScratchpadEntry]) -> str | None:
         del reported_metrics
-        if not any(e.action == "get_portfolio_composition" and _successful(e)
-                   for e in scratchpad):
+        if not any(
+                is_successful_tool_entry(e, "get_portfolio_composition")
+                for e in scratchpad):
             return (
                 "you have no successful get_portfolio_composition result this "
                 "run -- call it (it takes no arguments) before concluding.")
-        if not any(e.action == "recompute_scenario" and _successful(e) and str(
-            (e.action_input or {}).get("ticker", "")).strip().upper() == wanted
-                   for e in scratchpad):
+        if not any(
+                is_successful_tool_entry(e, "recompute_scenario")
+                and str((e.action_input or {}).get("ticker", "")).strip(
+                ).upper() == wanted for e in scratchpad):
             return (
                 f"you have no successful recompute_scenario result for "
                 f"{wanted} "

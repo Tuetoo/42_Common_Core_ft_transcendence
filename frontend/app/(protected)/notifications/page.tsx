@@ -1,6 +1,6 @@
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { getMe, getUnreadTotal } from "@/app/lib/session";
-import { markAllNotificationsRead } from "@/app/lib/actions/notifications";
+import { MarkAllReadButton } from "./mark-all-read";
 import { Pager, pageParam } from "../pager";
 import { LocalTime } from "@/app/(protected)/local-time";
 import { LiveFeed } from "./live-feed";
@@ -44,11 +44,7 @@ export default async function NotificationsPage({ searchParams }: { searchParams
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="section-title">History</h2>
           {hasUnread && (
-            <form action={markAllNotificationsRead}>
-              <button type="submit" className="link-btn">
-                Mark all as read
-              </button>
-            </form>
+            <MarkAllReadButton />
           )}
         </div>
         {notifications.length === 0 ? (

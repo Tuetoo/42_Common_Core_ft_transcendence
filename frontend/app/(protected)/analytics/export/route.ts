@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, readApiError } from "@/app/lib/backend";
+import { backendFetch } from "@/app/lib/backend";
 
 // The browser can't download the CSV from the backend itself: the access
 // token is in an httpOnly cookie that page scripts can't read. This route
@@ -37,17 +37,17 @@ export async function GET(request: NextRequest) {
     return redirectTo("/login");
   }
   if (!res?.ok) {
-    // Back to the dashboard with the same filters and a readable message,
-    // instead of a bare error page in place of the download.
-    const message = res
-      ? (await readApiError(res, `the server answered ${res.status}`)).message
-      : "could not reach the server";
+    // Back to the dashboard with the same filters and an error code (see
+    // EXPORT_ERRORS in ../page.tsx), instead of a bare error page in place
+    // of the download. A code, not a message: the page never shows text
+    // taken from its URL.
+    const code = !res ? "unreachable" : res.status === 422 ? "invalid" : "failed";
     const back = new URLSearchParams();
     for (const name of FILTER_PARAMS) {
       const value = incoming.get(name);
       if (value) back.set(name, value);
     }
-    back.set("export_error", message);
+    back.set("export_error", code);
     return redirectTo(`/analytics?${back}`);
   }
 

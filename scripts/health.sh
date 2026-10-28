@@ -11,7 +11,7 @@
 # 3. portfolios skipped by the last market-close run
 # 4. alerts that are firing right now
 # 5. NewsAPI requests in the last 24 h, as counted by ai-service
-set -euo pipefail
+set -uo pipefail  # no `set -e`: a down Prometheus must not hide later sections
 . "$(dirname "$0")/lib.sh"
 
 prom="${PROMETHEUS_LOCAL_URL:-http://127.0.0.1:9090}"

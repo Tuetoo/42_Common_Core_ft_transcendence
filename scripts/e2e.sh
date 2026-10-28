@@ -18,15 +18,18 @@ part="${1:-all}"
 guard_busy_window "end-to-end run"
 
 require_admin_id
-token=$(make_token "$ADMIN_USER_ID" admin 2)
-[ -n "$token" ] || die "could not create an admin token (is auth-service up?)"
+E2E_ADMIN_TOKEN=$(make_token "$ADMIN_USER_ID" admin 2)
+[ -n "$E2E_ADMIN_TOKEN" ] || die "could not create an admin token (is auth-service up?)"
+# `-e NAME` without a value: compose copies it from this environment, so the
+# token is not on the docker command line (visible in `ps`).
+export E2E_ADMIN_TOKEN
 
 run_core() {
-  "${COMPOSE[@]}" exec -T -e E2E_ADMIN_TOKEN="$token" core-service \
+  "${COMPOSE[@]}" exec -T -e E2E_ADMIN_TOKEN core-service \
     python -m scripts.e2e_check "$@"
 }
 run_tier() {
-  "${COMPOSE[@]}" exec -T -e E2E_ADMIN_TOKEN="$token" ai-service \
+  "${COMPOSE[@]}" exec -T -e E2E_ADMIN_TOKEN ai-service \
     python -m scripts.e2e_tier_check "$@"
 }
 

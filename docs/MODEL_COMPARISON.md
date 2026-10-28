@@ -250,12 +250,12 @@ Claude's Reflection (Sonnet) is a much stricter reviewer. Before the fixes, this
 
 - **Independent Gemini clusters at BUY around 0.75; independent Claude clusters at HOLD around 0.55.** In G3 vs C4 the actions agree on 10/19 tickers. All 9 disagreements are Claude HOLD against Gemini BUY. The two confidence series barely correlate (r = 0.13, J6).
 - Neither number separates strong from weak cases. In C4, MSFT (a HOLD forced by the 50% position cap) and NVDA (BUY on +106% revenue) both get 0.62.
-- The cause is the prompt, not the model: the Judge prompt defines confidence only as `"confidence": 0.0-1.0` (`ai/agents/judge.py:136`), so each model falls back to its own habit.
+- The cause is the prompt, not the model: the Judge prompt defines confidence only as `"confidence": 0.0-1.0` (`ai/agents/judge.py:137`), so each model falls back to its own habit.
 - Claude's caution is mostly well-founded in direction (valuation, negative free cash flow, overbought technicals, the 5.10% yield and the Fed hike), but it treats HOLD as "not buying": on TSLA the case reads bearish, yet SELL is never weighed (J6 §9).
 
 ### 8.6 Anchoring
 
-When the Judge sees the previous verdict, it mostly repeats it. The prompt asks for an explanation whenever confidence moves by 0.05 or more (`judge.py:86-88`, threshold `CONFIDENCE_CHANGE_TO_EXPLAIN` at `:253`), which makes staying put the easy choice.
+When the Judge sees the previous verdict, it mostly repeats it. The prompt asks for an explanation whenever confidence moves by 0.05 or more (`judge.py:87-89`, threshold `CONFIDENCE_CHANGE_TO_EXPLAIN` at `:254`), which makes staying put the easy choice.
 
 | Pair | Same action | Same confidence |
 |---|---|---|
@@ -300,8 +300,8 @@ To use it, set `LLM_DEFAULT_PROVIDER=anthropic`. The built-in default (`config.p
 - Mistral is wired in with its own backup models and pacing but was not evaluated in these runs.
 
 **Open limitations (not solved by choosing a model):**
-1. Judge confidence has no defined scale (`judge.py:136`); Claude sits near 0.55 and Gemini near 0.75 regardless of evidence strength.
-2. Anchoring: the Judge copies the previous verdict (19/19 actions in C5 and C6) because of the 0.05 "explain the change" rule (`judge.py:86-88`).
+1. Judge confidence has no defined scale (`judge.py:137`); Claude sits near 0.55 and Gemini near 0.75 regardless of evidence strength.
+2. Anchoring: the Judge copies the previous verdict (19/19 actions in C5 and C6) because of the 0.05 "explain the change" rule (`judge.py:87-89`).
 3. Position sizing is first come, first served (`position_sizing.py:259`): the first BUY in batch order takes most of the cash.
 4. Occasional Judge arithmetic errors on funding statements, and stale filing records (ORCL restructuring, LLY FX) that both models repeat.
 5. No backup model is configured for Anthropic, so a Claude outage stops analyses until the provider is switched.

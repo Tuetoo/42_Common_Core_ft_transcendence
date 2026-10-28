@@ -1,8 +1,8 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { clearSession, getAccessToken } from "@/app/lib/session";
-import { backendFetch, publicFetch, readApiError } from "@/app/lib/backend";
+import { call, clearSession, jsonInit } from "@/app/lib/session";
+import { publicFetch, readApiError } from "@/app/lib/backend";
 
 // Actions behind the three links auth-service puts in emails
 // (verify-email, reset-password, invitations/accept). Each one is triggered
@@ -93,25 +93,14 @@ export async function acceptInvitation(
   _prevState: LinkActionState,
   _formData: FormData
 ): Promise<LinkActionState> {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-  let res: Response;
-  try {
-    // The token goes in the body, never the URL, so it stays out of access logs.
-    res = await backendFetch("/organizations/invitations/accept", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-  } catch {
-    return { error: UNREACHABLE };
-  }
-  if (!res.ok) {
-    return { error: (await readApiError(res, "Could not accept this invitation")).message };
-  }
-  const { data } = await res.json();
+  // The token goes in the body, never the URL, so it stays out of access logs.
+  const result = await call(
+    "/organizations/invitations/accept",
+    jsonInit("POST", { token }),
+    "Could not accept this invitation"
+  );
+  if (!result.ok) return { error: result.error };
+  const { data } = await result.res.json();
   redirect(`/organizations/${data.organization_id}`);
 }
 

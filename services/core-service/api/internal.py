@@ -292,10 +292,12 @@ async def get_tracked_tickers(
 @router.get("/documents/filenames")
 async def get_document_filenames(
         ticker: str | None = Query(default=None), category: str = Query(...),
+        system_only: bool = Query(default=False),
         db: AsyncSession = Depends(get_db, scope="function")) -> list[str]:
     return await DocumentRepository(db).list_filenames(
         ticker=ticker, category=category,
-        failed_retry_days=settings.FAILED_DOCUMENT_RETRY_DAYS)
+        failed_retry_days=settings.FAILED_DOCUMENT_RETRY_DAYS,
+        owner_id=SYSTEM_DOCUMENT_OWNER_ID if system_only else None)
 
 
 @router.post("/documents")

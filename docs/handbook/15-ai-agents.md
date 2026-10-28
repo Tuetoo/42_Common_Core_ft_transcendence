@@ -188,8 +188,9 @@ error (`react_loop.tool_reported_error`, `react_loop.tool_raised`).
 (compared as sorted JSON) that already succeeded, or that already failed
 twice, is blocked before it runs (`react_loop.duplicate_action_blocked`).
 `get_current_price` is exempt (a live price can change). When a new
-observation is at least 85% similar (`difflib`) to one of the last three,
-a note is appended that says another similar search is unlikely to help,
+observation is at least 85% similar (`difflib`) to the observation of one
+of the last three scratchpad entries (correction and blocked entries
+included), a note is appended that says another similar search is unlikely to help,
 and repeating that exact call is blocked next time.
 
 **The last turn.** When one productive iteration is left, the system
@@ -333,9 +334,10 @@ Agents add their own fields: `verification_warnings` (a list, the
 structured copy of the banners: a banner inside a summary is easily lost by
 the next LLM that reads it), `key_facts`, `no_evidence`, `evidence_yield`,
 `risk_events`, `live_fred`, `injected_context` (context the agent was given,
-never evidence), `final_answer` (the answer before code-added lines),
-`disclosures`, `reused_prior_note`, `latest_quarter`, the Filing lists,
-and Sentiment's `sentiment_label`.
+never evidence), `final_answer` (the answer before code-added lines,
+stored only by agents that add lines to their summary),
+`disclosures`, `reused_prior_note`, `latest_quarter` and the Filing
+lists.
 
 If the agent raises, `_run_agent_safely` returns a `FAILED` output
 (`score=0.0`, not well supported) with a `failure_kind`; a summary that
@@ -525,8 +527,7 @@ the tolerance of one allowed value.
   2. the categorical claims are required whenever the tool printed the
      facts they are checked against;
   3. `price_vs_sma20/50` must equal the printed "Price vs SMA(N)" word
-     (or, without one, the position recomputed from the latest close
-     with a 0.1% band);
+     (the tool prints it whenever it prints that average);
   4. `macd_trend` must match the histogram's sign; near zero
      (`|histogram|` below 5% of ATR(14), at least 0.01) "neutral" is also
      accepted;
@@ -817,18 +818,12 @@ the tolerance of one allowed value.
   `label_without_evidence` (a "Sentiment:" line although neither News nor
   its own search returned a relevant article). No own-evidence figure
   check.
-- **After the run:** the label is read with a regex; if missing, a Lite
-  classifier call (`_classify_sentiment_label`, JSON mode) recovers it,
-  or it stays visibly missing (`None`, never a default "neutral"). When
-  the line is missing and every `search_news` call Sentiment made returned
-  a tool error (for example NewsAPI's quota cooldown), no classifier call
-  is made and the label stays `None` (`sentiment.no_label_after_failed_searches`):
-  the classifier must pick one of six labels and stored "neutral" for
-  write-ups that said no reading was possible. With no
-  evidence at all, no classifier call is made, the label is `None`, a
-  `[NO EVIDENCE: ...]` banner is added and the score is 0.35; a label line
-  the model still wrote is kept as written and logged
-  (`sentiment.label_written_without_evidence`). Thin evidence (1-2 items,
+- **After the run:** the "Sentiment:" label stays inside the summary
+  text and is not stored; no extra call recovers a missing one (the label
+  is read only by the no-evidence check). With
+  no evidence at all, a `[NO EVIDENCE: ...]` banner is added and the
+  score is 0.35; a label line the model still wrote is kept as written and
+  logged (`sentiment.label_written_without_evidence`). Thin evidence (1-2 items,
   or News relied only on an unverified web fallback) caps the score at 0.6.
   `raw_output["verification_warnings"]` is always `[]` (the key is kept for
   readers); `finish_meta`, `no_evidence` and `evidence_yield` are stored.
@@ -846,7 +841,7 @@ the tolerance of one allowed value.
   `web_search` (lines carry the catalog field). `MAX_ITERATIONS = 7`.
 - **Prefetch:** `fed_funds_rate` (DFF) and `10y_treasury_yield` (DGS10)
   always, in code (`_prefetch_live_fred`, one `prefetch_tool_call` per
-  series, deliberately not tied to `AGENT_PREFETCH_ENABLED` because the
+  series, both at the same time, deliberately not tied to `AGENT_PREFETCH_ENABLED` because the
   validator checks against them); then,
   with prefetch enabled, `cpi` with a lookback long enough for a
   year-over-year rate and `search_prior_macro_notes(query="Fed policy
@@ -1359,12 +1354,13 @@ quotes, tool values), never from re-parsed model prose.
   call is made on the same path: the same messages, the first answer as
   the assistant turn, and a request to restate each listed figure exactly
   as the evidence gives it (value, unit and period) or remove it, not to
-  add items together, and to return the whole JSON again. The second
-  answer is accepted whatever it says (leaning and confidence included);
-  its rationale is checked once more and a remaining problem is only logged
-  (`judge.ungrounded_figures_after_rewrite`). Fails open: when the call
-  raises, the reply does not parse, or it has no English rationale, the
-  first answer is kept (`judge.ungrounded_rewrite_failed`). Only the
+  add items together, and to return the whole JSON again. A usable
+  second answer is accepted whatever it says (leaning and confidence
+  included); its rationale is checked once more and a remaining problem is
+  only logged (`judge.ungrounded_figures_after_rewrite`). Fails open: when
+  the call raises, the reply does not parse, it has no English rationale,
+  or it has no `leaning` or no `confidence` key, the first answer is kept
+  (`judge.ungrounded_rewrite_failed`). Only the
   rationale is checked (`opposing_points` are not shown to users; checking
   them would add false positives on correct sums and midpoints). Replay on
   32 stored final rationales: 1 trigger (GOOGL "$36.915 million" for
@@ -1396,7 +1392,8 @@ quotes, tool values), never from re-parsed model prose.
   logged (`judge.unparseable_response`: first 500 characters, the last
   300, `raw_chars`, `parse_error`, `error_pos`/`error_line`/`error_col`,
   `error_context` = 300 characters before to 200 after the error, `model`,
-  `finish_reason`) and the Judge is asked ONCE again in the same
+  `finish_reason`, and `attempt`: 1 for the first answer, 2 for the JSON
+  re-ask, 3 for the figure rewrite) and the Judge is asked ONCE again in the same
   conversation (same chain, same evidence, its reply and the parse error
   with its position; `judge.json_reask`). A readable second answer is used
   as the first one would have been (`judge.json_reask_recovered`; the
@@ -1411,7 +1408,7 @@ quotes, tool values), never from re-parsed model prose.
   a non-English rationale is `judge_failed`
   (`judge.non_english_rationale`). The confidence is clamped to 0-1 (a
   value that is not a finite number, such as NaN or Infinity, becomes 0.0), an
-  unknown leaning becomes HOLD, and `converged` counts only a real boolean
+  unknown leaning becomes HOLD (logged as `judge.unknown_leaning` with the raw value), and `converged` counts only a real boolean
   or the string "true" (so the string `"false"` cannot end a debate). The graph's
   availability retries and no-verdict handling are in chapter 16.
 - **The rationale is stored as written:** a regex that removes "debate
@@ -1436,7 +1433,7 @@ quotes, tool values), never from re-parsed model prose.
   agent's loop (3.5).
 - **LLM part:** a `HIGHEST_ACCURACY` citation review (`max_tokens` 2048,
   JSON mode, one delayed retry after
-  `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60) on a 429/503 after the
+  `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60) on a 429/503/timeout after the
   primary and the fallback model both failed; the wait is skipped when
   one of the two models is free now, chapter 14, 3.10, logged `free_model` on
   `reflection.citation_review_delayed_retry`). It checks four things:
@@ -1536,7 +1533,7 @@ quotes, tool values), never from re-parsed model prose.
 | `PRIOR_NOTE_MAX_SIMILARITY` | 0.9 | `config.py` | Word-sequence similarity at which a Risk or News answer is a copy of a prior note (News: rejected once; both: recycled, not archived). |
 | `NEWS_WEB_FALLBACK_DAYS` | 7 | `config.py` | Look-back of News's Tavily news-mode fallback. |
 | `JUDGE_STATE_QUARTER_DECLINE_PCT` | 15.0 | `config.py` | Latest-quarter decline (or a swing to a loss) the Judge must state. |
-| `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` | 60.0 | `config.py` | Reflection review's one delayed retry after 429/503; 0 = off. |
+| `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` | 60.0 | `config.py` | Reflection review's one delayed retry after 429/503/timeout; 0 = off. |
 | `SENTIMENT_THINKING_BUDGET` | 1024 | `config.py` | Thinking budget of Sentiment's ReAct turns on Lite models; 0 = off. |
 | `_SCORE_*`, `_PENALTY_*` | see 3.4 | `loop.py` | The graded score. |
 | `CONFIDENCE_CHANGE_TO_EXPLAIN` | 0.05 | `ai/agents/judge.py` | Confidence move against the Judge's own earlier verdict that needs `change_since_previous`. |
@@ -1630,7 +1627,7 @@ portfolio details.
 | An agent `failed` in the result | Its `summary` holds the exception text ("... agent failed: ..."); log `agent_node.failed` with `failure_kind` (`rate_limit`, `server_overload`, `non_english`, ...). |
 | `react_loop.unparseable_response` repeated | The Lite model returned broken JSON; check `google.non_stop_finish_reason` with `MAX_TOKENS` and `thinking_tokens` for the same moment. |
 | `react_loop.finish_answer_validation_failed` | A validator rejected an answer; `issue` and `attempt` say why. Usually fixed on the next attempt. |
-| `react_loop.finish_answer_validation_unresolved` / `finish_gate_unresolved` | Not fixed within the budget; the summary should carry a `[VERIFICATION WARNING: ...]`. |
+| `react_loop.finish_answer_validation_unresolved` / `finish_gate_unresolved` | Not fixed within the budget; for Market, Technical, Fundamental, Macro and Risk the summary carries a `[VERIFICATION WARNING: ...]`. |
 | `react_loop.duplicate_action_blocked` many times | The agent keeps repeating calls; the run may end with "Repeated duplicate/blocked tool calls". |
 | `react_loop.final_turn_action_overridden` | Iteration cap reached; `hit_iteration_cap=True`, score 0.35. |
 | `news.live_search_no_evidence`, `sentiment.no_evidence` | NewsAPI returned nothing relevant; check `NEWSAPI_API_KEY` and the relevance filter logs. Look for `newsapi.request_failed` (status, NewsAPI code) and `newsapi.rate_limited_cooldown_started`. |
@@ -1808,8 +1805,9 @@ creating one writes data). Everything below is read-only.
 
 11. **The Judge writes "$36.915 million" where the evidence says
     "$36,915 million". What happens?** The figure check finds no match,
-    logs `judge.ungrounded_figures` and asks once for a rewrite; the second
-    answer is accepted whatever it says.
+    logs `judge.ungrounded_figures` and asks once for a rewrite; a usable
+    second answer (English rationale, a leaning and a confidence) is
+    accepted whatever it says.
 
 12. **Which of the Judge's answer fields are stored?** Only `converged`,
     `leaning`, `confidence` and `rationale`. The deciding factor, the change

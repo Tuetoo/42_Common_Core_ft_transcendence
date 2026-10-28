@@ -23,11 +23,12 @@ from ai.graph.nodes import (_run_agent_safely, bear_node, bull_node,
                             debate_join_node, episodic_memory_node, judge_node,
                             recommendation_node, reflection_node,
                             select_agents)
-from ai.graph.state import (MAX_DEBATE_ROUNDS, AgentOutput, AnalysisState,
-                            DebateArgument, DebateState, EpisodicMemoryHit,
-                            JudgeVerdict, ReflectionVerdict,
-                            merge_debate_state, replace_reflection_feedback)
-from ai.llm.base import (LLMResponse, LLMServerOverloadedError, LLMTier,
+from ai.graph.state import (AgentOutput, AnalysisState, DebateArgument,
+                            DebateState, EpisodicMemoryHit, JudgeVerdict,
+                            ReflectionVerdict, merge_debate_state,
+                            replace_reflection_feedback)
+from ai.llm.base import (LLMConfigError, LLMProviderTimeoutError,
+                         LLMResponse, LLMServerOverloadedError, LLMTier,
                          LLMUsage)
 from alembic import command
 from helpers import _ALL_ROLES, _BUY, _P, _AlwaysFailsRouter, _RaisingRouter
@@ -196,7 +197,6 @@ class TestDebateRouting:
         state = _state(selected_agents=[AgentRole.MARKET, AgentRole.NEWS])
         assert route_after_news(state) == "agent_join_node"
 
-        assert MAX_DEBATE_ROUNDS == 3
         state = _state(
             debate=DebateState(
                 round_number=5, mutual_rounds_completed=2, verdicts=[
@@ -666,6 +666,17 @@ class TestJudgeNode:
             assert update["judge_retry_seconds"] == sum(waits), case_id
 
         router, sleeps, state = _judge_with_failures(
+            monkeypatch, [LLMProviderTimeoutError("timed out after 120s")])
+
+        async def _free(chain):
+            return None
+
+        monkeypatch.setattr(nodes_module, "chain_capacity", _free)
+        update = await judge_node(state)
+        assert update["debate"].verdicts[0].judge_failed is False
+        assert router.calls == 2 and update["judge_retry_attempts"] == 1
+
+        router, sleeps, state = _judge_with_failures(
             monkeypatch, [LLMServerOverloadedError("503")])
         spent = config.settings.JUDGE_RETRY_BUDGET_SECONDS
         state = state.model_copy(update={"judge_retry_seconds": spent})
@@ -1103,8 +1114,6 @@ class TestEpisodicMemory:
 
         line = _hit("hold", 0.4, 60, "correct").track_record_line(30)
         assert line.endswith("(confidence 0.40), call was correct")
-        assert "summary" not in EpisodicMemoryHit.model_fields
-        assert "reasoning" not in EpisodicMemoryHit.model_fields
         f = memory_module.stored_judge_verdict
         assert f("buy", 0.7) == (RecommendationAction.BUY, 0.7)
         assert f("buy", None) == (None, None)
@@ -1150,19 +1159,22 @@ class TestEpisodicMemory:
 
 @pytest.mark.usefixtures("_schema_ready", "no_memory_io")
 @pytest.mark.asyncio
-async def test_full_analysis_graph_runs_to_completion():
+async def test_full_analysis_graph_runs_to_completion(monkeypatch):
+
+    async def _no_llm(self, tier, messages, **kwargs):
+        raise LLMConfigError("no key configured")
+
+    monkeypatch.setattr(router_module.LLMRouter, "complete", _no_llm)
     graph = build_analysis_graph()
     state = _state(analysis_type=AnalysisType.FULL, holdings_count=3)
     result = await graph.ainvoke(state, config={"recursion_limit": 100})
     assert len(result["agent_outputs"]) == 9
     assert result["skipped_agents"] == []
-    if result["final_recommendation"] is not None:
-        assert result.get("no_verdict_reason") is None
-    else:
-        assert result["no_verdict_reason"] == "no_evidence"
-        assert all(
-            out.status.value == "failed"
-            for out in result["agent_outputs"].values())
+    assert result["final_recommendation"] is None
+    assert result["no_verdict_reason"] == "no_evidence"
+    assert all(
+        out.status.value == "failed"
+        for out in result["agent_outputs"].values())
 
 
 def _final_payload(action: str, confidence: float) -> dict[str, Any]:

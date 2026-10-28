@@ -2,6 +2,7 @@
 
 import { useActionState } from "react";
 import { removeWatchlistItem, type RemoveWatchlistItemState } from "@/app/lib/actions/watchlists";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: RemoveWatchlistItemState = {};
 
@@ -21,11 +22,7 @@ export function RemoveTickerButton({ watchlistId, ticker }: { watchlistId: strin
       >
         {ticker} {pending ? "…" : "×"}
       </button>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state.error} />
     </form>
   );
 }

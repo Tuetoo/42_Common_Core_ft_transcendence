@@ -10,6 +10,7 @@ import {
 } from "@/app/lib/actions/auth";
 import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../../field-rules";
 import { OAUTH_MARKER_KEY } from "../../oauth-buttons";
+import { FormMessage } from "@/app/form-message";
 
 type Outcome =
   | { kind: "login"; accessToken: string; refreshToken: string; next: string }
@@ -18,6 +19,11 @@ type Outcome =
 
 const NOT_THIS_TAB =
   "This sign-in was not started in this browser tab, so it was not accepted. Start the sign-in again.";
+// A fixed text: anyone can build a link to this page with their own
+// fragment, so text from the URL is never shown. The backend logs the real
+// reason (oauth_callback_failed).
+const SIGN_IN_FAILED =
+  "Sign-in with the provider did not work. Try again, or log in with your email and password.";
 
 function storedMarker(): string | null {
   try {
@@ -57,7 +63,6 @@ function readFragment(): Outcome {
   const accessToken = params.get("access_token");
   const refreshToken = params.get("refresh_token");
   const challengeToken = params.get("challenge_token");
-  const error = params.get("error");
   const next = params.get("next") ?? "";
 
   if (accessToken || challengeToken) {
@@ -68,10 +73,7 @@ function readFragment(): Outcome {
   }
   if (accessToken && refreshToken) return { kind: "login", accessToken, refreshToken, next };
   if (challengeToken) return { kind: "challenge", challengeToken, next };
-  return {
-    kind: "error",
-    message: params.get("message") ?? (error ? `Sign-in failed (${error}).` : "Sign-in failed."),
-  };
+  return { kind: "error", message: SIGN_IN_FAILED };
 }
 
 function OAuthResultInBrowser() {
@@ -128,10 +130,7 @@ function TwoFactorStep({ challengeToken, next }: { challengeToken: string; next:
           <label htmlFor="code">Authentication code</label>
           <input id="code" name="code" type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required autoFocus />
         </div>
-        {/* Always mounted so screen readers announce the error when it appears. */}
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
+        <FormMessage text={state.error} />
         <button type="submit" disabled={pending} className="btn btn-primary">
           {pending ? "Verifying…" : "Verify"}
         </button>

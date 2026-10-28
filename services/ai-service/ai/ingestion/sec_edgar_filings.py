@@ -142,7 +142,10 @@ def _merged_amendment_text(
         company: Any, filing: Any, *, full_history: bool, ticker: str,
         filing_date: str) -> str | None:
     try:
-        period_of_report = str(filing.period_of_report)
+        raw_period = filing.period_of_report
+        if not raw_period:
+            return None
+        period_of_report = str(raw_period)
 
         def _fetch_amendments() -> list[Any]:
             return _amendment_listing(company, full_history=full_history)
@@ -150,6 +153,8 @@ def _merged_amendment_text(
         amendment_filings = _call_with_timeout(
             _fetch_amendments, _EDGAR_API_TIMEOUT_SECONDS)
         for amendment in amendment_filings:
+            if str(amendment.filing_date) < filing_date:
+                continue
             if str(amendment.period_of_report) != period_of_report:
                 continue
             text = filing_text(amendment)
@@ -275,7 +280,7 @@ def _period_of_report(filing: Any) -> str | None:
     try:
         value = str(getattr(filing, "period_of_report", "") or "")[:10]
         date.fromisoformat(value)
-    except (TypeError, ValueError):
+    except Exception:
         return None
     return value
 
@@ -336,6 +341,7 @@ async def list_new_filings(
             logger.warning(
                 "sec_edgar_filings.filing_too_large_skipped", ticker=ticker,
                 form=form, filing_date=filing_date, error=str(exc))
+            report_source_failure("sec_edgar")
             continue
         is_fallback = is_fallback_summary(summary.text)
         extracted = None
@@ -402,9 +408,8 @@ async def _tracked_ingest(ticker: str) -> _TrackedIngest:
 
 
 async def _ingest_new_filings(ticker: str) -> FilingIngestResult:
-    existing = set(
-        await
-        get_existing_document_filenames(ticker, DocumentCategory.FILING.value))
+    existing = set(await get_existing_document_filenames(
+        ticker, DocumentCategory.FILING.value, system_only=True))
     new_filings = await list_new_filings(
         ticker, already_ingested_filenames=existing)
     result = FilingIngestResult(new_filings=new_filings)

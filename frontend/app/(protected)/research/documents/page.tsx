@@ -1,10 +1,10 @@
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
-import { Pager, firstParam, pageParam } from "../../pager";
+import { Pager, pageParam } from "../../pager";
 import { UploadDocumentForm } from "./upload-document-form";
 import { DocumentTable } from "./document-table";
-import { TICKER_PATTERN, TICKER_RE, TICKER_TITLE } from "@/app/lib/format";
+import { DATE_RE, TICKER_PATTERN, firstParam, TICKER_RE, TICKER_TITLE } from "@/app/lib/format";
 import { DOCUMENT_CATEGORIES, DOCUMENT_STATUSES } from "../limits";
 import { loadOrganizations } from "../organizations";
 import type { Paginated, ResearchDocument } from "../types";
@@ -20,7 +20,6 @@ const SORTS = [
   ["status", "Status A–Z"],
   ["-status", "Status Z–A"],
 ] as const;
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 type SearchParams = Record<string, string | string[] | undefined>;
 

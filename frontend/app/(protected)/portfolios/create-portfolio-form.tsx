@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { createPortfolio, type CreatePortfolioState } from "@/app/lib/actions/portfolios";
 import { CURRENCIES, NAME_MAX_LENGTH } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: CreatePortfolioState = {};
 
@@ -50,11 +51,7 @@ export function CreatePortfolioForm({ organizations }: { organizations: { id: st
           </p>
         )}
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Creating…" : "Create portfolio"}
       </button>

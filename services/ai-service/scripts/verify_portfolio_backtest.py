@@ -2,19 +2,13 @@ import argparse
 import asyncio
 import math
 import statistics
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 from shared.market_calendar import MARKET_TZ
-
-_AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
-if str(_AI_SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_SERVICE_DIR))
 
 TRADING_DAYS = 252
 MONEY_TOLERANCE = 0.01

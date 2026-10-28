@@ -20,10 +20,11 @@ from ai.llm.base import LLMError, LLMResponse, LLMUsage
 from ai.rag.visibility import ChunkVisibility
 from database import SessionLocal
 from helpers import _AlwaysFailsRouter
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from domains.analysis.repository import AnalysisRepository
 from domains.knowledge.model import AgentReport, KgEntity, KgRelation
-from domains.knowledge.repository import KnowledgeGraphRepository
+from domains.knowledge.repository import (AgentReportRepository,
+                                          KnowledgeGraphRepository)
 from domains.rag.model import DocumentChunk, EmbeddingJob
 from shared.enums import AgentRole, DocumentCategory
 
@@ -362,9 +363,29 @@ class TestArchiveAgentReport:
             archival_module._UNKNOWN_OWNER) == ChunkVisibility()
 
         async with SessionLocal() as session:
+            other = await AnalysisRepository(session).create(
+                user_id=uuid4(), portfolio_id=None, ticker="DUPX")
+            reports = AgentReportRepository(session)
+            for analysis_id in (mine.id, other.id, system.id, other.id):
+                await reports.create(
+                    report_id=uuid4(), analysis_id=analysis_id,
+                    agent_role="macro", ticker="DUPX",
+                    category=DocumentCategory.MACRO_RESEARCH.value,
+                    content="x")
+            await session.commit()
+        for owner_id, expected in ((user, mine.id), (None, system.id)):
+            recent = await archival_module._recent_reports_of_owner(
+                category=DocumentCategory.MACRO_RESEARCH, ticker="DUPX",
+                owner=owner_id)
+            assert [r.analysis_id for r in recent] == [expected]
+
+        async with SessionLocal() as session:
+            await session.execute(
+                delete(AgentReport).where(AgentReport.ticker == "DUPX"))
             repo = AnalysisRepository(session)
             await session.delete(await repo.get_by_id(mine.id))
             await session.delete(await repo.get_by_id(system.id))
+            await session.delete(await repo.get_by_id(other.id))
             await session.commit()
 
 
@@ -398,17 +419,11 @@ class TestNearDuplicateArchivalSupersede:
 
     def _patch_recent_reports(self, monkeypatch, reports: list) -> None:
 
-        class _FakeRepo:
-
-            def __init__(self, session):
-                pass
-
-            async def list_recent_by_category(
-                    self, category, ticker=None, limit=5):
-                return reports[:limit]
+        async def _recent(*, category, ticker, owner):
+            return reports
 
         monkeypatch.setattr(
-            archival_module, "AgentReportRepository", _FakeRepo)
+            archival_module, "_recent_reports_of_owner", _recent)
         monkeypatch.setattr(
             archival_module, "SessionLocal",
             lambda: TestNearDuplicateArchivalSupersede._FakeSession())
@@ -461,22 +476,15 @@ class TestNearDuplicateArchivalSupersede:
             def __init__(self, session):
                 pass
 
-            async def list_recent_by_category(
-                    self, category, ticker=None, limit=5):
-                return [
-                    TestNearDuplicateArchivalSupersede._FakeReport(
-                        "r1", original)
-                ]
-
             async def delete(self, report_id):
                 superseded_report_ids.append(report_id)
 
         superseded_report_ids: list = []
         monkeypatch.setattr(
             archival_module, "AgentReportRepository", _FakeReportRepo)
-        monkeypatch.setattr(
-            archival_module, "SessionLocal",
-            lambda: TestNearDuplicateArchivalSupersede._FakeSession())
+        self._patch_recent_reports(
+            monkeypatch,
+            [TestNearDuplicateArchivalSupersede._FakeReport("r1", original)])
         self._patch_embed_texts(
             monkeypatch, [[0.9, 0.1, 0.0], [0.89, 0.12, 0.0]])
 
@@ -534,13 +542,6 @@ class TestNearDuplicateArchivalSupersede:
             def __init__(self, session):
                 pass
 
-            async def list_recent_by_category(
-                    self, category, ticker=None, limit=5):
-                return [
-                    TestNearDuplicateArchivalSupersede._FakeReport(
-                        "r1", content)
-                ]
-
             async def create(self, **kwargs):
                 events.append("new_report_created")
 
@@ -595,6 +596,9 @@ class TestNearDuplicateArchivalSupersede:
             _delete_document_completely)
         monkeypatch.setattr(archival_module, "index_chunks", _index_chunks)
         monkeypatch.setattr(archival_module, "_extract_and_store_kg", _no_kg)
+        self._patch_recent_reports(
+            monkeypatch,
+            [TestNearDuplicateArchivalSupersede._FakeReport("r1", content)])
 
         async def _owners(ids):
             return dict.fromkeys(ids)
@@ -825,7 +829,8 @@ class TestFilingFallbackNotPersisted:
             created.append(kwargs["filename"])
             return "id"
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         async def _filings(ticker, *, already_ingested_filenames):

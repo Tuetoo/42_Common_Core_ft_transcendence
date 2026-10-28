@@ -9,6 +9,8 @@ import {
   type FriendActionState,
 } from "@/app/lib/actions/friends";
 import { PRESENCE_EVENT, useUserEvents } from "@/app/lib/use-channel";
+import { FormMessage } from "@/app/form-message";
+import { USERNAME_PATTERN, USERNAME_TITLE } from "@/app/(public)/field-rules";
 
 const initialState: FriendActionState = {};
 
@@ -28,8 +30,8 @@ export function AddFriendForm() {
             required
             minLength={3}
             maxLength={32}
-            pattern="[A-Za-z0-9_.\-]{3,32}"
-            title="3-32 characters: letters, digits, underscore, dot or hyphen"
+            pattern={USERNAME_PATTERN}
+            title={USERNAME_TITLE}
             defaultValue={state.username ?? ""}
           />
         </div>
@@ -37,16 +39,8 @@ export function AddFriendForm() {
           {pending ? "Sending…" : "Send request"}
         </button>
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state?.success && (
-        <p aria-live="polite" className="form-message success">
-          Request sent.
-        </p>
-      )}
+      <FormMessage text={state?.error} />
+      <FormMessage kind="success" text={state?.success ? "Request sent." : null} />
     </form>
   );
 }
@@ -70,11 +64,7 @@ export function ConnectionButton({
       <button type="submit" disabled={pending} className={primary ? "btn btn-primary" : "btn btn-ghost"}>
         {pending ? "…" : label}
       </button>
-      {state?.error && (
-        <span aria-live="polite" className="form-message error" style={{ fontSize: 12 }}>
-          {state.error}
-        </span>
-      )}
+      <FormMessage text={state?.error} style={{ fontSize: 12 }} />
     </form>
   );
 }

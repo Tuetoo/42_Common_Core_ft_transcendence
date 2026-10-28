@@ -8,7 +8,7 @@ import {
   formatBytes,
   tickerError,
 } from "../../limits";
-import { UUID_RE } from "@/app/lib/format";
+import { DATE_RE, UUID_RE } from "@/app/lib/format";
 
 // Room for the multipart boundaries and the small text fields.
 const MULTIPART_OVERHEAD = 64 * 1024;
@@ -94,7 +94,7 @@ export async function POST(request: Request) {
 
   const contentDate = form.get("content_date");
   if (typeof contentDate === "string" && contentDate) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(contentDate)) return fail("Invalid document date", 400);
+    if (!DATE_RE.test(contentDate)) return fail("Invalid document date", 400);
     outgoing.set("content_date", `${contentDate}T00:00:00Z`);
   }
 

@@ -2,6 +2,8 @@
 
 import { useActionState } from "react";
 import { inviteMember, type InviteMemberState } from "@/app/lib/actions/organizations";
+import { FormMessage } from "@/app/form-message";
+import { EMAIL_MAX } from "@/app/(public)/field-rules";
 
 const initialState: InviteMemberState = {};
 
@@ -20,7 +22,7 @@ export function InviteMemberForm({ orgId, roles }: { orgId: string; roles: reado
           autoComplete="off"
           type="email"
           required
-          maxLength={254}
+          maxLength={EMAIL_MAX}
           defaultValue={state.values?.email ?? ""}
           placeholder="name@example.com"
         />
@@ -35,16 +37,8 @@ export function InviteMemberForm({ orgId, roles }: { orgId: string; roles: reado
           ))}
         </select>
       </div>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.success && (
-        <p aria-live="polite" className="form-message success">
-          {state.success}
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.success} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Sending…" : "Send invitation"}
       </button>

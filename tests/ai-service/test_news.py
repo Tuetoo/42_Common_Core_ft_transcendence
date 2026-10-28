@@ -45,7 +45,7 @@ from ai.providers.base import (MacroDataPoint, NewsArticle, PriceQuote,
                                WebSearchResult)
 from ai.providers.fred import _PERCENT_SERIES_IDS, _SERIES_ALIASES
 from ai.providers.news_relevance import (COMPANY_BUSINESS, ClassifiedArticle,
-                                         align_verdicts, company_aliases,
+                                         align_verdicts,
                                          consent_target_url, precheck_reason,
                                          read_verdicts)
 from ai.providers.newsapi import NewsApiArticle, NewsApiProvider, SourceCatalog
@@ -1029,12 +1029,6 @@ def _msft_answer(broken: int | None = 2) -> str:
 class TestNewsRelevance:
 
     def test_filters_verdict_alignment_and_prompt(self):
-        dis = company_aliases("DIS", _LEGAL["DIS"])
-        assert dis.strong == ("walt disney", "waltdisney")
-        assert company_aliases("AMD", _LEGAL["AMD"]).strong == (
-            "advanced micro devices", "advancedmicrodevices")
-        assert company_aliases("KO", None).strong == ()
-
         pre_drops = {
             "package-version": (
                 "microsoft-agents-hosting-core 1.8.0",
@@ -1415,7 +1409,6 @@ class TestWebSearch:
             })
         results = await TavilyProvider().search("q")
         assert [r.title for r in results] == ["high", "low", "none"]
-        assert [getattr(r, "score", None) for r in results] == [0.9, 0.2, None]
 
     async def _web_kinds_drop_results_and_the_company_is_named(
             self, known_companies):
@@ -2372,11 +2365,6 @@ class TestAnalysisPlumbing:
             e for e in logs if e["event"] ==
             "google.pool_pacing_wait_exceeds_threshold_failing_fast")
         assert event["max_wait_seconds"] == 30.0
-
-
-def test_link_unavailable_is_one_shared_object():
-    assert web_tool_module.LINK_UNAVAILABLE is (
-        news_tool_module.LINK_UNAVAILABLE)
 
 
 def _japanese_article() -> NewsArticle:

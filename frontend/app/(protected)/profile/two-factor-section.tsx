@@ -11,6 +11,7 @@ import {
   type DisableTwoFactorState,
 } from "@/app/lib/actions/profile";
 import { TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "@/app/(public)/field-rules";
+import { FormMessage } from "@/app/form-message";
 
 const setupInitial: SetupTwoFactorState = {};
 const verifyInitial: VerifyTwoFactorState = {};
@@ -52,11 +53,7 @@ export function TwoFactorSection() {
                 <label htmlFor="verify-code">Authentication code</label>
                 <input id="verify-code" name="code" autoComplete="one-time-code" type="text" inputMode="numeric" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required />
               </div>
-              {verifyState.error && !verifyState.needsRelogin && (
-                <p aria-live="polite" className="form-message error">
-                  {verifyState.error}
-                </p>
-              )}
+              <FormMessage text={verifyState.error && !verifyState.needsRelogin ? verifyState.error : null} />
               <button type="submit" disabled={verifyPending} className="btn btn-primary">
                 {verifyPending ? "Confirming…" : "Confirm and enable"}
               </button>
@@ -70,26 +67,28 @@ export function TwoFactorSection() {
                 off below first.
               </p>
             )}
-            {setupState.error && !setupState.alreadyEnabled && !setupState.needsRelogin && (
-              <p aria-live="polite" className="form-message error">
-                {setupState.error}
-              </p>
-            )}
+            <FormMessage
+              text={setupState.error && !setupState.alreadyEnabled && !setupState.needsRelogin ? setupState.error : null}
+            />
             <button type="submit" disabled={setupPending} className="btn btn-primary">
               {setupPending ? "Starting…" : "Enable 2FA"}
             </button>
           </form>
         )}
 
-        {needsRelogin && (
-          <p aria-live="polite" className="form-message error">
-            For security, turning on 2FA needs a login from the last few minutes.{" "}
-            <Link href="/login?next=/profile" className="link-btn">
-              Log in again
-            </Link>{" "}
-            and retry.
-          </p>
-        )}
+        <FormMessage
+          text={
+            needsRelogin ? (
+              <>
+                For security, turning on 2FA needs a login from the last few minutes.{" "}
+                <Link href="/login?next=/profile" className="link-btn">
+                  Log in again
+                </Link>{" "}
+                and retry.
+              </>
+            ) : null
+          }
+        />
       </div>
 
       <div className="flex flex-col gap-3">
@@ -106,11 +105,7 @@ export function TwoFactorSection() {
                 <label htmlFor="disable-code">Authentication code</label>
                 <input id="disable-code" name="code" autoComplete="one-time-code" type="text" inputMode="numeric" maxLength={6} pattern={TOTP_CODE_PATTERN} title={TOTP_CODE_TITLE} required />
               </div>
-              {disableState.error && (
-                <p aria-live="polite" className="form-message error">
-                  {disableState.error}
-                </p>
-              )}
+              <FormMessage text={disableState.error} />
               <button type="submit" disabled={disablePending} className="btn btn-ghost">
                 {disablePending ? "Disabling…" : "Disable 2FA"}
               </button>

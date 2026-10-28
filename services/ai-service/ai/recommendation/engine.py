@@ -211,7 +211,8 @@ def build_final_recommendation(
             cap_notes.append(_lowered_sentence(confidence, after, reason))
         confidence = after
 
-    if not state.debate.converged:
+    converged = verdict.converged
+    if not converged:
         lower(
             max(0.0, confidence - _UNCONVERGED_DEBATE_PENALTY),
             "the Bull/Bear debate did not converge")
@@ -234,7 +235,9 @@ def build_final_recommendation(
         cap_notes.append(
             position_limit_note(state.ticker, state.position_weight_pct))
 
-    missing_sides = state.debate.unavailable_latest_sides()
+    missing_sides = (
+        state.debate.unavailable_latest_sides()
+        if verdict is state.debate.latest_verdict else [])
     if len(missing_sides) == 1:
         missing = missing_sides[0]
         latest = state.debate.latest_argument(missing)
@@ -269,7 +272,7 @@ def build_final_recommendation(
                 f"usable evidence ({this_count}) than the prior analysis had "
                 f"({prior.well_supported_count}).")
 
-    base_note = state.confidence_adjustment_note()
+    base_note = state.confidence_adjustment_note(converged=converged)
     confidence = round(confidence, 2)
     note_parts = [
         p for p in (
@@ -281,5 +284,5 @@ def build_final_recommendation(
         ticker=state.ticker, action=action, confidence=confidence,
         reasoning=reasoning, confidence_adjustment_note=(
             " ".join(note_parts) if note_parts else None),
-        debate_converged=state.debate.converged and not missing_sides,
+        debate_converged=converged and not missing_sides,
         judge_leaning=verdict.leaning, judge_confidence=verdict.confidence)

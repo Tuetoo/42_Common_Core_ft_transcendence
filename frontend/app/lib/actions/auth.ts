@@ -2,7 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { clearSession, getRefreshToken, setSession } from "@/app/lib/session";
-import { extractErrorMessage, publicFetch, readApiError } from "@/app/lib/backend";
+import { publicFetch, readApiError } from "@/app/lib/backend";
 
 // Only same-site paths: "/x" yes, "//evil.com" or "https://evil.com" no —
 // otherwise a crafted ?next= link could bounce a user to another site
@@ -110,7 +110,7 @@ export async function register(
   }
 
   if (!res.ok) {
-    return { error: await extractErrorMessage(res, "Registration failed, please try again later") };
+    return { error: (await readApiError(res, "Registration failed, please try again later")).message };
   }
 
   return { success: true };

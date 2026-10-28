@@ -73,7 +73,8 @@ These steps were done once; repeat them only for a new host.
    stays free for the challenge. `sudo certbot renew --dry-run` tests it.
    The certificate names only this domain. The frontend reaches the API
    on the gateway's internal plain-HTTP listener
-   (`BACKEND_API_URL=http://gateway:8080/api/v1`, Docker network only),
+   (`BACKEND_API_URL=http://gateway:8080/api/v1`, on the `edge` Docker
+   network, not published),
    so no certificate that names `gateway` is needed.
 6. `.env.docker`: copy the local file
    (`scp -i <key> .env.docker ubuntu@<host>:/home/ubuntu/alphamind/`),
@@ -228,7 +229,11 @@ using the other address:
   Google's consent screen in testing mode only admits listed test users.
 - Operator commands (`make health`, `make e2e`, `bash scripts/psql.sh`,
   logs) run on the host after `ssh -i <key> ubuntu@<host>` and
-  `cd ~/alphamind`, exactly as locally.
+  `cd ~/alphamind`, exactly as locally. The host runs the production
+  image stage, so the two operator scripts that write under `/app`
+  (`measure_rag_recall --sweep --apply`, `regenerate_filing_summaries`)
+  fail there with a permission error; run them on the local stack
+  (handbook chapter 2, section 3.5b).
 
 ## 6. Operations on the host
 

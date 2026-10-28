@@ -5,8 +5,8 @@
 > layers. **Logs**: every service writes one JSON line per event with
 > structlog; Vector copies the output of every docker compose container
 > into daily files under `./logs`, kept 14 days. **Metrics**: every service exposes `/metrics`;
-> Prometheus scrapes them (and two exporters for PostgreSQL and Redis)
-> every 15 seconds. **Alerts and dashboards**: Prometheus evaluates alert
+> Prometheus scrapes them (and two exporters for PostgreSQL and Redis,
+> and Qdrant's own `/metrics`) every 15 seconds. **Alerts and dashboards**: Prometheus evaluates alert
 > rules (with unit tests), Alertmanager emails firing alerts to MailHog,
 > and Grafana shows two provisioned dashboards behind the gateway.
 
@@ -17,6 +17,7 @@
  auth / core / ai  --stdout JSON lines-->  Docker json-file      auth/core/ai  GET /metrics
  (structlog)                               (5 x 20 MB per        postgres-exporter :9187
  every other container --stdout-->          container)           redis-exporter    :9121
+                                                                 qdrant            :6333
                                                |                 alertmanager      :9093
                                      docker.sock (read)          prometheus        :9090
                                                v                        ^
@@ -245,6 +246,7 @@ Scrape jobs (each adds a `service` label used by dashboards and alerts):
 | `ai-service` | `ai-service:8000/metrics` | `ai-service` | HTTP metrics + analysis/LLM metrics |
 | `postgres` | `postgres-exporter:9187` | `postgres` | PostgreSQL (`pg_up`, `pg_stat_database_*`, ...) |
 | `redis` | `redis-exporter:9121` | `redis` | Redis (`redis_up`, memory, commands, keys) |
+| `qdrant` | `qdrant:6333/metrics` | `qdrant` | Qdrant's own metrics; scraped mainly so `ServiceDown` covers Qdrant (ai-service's `/metrics` keeps answering while Qdrant is down) |
 | `alertmanager` | `alertmanager:9093` | `alertmanager` | Alertmanager itself |
 | `prometheus` | `localhost:9090` | `prometheus` | Prometheus itself |
 
@@ -384,7 +386,11 @@ label (from the scrape or set in the rule).
 | `RedisDown` | `redis_up == 0` | 1m | critical (`service: redis`) |
 
 `up` is 0 when Prometheus cannot scrape a target. `pg_up`/`redis_up` are 0
-when the exporter runs but cannot reach the database.
+when the exporter runs but cannot reach the database. The gateway, the
+frontend, the object storage, the scheduler container, vector and Grafana
+are not scraped, so no alert fires when one of them stops (a stopped
+scheduler still shows up through the stale-job alerts); there is also no
+disk-space metric.
 
 **Group `http`**
 
@@ -442,16 +448,24 @@ next evaluation.
 | Alert | Expression (summary) | For | Severity |
 |---|---|---|---|
 | `DailyJobStale` | `time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup\|review-run\|rag-ingest\|logs-cleanup\|purge-unverified\|notification-retention\|deleted-user-sweep-core\|deleted-user-sweep-ai"} > 26 * 3600` | 10m | warning (`service: scheduler`) |
-| `TradingDayJobStale` | same for `market-open\|market-close\|tier-monitoring`, `> 100 * 3600` | 10m | warning (`service: scheduler`) |
+| `TradingDayJobStale` | same for `market-open\|market-close\|tier-monitoring`, `> 26 * 3600 + 50 * 3600 * (last success on Friday or Saturday) + 24 * 3600 * (last success on Sunday)`, weekday from `day_of_week()` | 10m | warning (`service: scheduler`) |
 | `MarketCloseSkippedPortfolios` | `alphamind_market_close_portfolios_skipped > 0` | none | warning (`service: core-service`) |
 
 The two stale-job alerts filter on `scheduled_job` and name the job with
 `{{ $labels.scheduled_job }}` in their text. A scheduler run in which every
 unit of work failed answers 500 and sends no heartbeat, so it also ends in
-these alerts ([26-scheduler-jobs.md](26-scheduler-jobs.md) section 3.4). The trading-day limit is 100
-hours because a closed-market weekday still reports success (the job
-answers "skipped"), so the longest normal gap is a weekend (Friday 17:30
-to Monday 17:30, 72 hours).
+these alerts ([26-scheduler-jobs.md](26-scheduler-jobs.md) section 3.4). A closed-market weekday
+still reports success (the job answers "skipped"), so a trading-day job
+must succeed every weekday. Its limit depends on the weekday of the last
+success (`day_of_week()`, UTC; every scheduled run ends on the same UTC
+weekday as its New York day): 26 hours after a Monday to Thursday
+success, 76 hours after a Friday (or a manual Saturday) success, because
+the next run is on Monday (Friday 17:30 to Monday 17:30 is 71-73 hours
+across a daylight-saving change), and 50 hours after a manual Sunday
+success (Monday's run ends less than 48 hours after any Sunday time). So
+a single missed run fires a few hours after its scheduled time, on the
+same New York day or early on the next UTC day, also after a manual
+Sunday run.
 
 **Group `durable_events`** (see [24-events.md](24-events.md))
 
@@ -471,7 +485,7 @@ the email text.
 
 `promtool test rules` feeds fake series, evaluates the rules at given times
 and compares the alerts (labels and rendered annotations) with the
-expected ones. The file (`evaluation_interval: 1m`) has seven test groups:
+expected ones. The file (`evaluation_interval: 1m`) has nine test groups:
 
 1. `up` of core-service goes to 0 and `pg_up` to 0 -> at 5m `ServiceDown`
    and `PostgresDown` fire with the expected labels and text.
@@ -491,11 +505,20 @@ expected ones. The file (`evaluation_interval: 1m`) has seven test groups:
 6. Job gauges stuck at time 0: `DailyJobStale` for `backup` and
    `deleted-user-sweep-ai` silent at 20h and firing at 30h ("last
    succeeded 1d 6h 0m 0s ago");
-   `TradingDayJobStale` for `market-close` silent at 30h (below 100h);
    `MarketCloseSkippedPortfolios` firing at 100m with value 2. The input
    series carry the labels a real scrape stores: `job="core-service"` and
    the job name in `scheduled_job`.
-7. `alphamind_outbox_unpublished_events` at 3 from minute 11 to minute 41:
+7. Trading-day jobs (test time 0 is Thursday 1970-01-01 00:00 UTC):
+   `market-close` last succeeded on Friday 22:30 UTC and missed Monday:
+   silent on Sunday and on Monday 23:30 (73 hours), firing on Tuesday
+   03:00 ("3d 4h 30m 0s"); `tier-monitoring` last succeeded on Tuesday
+   22:30 UTC and missed Wednesday: silent on Wednesday 23:00 (24.5
+   hours), firing on Thursday 01:00 ("1d 2h 30m 0s").
+8. Trading-day job after a manual Sunday run: `market-close` last
+   succeeded on Sunday 15:00 UTC and missed Monday: silent on Monday
+   23:30 (32.5 hours) and Tuesday 16:00 (49 hours), firing on Tuesday
+   18:00 ("2d 3h 0m 0s").
+9. `alphamind_outbox_unpublished_events` at 3 from minute 11 to minute 41:
    no `OutboxBacklog` at 20m, firing at 30m ("3 durable event(s) not yet
    published"), silent again at 50m.
 
@@ -563,7 +586,7 @@ The two dashboards:
 
 | Dashboard (uid) | Panels |
 |---|---|
-| AlphaMind - Service Overview (`alphamind-overview`) | request rate by service; p95 latency by service; 5xx rate by service |
+| AlphaMind - Service Overview (`alphamind-overview`) | request rate by service; p95 latency by service; 5xx rate by service (with the same handler filters as the alert rules: no `/metrics` and `/health` probes, and for p95 also no `/internal/*` jobs and RAG ask handlers) |
 | AlphaMind - Infrastructure & AI pipeline (`alphamind-infra`) | scrape targets up; firing alerts table (`ALERTS{alertstate="firing"}`); analysis queue (pending, running); analyses finished in 24h by status; failed analyses by reason per hour; LLM errors by provider and kind; ai-service p95 by handler; PostgreSQL up, connections, transactions/s, database size, deadlocks, cache hit ratio; Redis up, memory, commands/s, clients, keys per DB, keyspace hit ratio |
 
 There is no dashboard panel for the job heartbeat gauges; use
@@ -655,7 +678,7 @@ gateway with a login; `/metrics` is 404 at the gateway.
 All steps are read-only.
 
 1. **Open Prometheus** at `http://127.0.0.1:9090` (local only). Show
-   *Status -> Targets*: seven jobs, all UP. Then run three queries in the
+   *Status -> Targets*: eight jobs, all UP. Then run three queries in the
    query page:
    ```
    up
@@ -675,8 +698,9 @@ All steps are read-only.
    ```
    (time() - alphamind_job_last_success_timestamp_seconds{scheduled_job="backup"}) / 3600
    ```
-   Say: "The rules alert above 26 hours for a daily job and 100 hours for
-   a trading-day job."
+   Say: "The rules alert above 26 hours for a daily job. A trading-day
+   job gets 26 hours too, or 76 hours when its last success was on a
+   Friday (50 hours after a manual Sunday run)."
    Optional fourth: `sum by (status, failure_reason) (increase(alphamind_analyses_total[24h]))`.
 
 2. **Show alert states.** Open *Alerts* (`http://127.0.0.1:9090/alerts`).

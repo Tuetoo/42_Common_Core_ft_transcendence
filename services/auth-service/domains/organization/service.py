@@ -211,6 +211,10 @@ class OrganizationService:
             raise PermissionDeniedError(
                 "Only the organization owner can invite admins.")
         await security.hit(
+            "invite:user", str(requester_id),
+            limit=settings.RATE_LIMIT_INVITATIONS_PER_USER,
+            window=settings.RATE_LIMIT_INVITATIONS_WINDOW_SECONDS)
+        await security.hit(
             "invite:org", str(org_id),
             limit=settings.RATE_LIMIT_INVITATIONS_PER_ORG,
             window=settings.RATE_LIMIT_INVITATIONS_WINDOW_SECONDS)

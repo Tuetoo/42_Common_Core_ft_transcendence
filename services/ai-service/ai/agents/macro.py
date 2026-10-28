@@ -1,3 +1,4 @@
+import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -224,10 +225,11 @@ def _macro_metrics_disagree_with_live_fred(
 
 async def _prefetch_live_fred(
         tool: GetMacroIndicatorsTool) -> list[ScratchpadEntry]:
-    return [
-        await prefetch_tool_call(tool, {"series": series.alias})
-        for series in _LIVE_SERIES
-    ]
+    return list(
+        await asyncio.gather(
+            *(
+                prefetch_tool_call(tool, {"series": series.alias})
+                for series in _LIVE_SERIES)))
 
 
 class MacroAgent(BaseAgent):

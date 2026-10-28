@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { addWatchlistItem, type AddWatchlistItemState } from "@/app/lib/actions/watchlists";
 import { TICKER_PATTERN, TICKER_TITLE, upperCaseInput } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: AddWatchlistItemState = {};
 
@@ -31,11 +32,7 @@ export function AddTickerForm({ watchlistId }: { watchlistId: string }) {
       <button type="submit" disabled={pending} className="btn btn-ghost">
         {pending ? "Adding…" : "Add"}
       </button>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error w-full">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} className="w-full" />
     </form>
   );
 }

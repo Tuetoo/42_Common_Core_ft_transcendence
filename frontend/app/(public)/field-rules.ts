@@ -17,7 +17,10 @@ export const PASSWORD_TITLE = `At least ${PASSWORD_MIN} characters and at most $
 export const EMAIL_MAX = 254;
 export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Profile timezones are IANA names the runtime knows.
+// Profile timezones are IANA names the runtime knows. The pattern is a
+// first browser check; isTimezone is the real one.
+export const TIMEZONE_PATTERN = "[A-Za-z0-9_+\\-\\/]+";
+export const TIMEZONE_TITLE = "An IANA timezone name such as Europe/Paris";
 export function isTimezone(value: string): boolean {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: value });

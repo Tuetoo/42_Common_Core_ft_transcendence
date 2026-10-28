@@ -159,6 +159,10 @@ export default function PrivacyPolicyPage() {
         </li>
         <li>Read notifications are deleted after 90 days. Unread ones are kept.</li>
         <li>
+          An organization invitation that was not accepted is deleted 7 days after it expires (invitations expire 7
+          days after they are sent).
+        </li>
+        <li>
           A sign-in session record (the IP address and browser information from your sign-in) is written when you
           sign in and again each time your sign-in is renewed automatically, which happens about every 15 minutes
           while you use the site. Each record expires 30 days after it is written. Expired records are deleted the
@@ -213,7 +217,7 @@ export default function PrivacyPolicyPage() {
       <ul>
         <li>View and change your profile and profile picture.</li>
         <li>Delete your own notes, documents and watchlist entries.</li>
-        <li>Leave an organization.</li>
+        <li>Leave an organization. Portfolios you shared with it become private again.</li>
         <li>Turn two-factor authentication on or off.</li>
       </ul>
       <h3>Anything else</h3>

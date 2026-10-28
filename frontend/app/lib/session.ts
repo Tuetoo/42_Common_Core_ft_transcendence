@@ -2,7 +2,7 @@ import { cache } from "react";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { ACCESS_TOKEN_COOKIE, COOKIE_OPTIONS, REFRESH_TOKEN_COOKIE } from "./session-cookies";
-import { backendFetch, extractErrorMessage, requireOk } from "./backend";
+import { backendFetch, readApiError, requireOk } from "./backend";
 
 export async function setSession(accessToken: string, refreshToken: string) {
   const cookieStore = await cookies();
@@ -40,7 +40,16 @@ export type Me = {
   email: string;
   system_role: string;
   permissions: string[];
-  profile: { avatar_url: string | null } | null;
+  is_verified: boolean;
+  created_at: string;
+  profile: {
+    first_name: string | null;
+    last_name: string | null;
+    bio: string | null;
+    avatar_url: string | null;
+    timezone: string | null;
+    country: string | null;
+  } | null;
 };
 
 // One /auth/me call per request, shared by the layout and every page.
@@ -74,25 +83,30 @@ export const getUnreadTotal = cache(async (accessToken: string): Promise<number 
 
 // One authenticated backend call for a server action: the result is either
 // the OK response or a message to show (not logged in, unreachable,
-// session expired, or the backend's own error).
-type CallResult = { ok: true; res: Response } | { ok: false; error: string };
+// session expired, or the backend's own error). `status` is the HTTP status
+// (401 when there is no token, 0 when the server could not be reached) and
+// `code` the backend's error code, for the few callers that act on them.
+type CallResult =
+  | { ok: true; res: Response }
+  | { ok: false; error: string; status: number; code: string | null };
 
 export async function call(path: string, init: RequestInit, fallback: string): Promise<CallResult> {
   const accessToken = await getAccessToken();
   if (!accessToken) {
-    return { ok: false, error: "You're not logged in" };
+    return { ok: false, error: "You're not logged in", status: 401, code: null };
   }
   let res: Response;
   try {
     res = await backendFetch(path, accessToken, init);
   } catch {
-    return { ok: false, error: "Could not reach the server. Is the backend running?" };
+    return { ok: false, error: "Could not reach the server. Is the backend running?", status: 0, code: null };
   }
   if (res.status === 401) {
-    return { ok: false, error: "Your session expired. Please log in again." };
+    return { ok: false, error: "Your session expired. Please log in again.", status: 401, code: null };
   }
   if (!res.ok) {
-    return { ok: false, error: await extractErrorMessage(res, fallback) };
+    const err = await readApiError(res, fallback);
+    return { ok: false, error: err.message, status: err.status, code: err.code };
   }
   return { ok: true, res };
 }

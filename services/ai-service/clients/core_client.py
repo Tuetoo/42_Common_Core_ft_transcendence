@@ -109,11 +109,14 @@ async def get_tracked_tickers() -> list[str]:
     return tickers
 
 
-async def get_existing_document_filenames(ticker: str | None,
-                                          category: str) -> list[str]:
+async def get_existing_document_filenames(
+        ticker: str | None, category: str, *,
+        system_only: bool = False) -> list[str]:
     params: dict[str, str] = {"category": category}
     if ticker is not None:
         params["ticker"] = ticker
+    if system_only:
+        params["system_only"] = "true"
     filenames: list[str] = await _get_json(
         "/internal/documents/filenames",
         f"checking existing filenames for {ticker}/{category}", params=params)

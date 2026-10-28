@@ -241,7 +241,8 @@ def _rate_key(scope: str, identity: str) -> str:
 
 
 async def hit(
-        scope: str, identity: str | None, *, limit: int, window: int) -> None:
+        scope: str, identity: str | None, *, limit: int, window: int,
+        message: str | None = None) -> None:
     if not settings.RATE_LIMIT_ENABLED or not identity:
         return
     hits = await fixed_window_hits(
@@ -250,40 +251,14 @@ async def hit(
         return
     count, retry_after = hits[0]
     if count > limit:
-        raise RateLimitedError(retry_after=retry_after)
+        raise RateLimitedError(message, retry_after=retry_after)
 
 
-async def two_factor_guard(user_id: str) -> None:
-    if not settings.RATE_LIMIT_ENABLED:
-        return
-    try:
-        ttl = await get_rate_limit_client(settings).ttl(
-            _rate_key("2fa:lock", user_id))
-    except Exception as exc:
-        logger.warning("rate_limit_unavailable", scope="2fa", error=str(exc))
-        return
-    if int(ttl) > 0:
-        raise RateLimitedError(
-            "Too many invalid codes. Please try again later.",
-            retry_after=int(ttl))
-
-
-async def two_factor_failed(user_id: str) -> None:
-    if not settings.RATE_LIMIT_ENABLED:
-        return
-    key = _rate_key("2fa:fail", user_id)
-    hits = await fixed_window_hits(
-        settings, [key], settings.RATE_LIMIT_2FA_WINDOW_SECONDS)
-    if hits is None or hits[0][0] < settings.RATE_LIMIT_2FA_FAILURES:
-        return
-    try:
-        client = get_rate_limit_client(settings)
-        await client.set(
-            _rate_key("2fa:lock", user_id), 1,
-            ex=settings.RATE_LIMIT_2FA_LOCK_SECONDS)
-        await client.delete(key)
-    except Exception as exc:
-        logger.warning("rate_limit_unavailable", scope="2fa", error=str(exc))
+async def two_factor_attempt(user_id: str) -> None:
+    await hit(
+        "2fa:fail", user_id, limit=settings.RATE_LIMIT_2FA_FAILURES,
+        window=settings.RATE_LIMIT_2FA_WINDOW_SECONDS,
+        message="Too many invalid codes. Please try again later.")
 
 
 async def two_factor_succeeded(user_id: str) -> None:

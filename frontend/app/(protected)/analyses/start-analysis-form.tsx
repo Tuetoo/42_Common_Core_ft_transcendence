@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { startAnalysis, type StartAnalysisState } from "@/app/lib/actions/analyses";
 import { ANALYSIS_TYPES, TICKER_PATTERN, TICKER_TITLE, upperCaseInput } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: StartAnalysisState = {};
 
@@ -53,11 +54,7 @@ export function StartAnalysisForm({ portfolios }: { portfolios: { id: string; na
       <p style={{ fontSize: 12, color: "var(--text-faint)", margin: 0 }}>
         A full analysis usually takes a few minutes. You can leave the page and come back.
       </p>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Starting…" : "Run analysis"}
       </button>

@@ -134,17 +134,12 @@ FALLBACK_UNVERIFIED_REASON = (
     "sentiment reading as unconfirmed.")
 
 
-def _succeeded(entry: ScratchpadEntry, action: str) -> bool:
-    return is_successful_tool_entry(entry, action) and not tool_reported_error(
-        str(entry.observation or ""))
-
-
 def fallback_sources_unverified(scratchpad: list[ScratchpadEntry]) -> bool:
-    if any(_succeeded(e, "search_news") for e in scratchpad):
+    if any(is_successful_tool_entry(e, "search_news") for e in scratchpad):
         return False
     headers = [
         parse_results_header(str(e.observation or "")) for e in scratchpad
-        if _succeeded(e, "web_search")
+        if is_successful_tool_entry(e, "web_search")
     ]
     with_results = [h for h in headers if h is not None and h.total > 0]
     if not with_results:
@@ -159,7 +154,10 @@ def prior_news_note_similarity(
         final_answer: str, scratchpad: list[ScratchpadEntry]) -> float | None:
     return prior_note_similarity(
         final_answer,
-        [e for e in scratchpad if _succeeded(e, "search_prior_news_notes")])
+        [
+            e for e in scratchpad
+            if is_successful_tool_entry(e, "search_prior_news_notes")
+        ])
 
 
 def _prior_note_ratio(

@@ -130,6 +130,8 @@ class AIServiceSettings(BaseServiceSettings):
     JUDGE_RETRY_BUDGET_SECONDS: float = 240.0
     JUDGE_RETRY_MAX_ATTEMPTS: int = 4
     SENTIMENT_THINKING_BUDGET: int = 1024
+    # Keep below core-service's _SENTIMENT_TIMEOUT (270 s,
+    # core clients/ai_client.py).
     SENTIMENT_TIMEOUT_SECONDS: float = 240.0
     DEBATE_SIDE_REPAIR_DELAY_SECONDS: float = 60.0
     AGENT_PREFETCH_ENABLED: bool = True

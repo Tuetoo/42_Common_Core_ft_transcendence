@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domains.market.model import Instrument, PriceBar
 from shared.exceptions import NotFoundError
 
+# core-service's clients/ai_client.py::_MAX_LOOKBACK_DAYS caps its
+# lookback at the same 3650.
 MAX_PRICE_LOOKBACK_DAYS = 3650
 CACHED_BARS_READ_LIMIT = MAX_PRICE_LOOKBACK_DAYS + 2
 

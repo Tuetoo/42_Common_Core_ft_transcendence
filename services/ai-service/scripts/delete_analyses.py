@@ -1005,7 +1005,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 if __name__ == "__main__":
     _args = parse_args(sys.argv[1:])
-    asyncio.run(
+    _plan = asyncio.run(
         run(
             confirm=_args.confirm, ids=_args.ids, failed=_args.failed,
             since=_args.since, until=_args.until, report_ids=_args.report_ids))
+    sys.exit(1 if _plan.unhandled_fks else 0)

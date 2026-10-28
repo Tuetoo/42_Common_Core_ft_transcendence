@@ -83,6 +83,26 @@ def _headers() -> dict[str, str]:
     return {"User-Agent": settings.SEC_EDGAR_USER_AGENT}
 
 
+async def _fetch_ticker_maps() -> tuple[dict[str, int], dict[str, str]]:
+    data = await _sec_get_json(
+        _TICKER_MAP_URL, op_name="sec_edgar.ticker_map",
+        what="SEC ticker->CIK mapping fetch")
+    try:
+        entries = [e for e in data.values() if isinstance(e, dict)]
+        cik_map: dict[str, int] = {}
+        title_map: dict[str, str] = {}
+        for entry in entries:
+            symbol = str(entry["ticker"]).upper()
+            if symbol in cik_map:
+                continue
+            cik_map[symbol] = int(entry["cik_str"])
+            title_map[symbol] = str(entry.get("title") or "")
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ProviderRequestError(
+            "SEC ticker->CIK mapping response could not be parsed") from exc
+    return cik_map, title_map
+
+
 async def _load_ticker_to_cik() -> dict[str, int]:
     global _ticker_to_cik_cache, _ticker_to_title_cache, _ticker_map_day
     if _ticker_to_cik_cache is not None and _ticker_map_day == _today():
@@ -91,24 +111,15 @@ async def _load_ticker_to_cik() -> dict[str, int]:
     async with _ticker_map_lock:
         if _ticker_to_cik_cache is not None and _ticker_map_day == _today():
             return _ticker_to_cik_cache
-        data = await _sec_get_json(
-            _TICKER_MAP_URL, op_name="sec_edgar.ticker_map",
-            what="SEC ticker->CIK mapping fetch")
-
         try:
-            entries = [e for e in data.values() if isinstance(e, dict)]
-            cik_map: dict[str, int] = {}
-            title_map: dict[str, str] = {}
-            for entry in entries:
-                symbol = str(entry["ticker"]).upper()
-                if symbol in cik_map:
-                    continue
-                cik_map[symbol] = int(entry["cik_str"])
-                title_map[symbol] = str(entry.get("title") or "")
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            raise ProviderRequestError(
-                "SEC ticker->CIK mapping response could not be parsed"
-            ) from exc
+            cik_map, title_map = await _fetch_ticker_maps()
+        except ProviderRequestError as exc:
+            if _ticker_to_cik_cache is None:
+                raise
+            logger.warning(
+                "sec_edgar.ticker_map_refresh_failed_using_previous",
+                map_day=str(_ticker_map_day), error=str(exc))
+            return _ticker_to_cik_cache
         _ticker_to_title_cache = title_map
         _ticker_to_cik_cache = cik_map
         _ticker_map_day = _today()

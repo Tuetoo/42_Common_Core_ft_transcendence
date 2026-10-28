@@ -12,18 +12,9 @@ import {
   type ResendState,
 } from "@/app/lib/actions/email-links";
 import { EMAIL_MAX, PASSWORD_MAX_BYTES, PASSWORD_MIN, PASSWORD_TITLE, checkPasswordBytes } from "./field-rules";
+import { FormMessage } from "@/app/form-message";
 
 const initial: LinkActionState = {};
-
-// Always mounted: a live region that appears together with its text is
-// often not announced by screen readers.
-function ErrorLine({ error }: { error?: string }) {
-  return (
-    <p aria-live="polite" className="form-message error">
-      {error}
-    </p>
-  );
-}
 
 export function VerifyEmailForm({ token }: { token: string }) {
   const [state, formAction, pending] = useActionState(verifyEmail.bind(null, token), initial);
@@ -40,7 +31,7 @@ export function VerifyEmailForm({ token }: { token: string }) {
   }
   return (
     <form action={formAction} className="form">
-      <ErrorLine error={state.error} />
+      <FormMessage text={state.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Verifying…" : "Verify my email"}
       </button>
@@ -77,7 +68,7 @@ export function ForgotPasswordForm() {
           onChange={(e) => setEmail(e.target.value)}
         />
       </div>
-      <ErrorLine error={state.error} />
+      <FormMessage text={state.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Sending…" : "Send reset link"}
       </button>
@@ -137,7 +128,7 @@ export function ResetPasswordForm({ token }: { token: string }) {
           onChange={(e) => setConfirm(e.target.value)}
         />
       </div>
-      <ErrorLine error={state.error} />
+      <FormMessage text={state.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Saving…" : "Set new password"}
       </button>
@@ -150,7 +141,7 @@ export function AcceptInvitationForm({ token }: { token: string }) {
 
   return (
     <form action={formAction} className="form">
-      <ErrorLine error={state.error} />
+      <FormMessage text={state.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Joining…" : "Accept invitation"}
       </button>
@@ -191,7 +182,7 @@ export function ResendVerificationForm({ autoFocus = false }: { autoFocus?: bool
           onChange={(e) => setEmail(e.target.value)}
         />
       </div>
-      <ErrorLine error={state.error} />
+      <FormMessage text={state.error} />
       <button type="submit" disabled={pending} className="btn btn-ghost">
         {pending ? "Sending…" : "Resend verification email"}
       </button>

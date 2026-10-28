@@ -150,9 +150,10 @@ POST   /api/v1/auth/2fa/disable
 Rules: emails are case-insensitive (stored lowercase; usernames are
 unique ignoring case). Login, 2FA codes, password-reset requests, register,
 resend-verification and invitations are rate limited (429 with
-`Retry-After`; limits in auth-service `config.py`); 5 wrong 2FA codes
-within 5 minutes, with no correct code between them, lock 2FA for 15
-minutes. `/2fa/setup` returns 409 while 2FA is enabled.
+`Retry-After`; limits in auth-service `config.py`); 2FA checks at most
+5 codes per user within one hour with no correct code between them (each
+attempt is counted before the code is checked), then answers 429 until
+the hour ends. Invitations are limited per organization and per sender. `/2fa/setup` returns 409 while 2FA is enabled.
 `/2fa/setup` and `/2fa/verify` (the step that enables 2FA) need a **recent
 login**: the access token's `auth_time` claim (the Unix time of the
 password or OAuth login that started the session; a refresh keeps it, it
@@ -195,10 +196,11 @@ the provider with a single-use `state` and a PKCE challenge (S256). The
 callback requires that cookie: a missing or foreign nonce burns the state
 and fails with `oauth_failed` without calling the provider.
 
-OAuth callback result: `GET /auth/oauth/{provider}/callback` never answers
-JSON. It always answers **303 See Other** with
+OAuth callback result: `GET /auth/oauth/{provider}/callback` answers
+every success and every handled error with **303 See Other** and
 `Location: ${FRONTEND_BASE_URL}/oauth/complete#<fragment>`, and deletes the
-nonce cookie on every outcome. The fragment is URL-encoded
+nonce cookie. An unexpected error (Redis or the database down) is a 500
+JSON body instead. The fragment is URL-encoded
 (`application/x-www-form-urlencoded`) and is one of:
 
 | Outcome | Fragment |
@@ -223,7 +225,8 @@ A fragment (the part after `#`) is never sent by the browser to any
 server and never appears in the `Referer` header. The frontend page
 `/oauth/complete` reads `window.location.hash`, removes it from the
 address bar with `history.replaceState`, and then stores the tokens,
-asks for the 2FA code, or shows the message. Before the authorize
+asks for the 2FA code, or shows a fixed error text (never the fragment's
+`message`; the real reason is in the `oauth_callback_failed` log). Before the authorize
 navigation, the frontend stores a random marker for the tab in
 `sessionStorage`; `/oauth/complete` accepts tokens or a 2FA challenge
 only when the fragment's `marker` equals that stored value, otherwise it
@@ -300,7 +303,8 @@ an invitation with the admin role only by the owner; 404 for an unknown,
 accepted or foreign invitation) and publishes
 `organization.invitation.revoked`. A new invitation replaces the
 organization's open invitations for the same email and removes its
-expired open invitations; accepted rows are kept. Replacing an open admin
+expired open invitations; the nightly purge-unverified job deletes open
+invitations that expired more than 7 days ago; accepted rows are kept. Replacing an open admin
 invitation is owner-only, like revoking it (an admin gets 403).
 
 Creating, changing and deleting an organization, removing a member,
@@ -353,7 +357,8 @@ POST   /api/v1/admin/users/{user_id}/reactivate     user:deactivate
 GET    /api/v1/admin/stats                          site:stats
 ```
 
-`GET /users` is paginated (`{items, total, page, page_size}`) with query
+`GET /users` is paginated and, unlike other paginated lists, wrapped in
+`data` (`{"data": {items, total, page, page_size}, "request_id"}`), with query
 parameters `page`, `page_size` (1-100, default 20), `q` (case-insensitive
 match on email or username), `role`, `is_active`, `include_deleted`
 (default false), `sort` (`created_at` (default) / `email` / `username` /
@@ -448,18 +453,22 @@ registered more than `UNVERIFIED_ACCOUNT_RETENTION_DAYS` (default 7) days
 ago, never verified its email, never signed in (`last_seen_at` is null) and
 has no OAuth link. Each account goes through the same path as
 `DELETE /api/v1/admin/users/{id}` (soft delete: anonymized email and
-username, sessions revoked, `user.deleted` published after the commit,
+username, sessions deleted, `user.deleted` published after the commit,
 with the user as `actor_id`, so nobody is notified), one account per
 transaction, so the email can register again. Then it cleans the auth
 leftovers of accounts deleted before the full deletion existed: for each
 deleted account that still has sessions, open sent invitations,
 memberships or owned organizations, it removes them as a delete does
 (owned organizations pass to a successor or are deleted), one account per
-transaction. Answer `{"retention_days", "candidates", "deleted",
+transaction. Last, it deletes every open organization invitation that
+expired more than `ORGANIZATION_INVITATION_EXPIRE_DAYS` (default 7) days
+ago (one statement). Answer `{"retention_days", "candidates", "deleted",
 "skipped", "failed", "deleted_account_leftovers": {"candidates",
-"cleaned", "failed", "lookup_failed"}}`; 500 with `"all_units_failed"`
-naming the step (`accounts`, `deleted_account_leftovers`, or
-`deleted_account_leftovers_lookup` when the leftover query failed) when
+"cleaned", "failed", "lookup_failed"}, "expired_invitations_deleted"}`;
+500 with `"all_units_failed"` naming the step (`accounts`,
+`deleted_account_leftovers`, `deleted_account_leftovers_lookup` when the
+leftover query failed, or `expired_invitations` when the invitation
+delete failed) when
 every unit of that step failed (`shared/scheduled_jobs.py`); the events
 of the accounts purged in the same run are still published.
 `skipped` counts an account that changed meanwhile (verified, signed in)
@@ -519,15 +528,20 @@ portfolio accounting — this is a read-only overlay on top of unchanged real
 USD bookkeeping.
 
 Portfolio rules: `visibility` is `private` or `organization` (422
-otherwise); creating a portfolio in an organization requires membership
-(403); the list shows your own portfolios plus non-private portfolios of your
+otherwise); creating a portfolio in an organization, or changing a
+portfolio's visibility to `organization`, requires a writer role in that
+organization (403); `organization` without an organization is 422; a
+member who leaves or is removed has their portfolios of that organization
+made private; the list shows your own portfolios plus non-private portfolios of your
 organizations. Deleting a portfolio deletes its holdings, transactions and
 snapshots (cascade). Transactions are validated per type (BUY/SELL need
 quantity and price, DEPOSIT/WITHDRAWAL need quantity, DIVIDEND needs a held
 ticker and dividend_per_share, STOCK_SPLIT needs split_ratio); tickers must
 match `^[A-Z0-9.-]{1,10}$` and `CASH` is reserved; dates more than one day in
-the future are rejected; `page` is capped at 100000. Holdings show the
-latest recommendation of an analysis on the same portfolio only.
+the future are rejected; `page` is capped at 100000. `latest_recommendation`
+of a holding is filled only by the public API's holdings list (the latest
+recommendation of an analysis on the same portfolio); the other holding
+answers send it as null, except the holding write responses.
 
 **Ledger-only holdings.** Holdings are derived only from the
 transaction ledger; the `holdings` table is a cache of the replayed result.
@@ -563,8 +577,8 @@ it.
   event to `core.event_outbox` in the delete's transaction and publishes
   it after the commit; the outbox dispatcher retries it until it reaches
   Redis (ai-service cancels the portfolio's unexecuted tiers, §6).
-- Every create/update/delete here notifies the actor (and the portfolio
-  owner when different): `portfolio_created`, `portfolio_updated`,
+- Every create/update/delete here notifies the owner (only the owner can
+  write): `portfolio_created`, `portfolio_updated`,
   `portfolio_deleted`, `transaction_created` (one per request, listing the
   recorded rows, e.g. `adjustment +5`).
 
@@ -576,9 +590,13 @@ Text a spreadsheet would run as a formula is prefixed with `'`.
 - `history.csv`: `date, total_value, cash_balance, holdings_value,
   daily_return` from the daily snapshots. `daily_return` is flow-adjusted:
   `(value_t - external flows since the previous snapshot) / value_{t-1} - 1`,
-  where external flows are deposits, withdrawals and adjustments valued at
-  their stated `price` (shares out without a price count as 0); empty when
-  there is no previous positive value.
+  where external flows are deposits, withdrawals and adjustments. An
+  adjustment is valued at the ticker's session close on or before its
+  snapshot day (signed quantity times close), the same rule as the
+  portfolio backtest; only when ai-service has no close is it valued at its
+  stated `price` (shares out written by the holding routes have no price
+  and then count as 0).
+  Empty when there is no previous positive value.
 - `transactions.csv`: every ledger field (`id, transaction_date,
   transaction_type, ticker, quantity, price, dividend_per_share,
   split_ratio, idempotency_key`), oldest first; `from`/`to` are UTC days,
@@ -626,7 +644,7 @@ GET    /api/v1/research/documents/{document_id}/preview
 
 `POST /api/v1/research/documents` is multipart; `category` and optional
 `ticker` are required form fields, not inferred from the file — see
-`docs/ERD.md` §3 for why. `GET .../content` streams the raw bytes back out of
+`docs/ERD.md` §3 for why. `GET .../content` returns the raw bytes (read whole, one response) out of
 object storage (S3 API; SeaweedFS in docker compose); it's the
 only way to retrieve a document's content —
 `storage_url` in the JSON response is an internal object key, not a browsable
@@ -851,7 +869,7 @@ not fail the revoke or update (it commits, logged
 `api_key_cache_write_failed`); only a cached "valid" entry left over from
 before the revoke can then keep the key working, for at most 30 seconds.
 Over the limit is **429**
-`rate_limited` with `Retry-After` (seconds to the next window); if Redis
+`rate_limit_exceeded` with `Retry-After` (seconds to the next window); if Redis
 is unavailable the limiter lets the request through (logged), the same
 shared implementation as auth-service's limits (`shared/redis.py`).
 In front of that, the gateway limits `/api/v1/public` to 5 requests per
@@ -911,7 +929,7 @@ keeps receiving status payloads until the token expires (at most 15
 minutes), while REST reads answer 404 at once. Every push reaches each
 socket at most once; a user's notifications arrive on every one of their
 `user:` sockets on any replica. Messages are `{"event": <event name>,
-"payload": <event payload>}`; the `analysis:{analysis_id}` channel
+"payload": <event payload>, "emitted_at": <ISO time>}`; the `analysis:{analysis_id}` channel
 carries `analysis.started`, `analysis.completed`, `analysis.failed`,
 `recommendation.ready`, `decision.recorded`, `tier.executed`,
 `tier.execution_failed` and `tier.cancelled` (payloads in §6).
@@ -971,7 +989,7 @@ POST   /internal/scheduler/heartbeat/{job}
 POST   /internal/scheduler/notification-retention
 POST   /internal/scheduler/deleted-user-sweep               (daily 04:30 New York)
 GET    /internal/tracked-tickers
-GET    /internal/documents/filenames
+GET    /internal/documents/filenames                       (?category=&ticker=&system_only=)
 POST   /internal/documents
 POST   /internal/documents/system                          (multipart)
 GET    /internal/stats
@@ -1001,8 +1019,11 @@ internal endpoints this portfolio's data feeds — `.../snapshots` and
 callers.
 
 `tracked-tickers` returns the union of every portfolio's holdings and every
-watchlist's items across all users — what ai-service's RAG auto-ingestion
-job should keep fresh. `documents/filenames` / `POST documents` are the
+watchlist's items, skipping owners whose live state says inactive (deactivated or deleted) — what ai-service's RAG auto-ingestion
+job should keep fresh. `documents/filenames` lists the filenames that
+already exist for a category and ticker (every owner by default;
+`system_only=true` limits it to system documents, which the nightly
+ingestion uses as its duplicate check). `documents/filenames` / `POST documents` are the
 automated-ingestion counterparts of the real, interactive
 `GET/POST /api/v1/research/documents` — used by the daily filing/news
 ingestion job (owned by a well-known system user, not a real logged-in one)
@@ -1083,7 +1104,9 @@ Answer 201 `{"id": str, "status": str, "duplicate": bool}`. It publishes
 ai-service indexes it as a system document (visible to every user's RAG
 search). A duplicate (same ticker, category and filename among system
 documents, not failed) returns the existing id with `duplicate: true` and
-publishes nothing; a failed one is re-uploaded in place.
+publishes nothing, unless that document looks stuck in a processing status:
+then it is reset to `uploaded` and `document.uploaded` is published again
+(still `duplicate: true`); a failed one is re-uploaded in place.
 
 `GET /internal/stats` returns core's part of the admin site
 statistics, a flat object of integer row counts: `portfolios`,
@@ -1237,7 +1260,8 @@ contract (`GET .../{backtest_id}` + `.../metrics`):
   trade universe and date range are discovered from real trigger history,
   not chosen by the caller (first trigger to the creation day). The
   workflow counts only fills whose `triggered_at` falls inside
-  that stored window.
+  that stored window. A tier filled from an earlier session's bar is
+  dated at the run that filled it.
 - `POST /api/v1/backtests/portfolio`
   (`ai/workflows/backtest_workflow.py`) — a real backtest of one
   real portfolio's actual composition over time, sourced from
@@ -1334,7 +1358,8 @@ Errors before any output: 422 (body), 403 (permission), **429** with
 clock minute and `RAG_ASK_RATE_LIMIT_PER_DAY` = 200 per UTC day per user,
 shared by both routes; a Redis outage lets requests through), **503** with
 `Retry-After: 30` when retrieval fails (both routes) or, for `/ask`, when
-the LLM fails or answers twice in another language. Other settings:
+the LLM fails, returns an empty answer, or answers twice in another
+language. Other settings:
 `RAG_ASK_MAX_OUTPUT_TOKENS` (1024), `RAG_ASK_SNIPPET_CHARS` (300).
 
 ### Analytics
@@ -1355,6 +1380,9 @@ request; 503 when core or auth cannot answer the access check) or `all`
 (every analysis; needs `site:stats`, else 403). `mine` is broader than
 `GET /api/v1/analyses`, which lists only the caller's own analyses
 (deliberate), so the analytics total can be larger than the list total.
+- `agents` -> `[{agent_id, agent, avg_score, success_rate}]`, one row per
+  agent from the nightly rollup (`ai.agent_metrics`), all users, no
+  filters; `agent` is the agent name.
 - `overview` -> `range {from, to}, scope, total_analyses, status_counts,
   recommendations, action_distribution, average_confidence, accuracy
   {evaluated, rate}, by_agent[{agent, runs, completed, failed,
@@ -1443,7 +1471,7 @@ statistics: `analyses_total`, `analyses_completed`, `analyses_failed`,
 `POST /internal/review/run` runs `ai/workflows/review_workflow.py`'s two
 evaluation passes (AI-accuracy scoring for all recommendations, decision-
 outcome evaluation for confirmed user decisions) and the agent metrics
-rollup — wired to `infra/scheduler/call-job.sh review-run`, daily at 2:00 AM ET.
+rollup — wired to `infra/scheduler/call-job.sh review-run`, daily at 00:20 ET.
 It answers through the scheduled-job rule (`shared/scheduled_jobs.py`):
 `{"recommendations_scored", "recommendations_attempted",
 "recommendations_failed", "decisions_evaluated", "decisions_attempted",
@@ -1454,7 +1482,8 @@ counts as failed).
 
 `POST /internal/scheduler/tier-monitoring` runs the daily check of every
 accepted (or still-acceptable) recommendation tier for a real trigger
-(today's actual high/low crossing the target price) or expiry — the hook
+(any daily high/low since acceptance crossing the target price; the first
+crossing bar fills) or expiry — the hook
 is wired to `infra/scheduler/call-job.sh tier-monitoring` (weekdays 17:00 ET). A
 trade core-service refuses for a business reason (4xx) moves the
 tier to the terminal status `execution_failed`; 5xx/timeouts are retried on
@@ -1580,8 +1609,8 @@ transaction committed (routes via `BackgroundTasks`, workflows after
 `session.commit()`), auth-service's `user.presence.changed` included; a
 publish failure is logged and never undoes the work.
 core-service creates each notification row once even with several replicas
-(a Redis claim keyed by the publisher's `event_id`, falling back to a hash
-of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pushes run on every replica for its own sockets.
+(a Redis claim keyed by the publisher's `event_id`, `core:event_claim:*`,
+5 minutes; fails open; a payload without `event_id` is not claimed), while WebSocket pushes run on every replica for its own sockets.
 
 | Event | Published by | Transport | Consumed by | Effect |
 |---|---|---|---|---|
@@ -1603,7 +1632,7 @@ of the payload, `core:event_claim:*`, 5 minutes; fails open), while WebSocket pu
 | `decision.outcome.evaluated` | ai-service | pub/sub | core-service | `decision_evaluated` notification to the deciding user |
 | `organization.created` / `.updated` / `.deleted` | auth-service | pub/sub | core-service | `organization_created` / `_updated` / `_deleted` for every id in `member_ids`; on `.deleted` core also deletes the organization's documents and notes and makes its shared portfolios private to their owners (deleted when the owner's account is deleted) |
 | `organization.member.joined` | auth-service | pub/sub | core-service | welcome notification to the new member and `organization_member_joined` to the other members; published after the commit |
-| `organization.member.left` / `.member.removed` / `.role.changed` | auth-service | pub/sub | core-service | the affected member (own wording) and the other members, `organization_member_left` / `_member_removed` / `organization_role_changed` |
+| `organization.member.left` / `.member.removed` / `.role.changed` | auth-service | pub/sub | core-service | the affected member (own wording) and the other members, `organization_member_left` / `_member_removed` / `organization_role_changed`; on `.member.left` and `.member.removed` core also makes that member's shared portfolios of the organization private |
 | `organization.invitation.created` | auth-service | pub/sub | core-service | `organization_invite` to the actor, and to the invitee when the email already has an account |
 | `organization.invitation.revoked` | auth-service | pub/sub | core-service | `organization_invitation_revoked` to the actor, and to the invitee when the email has an account |
 | `friend.requested` / `.accepted` / `.removed` | auth-service | pub/sub | core-service | `friend_request` / `friend_accepted` / `friend_removed` to the actor, and to the other side for a request, an accept and `action` `removed`; `.removed` also re-checks both users' open sockets |
@@ -1628,15 +1657,15 @@ Payloads (built by `services/auth-service/events_out.py`,
   "analysis_id", "user_id", "ticker", "decision"}`.
 - `decision.outcome.evaluated`: `{"decision_id", "analysis_id",
   "user_id", "ticker", "evaluation_days", "alpha" (the decision's return
-  minus the benchmark's, a fraction) | null, "outperformed" | null}`
-  (null when there was no price data).
+  minus the benchmark's, a fraction), "outperformed"}` (published only
+  when both returns could be computed).
 - `tier.executed` / `.execution_failed` / `.cancelled`: `{"tier_id",
   "analysis_id", "user_id" ("" for a system analysis -- core then notifies
   the portfolio owner), "portfolio_id", "ticker", "action": "buy" | "sell",
   "quantity" (string), "price" (string), "reason" (failed/cancelled only;
   for cancelled: `declined`, `superseded` or `portfolio_deleted`)}`.
 - `backtest.completed` / `.failed`: `{"backtest_id", "user_id", "kind",
-  "status": "completed" | "failed", "error" | null}`.
+  "error" | null}` (the event name carries the outcome).
 - `backtest.deleted`: `{"backtest_id", "user_id", "kind"}`.
 - every `organization.*` event (including `member.joined`):
   `{"organization_id", "organization_name", "actor_id", "user_id" (the

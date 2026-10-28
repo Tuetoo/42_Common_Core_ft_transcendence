@@ -560,7 +560,7 @@ class AuthService:
     async def _check_totp(
             self, user_id: UUID, row: TwoFactorSecret, code: str,
             error: AppError) -> None:
-        await security.two_factor_guard(str(user_id))
+        await security.two_factor_attempt(str(user_id))
         try:
             secret = security.decrypt_secret(row.secret)
         except security.UnreadableTotpSecretError:
@@ -569,7 +569,6 @@ class AuthService:
         step = security.match_totp_step(secret, code)
         if step is None or not await self.users.consume_totp_step(row.id,
                                                                   step):
-            await security.two_factor_failed(str(user_id))
             raise error
         await security.two_factor_succeeded(str(user_id))
 

@@ -32,12 +32,6 @@ _LEGAL_SUFFIX_WORDS = frozenset({
 })
 
 
-@dataclass(frozen=True)
-class CompanyAliases:
-    ticker: str
-    strong: tuple[str, ...]
-
-
 def core_name_words(legal_name: str) -> list[str]:
     name = re.sub(r"/[A-Za-z]{1,4}\s*$", "", legal_name.strip())
     words = re.findall(r"[A-Za-z0-9&']+(?:[-.][A-Za-z0-9]+)*", name.upper())
@@ -50,41 +44,6 @@ def core_name_words(legal_name: str) -> list[str]:
 
 def company_search_name(legal_name: str) -> str:
     return " ".join(core_name_words(legal_name)).title()
-
-
-def company_aliases(ticker: str, legal_name: str | None) -> CompanyAliases:
-    ticker = ticker.upper()
-    if not legal_name or not legal_name.strip():
-        return CompanyAliases(ticker=ticker, strong=())
-    words = core_name_words(legal_name)
-    strong = [" ".join(words).lower()]
-    if len(words) > 1 and all(w.isalpha() for w in words):
-        strong.append("".join(words).lower())
-    return CompanyAliases(ticker=ticker, strong=tuple(strong))
-
-
-_DOTTED_INITIALS = re.compile(r"(?<![a-z0-9])(?:[a-z]\.\s?){2,}(?=[a-z])")
-
-
-def _normalize(text: str) -> str:
-    text = text.lower().replace("\u2019", "'")
-    return re.sub(r"(?<=[a-z0-9])[-\u2010\u2011\u2013](?=[a-z0-9])", " ", text)
-
-
-def names_alias(text: str, aliases: Sequence[str]) -> bool:
-    normalized = _normalize(text)
-    collapsed = _DOTTED_INITIALS.sub(
-        lambda m: m.group(0).replace(".", "").replace(" ", ""), normalized)
-    for alias in aliases:
-        pattern = r"\s+".join(re.escape(part) for part in alias.split())
-        regex = rf"(?<![a-z0-9]){pattern}(?![a-z0-9])"
-        if re.search(regex, normalized) or re.search(regex, collapsed):
-            return True
-    return False
-
-
-def headline_names_company(title: str, aliases: CompanyAliases) -> bool:
-    return names_alias(title, aliases.strong)
 
 
 _GENERIC_QUERY_WORDS = frozenset({
@@ -250,7 +209,7 @@ async def lookup_search_name(ticker: str) -> str | None:
 
 THIS_COMPANY = "this_company"
 PARTY = "party"
-SUBJECTS = ("this_company", PARTY, "other_company", "none")
+SUBJECTS = (THIS_COMPANY, PARTY, "other_company", "none")
 KEPT_SUBJECTS = frozenset({THIS_COMPANY, PARTY})
 
 COMPANY_BUSINESS = "company_business"
@@ -292,7 +251,8 @@ KIND_DEFINITIONS: dict[str, str] = {
 NEWS_KINDS = (
     COMPANY_BUSINESS, STOCK_MARKET, CONSUMER_PRODUCT, OPINION_LISTICLE,
     PRICE_PAGE, NOT_NEWS)
-KEPT_KINDS = frozenset({COMPANY_BUSINESS, STOCK_MARKET, OPINION_LISTICLE})
+KEPT_KINDS = frozenset(
+    {COMPANY_BUSINESS, STOCK_MARKET, OPINION_LISTICLE, CONSUMER_PRODUCT})
 EVIDENCE_KINDS = frozenset({COMPANY_BUSINESS, STOCK_MARKET, UNCLASSIFIED})
 CONFIRMED_EVIDENCE_KINDS = EVIDENCE_KINDS - {UNCLASSIFIED}
 
@@ -636,7 +596,6 @@ async def _classify_batch(
             ClassifiedArticle(a, UNCLASSIFIED, checked=False) for a in articles
         ]
 
-    aliases = company_aliases(ticker, company_name)
     kept: list[ClassifiedArticle] = []
     dropped: list[dict[str, Any]] = []
     invalid: list[str] = []
@@ -656,8 +615,7 @@ async def _classify_batch(
             continue
         subject, kind = verdict
         counts[f"{subject}/{kind}"] += 1
-        kept_kind = kind in KEPT_KINDS or kind == CONSUMER_PRODUCT
-        if subject in KEPT_SUBJECTS and kept_kind:
+        if subject in KEPT_SUBJECTS and kind in KEPT_KINDS:
             kept.append(ClassifiedArticle(article, kind))
             continue
         dropped.append({
@@ -665,9 +623,7 @@ async def _classify_batch(
             "subject": subject,
             "kind": kind,
             "reasoning": (
-                str(item.get("reasoning", ""))[:160] if item else ""),
-            "title_names_company": headline_names_company(
-                article.title, aliases)
+                str(item.get("reasoning", ""))[:160] if item else "")
         })
 
     if invalid:

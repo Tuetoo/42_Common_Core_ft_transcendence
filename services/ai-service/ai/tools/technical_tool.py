@@ -6,11 +6,10 @@ from ai.tools.base import Tool, clamp_int
 from ai.tools.indicators import (atr, bollinger_bands, macd,
                                  price_position_vs_level, rsi, rsi_band_words,
                                  sma)
-from ai.tools.market_data_cache import (get_bars_cache_first,
+from ai.tools.market_data_cache import (INDICATOR_LOOKBACK_DAYS,
+                                        MAX_LOOKBACK_DAYS,
+                                        get_bars_cache_first,
                                         missing_session_note)
-
-_DEFAULT_LOOKBACK_DAYS = 90
-_MAX_LOOKBACK_DAYS = 730
 
 
 class GetTechnicalIndicatorsTool(Tool):
@@ -40,15 +39,15 @@ class GetTechnicalIndicatorsTool(Tool):
         self.analysis_ticker = analysis_ticker
 
     async def run(  # type: ignore[override]
-        self, ticker: str, lookback_days: int = _DEFAULT_LOOKBACK_DAYS
+        self, ticker: str, lookback_days: int = INDICATOR_LOOKBACK_DAYS
     ) -> str:
         return self.label_result(
             ticker, await self._indicators(ticker, lookback_days))
 
     async def _indicators(self, ticker: str, lookback_days: int) -> str:
         lookback_days = clamp_int(
-            lookback_days, default=_DEFAULT_LOOKBACK_DAYS, lo=1,
-            hi=_MAX_LOOKBACK_DAYS)
+            lookback_days, default=INDICATOR_LOOKBACK_DAYS, lo=1,
+            hi=MAX_LOOKBACK_DAYS)
         try:
             bars = await get_bars_cache_first(
                 ticker, interval="1d", lookback_days=lookback_days,

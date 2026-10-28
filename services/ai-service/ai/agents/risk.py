@@ -13,9 +13,9 @@ from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
                             is_successful_tool_entry, prefetch_tool_calls)
 from ai.graph.state import AgentOutput, AnalysisState
 from ai.knowledge.filing_records import (LEGAL_STATUSES, TRANSACTION_STATUSES,
-                                         legal_record_count, ordered_rows,
-                                         parse_filing_filename, record_by_id,
-                                         record_title)
+                                         is_record_id, legal_record_count,
+                                         ordered_rows, parse_filing_filename,
+                                         record_by_id, record_title)
 from ai.knowledge.recycled_content import (prior_note_similarity,
                                            split_agent_note_passages)
 from ai.rag.visibility import visibility_for_state
@@ -264,7 +264,6 @@ def _risk_event_issue(
     return None
 
 
-_RECORD_ID_RE = re.compile(r"^F\d+\.[A-Z]\d+$", re.IGNORECASE)
 _FILING_LABEL_RE = re.compile(r"^F(\d+)$", re.IGNORECASE)
 
 
@@ -413,7 +412,7 @@ def _record_is_of_entity(
 def _cited_record(
         event: dict[str, str], rows: Sequence[Any],
         shown: bool) -> dict[str, Any] | None:
-    if not shown or not _RECORD_ID_RE.match(event["source_id"]):
+    if not shown or not is_record_id(event["source_id"]):
         return None
     record = record_by_id(rows, event["source_id"])
     return (
@@ -477,7 +476,7 @@ def _cited_filing(
         if log and record is not None and record["status"] != event["status"]:
             _log_status_mismatch(entity, record, event["status"])
         return None, record
-    if _RECORD_ID_RE.match(source_id):
+    if is_record_id(source_id):
         record = record_by_id(rows, source_id) if shown else None
         if record is None:
             return (
@@ -590,7 +589,7 @@ def _event_source_issue(
     issue, record = _cited_filing(event, rows, shown, scratchpad, log=log)
     if issue is not None:
         return issue, False
-    if (record is not None and _RECORD_ID_RE.match(event["source_id"])
+    if (record is not None and is_record_id(event["source_id"])
             and not _record_is_of_entity(event["entity"], record, rows)):
         if log:
             logger.info(
@@ -626,8 +625,7 @@ def _risk_answer_issue(
     if issue is not None:
         return issue, False
     events = _reported_risk_events(reported_metrics)
-    if isinstance(events, str):
-        return events, False
+    assert not isinstance(events, str)
     name_parts: list[str] = []
     for event in events:
         found, once = _event_source_issue(
@@ -795,7 +793,7 @@ def _plain_source(
         return (
             f"{row.form} filed {row.filing_date.isoformat()}"
             if row is not None else "")
-    if _RECORD_ID_RE.match(source):
+    if is_record_id(source):
         record = record_by_id(rows, source) if shown else None
         if record is None:
             return ""

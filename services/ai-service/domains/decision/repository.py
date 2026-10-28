@@ -65,7 +65,8 @@ class InvestmentDecisionRepository:
         stmt = (
             select(InvestmentDecision).where(
                 InvestmentDecision.user_id == user_id).order_by(
-                    InvestmentDecision.created_at.desc()))
+                    InvestmentDecision.created_at.desc(),
+                    InvestmentDecision.id.desc()))
         total = await count_query(self.session, stmt)
         stmt = stmt.offset(pagination.offset).limit(pagination.limit)
         result = await self.session.execute(stmt)

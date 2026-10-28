@@ -19,3 +19,5 @@
 **/dump.rdb
 **/.vscode
 services/*/shared
+# Local drafts of scripts.regenerate_filing_summaries (git-ignored).
+services/ai-service/_regenerated

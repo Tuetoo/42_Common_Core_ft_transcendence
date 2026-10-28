@@ -1,8 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, extractErrorMessage, readApiError } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import { USERNAME_RE, avatarFileError, isTimezone } from "@/app/(public)/field-rules";
 
 export type ProfileValues = {
@@ -54,32 +53,19 @@ export async function updateProfile(
     return { values, error: invalid };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { values, error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch("/auth/me", accessToken, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: values.username,
-        first_name: values.first_name || null,
-        last_name: values.last_name || null,
-        bio: values.bio || null,
-        timezone: values.timezone || null,
-        country: values.country || null,
-      }),
-    });
-  } catch {
-    return { values, error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { values, error: await extractErrorMessage(res, "Could not update profile") };
-  }
+  const result = await call(
+    "/auth/me",
+    jsonInit("PATCH", {
+      username: values.username,
+      first_name: values.first_name || null,
+      last_name: values.last_name || null,
+      bio: values.bio || null,
+      timezone: values.timezone || null,
+      country: values.country || null,
+    }),
+    "Could not update profile"
+  );
+  if (!result.ok) return { values, error: result.error };
 
   // The username also shows in the sidebar.
   revalidatePath("/", "layout");
@@ -106,26 +92,13 @@ export async function uploadAvatar(
     return { error: fileError };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
   const upload = new FormData();
   upload.append("file", file);
 
-  let res: Response;
-  try {
-    // No Content-Type header: fetch sets multipart/form-data together with
-    // the boundary string the backend needs to split the parts.
-    res = await backendFetch("/auth/me/avatar", accessToken, { method: "POST", body: upload });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { error: await extractErrorMessage(res, "Could not upload the avatar") };
-  }
+  // No Content-Type header: fetch sets multipart/form-data together with
+  // the boundary string the backend needs to split the parts.
+  const result = await call("/auth/me/avatar", { method: "POST", body: upload }, "Could not upload the avatar");
+  if (!result.ok) return { error: result.error };
 
   // The new picture shows on the profile and in the sidebar.
   revalidatePath("/", "layout");
@@ -146,30 +119,18 @@ export async function setupTwoFactor(
   _prevState: SetupTwoFactorState,
   _formData: FormData
 ): Promise<SetupTwoFactorState> {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch("/auth/2fa/setup", accessToken, { method: "POST" });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    const err = await readApiError(res, "Could not start 2FA setup");
-    if (err.status === 409) {
-      return { alreadyEnabled: true, error: err.message };
+  const result = await call("/auth/2fa/setup", { method: "POST" }, "Could not start 2FA setup");
+  if (!result.ok) {
+    if (result.status === 409) {
+      return { alreadyEnabled: true, error: result.error };
     }
-    if (err.code === "recent_login_required") {
-      return { needsRelogin: true, error: err.message };
+    if (result.code === "recent_login_required") {
+      return { needsRelogin: true, error: result.error };
     }
-    return { error: err.message };
+    return { error: result.error };
   }
 
-  const { data } = await res.json();
+  const { data } = await result.res.json();
   return { secret: data.secret, provisioningUri: data.provisioning_uri };
 }
 
@@ -188,25 +149,9 @@ export async function verifyTwoFactor(
     return { error: "Please enter the 6-digit code" };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch("/auth/2fa/verify", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    const err = await readApiError(res, "Invalid code");
-    return { error: err.message, needsRelogin: err.code === "recent_login_required" };
+  const result = await call("/auth/2fa/verify", jsonInit("POST", { code }), "Invalid code");
+  if (!result.ok) {
+    return { error: result.error, needsRelogin: result.code === "recent_login_required" };
   }
 
   revalidatePath("/profile");
@@ -227,25 +172,8 @@ export async function disableTwoFactor(
     return { error: "Please enter the 6-digit code" };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch("/auth/2fa/disable", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { error: await extractErrorMessage(res, "Invalid code") };
-  }
+  const result = await call("/auth/2fa/disable", jsonInit("POST", { code }), "Invalid code");
+  if (!result.ok) return { error: result.error };
 
   revalidatePath("/profile");
   return { success: true };

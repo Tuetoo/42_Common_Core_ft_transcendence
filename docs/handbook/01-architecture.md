@@ -38,11 +38,14 @@ Think of AlphaMind as a small company building:
 - **Prometheus, Alertmanager, Grafana, the exporters and vector** are the
   security cameras and log books.
 
-All containers run on one Docker network created by Compose. Inside that
-network every container can reach every other one by its service name
-(for example `http://core-service:8000`). Only the gateway is published to
-all interfaces of the host; a few developer tools are published on
-`127.0.0.1` only.
+The containers run on two Docker networks created by Compose. `default`
+holds the gateway and every backend container; inside it every container
+can reach every other one by its service name (for example
+`http://core-service:8000`). `edge` holds only the frontend and the
+gateway, so the frontend can reach the gateway and nothing else (it needs
+nothing else: all its server-side calls go to `http://gateway:8080`).
+Only the gateway is published to all interfaces of the host; a few
+developer tools are published on `127.0.0.1` only.
 
 ```
                         Browser / curl / scripts on the host
@@ -71,11 +74,11 @@ all interfaces of the host; a few developer tools are published on
  | ai       |  | events  |  | (core, ai)       |       |             |    |           |
  +----------+  +---------+  +------------------+       +-------------+    +-----------+
 
- scheduler (cron, America/New_York) --HTTP + token--> core-service, ai-service
+ scheduler (cron, America/New_York) --HTTP + token--> auth-service, core-service, ai-service
            \--> pg_dump, Qdrant snapshots, S3 object copy, avatars tar --> ./backups/
 
  prometheus --scrapes /metrics--> auth, core, ai, postgres-exporter, redis-exporter,
-                                   alertmanager, itself
+                                   qdrant, alertmanager, itself
            --alerts--> alertmanager --email--> mailhog
  grafana --queries--> prometheus
  vector --reads Docker logs--> ./logs/<service>/<YYYY-MM-DD>.log
@@ -179,9 +182,10 @@ There are three levels of reachability:
    - Prometheus: `http://127.0.0.1:9090`
    - Alertmanager: `http://127.0.0.1:9093`
    - Adminer (only when started): `http://127.0.0.1:8080`
-3. **Internal only (Docker network):** PostgreSQL 5432, Redis 6379, the
-   three services on 8000, the frontend on 3000, the gateway's internal
-   listener on 8080, SeaweedFS 9000, Grafana 3000, the exporters.
+3. **Internal only (Docker networks):** PostgreSQL 5432, Redis 6379, the
+   three services on 8000, the gateway's internal listener on 8080,
+   SeaweedFS 9000, Grafana 3000, the exporters (all on `default`), and the
+   frontend on 3000 (on `edge`, reachable only from the gateway).
    You reach them with `docker compose exec` (for example
    `bash scripts/psql.sh`) or through the gateway (Grafana).
 
@@ -197,7 +201,7 @@ The public paths, grouped by backend (`infra/gateway/nginx.conf`):
 |---|---|
 | auth-service | `/api/v1/auth` (rate limited: 10 req/s per client address, burst 20, then `429`), `/api/v1/organizations`, `/api/v1/connections`, `/api/v1/admin`, `/static/avatars` |
 | core-service | `/api/v1/portfolios`, `/api/v1/watchlists`, `/api/v1/api-keys`, `/api/v1/research`, `/api/v1/notifications`, `/api/v1/public`, `/api/v1/moderation`, `/ws` (WebSocket, read timeout 3600 s) |
-| ai-service | `/api/v1/analyses`, `/api/v1/market`, `/api/v1/analytics`, `/api/v1/decisions`, `/api/v1/backtests`, `/api/v1/rag` (no buffering, read timeout 180 s, for Server-Sent Events) |
+| ai-service | `/api/v1/analyses`, `/api/v1/market`, `/api/v1/analytics`, `/api/v1/decisions` (read timeout 300 s, for the synchronous LLM decision review), `/api/v1/backtests`, `/api/v1/rag` (no buffering, read timeout 180 s, for Server-Sent Events) |
 | grafana | `/grafana/` |
 | gateway itself | `/status` (static page that polls `/health/auth`, `/health/core`, `/health/ai` every 15 seconds) |
 | Swagger | `/docs/auth/`, `/docs/core/`, `/docs/ai/` and their spec files `/api/openapi-auth.json`, `/api/openapi-core.json`, `/api/openapi-ai.json` |
@@ -701,10 +705,11 @@ What still needs an image **rebuild** (`up -d --build`, or
 
 - One `pyproject.toml` and one `uv.lock` at the repository root list the
   dependencies of all three services. Each service image installs the
-  whole locked set with `uv sync --frozen` (uv pinned to `0.8.17` in the
+  whole locked set with `uv sync --locked` (uv pinned to `0.8.17` in the
   Dockerfiles, the same version the lock file is maintained with, so
-  builds are reproducible). `--frozen` makes the build fail if `uv.lock`
-  is out of date, instead of silently resolving new versions. Because
+  builds are reproducible). `--locked` makes the build fail if `uv.lock`
+  does not match `pyproject.toml`, instead of silently installing a stale
+  set. Because
   `uv.lock` is copied into every service image, a change to it needs a
   rebuild of all three service images (the scheduler image does not use
   it).
@@ -735,7 +740,7 @@ Lead). The gateway's `location /` proxies every page to `frontend:3000`.
 The browser only talks to the HTTPS listener. The frontend's server side
 (pages, Server Actions, route handlers) calls the API at
 `BACKEND_API_URL=http://gateway:8080/api/v1`: the gateway's internal
-plain-HTTP listener, reachable only on the Docker network. So no
+plain-HTTP listener, reachable only on the Docker networks. So no
 certificate has to name `gateway`. The frontend copies the browser's
 address (the `X-Real-IP` the HTTPS listener set) into `X-Forwarded-For`,
 and the internal listener trusts it from private Docker addresses, so
@@ -766,7 +771,7 @@ scripts.
 | bm25s | Keyword (BM25) search, fused with Qdrant's vector search for hybrid retrieval. |
 | y-py | Python bindings for Yrs, the Rust implementation of the Yjs CRDT, for collaborative note editing in core-service. |
 | nginx | Mature reverse proxy: TLS, WebSocket upgrade, path routing, rate limiting, static status page. |
-| Next.js 16 + React 19 (Node 24) | The frontend: server-rendered pages and Server Actions, so the refresh token stays in an httpOnly cookie on the frontend's server (the short-lived access token is also given to the page for live connections); `yjs` for the collaborative note editor. |
+| Next.js 16 + React 19 (Node 24) | The frontend: server-rendered pages and Server Actions, so the refresh token stays in an httpOnly cookie that page scripts cannot read; only the frontend's server sends it to the API (the short-lived access token is also given to the page for live connections); `yjs` for the collaborative note editor. |
 | Prometheus + Alertmanager + Grafana + exporters | Standard open-source metrics, alert rules with unit tests, email alerts, dashboards. |
 | vector | Copies every compose container's output to dated files on disk, independent of the application code, so logs survive container recreation. |
 | MailHog | Catches all email locally, so verification and reset emails can be read without a real mail provider. |
@@ -996,7 +1001,7 @@ Run from the repository root with the stack already up (see
 
 | File | What it holds |
 |---|---|
-| `docker-compose.yaml` | Every container, ports, volumes, health checks, dependencies, log limits, profiles. |
+| `docker-compose.yaml` | Every container, ports, volumes, health checks, dependencies, log limits, profiles, the two networks (`default`, `edge`). |
 | `docker-compose.override.yml` | Development stage (its Dockerfile `CMD` runs uvicorn without `--reload` and with `--proxy-headers`), bind-mounted source, ai-service `LOG_LEVEL=DEBUG`. |
 | `shared/logging.py`, `shared/exceptions.py`, `shared/schemas.py` | Request id middleware, error envelope and status map, response and pagination models (section 3.6b). |
 | `.env.example` | Template and documentation of every environment setting. |

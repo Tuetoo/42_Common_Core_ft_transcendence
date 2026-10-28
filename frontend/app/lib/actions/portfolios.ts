@@ -1,8 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import { boundedText, CURRENCIES, NAME_MAX_LENGTH, normalizeTicker, positiveDecimal, UUID_RE } from "@/app/lib/format";
 
 // Every form state carries the submitted values back on an error: React
@@ -27,21 +26,8 @@ async function send(
   body: unknown,
   fallback: string
 ): Promise<string | null> {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return "You're not logged in";
-  }
-  let res: Response;
-  try {
-    res = await backendFetch(path, accessToken, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    return "Could not reach the server. Is the backend running?";
-  }
-  return res.ok ? null : await extractErrorMessage(res, fallback);
+  const result = await call(path, jsonInit(method, body), fallback);
+  return result.ok ? null : result.error;
 }
 
 export type CreatePortfolioState = {

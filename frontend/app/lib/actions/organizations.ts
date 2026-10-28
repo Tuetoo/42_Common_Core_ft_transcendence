@@ -3,14 +3,10 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { call, jsonInit } from "@/app/lib/session";
-import { UUID_RE } from "@/app/lib/format";
+import { ORG_DESCRIPTION_MAX as DESCRIPTION_MAX, ORG_NAME_MAX as NAME_MAX, UUID_RE } from "@/app/lib/format";
 import { EMAIL_MAX, EMAIL_RE } from "@/app/(public)/field-rules";
 import type { ActionResult } from "./admin";
 
-// Limits match OrganizationCreate / OrganizationUpdate / InvitationCreate in
-// services/auth-service/domains/organization/schema.py.
-const NAME_MAX = 128;
-const DESCRIPTION_MAX = 1000;
 // The owner role can never be assigned (MemberRoleUpdate, InvitationCreate).
 const ASSIGNABLE_ROLES = ["admin", "member", "viewer"];
 

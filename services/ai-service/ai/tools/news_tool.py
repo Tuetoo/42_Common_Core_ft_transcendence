@@ -255,12 +255,14 @@ class SearchNewsTool(Tool):
     async def run(  # type: ignore[override]
             self, query: str, limit: int = 20) -> str:
         limit = clamp_int(limit, default=20, lo=1, hi=100)
-        company_name: str | None = None
+        fallback: str | None = None
         if self.ticker is not None:
             company_name = await lookup_search_name(self.ticker)
             model_query = query
             query = build_ticker_news_query(
                 model_query, ticker=self.ticker, company_name=company_name)
+            fallback = build_ticker_news_query(
+                "", ticker=self.ticker, company_name=company_name)
             limit = max(limit, TICKER_SCOPED_MIN_LIMIT)
             logger.info(
                 "news_tool.ticker_query_built", ticker=self.ticker,
@@ -271,9 +273,7 @@ class SearchNewsTool(Tool):
             return self._failed(query, exc)
         articles = await self._with_recent(query, articles)
 
-        if not articles and self.ticker is not None and ") AND (" in query:
-            fallback = build_ticker_news_query(
-                "", ticker=self.ticker, company_name=company_name)
+        if not articles and fallback is not None and query != fallback:
             logger.info(
                 "news_tool.topic_query_empty_fallback", ticker=self.ticker,
                 query=query, fallback_query=fallback)

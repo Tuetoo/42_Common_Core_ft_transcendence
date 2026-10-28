@@ -36,18 +36,15 @@ async def run(
         copy_all: bool = False) -> int:
     print("=== CONFIRM ===" if confirm else "=== PREVIEW (read-only) ===")
     if source == target:
-        print("ABORT: --source and --target are the same collection")
-        return 0
+        sys.exit("ABORT: --source and --target are the same collection")
     source_size = await _vector_size(source)
     if source_size is None:
-        print(f"ABORT: source collection {source!r} does not exist")
-        return 0
+        sys.exit(f"ABORT: source collection {source!r} does not exist")
     target_size = await _vector_size(target)
     if target_size is not None and target_size != dims:
-        print(
+        sys.exit(
             f"ABORT: target {target!r} exists with {target_size}-dim vectors, "
             f"not {dims}")
-        return 0
     points = await _all_points(source)
     existing_ids = ({str(p.id)
                      for p in await _all_points(target)}

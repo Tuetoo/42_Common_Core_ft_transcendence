@@ -110,8 +110,8 @@ _get_client(settings, db_index):
 
 Two details matter:
 
-- **The database number in `REDIS_URL` is stripped.** `.env.example` has
-  `REDIS_URL=redis://redis:6379/0`. `redis.from_url` lets a `/0` in the
+- **The database number in `REDIS_URL` is stripped.** A URL such as
+  `redis://redis:6379/0` carries a database part. `redis.from_url` lets a `/0` in the
   URL win over the `db=` argument, so every helper would silently use
   DB 0: the durable streams would end up in DB 0 while an operator looks
   for them in DB 3, and a working ingestion pipeline would look broken.
@@ -223,13 +223,14 @@ hashed so raw addresses never sit in Redis. Scopes and limits
 | `register:ip` | 10 | 1 h |
 | `reset:email` / `reset:ip` | 3 / 10 | 1 h |
 | `resend:email` | 3 | 1 h |
-| `invite:org` | 20 | 1 h |
+| `invite:user` / `invite:org` | 20 per sender / 20 per organization | 1 h |
 | `friend:user` | 30 friend requests per requester | 1 h |
-| `2fa:fail` -> `2fa:lock` | 5 failures in 5 min (a correct code resets) | lock for 15 min |
+| `2fa:fail` | 5 attempts, counted before the code is checked (a correct code resets) | 1 h |
 
-The 2FA lock uses its own keys: failures count in
-`auth:rl:2fa:fail:<hash>` (a correct code deletes it); at the limit `auth:rl:2fa:lock:<hash>` is set
-with a 15-minute TTL, and every attempt first checks that TTL.
+The 2FA limit counts every attempt in `auth:rl:2fa:fail:<hash>` before
+the code is checked (the same atomic fixed window as the other scopes,
+so parallel requests cannot pass the limit); a correct code deletes the
+key. Over the limit every attempt gets 429 until the window ends.
 `RATE_LIMIT_ENABLED` turns all of it off (tests).
 
 **core-service public API** (`services/core-service/apikeys.py`):
@@ -403,7 +404,7 @@ on port 9121.
 | Setting | Default | Meaning | File |
 |---|---|---|---|
 | `REDIS_HOST` / `REDIS_PORT` | `redis` / `6379` | server address | `shared/config.py` |
-| `REDIS_URL` | unset (`.env.example`: `redis://redis:6379/0`) | full URL; any `/n` database part is ignored | `shared/config.py`, `shared/redis.py` |
+| `REDIS_URL` | unset (not in `.env.example`) | full URL; any `/n` database part is ignored | `shared/config.py`, `shared/redis.py` |
 | `REDIS_DB_CACHE` | `0` | caches, markers, heartbeats | `shared/config.py` |
 | `REDIS_DB_RATE_LIMIT` | `1` | rate-limit counters | `shared/config.py` |
 | `REDIS_DB_EVENTS` | `2` | user state, event claims, Yjs markers (and the pub/sub client) | `shared/config.py` |
@@ -646,7 +647,7 @@ counted from `ai.analyses` in PostgreSQL.
 | `shared/user_state.py` | live role/active state readers and writer; org-role cache and its invalidation |
 | `services/auth-service/user_state_sync.py` | auth-service side of the mirror |
 | `services/ai-service/ai/providers/newsapi.py` | NewsAPI usage log and source catalog keys |
-| `services/auth-service/security.py` | auth scopes, 2FA lock |
+| `services/auth-service/security.py` | auth scopes, 2FA attempt limit |
 | `services/core-service/apikeys.py` | public API counters, key validation cache |
 | `services/ai-service/rate_limit.py` | per-user minute and day counters (`check_user_rate_limit`) for the research assistant (`domains/rag/qa.py`) and decision reviews (`domains/decision/api.py`) |
 | `shared/events.py` | pub/sub publish/subscribe, streams, consumer group |

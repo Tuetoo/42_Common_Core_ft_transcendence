@@ -17,7 +17,8 @@ from ai.llm.base import (AGENT_LLM_CALL_RETRIES, JsonObjectParse, LLMMessage,
                          parse_json_object)
 from ai.llm.router import (LLMRouter, fallback_call_count,
                            recording_served_models)
-from ai.recommendation.engine import position_limit_line, previous_verdict
+from ai.recommendation.engine import (PreviousVerdict, position_limit_line,
+                                      previous_verdict)
 from ai.tools.base import is_evidence_record
 from config import settings
 from shared.enums import (AgentRole, AnalysisFailureReason,
@@ -220,8 +221,8 @@ def _trailing_and_forward_pe(
 
 
 def previous_verdict_line(
-        state: AnalysisState) -> tuple[str, RecommendationAction | None]:
-    previous = previous_verdict(state)
+    state: AnalysisState, previous: PreviousVerdict | None
+) -> tuple[str, RecommendationAction | None]:
     if previous is None:
         return "", None
     issued_at, action, confidence, judge_own, _ = previous
@@ -375,15 +376,14 @@ def _parse_failure_fields(result: JsonObjectParse) -> dict[str, Any]:
 
 
 def _parse_response(
-    raw: str, *, attempt: int = 1, response: LLMResponse | None = None
+    response: LLMResponse, *, attempt: int
 ) -> tuple[dict[str, Any] | None, JsonObjectParse]:
+    raw = response.content
     result = parse_json_object(raw)
     if result.data is None:
         log_unparseable(
             "judge.unparseable_response", raw, attempt=attempt,
-            model=response.model if response is not None else None,
-            finish_reason=(
-                response.finish_reason if response is not None else None),
+            model=response.model, finish_reason=response.finish_reason,
             **_parse_failure_fields(result))
         return None, result
     if result.leading_chars or result.trailing_text or result.lenient_strings:
@@ -446,7 +446,7 @@ class JudgeAgent:
         except Exception as exc:
             logger.warning("judge.json_reask_failed", error=str(exc)[:300])
             return None, response
-        parsed, _ = _parse_response(retry.content, attempt=2, response=retry)
+        parsed, _ = _parse_response(retry, attempt=2)
         if parsed is None:
             logger.warning(
                 "judge.json_reask_failed", error="reply still unparseable")
@@ -481,13 +481,15 @@ class JudgeAgent:
             logger.warning(
                 "judge.ungrounded_rewrite_failed", error=str(exc)[:300])
             return parsed, answer
-        rewritten, _ = _parse_response(response.content, response=response)
+        rewritten, _ = _parse_response(response, attempt=3)
         rationale = str(rewritten.get("rationale") or "") if rewritten else ""
         if (rewritten is None or not rationale.strip()
-                or non_english_reason(rationale)):
+                or non_english_reason(rationale)
+                or not {"leaning", "confidence"} <= rewritten.keys()):
             logger.warning(
                 "judge.ungrounded_rewrite_failed",
-                error="rewrite unparseable or without an English rationale")
+                error=("rewrite unparseable, without an English rationale, "
+                       "or without a leaning and confidence"))
             return parsed, answer
         still = sorted(find_ungrounded_figures(rationale, reference))
         if still:
@@ -530,8 +532,8 @@ class JudgeAgent:
         holding_line += position_limit_line(state)
         holding_line += trailing_pe_line(state)
         holding_line += profit_trend_line(state)
-        verdict_line, previous_action = previous_verdict_line(state)
         previous = previous_verdict(state)
+        verdict_line, previous_action = previous_verdict_line(state, previous)
         previous_confidence = (
             previous.confidence if previous is not None else None)
         previous_is_final = previous is None or not previous.judge_own
@@ -562,7 +564,7 @@ class JudgeAgent:
                 shared_evidence=evidence_text)
         ]
         response = await self._complete(messages)
-        parsed, failure = _parse_response(response.content, response=response)
+        parsed, failure = _parse_response(response, attempt=1)
         if parsed is None:
             parsed, response = await self._reask_for_json(
                 messages, response, failure)
@@ -599,6 +601,9 @@ class JudgeAgent:
             leaning = RecommendationAction(
                 str(parsed.get("leaning", "hold")).lower())
         except ValueError:
+            logger.warning(
+                "judge.unknown_leaning",
+                raw=str(parsed.get("leaning"))[:40])
             leaning = RecommendationAction.HOLD
 
         try:
@@ -667,18 +672,13 @@ def change_since_previous_required(
 
 def _log_deciding_factor(
         parsed: dict[str, Any], leaning: RecommendationAction,
-        previous_action: RecommendationAction | None, *,
-        confidence: float | None = None,
-        previous_confidence: float | None = None,
-        previous_is_final: bool = True) -> None:
+        previous_action: RecommendationAction | None, *, confidence: float,
+        previous_confidence: float | None, previous_is_final: bool) -> None:
     factor = str(parsed.get("deciding_factor") or "").strip()[:200]
     change = str(parsed.get("change_since_previous") or "").strip()[:300]
     basis = str(parsed.get("change_basis") or "").strip().lower()
-    flipped, moved = (
-        change_since_previous_required(
-            leaning, confidence, previous_action, previous_confidence)
-        if confidence is not None else
-        (previous_action is not None and previous_action != leaning, False))
+    flipped, moved = change_since_previous_required(
+        leaning, confidence, previous_action, previous_confidence)
     previous_leaning = previous_action.value if previous_action else None
     logger.info(
         "judge.deciding_factor", deciding_factor=factor or None,

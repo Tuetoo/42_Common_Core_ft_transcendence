@@ -86,20 +86,27 @@ def _archive_visibility(owner: object) -> ChunkVisibility:
     return ChunkVisibility.for_owner(owner)
 
 
+async def _recent_reports_of_owner(
+        *, category: DocumentCategory, ticker: str | None,
+        owner: UUID | None) -> list[AgentReport]:
+    query = select(AgentReport).join(
+        Analysis, Analysis.id == AgentReport.analysis_id).where(
+            AgentReport.category == category.value,
+            Analysis.user_id.is_(None)
+            if owner is None else Analysis.user_id == owner)
+    if ticker is not None:
+        query = query.where(AgentReport.ticker == ticker)
+    query = query.order_by(AgentReport.created_at.desc()).limit(
+        _NEAR_DUPLICATE_DEDUP_LOOKBACK)
+    async with SessionLocal() as session:
+        return list((await session.scalars(query)).all())
+
+
 async def _find_near_duplicate_of_recent_report(
         *, category: DocumentCategory, content: str, ticker: str | None,
-        owner: object) -> AgentReport | None:
-    async with SessionLocal() as session:
-        recent = await AgentReportRepository(session).list_recent_by_category(
-            category.value, ticker=ticker,
-            limit=_NEAR_DUPLICATE_DEDUP_LOOKBACK)
-    if recent:
-        report_owners = await _analysis_owners(
-            [report.analysis_id for report in recent])
-        recent = [
-            report for report in recent if report.analysis_id in report_owners
-            and report_owners[report.analysis_id] == owner
-        ]
+        owner: UUID | None) -> AgentReport | None:
+    recent = await _recent_reports_of_owner(
+        category=category, ticker=ticker, owner=owner)
     if not recent:
         return None
 
@@ -210,7 +217,7 @@ async def archive_agent_report(
     duplicate = (
         await _find_near_duplicate_of_recent_report(
             category=category, content=content, ticker=ticker, owner=owner)
-        if owner is not _UNKNOWN_OWNER else None)
+        if owner is None or isinstance(owner, UUID) else None)
 
     report_id = uuid4()
 

@@ -19,7 +19,8 @@ from ai.graph.state import (AVAILABILITY_FAILURE_KINDS, FAILURE_KIND_TEXT,
                             is_usable_evidence,
                             lacks_successful_tool_evidence)
 from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage,
-                         LLMRateLimitError, LLMRequestTimeoutError,
+                         LLMProviderTimeoutError, LLMRateLimitError,
+                         LLMRequestTimeoutError, LLMResponse,
                          LLMServerOverloadedError, LLMTier, log_unparseable,
                          parse_json_dict)
 from ai.llm.router import (LLMRouter, capacity_aware_delay,
@@ -220,7 +221,7 @@ def _earlier_other_side_text(
 
 def review_skip_reason_for(exc: LLMError) -> str:
     name = type(exc).__name__
-    if isinstance(exc, LLMRequestTimeoutError):
+    if isinstance(exc, (LLMRequestTimeoutError, LLMProviderTimeoutError)):
         return f"{name}: the LLM provider timed out"
     if isinstance(exc, LLMServerOverloadedError):
         return f"{name}: {FAILURE_KIND_TEXT['server_overload']}"
@@ -367,7 +368,8 @@ class ReflectionAgent:
             usable_agent_count=usable_count,
             agent_count=len(state.agent_outputs))
 
-    async def _review_call(self, messages: list[Any]) -> Any:
+    async def _review_call(
+            self, messages: list[LLMMessage]) -> LLMResponse:
         return await self.llm_router.complete(
             self.llm_tier, messages, retries=AGENT_LLM_CALL_RETRIES,
             response_format="json_object", max_tokens=_REVIEW_MAX_TOKENS)
@@ -401,7 +403,7 @@ class ReflectionAgent:
         try:
             try:
                 response = await self._review_call(messages)
-            except LLMRateLimitError as first_exc:
+            except (LLMRateLimitError, LLMProviderTimeoutError) as first_exc:
                 if settings.REFLECTION_REVIEW_DELAYED_RETRY_SECONDS <= 0:
                     raise
                 delay, free_model = await capacity_aware_delay(

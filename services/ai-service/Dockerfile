@@ -7,9 +7,9 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock* /app/
 
 FROM base AS development
-# --frozen only: the build fails when uv.lock is stale instead of
-# silently re-resolving dependencies.
-RUN uv sync --frozen
+# --locked: the build fails when uv.lock does not match pyproject.toml
+# instead of silently installing a stale or re-resolved set.
+RUN uv sync --locked
 COPY shared /app/shared
 COPY services/ai-service/ /app/
 ENV PATH="/opt/venv/bin:$PATH"
@@ -20,7 +20,7 @@ EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
 
 FROM base AS production
-RUN uv sync --frozen --no-dev
+RUN uv sync --locked --no-dev
 COPY shared /app/shared
 COPY services/ai-service/ /app/
 ENV PATH="/opt/venv/bin:$PATH"

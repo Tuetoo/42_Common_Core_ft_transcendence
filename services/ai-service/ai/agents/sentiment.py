@@ -3,11 +3,8 @@ from typing import Any
 import structlog
 from ai.agents.finish_checks import InternalTokenValidator
 from ai.agents.loop import (BaseAgent, ReActAgentLoop, ScratchpadEntry,
-                            is_thin_evidence, tool_reported_error)
+                            is_thin_evidence)
 from ai.graph.state import AgentOutput, AnalysisState
-from ai.llm.base import (AGENT_LLM_CALL_RETRIES, LLMError, LLMMessage, LLMTier,
-                         parse_json_dict)
-from ai.llm.router import LLMRouter
 from ai.tools.news_tool import (SearchNewsTool, live_search_yield,
                                 ran_live_search)
 from config import settings
@@ -21,8 +18,6 @@ MAX_ITERATIONS = 4
 def _news_ran_fresh_search(news_output: AgentOutput | None) -> bool | None:
     if news_output is None:
         return None
-    if news_output.status == AgentStatus.FAILED:
-        return False
     if not isinstance(news_output.raw_output, dict):
         return None
     scratchpad = news_output.raw_output.get("scratchpad")
@@ -94,44 +89,6 @@ def _extract_sentiment_label(final_answer: str) -> str | None:
     return match.group(1).lower()
 
 
-_LABEL_CLASSIFICATION_SYSTEM_PROMPT = (
-    "You are a strict text classifier, not an analyst -- do not form your "
-    "own opinion of the ticker. Given a market-sentiment write-up, "
-    "classify its OVERALL sentiment as exactly one of these six labels, "
-    f"verbatim, no other words: {', '.join(_SENTIMENT_LABELS)}.\n\n"
-    "Respond with exactly one JSON object and nothing else:\n"
-    '{"sentiment_label": "<one of the six labels above, verbatim>"}')
-
-
-def _parse_label_response(raw: str) -> str | None:
-    parsed = parse_json_dict(raw)
-    if parsed is None:
-        return None
-    label = str(parsed.get("sentiment_label", "")).strip().lower()
-    return label if label in _SENTIMENT_LABELS else None
-
-
-async def _classify_sentiment_label(
-        llm_router: LLMRouter, final_answer: str, ticker: str) -> str | None:
-    try:
-        response = await llm_router.complete(
-            LLMTier.CHEAP, [
-                LLMMessage(
-                    role="system",
-                    content=_LABEL_CLASSIFICATION_SYSTEM_PROMPT),
-                LLMMessage(
-                    role="user", content=(
-                        f"Ticker: {ticker}\n\nSentiment write-up:\n"
-                        f"{final_answer}"))
-            ], retries=AGENT_LLM_CALL_RETRIES, response_format="json_object")
-    except LLMError as exc:
-        logger.info(
-            "sentiment.label_classification_fallback_unavailable",
-            error=str(exc))
-        return None
-    return _parse_label_response(response.content)
-
-
 NO_EVIDENCE_LABEL_MESSAGE = (
     "No-evidence check: neither the News Agent's live search nor your own "
     "search returned any relevant article this run, so there is no "
@@ -140,16 +97,6 @@ NO_EVIDENCE_LABEL_MESSAGE = (
 _SENTIMENT_VALIDATION_SUFFIX = (
     "Fix only what the check above names, keep every other correct fact, "
     "then set finish_answer again.")
-
-
-def _own_searches_all_failed(scratchpad: list[ScratchpadEntry]) -> bool:
-    searches = [
-        e for e in scratchpad
-        if e.action == SearchNewsTool.name and e.is_tool_result
-    ]
-    return bool(searches) and all(
-        e.tool_error or tool_reported_error(str(e.observation or ""))
-        for e in searches)
 
 
 def _news_fallback_unverified(news_output: AgentOutput | None) -> bool:
@@ -210,12 +157,6 @@ def _build_extra_context(
 
 class SentimentAgent(BaseAgent):
 
-    def __init__(
-            self, role: AgentRole,
-            llm_router: LLMRouter | None = None) -> None:
-        super().__init__(role)
-        self.llm_router = llm_router or LLMRouter()
-
     async def run(self, state: AnalysisState) -> AgentOutput:
         feedback = state.reflection_feedback.get(self.role)
         news_yield = _news_live_yield(state.agent_outputs.get(AgentRole.NEWS))
@@ -254,25 +195,6 @@ class SentimentAgent(BaseAgent):
                 state, feedback, state.procedural_hints.get(self.role)))
         own_yield = live_search_yield(result.scratchpad)
         no_evidence = not news_yielded and not own_yield
-        sentiment_label = (
-            None if no_evidence else _extract_sentiment_label(
-                result.final_answer))
-        if (sentiment_label is None and not no_evidence
-                and _own_searches_all_failed(result.scratchpad)):
-            logger.info(
-                "sentiment.no_label_after_failed_searches",
-                ticker=state.ticker)
-        elif sentiment_label is None and not no_evidence:
-            sentiment_label = await _classify_sentiment_label(
-                self.llm_router, result.final_answer, state.ticker)
-            if sentiment_label is not None:
-                logger.info(
-                    "sentiment.label_recovered_via_classification_fallback",
-                    label=sentiment_label)
-            else:
-                logger.warning(
-                    "sentiment.label_extraction_failed_after_fallback",
-                    final_answer_excerpt=result.final_answer[:200])
         summary = result.final_answer
         if no_evidence:
             logger.warning("sentiment.no_evidence", ticker=state.ticker)
@@ -293,7 +215,6 @@ class SentimentAgent(BaseAgent):
                 is_thin_evidence(evidence_yield)
                 or (news_yielded and _news_fallback_unverified(news_output))),
             raw_output={
-                "sentiment_label": sentiment_label,
                 "no_evidence": no_evidence,
                 "evidence_yield": evidence_yield
             })

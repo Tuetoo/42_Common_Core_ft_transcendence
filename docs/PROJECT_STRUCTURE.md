@@ -354,11 +354,13 @@ process cannot import two of them.
 └── app/
     ├── layout.tsx, page.tsx, globals.css, site-footer.tsx (Privacy
     │                        Policy and Terms links), not-found.tsx,
-    │                        global-error.tsx
+    │                        global-error.tsx, form-message.tsx (the
+    │                        always-mounted message line under forms)
     ├── healthz/route.ts     GET /healthz: 200 only when the API answers
     ├── lib/                 backend.ts (API calls and backend error
     │   │                    parsing), session.ts (httpOnly cookies, the
-    │   │                    signed-in user and permissions),
+    │   │                    signed-in user and permissions, `call()`
+    │   │                    for one authenticated Server Action call),
     │   │                    session-cookies.ts (cookie names for proxy.ts),
     │   │                    ws-url.ts (WebSocket URL and close helper),
     │   │                    use-channel.ts (the shared WebSocket hook),
@@ -374,7 +376,8 @@ process cannot import two of them.
     ├── (legal)/             privacy and terms pages, readable signed in
     │                        or not; legal.ts (their last-updated date)
     └── (protected)/         pages that need a login (layout.tsx checks the
-                             session; sidebar and mobile navigation):
+                             session; sidebar and mobile navigation;
+                             loading.tsx while a page loads):
                              portfolios, backtests, watchlists, analyses,
                              analytics,
                              research (notes, collaborative editor, ask,

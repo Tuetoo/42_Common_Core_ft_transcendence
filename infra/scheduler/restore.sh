@@ -10,7 +10,7 @@
 # Usage:
 #   restore.sh [--yes] [--only postgres|qdrant|objectstore|avatars] <backup dir>
 #   restore.sh --verify [--only ...] <backup dir>
-#     <backup dir>  /backups/2026-09-29_0230 or just 2026-09-29_0230
+#     <backup dir>  /backups/2026-09-29_0050 or just 2026-09-29_0050
 #     --only X      restore (or verify) a single part (repeatable);
 #                   default: all parts present in the backup
 #     --yes         really restore (destructive: replaces current data)
@@ -58,9 +58,9 @@
 #   docker compose --env-file .env.docker stop auth-service core-service ai-service scheduler
 #   docker compose --env-file .env.docker up -d --wait objectstore
 #   docker compose --env-file .env.docker --profile tools run --rm restore \
-#       /scripts/restore.sh --yes /backups/2026-09-29_0230
+#       /scripts/restore.sh --yes /backups/2026-09-29_0050
 #   docker compose --env-file .env.docker --profile tools run --rm restore \
-#       /scripts/restore.sh --verify /backups/2026-09-29_0230
+#       /scripts/restore.sh --verify /backups/2026-09-29_0050
 #   docker compose --env-file .env.docker up -d
 
 set -eu

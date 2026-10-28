@@ -45,11 +45,11 @@ network.
   |     /status                  -> static file (status.html)   |
   |     /internal/*, /metrics                -> 404             |
   |     anything else (pages, /healthz)      -> frontend:3000   |
-  |  port 8080 (Docker network only, plain HTTP):               |
+  |  port 8080 (Docker networks only, plain HTTP):              |
   |     /api/v1/..., /health/{auth,core,ai} -> same as above    |
   |     anything else                        -> 404             |
   +-------------------------------------------------------------+
-        |   plain HTTP inside the Docker network
+        |   plain HTTP inside the Docker networks
         v
   auth-service   core-service   ai-service   grafana   frontend
   (uvicorn, port 8000, started with --proxy-headers
@@ -291,8 +291,9 @@ Every request, whatever the path, gets a 301 to the same path and query on
 - Certificate and key: `/etc/nginx/certs/server.crt`,
   `/etc/nginx/certs/server.key`.
 - `ssl_protocols TLSv1.2 TLSv1.3;`
-- `ssl_ciphers`: the Mozilla "intermediate" list for TLS 1.2 (ECDHE and DHE
-  key exchange with AES-GCM or CHACHA20-POLY1305). TLS 1.3 suites are not
+- `ssl_ciphers`: the Mozilla "intermediate" list for TLS 1.2 (ECDHE key
+  exchange with AES-GCM or CHACHA20-POLY1305; the two DHE suites in the
+  list are never negotiated, because no `ssl_dhparam` is set). TLS 1.3 suites are not
   configurable here and are all strong.
 - `ssl_prefer_server_ciphers off;` (the client may pick its preferred
   suite; every suite on the list is strong),
@@ -318,7 +319,8 @@ Every request, whatever the path, gets a 301 to the same path and query on
 
 The frontend's server side (pages, Server Actions, route handlers) calls
 `BACKEND_API_URL=http://gateway:8080/api/v1`. Only containers on the
-Docker network reach this port. Connections inside the backend may be
+Docker networks reach this port: the frontend on `edge` (which it shares
+only with the gateway) and the backend containers on `default`. Connections inside the backend may be
 unencrypted; every browser connection still uses the HTTPS server. Plain
 HTTP here means the frontend needs no certificate that names `gateway`
 (the cloud certificate names only the public domain).
@@ -435,7 +437,8 @@ Grafana and the Swagger locations are on the HTTPS server only.
 
 | Location | Notes |
 |---|---|
-| `/api/v1/analyses`, `/api/v1/market`, `/api/v1/analytics`, `/api/v1/decisions`, `/api/v1/backtests` | plain proxy |
+| `/api/v1/analyses`, `/api/v1/market`, `/api/v1/analytics`, `/api/v1/backtests` | plain proxy |
+| `/api/v1/decisions` | `proxy_read_timeout 300s;` (`POST /api/v1/decisions/{id}/review` is one synchronous LLM call; a provider timeout and its one retry can take up to 240 s with Anthropic, 120 s per attempt) |
 | `/api/v1/rag` | `proxy_buffering off; proxy_cache off; proxy_read_timeout 180s;` |
 
 `/api/v1/rag/ask/stream` is a Server-Sent Events stream. With nginx's
@@ -542,7 +545,16 @@ substitutes it with regular expressions. The CI workflow
 
 Why the CSP is only on `/status`: the API returns JSON (a CSP does nothing
 for it), and Swagger UI and Grafana ship their own inline scripts, which a
-strict CSP would break.
+strict CSP would break. The Next.js pages, the main HTML surface, also
+get no CSP: every App Router page carries inline scripts with that page's
+data, so a fixed list of hashes cannot cover them. A CSP for them would
+need a fresh nonce per request, set by the frontend itself
+(`frontend/proxy.ts`), and that is not built. This is a known gap: an
+injected script in a page would run, and the page holds the access token
+that the WebSocket components use (chapter
+[29](29-security.md) section 3.4). Grafana is served over HTTPS without
+`GF_SECURITY_COOKIE_SECURE=true`, so its session cookie has no `Secure`
+flag (the browser only reaches Grafana over HTTPS through the gateway).
 
 ### 3.7 Why `/internal/*` is not proxied
 
@@ -697,6 +709,7 @@ accepted for this deployment.
 | `worker_processes` / `worker_connections` | `auto` / `1024` | one worker per CPU; connections per worker (client and upstream sides) | `nginx.conf` (top level) |
 | `proxy_read_timeout` `/ws` | `3600s` | an idle WebSocket closes after one hour without traffic | `nginx.conf` |
 | `proxy_read_timeout` `/api/v1/rag` | `180s` | long streamed answers | `api_locations.conf` |
+| `proxy_read_timeout` `/api/v1/decisions` | `300s` | the synchronous LLM decision review (timeout plus one retry, up to 240 s) | `api_locations.conf` |
 | `proxy_read_timeout` `/` (frontend) | `180s` | the streamed document answers through the frontend route | `nginx.conf` |
 | other proxied paths | nginx default (60 s read timeout) | | |
 | `ssl_protocols` | `TLSv1.2 TLSv1.3` | | `nginx.conf` |
@@ -781,7 +794,7 @@ HSTS and friends from a whole location.
 *Alternative:* `'unsafe-inline'`, or a CSP on every path.
 *Reason:* `'unsafe-inline'` would allow any injected script. Hashes allow
 exactly the shipped script and style. Other paths are JSON or ship their
-own inline code (Swagger, Grafana). The hash-sync script and the CI check
+own inline code (Swagger, Grafana, the Next.js pages; section 3.6). The hash-sync script and the CI check
 stop the classic failure ("someone edited the page and it went blank").
 
 **Access log without query strings.**
@@ -1071,7 +1084,7 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 10. 825 days, for `DNS:localhost` and `IP:127.0.0.1`.
 11. The cloud certificate names only the public domain, so TLS to the
     name `gateway` would fail. The internal listener is on the Docker
-    network only, where unencrypted connections are allowed.
+    networks only, where unencrypted connections are allowed.
 
 </details>
 
@@ -1087,7 +1100,7 @@ make rebuild S=gateway RESTART_ONLY=1    # nginx loads the new pair
 | `infra/gateway/certs/README.md` | what belongs in the (git-ignored) certificate directory |
 | `infra/gateway/status.html` | the public status page (one inline script, one inline style) |
 | `infra/gateway/csp_hashes.py` | computes, checks and writes the CSP hashes of the status page |
-| `docker-compose.yaml` (service `gateway`, `grafana`) | image, mounts, ports, `depends_on`, Grafana sub-path settings |
+| `docker-compose.yaml` (service `gateway`, `grafana`) | image, mounts, ports, `depends_on`, networks (`edge` with the frontend, `default` with the backends), Grafana sub-path settings |
 | `docker-compose.override.yml` | development target, bind mounts and `LOG_LEVEL` for the services (the uvicorn flags are in the Dockerfile development `CMD`) |
 | `services/*/Dockerfile` | production and development `CMD` with `--proxy-headers --forwarded-allow-ips=*` |
 | `services/*/main.py` | each service's `/health` and unique `openapi_url` |

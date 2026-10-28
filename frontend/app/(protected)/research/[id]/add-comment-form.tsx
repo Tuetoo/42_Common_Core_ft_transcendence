@@ -3,6 +3,7 @@
 import { useActionState, useEffect, useRef } from "react";
 import { addComment, type AddCommentState } from "@/app/lib/actions/research";
 import { COMMENT_MAX } from "../limits";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: AddCommentState = {};
 
@@ -35,11 +36,7 @@ export function AddCommentForm({ noteId }: { noteId: string }) {
           Up to {COMMENT_MAX.toLocaleString("en-US")} characters. Sentiment is analysed after posting.
         </span>
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Posting…" : "Post comment"}
       </button>

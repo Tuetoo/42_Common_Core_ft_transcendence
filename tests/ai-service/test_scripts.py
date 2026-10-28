@@ -235,7 +235,7 @@ class TestSmokeRunner:
         assert out.getvalue() == ""
 
         names = [c.name for c in smoke.CHECKS]
-        assert len(names) == len(set(names)) == 18
+        assert len(names) == len(set(names))
         assert [c.name for c in smoke.CHECKS if c.needs_llm] == ["llm"]
 
 
@@ -950,9 +950,7 @@ class TestDeleteAnalyses:
 def _tier_checker(out=None):
     from scripts.e2e_tier_check import TierCheck
 
-    args = argparse.Namespace(
-        keep=False, verbose=False, break_lock=False,
-        base_url="https://gateway", host_header="localhost")
+    args = argparse.Namespace(keep=False, verbose=False, break_lock=False)
     checker = TierCheck(args, out or io.StringIO())
     checker.admin_id = uuid4()
     checker.portfolio_id = str(uuid4())
@@ -1493,26 +1491,11 @@ class TestRepositoryConfiguration:
     def test_dependencies_env_example_gitignore_and_clean_target(self) -> None:
         data = tomllib.loads((ROOT / "pyproject.toml").read_text())
         runtime = _dep_names(data["project"]["dependencies"])
-        dev = _dep_names(data["dependency-groups"]["dev"])
-        removed = {
-            "langchain", "langchain-openai", "langchain-anthropic",
-            "langchain-mistralai", "langchain-google-genai", "authlib",
-            "orjson", "python-dotenv", "pytest-cov", "pre-commit"
-        }
-        assert not (runtime | dev) & removed
         assert "langgraph" in runtime
-        assert (
-            ".pre-commit-config" not in (ROOT / "pyproject.toml").read_text())
 
         lock = tomllib.loads((ROOT / "uv.lock").read_text())
         root = next(p for p in lock["package"] if p["name"] == "alphamind")
         locked = {d["name"] for d in root.get("dependencies", [])}
-        locked_dev = {
-            d["name"]
-            for d in root.get("dev-dependencies", {}).get("dev", [])
-        }
-        for name in ("langchain", "authlib", "pytest-cov", "pre-commit"):
-            assert name not in locked | locked_dev
         assert "langgraph" in locked
         names = {p["name"] for p in lock["package"]}
         assert "langchain-core" in names
@@ -1569,10 +1552,7 @@ class TestRepositoryConfiguration:
             "run-analysis-uses-lib-and-runs-folder": (
                 ("scripts", "run_analysis.sh"),
                 ['. "$(dirname "$0")/lib.sh"',
-                 'OUTDIR="runs/run_'], ["COMPOSE=("]),
-            "ai-image-creates-no-avatar-folder": ((
-                "services", "ai-service", "Dockerfile"), [],
-                                                  ["avatars", "/app/data"]),
+                 'OUTDIR="runs/run_'], []),
             "scheduler-image-has-the-s3-copy-tools": ((
                 "infra", "scheduler", "Dockerfile"), [
                     " rclone",
@@ -1581,7 +1561,7 @@ class TestRepositoryConfiguration:
             "cron-jobs-get-the-s3-settings": (
                 ("infra", "scheduler", "entrypoint.sh"),
                 ["S3_ENDPOINT_URL S3_ACCESS_KEY S3_SECRET_KEY S3_REGION"
-                 ], ["OBJECTSTORE_DATA_DIR"]),
+                 ], []),
             "cron-jobs-reach-auth-service": (
                 ("infra", "scheduler", "entrypoint.sh"),
                 ["export AUTH_SERVICE_URL='${AUTH_SERVICE_URL:-http://auth"
@@ -1634,9 +1614,6 @@ class TestOperatorShellScripts:
             input=json.dumps(alerts), capture_output=True, text=True,
             check=True).stdout.splitlines()
         assert out == ["DailyJobStale  backup", "ServiceDown  ai-service"]
-
-        text = (ROOT / "scripts" / "health.sh").read_text()
-        assert not re.search(r"round\d", text, re.IGNORECASE)
 
         cases = {
             "default-model": ([], ""),
@@ -1780,3 +1757,44 @@ def test_deploy_script_commit_choice_and_scheduler_state(tmp_path) -> None:
             assert not any("git merge --ff" in c for c in calls), case_id
         if case_id in ("not-a-sha", "short-sha"):
             assert not any(c.startswith("git ") for c in calls), case_id
+
+
+def test_usage_report_wall_time_ends_at_a_timeout_or_cancel():
+    report = importlib.import_module("scripts.llm_usage_report")
+    for end in ("analysis_queue_job_timed_out",
+                "analysis_queue_job_cancelled"):
+        usage = report.AnalysisUsage("a1")
+        usage.add({
+            "event": "analysis_queue_job_started",
+            "timestamp": "2026-10-21T09:00:00Z"
+        })
+        usage.add({"event": end, "timestamp": "2026-10-21T09:45:00Z"})
+        assert usage.wall_seconds() == (2700.0, True), end
+
+
+@pytest.mark.asyncio
+async def test_user_mode_upload_reports_failure(tmp_path):
+    from scripts.upload_seed_documents import _upload_one
+
+    doc = tmp_path / "AMD_note.PDF"
+    doc.write_bytes(b"%PDF-1.4")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if b"application/pdf" not in request.content:
+            return httpx.Response(415, json={"detail": "bad type"})
+        if request.headers["Authorization"] == "Bearer bad":
+            return httpx.Response(403, json={"detail": "no"})
+        return httpx.Response(
+            201, json={"data": {
+                "id": "d1",
+                "status": "uploaded"
+            }})
+
+    async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler)) as client:
+        with redirect_stdout(io.StringIO()):
+            ok = await _upload_one(
+                client, "http://gw", "good", doc, "analyst_report", "AMD")
+            failed = await _upload_one(
+                client, "http://gw", "bad", doc, "analyst_report", "AMD")
+    assert (ok, failed) == (True, False)

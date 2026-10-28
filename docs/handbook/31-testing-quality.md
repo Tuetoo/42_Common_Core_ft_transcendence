@@ -165,16 +165,16 @@ what a service covers. Where things live:
 | Smoke and `e2e_tier_check` scripts, operator scripts | `tests/ai-service/test_scripts.py` |
 | Analysis repository, service and queue, create and read routes, backtest routes, analytics, internal routes, events, user deletion and the nightly sweep, migrations | `tests/ai-service/test_api.py` |
 
-Size (collected tests: 570 test functions in the 21 unit-test files,
+Size (collected tests: 593 test functions in the 21 unit-test files,
 plus the 4 `alembic_contract.py` checks that every suite collects; no
 test is parametrized):
 
-| Suite | Test files | Collected tests | Statement coverage |
-|---|---|---|---|
-| `tests/auth-service` | 3 | 54 | 75% |
-| `tests/core-service` | 4 | 102 | 66% |
-| `tests/ai-service` | 14 | 426 | 90% |
-| `tests/integration` | 1 | 1 | not measured |
+| Suite | Test files | Collected tests |
+|---|---|---|
+| `tests/auth-service` | 3 | 55 |
+| `tests/core-service` | 4 | 107 |
+| `tests/ai-service` | 14 | 443 |
+| `tests/integration` | 1 | 1 |
 
 The suite was reduced by removing tests that covered no code line or
 branch beyond the others and by merging the rest by topic: tests that
@@ -527,13 +527,13 @@ lint:
 
 | Workflow | Trigger | Steps |
 |---|---|---|
-| `auth-service-ci.yml` | pull request or push to `main` touching `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, the shared test helpers (`tests/alembic_contract.py`, `tests/auth_tokens.py`), `Makefile`, `pyproject.toml`, `uv.lock` or the workflow | `uv sync --frozen` (uv 0.8.17); `uv run flake8 --extend-exclude mistral_provider.py services/auth-service shared tests/auth-service`; `make mypy-shared mypy-auth`; `make test-auth` (testcontainers on the runner's Docker); `docker build ... --target production` |
-| `core-service-ci.yml` | same, for core, plus `infra/scheduler/**`, `infra/gateway/nginx.conf` and `infra/prometheus/alert_rules.yml` (read by its tests) | same with `services/core-service`, `tests/core-service`, `mypy-core`, `test-core` |
+| `auth-service-ci.yml` | pull request or push to `main` touching `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, the shared test helpers (`tests/alembic_contract.py`, `tests/auth_tokens.py`), `Makefile`, `pyproject.toml`, `uv.lock`, `.dockerignore` or the workflow | `uv sync --locked` (uv 0.8.17); `uv run flake8 --extend-exclude mistral_provider.py services/auth-service shared tests/auth-service`; `make mypy-shared mypy-auth`; `make test-auth` (testcontainers on the runner's Docker); `docker build ... --target production` |
+| `core-service-ci.yml` | same, for core, plus `infra/scheduler/**`, `infra/gateway/nginx.conf` and `infra/prometheus/alert_rules.yml` (read by its tests) and `.dockerignore` | same with `services/core-service`, `tests/core-service`, `mypy-core`, `test-core` |
 | `ai-service-ci.yml` | same, for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example`, `.gitignore`, `.dockerignore` and the auth and core Dockerfiles (read by `test_scripts.py`) | same with `services/ai-service`, `tests/ai-service`, `mypy-ai`, `test-ai` |
 | `integration-ci.yml` ("stack smoke CI"), job `config-checks` | pull request touching `infra/**`, `scripts/**`, the compose files, `.dockerignore`, `frontend/Dockerfile`, `Makefile`, `.env.example` or the workflow; push to `main` | `uv run flake8 infra`; `csp_hashes.py --check`; `docker compose config -q` of the stack and of the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` |
-| `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` and the frontend's `/healthz` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404, `/login` = 200, `/healthz` = 200; `down -v` (always, also after a failure) |
+| `integration-ci.yml`, job `stack-smoke` | push to `main` only | makes `.env.docker` from `.env.example` plus `APP_ENV=production` and random `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN`, `JWT_SECRET`, `TOTP_ENCRYPTION_KEY`; `make certs`; `docker compose --env-file .env.docker -f docker-compose.yaml up -d --build` (the explicit `-f` skips `docker-compose.override.yml`, so CI builds and runs the `production` image stages: non-root user, no bind mounts, no `LOG_LEVEL=DEBUG`); waits up to 5 minutes for `/health/{auth,core,ai}` and the frontend's `/healthz` (on timeout it prints `ps` and the last 100 log lines and fails); checks `http://.../status` = 301, `https://.../status` = 200, `/internal/x` = 404, `/metrics` = 404, `/login` = 200, `/healthz` = 200; `down -v` (always, also after a failure) |
 | `frontend-ci.yml` ("frontend CI") | pull request touching `frontend/**` or the workflow; push to `main` touching the same | in `frontend/`, Node 24: `npm ci`; `npm run lint` (ESLint); `npx next typegen && npx tsc --noEmit`; `npm run build` |
-| `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand; it then waits for every other workflow run of the same commit and deploys only if all succeeded or were skipped (the per-service checks run only for the services the commit touches; chapter [32](32-ci-cd.md) section 3.4) | SSH to the cloud host with a key that may only run `scripts/deploy.sh`, sending the checked commit sha (fast-forward to that commit, `docker compose up -d --build --wait`; the scheduler keeps its state: a stopped scheduler stays stopped); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
+| `deploy.yml` | "stack smoke CI" succeeded for a push to `main` (`workflow_run`), or started by hand; it then waits for every other workflow run of the same commit and the newest push run on `main` of every other workflow, and deploys only if all succeeded or were skipped (the per-service checks run only for the services the commit touches; chapter [32](32-ci-cd.md) section 3.4) | SSH to the cloud host with a key that may only run `scripts/deploy.sh`, sending the checked commit sha (fast-forward to that commit, `docker compose up -d --build --wait`; the scheduler keeps its state: a stopped scheduler stays stopped); see [../DEPLOYMENT.md](../DEPLOYMENT.md) |
 
 The stack smoke job does not run `tests/integration` (no seeded corpus or
 embedding key in CI) despite the file name.

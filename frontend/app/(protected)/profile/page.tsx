@@ -1,27 +1,9 @@
 import { LocalTime } from "@/app/(protected)/local-time";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, requireOk } from "@/app/lib/backend";
+import { getMe } from "@/app/lib/session";
 import { Avatar } from "../avatar";
 import { AvatarForm } from "./avatar-form";
 import { EditProfileForm } from "./edit-profile-form";
 import { TwoFactorSection } from "./two-factor-section";
-
-type Me = {
-  email: string;
-  username: string;
-  system_role: string;
-  permissions: string[];
-  is_verified: boolean;
-  created_at: string;
-  profile: {
-    first_name: string | null;
-    last_name: string | null;
-    bio: string | null;
-    avatar_url: string | null;
-    timezone: string | null;
-    country: string | null;
-  } | null;
-};
 
 // What each system role means for this user, in plain words.
 const ROLE_SUMMARY: Record<string, string> = {
@@ -32,13 +14,8 @@ const ROLE_SUMMARY: Record<string, string> = {
 };
 
 export default async function ProfilePage() {
-  const accessToken = await getAccessToken();
-
-  const res = await backendFetch("/auth/me", accessToken!, { cache: "no-store" });
-
-  requireOk(res, "Failed to load profile");
-
-  const { data: me }: { data: Me } = await res.json();
+  // The layout already loaded the user; getMe() is cached per request.
+  const { me } = await getMe();
 
   return (
     <div className="page">

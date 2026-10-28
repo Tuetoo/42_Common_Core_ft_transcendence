@@ -329,6 +329,7 @@ core-service use them. The values in `.env.example` match the defaults.
 | `RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL` | `3` per 3600 s | Limit on resend requests. | same |
 | `RATE_LIMIT_REGISTER_PER_IP` | `10` per 3600 s | Limit on registrations. | same |
 | `RATE_LIMIT_INVITATIONS_PER_ORG` | `20` per 3600 s | Limit on invitations per organization. | same |
+| `RATE_LIMIT_INVITATIONS_PER_USER` | `20` per 3600 s | Limit on invitations per sender, across all their organizations. | same |
 | MailHog image / ports | `mailhog/mailhog:v1.0.1`, `127.0.0.1:8025:8025` | Web UI and API on the loopback interface only. The SMTP port 1025 is not published to the host. | `docker-compose.yaml` |
 | Alert email settings | see 3.7 | Alertmanager's own SMTP and recipient. | `infra/alertmanager/alertmanager.yml` |
 

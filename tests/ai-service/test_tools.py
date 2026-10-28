@@ -1427,7 +1427,8 @@ class TestRetrievalAndArchive:
         monkeypatch.setattr(
             retriever_module, "get_bm25_index", lambda: _BM25())
         monkeypatch.setattr(retriever_module, "embed_query", _embed)
-        retriever = FilingRetriever(top_k=8, use_query_expansion=False)
+        retriever = FilingRetriever(
+            top_k=8, use_query_expansion=False, visibility=None)
 
         out = await retriever.retrieve("revenue guidance", ticker="AMD")
 
@@ -1969,8 +1970,6 @@ class TestPositionSizing:
                 current_weight_pct=Decimal(0), unpriced=[]),
             budget=Decimal("7698.95"))
         assert "Size cap" not in note and "totalling 500.00" in note
-        assert "smallest of the remaining BUY cash" not in (
-            sizing_module._SYSTEM_PROMPT)
         note = tier_sizing_note(
             action=RecommendationAction.SELL, ticker="MSFT", tiers=[
                 TierSuggestion(

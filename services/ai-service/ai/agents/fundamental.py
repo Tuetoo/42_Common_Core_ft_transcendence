@@ -223,10 +223,7 @@ def _reported_metrics_disagree_with_fundamentals(
         final_answer: str, reported_metrics: dict[str, Any] | None,
         scratchpad: list[ScratchpadEntry]) -> str | None:
     del final_answer
-    fresh: dict[str, float] | None = None
-    for entry in scratchpad:
-        if _is_good_fundamentals_entry(entry):
-            fresh = _parse_fresh_fundamentals(entry.observation or "")
+    fresh = _latest_get_fundamentals_metrics(scratchpad)
     if not fresh:
         return None
     if not reported_metrics:

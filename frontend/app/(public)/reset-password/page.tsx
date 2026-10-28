@@ -1,12 +1,13 @@
 import Link from "next/link";
 import { ResetPasswordForm } from "../link-forms";
+import { firstParam, type SearchParam } from "@/app/lib/format";
 
 export default async function ResetPasswordPage({
   searchParams,
 }: {
-  searchParams: Promise<{ token?: string }>;
+  searchParams: Promise<{ token?: SearchParam }>;
 }) {
-  const { token } = await searchParams;
+  const token = firstParam((await searchParams).token);
 
   return (
     <div className="flex flex-col gap-6">

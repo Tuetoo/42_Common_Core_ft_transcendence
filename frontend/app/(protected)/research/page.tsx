@@ -2,11 +2,11 @@ import { LocalTime } from "@/app/(protected)/local-time";
 import Link from "next/link";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
-import { Pager, firstParam, pageParam } from "../pager";
+import { Pager, pageParam } from "../pager";
 import { CreateNoteForm } from "./create-note-form";
 import { SentimentPill } from "./sentiment-pill";
 import { loadOrganizations } from "./organizations";
-import { UUID_RE } from "@/app/lib/format";
+import { UUID_RE, firstParam } from "@/app/lib/format";
 import { SEARCH_TEXT_MAX, TAG_MAX_CHARS } from "./limits";
 import type { Note, Paginated } from "./types";
 

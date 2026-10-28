@@ -216,13 +216,12 @@ async def _login(
 
 async def _upload_one(
         client: httpx.AsyncClient, base_url: str, token: str, path: Path,
-        category: str, ticker: str | None) -> None:
-    media_type = "application/pdf" if path.suffix == ".pdf" else "text/plain"
+        category: str, ticker: str | None) -> bool:
     with open(path, "rb") as f:
         resp = await client.post(
             f"{base_url}/api/v1/research/documents",
             headers={"Authorization": f"Bearer {token}"},
-            files={"file": (path.name, f, media_type)}, data={
+            files={"file": (path.name, f, _media_type(path))}, data={
                 "category": category,
                 **({
                     "ticker": ticker
@@ -230,9 +229,10 @@ async def _upload_one(
             })
     if resp.status_code >= 400:
         print(f"FAILED {path.name}: {resp.status_code} {resp.text[:300]}")
-        return
+        return False
     doc = resp.json()["data"]
     print(f"OK {path.name} -> id={doc['id']} status={doc['status']}")
+    return True
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -297,7 +297,7 @@ async def main(argv: list[str] | None = None) -> int:
         token = await _login(client, args.base_url, args.email, args.password)
         print("Logged in.")
 
-        uploaded, skipped = 0, 0
+        uploaded, failed, skipped = 0, 0, 0
         seed_root = Path(args.seed_root) if args.seed_root else None
         for directory, category, ticker_from_filename in _seed_sources(
                 seed_root):
@@ -313,14 +313,16 @@ async def main(argv: list[str] | None = None) -> int:
                     continue
                 ticker = (
                     path.name.split("_")[0] if ticker_from_filename else None)
-                await _upload_one(
-                    client, args.base_url, token, path, category, ticker)
-                uploaded += 1
+                if await _upload_one(
+                        client, args.base_url, token, path, category, ticker):
+                    uploaded += 1
+                else:
+                    failed += 1
 
         print(
-            f"\nDone: {uploaded} files uploaded, {skipped} category "
-            "directories skipped (not found).")
-    return 0
+            f"\nDone: {uploaded} files uploaded, {failed} failed, {skipped} "
+            "category directories skipped (not found).")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

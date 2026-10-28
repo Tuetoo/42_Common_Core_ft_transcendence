@@ -2,9 +2,10 @@
 
 import { useActionState, useState } from "react";
 import { setUserActiveById, type AccountByIdState } from "@/app/lib/actions/admin";
+import { FormMessage } from "@/app/form-message";
+import { UUID_PATTERN } from "@/app/lib/format";
 
 const initialState: AccountByIdState = {};
-const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 
 // For moderators, who cannot list users: the button pressed sends
 // intent=deactivate or intent=reactivate together with the id.
@@ -30,16 +31,8 @@ export function AccountByIdForm() {
           className="mono"
         />
       </div>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.message && (
-        <p aria-live="polite" className="form-message success">
-          {state.message}
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.message} />
       <div className="flex flex-wrap gap-2">
         <button type="submit" name="intent" value="deactivate" disabled={pending} className="btn btn-primary">
           Deactivate

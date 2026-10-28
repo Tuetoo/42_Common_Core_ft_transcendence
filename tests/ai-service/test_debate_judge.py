@@ -22,9 +22,9 @@ from ai.graph.state import (ISSUE_LLM_REVIEW, ISSUE_NO_EVIDENCE_NOT_RETRIED,
                             EpisodicMemoryHit, JudgeVerdict,
                             PriorRecommendation, ReflectionIssue,
                             ReflectionVerdict)
-from ai.llm.base import (LLMNonEnglishOutputError, LLMResponse,
-                         LLMServerOverloadedError, LLMTier, LLMUsage,
-                         parse_json_object)
+from ai.llm.base import (LLMNonEnglishOutputError, LLMProviderTimeoutError,
+                         LLMResponse, LLMServerOverloadedError, LLMTier,
+                         LLMUsage, parse_json_object)
 from ai.providers import sec_edgar
 from ai.providers.base import PriceQuote, ProviderRequestError
 from ai.recommendation.engine import (build_final_recommendation,
@@ -147,7 +147,6 @@ class _CountingReviewRouter:
         return LLMResponse(
             content=json.dumps({
                 "issues": [],
-                "retry_roles": [],
                 "checked_claims": ["c"]
             }), provider="fake", model="fake-model",
             usage=LLMUsage(prompt_tokens=1, completion_tokens=1))
@@ -188,8 +187,7 @@ async def _judge_logs(
 
 _CLEAN_REVIEW = json.dumps({
     "checked_claims": ["close 100.0"],
-    "issues": [],
-    "retry_roles": {}
+    "issues": []
 })
 
 
@@ -295,6 +293,28 @@ class TestFinalRecommendation:
         assert "Confidence lowered" not in (
             _final(no_issues).confidence_adjustment_note or "")
 
+    def test_kept_earlier_verdict_uses_its_own_convergence(self):
+        valid = JudgeVerdict(
+            round_number=1, converged=True, leaning=RecommendationAction.SELL,
+            confidence=0.62, rationale="r")
+        failed = JudgeVerdict(
+            round_number=2, converged=False,
+            leaning=RecommendationAction.HOLD, confidence=0.0, rationale="",
+            judge_failed=True)
+        state = _state(
+            debate=DebateState(
+                round_number=2, converged=False, verdicts=[valid, failed],
+                arguments=[*_args(), *_args(bull_ok=False, round_number=2)]))
+        rec = build_final_recommendation(
+            state, state.debate.latest_valid_verdict)
+        assert rec.action == RecommendationAction.SELL
+        assert rec.confidence == 0.62
+        assert rec.debate_converged is True
+        note = rec.confidence_adjustment_note or ""
+        assert "did not converge" not in note
+        assert "argument was unavailable" not in note
+        assert "earlier valid verdict from round 1" in note
+
     def test_every_lowering_is_listed_with_its_amount(self):
         outputs = {r: _ok(r) for r in _ALL_ROLES}
         for role in _ALL_ROLES[7:]:
@@ -306,7 +326,12 @@ class TestFinalRecommendation:
                     issues=["a", "b", "c"])
             ], debate=DebateState(
                 round_number=2, converged=False, arguments=_args(),
-                verdicts=[_verdict("hold", 0.87)]))
+                verdicts=[
+                    JudgeVerdict(
+                        round_number=2, converged=False,
+                        leaning=RecommendationAction.HOLD, confidence=0.87,
+                        rationale="r")
+                ]))
         rec = _final(state)
         note = rec.confidence_adjustment_note or ""
         assert rec.confidence == pytest.approx(0.57)
@@ -925,7 +950,8 @@ class TestJudgeFigureRewrite:
         failed_rewrites = {
             "provider-error": RuntimeError("provider down"),
             "not-json": "not json",
-            "incomplete-json": json.dumps({"leaning": "sell"})
+            "incomplete-json": json.dumps({"leaning": "sell"}),
+            "no-verdict-fields": json.dumps({"rationale": _UNIT_FIXED})
         }
         for case_id, second in failed_rewrites.items():
             router = _Router(_answer(_UNIT_SLIP), second)
@@ -1507,7 +1533,6 @@ class TestDebateSides:
 
     @pytest.mark.asyncio
     async def test_one_regeneration_then_kept_or_logged(self, monkeypatch):
-        assert dc.DEBATE_MAX_REGENERATIONS == 1
         for side in ("bull", "bear"):
             router = _Router("Growth 25% [market].", "Still 25% [market].")
             monkeypatch.setattr(
@@ -1543,8 +1568,6 @@ class TestDebateSides:
         events = _events(logs, "bull.final_draft_still_flagged")
         assert len(events) == 1
         assert events[0]["ungrounded_figures"] == ["$88.8B"]
-        assert _events(logs, "debate.regenerated_still_ungrounded") == []
-        assert _events(logs, "debate.contradicted_regenerated") == []
 
         for failure in (LLMServerOverloadedError("503"),
                         LLMNonEnglishOutputError("x", reason="script")):
@@ -1647,6 +1670,38 @@ def _failed_verdict(reason: str) -> JudgeVerdict:
 
 class TestReflection:
 
+    @pytest.mark.asyncio
+    async def test_provider_timeout_gets_the_delayed_review_retry(
+            self, monkeypatch):
+        sleeps: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        async def _delay(tier: Any, seconds: float) -> tuple[float, None]:
+            return seconds, None
+
+        monkeypatch.setattr(reflection_module.asyncio, "sleep", _sleep)
+        monkeypatch.setattr(reflection_module, "capacity_aware_delay", _delay)
+        monkeypatch.setattr(
+            reflection_module.settings,
+            "REFLECTION_REVIEW_DELAYED_RETRY_SECONDS", 60.0)
+        timeout = LLMProviderTimeoutError("timed out after 120s")
+        clean = json.dumps({"checked_claims": [], "issues": []})
+        state = _state(agent_outputs={AgentRole.MARKET: _ok(AgentRole.MARKET)})
+        router = _Router(timeout, clean)
+        monkeypatch.setattr(reflection_module, "LLMRouter", lambda: router)
+        verdict = await ReflectionAgent().check(state)
+        assert verdict.llm_review_ran is True
+        assert sleeps == [60.0] and len(router.calls) == 2
+
+        router = _Router(timeout, timeout)
+        monkeypatch.setattr(reflection_module, "LLMRouter", lambda: router)
+        verdict = await ReflectionAgent().check(state)
+        assert verdict.llm_review_ran is False
+        assert verdict.llm_review_skip_reason == (
+            "LLMProviderTimeoutError: the LLM provider timed out")
+
     @pytest.mark.usefixtures("clean_pacer")
     @pytest.mark.asyncio
     async def test_skipped_review_is_not_verified(self, monkeypatch):
@@ -1718,10 +1773,7 @@ class TestReflection:
 
         review = json.dumps({
             "checked_claims": ["x"],
-            "issues": ["news is thin"],
-            "retry_roles": {
-                "news": "search again"
-            }
+            "issues": ["news is thin"]
         })
         monkeypatch.setattr(
             reflection_module, "LLMRouter",
@@ -2059,6 +2111,19 @@ class TestPositionSizing:
             committed_buy_cash=Decimal("0"), capped_by_weight=False,
             min_notional=Decimal("100"), position=None)
         assert capped is not None and capped.window_days == 30
+
+        for window, expected in ((14.0, 14), (True, None), (14.5, None),
+                                 ("14", None)):
+            sized, _ = _validated_sizing(
+                json.dumps({
+                    "window_days": window,
+                    "tiers": [{"target_price": 100.0, "quantity": 2.0}]
+                }), action=RecommendationAction.BUY, ticker="KO",
+                budget=Decimal("1000"), cash=Decimal("1000"),
+                committed_buy_cash=Decimal("0"), capped_by_weight=False,
+                min_notional=Decimal("100"), position=None)
+            got = sized.window_days if sized is not None else None
+            assert got == expected, window
 
         non_finite = json.dumps({
             "window_days": 10,

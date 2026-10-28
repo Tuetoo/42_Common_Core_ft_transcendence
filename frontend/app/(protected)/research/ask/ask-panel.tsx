@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { TICKER_PATTERN, TICKER_TITLE } from "@/app/lib/format";
 import { DOCUMENT_CATEGORIES, QUESTION_MAX, tickerError } from "../limits";
+import { FormMessage } from "@/app/form-message";
 
 type Citation = {
   index: number;
@@ -217,11 +218,7 @@ export function AskPanel() {
         </div>
       </form>
 
-      {error && (
-        <p aria-live="polite" className="form-message error">
-          {error}
-        </p>
-      )}
+      <FormMessage text={error} />
 
       {(answer || streaming) && (
         <div className="section">

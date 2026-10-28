@@ -503,10 +503,14 @@ relay = YjsRelay()
 
 
 async def _publish_cross_replica(note_id: str, update: bytes) -> None:
-    client = get_events_client(settings)
     encoded = base64.b64encode(update).decode("ascii")
-    await client.publish(
-        f"{_REDIS_CHANNEL_PREFIX}{note_id}", f"{_REPLICA_ID}:{encoded}")
+    try:
+        await get_events_client(settings).publish(
+            f"{_REDIS_CHANNEL_PREFIX}{note_id}", f"{_REPLICA_ID}:{encoded}")
+    except Exception:
+        logger.warning(
+            "yjs_cross_replica_publish_failed", note_id=note_id,
+            exc_info=True)
 
 
 async def _subscribe_note_channels(pubsub: Any) -> None:

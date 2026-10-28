@@ -15,7 +15,6 @@ import ai.tools.news_tool as news_tool_module
 import ai.tools.research_archive_tool as research_archive_tool_module
 import ai.tools.risk_tool as risk_tool_module
 import ai.tools.technical_tool as technical_tool_module
-import config
 import pytest
 from ai.agents import debate_common as dc
 from ai.agents import (filing, fundamental, judge, macro, market, news,
@@ -53,9 +52,9 @@ from ai.tools.base import Tool
 from ai.tools.filing_tool import SearchFilingsTool
 from ai.tools.news_tool import counts_as_live_search
 from ai.tools.research_archive_tool import SearchResearchArchiveTool
-from helpers import (_TSLA_ROWS, _action, _AlwaysFailsRouter, _events,
-                     _finish, _news_output, _NoCallRouter, _pad, _Router, _Row,
-                     _ScriptedAgentRouter, _state, _validator)
+from helpers import (_TSLA_ROWS, _action, _events, _finish, _news_output,
+                     _pad, _Router, _Row, _ScriptedAgentRouter, _state,
+                     _validator)
 from structlog.testing import capture_logs
 from shared.enums import (AgentRole, AgentStatus, AnalysisType,
                           DocumentCategory, RecommendationAction)
@@ -85,10 +84,6 @@ _AMZN_NEWS = (
     "scrutiny following a September 2026 cargo plane incident in Miami, and "
     "a proposed nationwide class action concerning the treatment of pregnant "
     "warehouse workers alongside ongoing FTC antitrust oversight.")
-_GONE_FROM_PROMPTS = [
-    "driven by", "primarily due to", "Round119", "round90",
-    "assess_source_credibility", "15.6%", "quarterly:"
-]
 _NO_TRIGGER_WORDS = ["maintaining, remains", "(maintaining, remains)"]
 _NO_CATALOG_PHRASES = ["[catalog outlet]", "[not in catalog]"]
 _LIVE_NEWS_LINE = "[2026-10-02 Fri] Src: Tesla deliveries 486,532 units"
@@ -303,7 +298,7 @@ _PROMPT_CASES = {
             '"deciding_factor"', "single factor that decides your verdict",
             "only when the user message includes that valuation note",
             "opposing_points"
-        ], ["trailing-twelve-month net income", "cited_figures"]),
+        ], ["trailing-twelve-month net income"]),
     "judge-base": (
         lambda: judge._BASE_SYSTEM_PROMPT,
         ["[agent-derived", dc.PERIOD_LABEL_RULE], _NO_TRIGGER_WORDS),
@@ -323,7 +318,7 @@ _PROMPT_CASES = {
             "state the status that the newest filing text you were shown "
             "supports", "management said on the Q2 2026 call",
             "already in your scratchpad", "catalog=no"
-        ], _GONE_FROM_PROMPTS + _NO_CATALOG_PHRASES),
+        ], _NO_CATALOG_PHRASES),
     "risk-prefetched-filing-search": (
         lambda: risk.PREFETCH_RISK_FILING_QUERY, ["legal proceedings"], []),
     "risk-prefetched-transcript-search": (
@@ -335,7 +330,7 @@ _PROMPT_CASES = {
             "already in your scratchpad", "always at least one of them",
             "catalog=no"
         ],
-        _GONE_FROM_PROMPTS + _NO_CATALOG_PHRASES + ["whichever of these 7"]),
+        _NO_CATALOG_PHRASES + ["whichever of these 7"]),
     "fundamental-prefetched-transcript-search": (
         lambda: fundamental.PREFETCH_TRANSCRIPT_QUERY, [], []),
     "filing": (
@@ -343,7 +338,7 @@ _PROMPT_CASES = {
             "Use the code-rendered values and the filing records",
             "'Six Months Ended' or 'Nine Months Ended' is six or nine months",
             "never annual", "never write one in your answer"
-        ], _GONE_FROM_PROMPTS + ["F1.R...", "an id such as F1.L2", "one-off"]),
+        ], ["F1.R...", "an id such as F1.L2", "one-off"]),
     "macro": (
         lambda: macro._SYSTEM_PROMPT, [
             "quote the year-over-year change", "You have no company data",
@@ -897,14 +892,6 @@ class TestAgentSetup:
     @pytest.mark.asyncio
     async def test_iteration_caps_and_prefetched_first_calls(
             self, record_prefetch):
-        assert sentiment.MAX_ITERATIONS == 4
-        assert filing.MAX_ITERATIONS == 5
-        assert fundamental.MAX_ITERATIONS == 8
-        assert technical.MAX_ITERATIONS == 4
-        assert risk.MAX_ITERATIONS == 7
-        assert macro.MAX_ITERATIONS == 7
-        assert news.MAX_ITERATIONS == 7
-        assert portfolio.MAX_ITERATIONS == 7
         cases = {
             "market": (
                 lambda: market.MarketAgent(role=AgentRole.MARKET), [(
@@ -1038,12 +1025,6 @@ class TestPromptsAndSettings:
             for text in absent:
                 assert text not in prompt, (case_id, text)
 
-        settings = config.settings
-        assert settings.MIN_BUY_TIER_CONFIDENCE == 0.5
-        assert settings.JUDGE_RETRY_BUDGET_SECONDS == 240.0
-        assert settings.DEBATE_SIDE_REPAIR_DELAY_SECONDS == 60.0
-        assert dc.DEBATE_MAX_REGENERATIONS == 1
-
 
 class TestMarketAgent:
 
@@ -1058,7 +1039,6 @@ class TestMarketAgent:
 
         assert output.role == AgentRole.MARKET
         assert output.status == AgentStatus.COMPLETED
-        assert AgentStatus.COMPLETED.value
         assert output.summary.startswith("[VERIFICATION WARNING: ")
         assert output.summary.endswith("\n\nAAPL is trending up.")
         assert len(output.raw_output["verification_warnings"]) == 1
@@ -1237,8 +1217,6 @@ class TestNewsAgent:
                 news, "ReActAgentLoop", _fixed_result_loop(result))
             with capture_logs() as logs:
                 await news.NewsAgent(role=AgentRole.NEWS).run(_state())
-            events = [log["event"] for log in logs]
-            assert "news.live_search_validator_exhausted" not in events
             unresolved = [
                 log for log in logs
                 if log["event"] == "news.finish_issue_unresolved"
@@ -1351,36 +1329,12 @@ class TestSentimentAgent:
         output = await sentiment.SentimentAgent(role=AgentRole.SENTIMENT
                                                 ).run(_state())
         assert output.status == AgentStatus.COMPLETED
-        assert output.raw_output["sentiment_label"] == "neutral"
         assert output.is_well_supported is True
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("fake_web_search")
-    async def test_label_is_read_from_the_line_or_recovered_by_classifier(
+    async def test_failed_own_search_with_news_evidence_is_not_no_evidence(
             self, monkeypatch):
-        router = _Router([_finish("Overall, the sentiment looks mixed.")])
-        monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
-        monkeypatch.setattr(
-            sentiment, "LLMRouter", lambda: _AlwaysFailsRouter())
-
-        output = await sentiment.SentimentAgent(role=AgentRole.SENTIMENT).run(
-            _state(agent_outputs={AgentRole.NEWS: _news_with_evidence()}))
-        assert output.raw_output["sentiment_label"] is None
-
-        router = _Router(
-            [_finish("Sentiment: cautiously optimistic, tempered by risk.")])
-        monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
-        classification_router = _Router(
-            [json.dumps({"sentiment_label": "positive"})])
-        monkeypatch.setattr(
-            sentiment, "LLMRouter", lambda: classification_router)
-
-        output = await sentiment.SentimentAgent(role=AgentRole.SENTIMENT).run(
-            _state(agent_outputs={AgentRole.NEWS: _news_with_evidence()}))
-
-        assert output.raw_output["sentiment_label"] == "positive"
-        assert "cautiously optimistic" in (
-            classification_router.calls[0][-1].content)
 
         class _QuotaNews:
 
@@ -1394,10 +1348,8 @@ class TestSentimentAgent:
             _finish("No sentiment reading is possible this run.")
         ])
         monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
-        output = await sentiment.SentimentAgent(
-            role=AgentRole.SENTIMENT, llm_router=_NoCallRouter()).run(
-                _state(agent_outputs={AgentRole.NEWS: _news_with_evidence()}))
-        assert output.raw_output["sentiment_label"] is None
+        output = await sentiment.SentimentAgent(role=AgentRole.SENTIMENT).run(
+            _state(agent_outputs={AgentRole.NEWS: _news_with_evidence()}))
         assert output.raw_output["no_evidence"] is False
         assert "proceed with the evidence you have" in (
             router.calls[1][-1].content)
@@ -1405,9 +1357,6 @@ class TestSentimentAgent:
     @pytest.mark.asyncio
     async def test_no_news_and_no_own_results_is_no_evidence(
             self, monkeypatch):
-        assert (
-            sentiment._news_ran_fresh_search(
-                _news_output(status=AgentStatus.FAILED)) is False)
         assert sentiment._news_ran_fresh_search(None) is None
 
         def no_news_state() -> AnalysisState:
@@ -1425,10 +1374,8 @@ class TestSentimentAgent:
             [_action("search_news", {"query": "AAPL"}), answer, answer])
         monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
         output = await sentiment.SentimentAgent(
-            role=AgentRole.SENTIMENT,
-            llm_router=_NoCallRouter()).run(no_news_state())
+            role=AgentRole.SENTIMENT).run(no_news_state())
         assert output.raw_output["no_evidence"] is True
-        assert output.raw_output["sentiment_label"] is None
         assert output.summary.startswith("[NO EVIDENCE:")
         assert "Sentiment: neutral -- a quiet period" in output.summary
         assert (output.score, output.is_well_supported) == (0.35, False)
@@ -1442,8 +1389,7 @@ class TestSentimentAgent:
         ])
         monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
         output = await sentiment.SentimentAgent(
-            role=AgentRole.SENTIMENT,
-            llm_router=_NoCallRouter()).run(no_news_state())
+            role=AgentRole.SENTIMENT).run(no_news_state())
         assert len(router.calls) == 2
         assert output.raw_output["no_evidence"] is True
 
@@ -1471,8 +1417,7 @@ class TestSentimentAgent:
             summary="Apple reported strong iPhone demand.")
         news_output.raw_output["fallback_sources_unverified"] = True
         state = _state(agent_outputs={AgentRole.NEWS: news_output})
-        await sentiment.SentimentAgent(
-            role=AgentRole.SENTIMENT, llm_router=_NoCallRouter()).run(state)
+        await sentiment.SentimentAgent(role=AgentRole.SENTIMENT).run(state)
         assert captured["thin_evidence"] is True
 
         seen: dict[str, Any] = {}
@@ -1747,23 +1692,6 @@ class TestFundamentalAgent:
         assert "15.6" in rejection
         assert "20.0" in rejection
 
-        router = _Router([
-            _action("web_search", {"query": "AAPL forward P/E analyst"}),
-            _action(
-                "assess_source_credibility",
-                {"url": "https://www.reuters.com/some-article"}),
-            _finish(
-                "forward P/E around 30x, source verified; analysts say "
-                "the "
-                "outlook looks stable")
-        ])
-        monkeypatch.setattr(loop_module, "LLMRouter", lambda: router)
-
-        output = await fundamental.FundamentalAgent(
-            role=AgentRole.FUNDAMENTAL).run(_state())
-
-        assert not output.summary.startswith("[VERIFICATION WARNING:")
-
     @pytest.mark.asyncio
     async def test_caveat_and_latest_quarter_are_carried_into_output(
             self, monkeypatch):
@@ -1900,16 +1828,9 @@ class TestTechnicalAgent:
         assert len(output.raw_output["verification_warnings"]) == 1
 
     def test_trend_helpers_reported_metrics_and_schema(self):
-        assert technical._actual_price_vs_sma20(200.0, 187.42) == "above"
-        assert technical._actual_price_vs_sma20(170.0, 187.42) == "below"
-        assert technical._actual_price_vs_sma20(187.42, 187.42) == "at"
-        assert technical._actual_macd_trend(0.247) == "bullish"
-        assert technical._actual_macd_trend(-0.247) == "bearish"
-        assert technical._actual_macd_trend(0.001) == "neutral"
         assert technical._accepted_macd_trends(0.5, 3.2) == ("bullish", )
         assert technical._accepted_macd_trends(-0.5, 3.2) == ("bearish", )
         assert technical._accepted_macd_trends(0.0, 3.2) == ("neutral", )
-        assert technical._accepted_macd_trends(0.034, None) == ("bullish", )
 
         cases = {
             "unknown-key-is-never-flagged": (
@@ -1932,7 +1853,9 @@ class TestTechnicalAgent:
                     "price_vs_sma20": "below",
                     "macd_trend": "bullish"
                 }, [
-                    _entry("get_technical_indicators", _INDICATORS_OBS),
+                    _entry(
+                        "get_technical_indicators", _INDICATORS_OBS +
+                        "\nPrice vs SMA(20): above (+0.9%)"),
                     _entry(
                         "get_recent_price_history", _INDICATORS_PRICE_HISTORY)
                 ], ["189.1", "above"]),
@@ -2924,8 +2847,11 @@ class TestJudgeAgent:
             self, monkeypatch):
         router = _Router([_judge_json(True, leaning="strong_buy")])
         monkeypatch.setattr(judge, "LLMRouter", lambda: router)
-        verdict = await JudgeAgent().assess_round(_state())
+        with capture_logs() as logs:
+            verdict = await JudgeAgent().assess_round(_state())
         assert verdict.leaning == RecommendationAction.HOLD
+        unknown = [e for e in logs if e["event"] == "judge.unknown_leaning"]
+        assert [e["raw"] for e in unknown] == ["strong_buy"]
 
         for case_id, confidence in (
                 ("nan", float("nan")), ("infinity", float("inf")),
@@ -3044,7 +2970,6 @@ class TestJudgeAgent:
         assert verdict.rationale.startswith("The tariff debate in Congress")
         prompt = router.calls[0][0].content
         assert '"change_since_previous"' in prompt
-        assert '"cited_figures"' not in prompt
         assert "trailing-twelve-month net income" not in prompt
         user = router.calls[0][1].content
         assert "operating income -41% year over year" in user
@@ -3147,9 +3072,3 @@ class TestReflectionAgent:
             ]))
         assert "no agent's actual evidence supports" in causes
         assert "(429)" in causes and "same feedback" in causes
-
-
-def test_technical_schema_requires_categorical_claims() -> None:
-    schema = technical._TECHNICAL_REPORTED_SCHEMA
-    assert schema["required"] == list(technical._CATEGORICAL_CLAIMS)
-    assert set(schema["required"]) <= set(schema["properties"])

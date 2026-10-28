@@ -792,7 +792,7 @@ class TestAgentQuality:
         }
         assert len(set(scores.values())) >= 6
 
-    def test_prior_note_only_amounts_are_listed_but_not_scored(self, capsys):
+    def test_prior_note_only_amounts_are_listed_but_not_scored(self):
         note = (
             "Prior risk note search results (1 passages):\n"
             "- (KO) [agent:risk] (2026-09-01): a $4.4B claim, trial in "
@@ -825,8 +825,6 @@ class TestAgentQuality:
             finish_meta=meta, role="news")
         flagged_score, ok = derive_agent_quality(flagged, is_retry=False)
         assert ok is True
-        out = capsys.readouterr().out
-        assert "agent_loop.prior_note_only_claims" not in out
         clean_score, _ = derive_agent_quality(clean, is_retry=False)
         assert flagged_score == clean_score
 

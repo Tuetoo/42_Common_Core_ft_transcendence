@@ -26,11 +26,6 @@
 }
 
 @theme inline {
-  --color-bg: var(--bg);
-  --color-bg-raised: var(--bg-raised);
-  --color-text: var(--text);
-  --color-text-secondary: var(--text-secondary);
-  --color-accent: var(--accent);
   --font-sans: var(--font-plex-sans);
   --font-mono: var(--font-plex-mono);
 }

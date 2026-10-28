@@ -16,7 +16,7 @@
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
-          "expr": "sum by (service) (rate(http_requests_total[5m]))",
+          "expr": "sum by (service) (rate(http_requests_total{handler!~\"/metrics|/health\"}[5m]))",
           "legendFormat": "{{service}}",
           "refId": "A"
         }
@@ -30,7 +30,7 @@
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket{handler!~\"/internal/.*|/metrics|/health|/api/v1/rag/ask.*\"}[5m])))",
           "legendFormat": "{{service}}",
           "refId": "A"
         }
@@ -44,7 +44,7 @@
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
-          "expr": "sum by (service) (rate(http_requests_total{status=~\"5..\"}[5m]))",
+          "expr": "sum by (service) (rate(http_requests_total{status=~\"5..\", handler!~\"/metrics|/health\"}[5m]))",
           "legendFormat": "{{service}}",
           "refId": "A"
         }

@@ -1,10 +1,9 @@
 import Form from "next/form";
 import { backendFetch, readApiError, requireOk } from "@/app/lib/backend";
 import { getMe } from "@/app/lib/session";
-import { TICKER_PATTERN, TICKER_TITLE, formatMetric, type Metric, type TimeseriesPoint } from "@/app/lib/format";
+import { TICKER_PATTERN, TICKER_TITLE, firstParam, formatMetric, type Metric, type TimeseriesPoint } from "@/app/lib/format";
 import { ActionDistributionChart, StatusDonutChart, TimeseriesChart } from "./charts";
 import { LiveRefresh } from "./live-refresh";
-import { firstParam } from "../pager";
 import { PrintButton } from "./print-button";
 
 type Accuracy = { evaluated: number; rate: number | null };
@@ -57,6 +56,13 @@ function renderedNow(): string {
   return new Date().toISOString();
 }
 
+// The codes the CSV export route (export/route.ts) puts in export_error.
+const EXPORT_ERRORS: Record<string, string> = {
+  unreachable: "could not reach the server.",
+  invalid: "the filters are not valid.",
+  failed: "the server could not create the file. Please try again.",
+};
+
 export default async function AnalyticsPage({ searchParams }: { searchParams: SearchParams }) {
   const params = await searchParams;
   // The URL is user input: keep only values the backend understands.
@@ -68,7 +74,8 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Se
     status: STATUSES.includes(firstParam(params.status)) ? firstParam(params.status) : "",
   };
   // Set by the CSV export route when the backend refused the export.
-  const exportError = firstParam(params.export_error).slice(0, 300);
+  const exportCode = firstParam(params.export_error);
+  const exportError = Object.hasOwn(EXPORT_ERRORS, exportCode) ? EXPORT_ERRORS[exportCode] : null;
   const metric: Metric = METRICS.some((m) => m.value === firstParam(params.metric))
     ? (firstParam(params.metric) as Metric)
     : "analyses";

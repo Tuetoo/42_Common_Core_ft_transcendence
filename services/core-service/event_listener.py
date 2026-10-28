@@ -1,6 +1,4 @@
 import asyncio
-import hashlib
-import json
 from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
@@ -12,7 +10,7 @@ from config import settings
 from database import SessionLocal
 from apikeys import ApiKey
 from outbox import publish_now
-from sqlalchemy import delete, or_, select, union
+from sqlalchemy import delete, or_, select, union, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from websocket_manager import WebSocketEnvelope, manager
 import domains.notification.service as notifications
@@ -43,13 +41,11 @@ _EVENT_CLAIM_TTL_SECONDS = 300
 
 async def _claim_event(event: str, payload: dict[str, Any]) -> bool:
     event_id = payload.get("event_id")
-    digest = (
-        str(event_id) if event_id else hashlib.sha256(
-            json.dumps(payload, sort_keys=True,
-                       default=str).encode()).hexdigest())
+    if not event_id:
+        return True
     try:
         claimed = await get_events_client(settings).set(
-            f"core:event_claim:{event}:{digest}", "1", nx=True,
+            f"core:event_claim:{event}:{event_id}", "1", nx=True,
             ex=_EVENT_CLAIM_TTL_SECONDS)
     except Exception:
         logger.warning("event_claim_failed", event_name=event, exc_info=True)
@@ -62,8 +58,8 @@ async def _notify_field(
         type: NotificationType, title: str, content: str) -> None:
     recipient = payload.get(key)
     if not recipient:
-        logger.warning(
-            f"event_missing_{key}", event_name=str(event),
+        log = logger.info if key == "user_id" else logger.warning
+        log(f"event_missing_{key}", event_name=str(event),
             analysis_id=payload.get("analysis_id"))
         return
     if not await _claim_event(event, payload):
@@ -273,9 +269,38 @@ async def _handle_organization_member_joined(payload: dict[str, Any]) -> None:
         user_content=f"You joined the organization {org}.")
 
 
+async def _unshare_member_portfolios(payload: dict[str, Any]) -> None:
+    try:
+        organization_id = UUID(str(payload.get("organization_id")))
+        user_id = UUID(str(payload.get("user_id")))
+    except ValueError:
+        logger.warning("member_portfolios_unshare_bad_ids", payload=payload)
+        return
+    try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                update(Portfolio).where(
+                    Portfolio.owner_id == user_id,
+                    Portfolio.organization_id == organization_id,
+                    Portfolio.visibility != "private").values(
+                        visibility="private"))
+            await session.commit()
+    except Exception:
+        logger.exception(
+            "member_portfolios_unshare_failed",
+            organization_id=str(organization_id), user_id=str(user_id))
+        return
+    count = int(getattr(result, "rowcount", 0) or 0)
+    if count:
+        logger.info(
+            "member_portfolios_unshared", organization_id=str(organization_id),
+            user_id=str(user_id), portfolios=count)
+
+
 async def _handle_organization_member_left(payload: dict[str, Any]) -> None:
     await _recheck_sessions([payload.get("user_id")],
                             reason=EventName.ORGANIZATION_MEMBER_LEFT)
+    await _unshare_member_portfolios(payload)
     org = _org_name(payload)
     await _notify_organization(
         payload, EventName.ORGANIZATION_MEMBER_LEFT,
@@ -289,6 +314,7 @@ async def _handle_organization_member_left(payload: dict[str, Any]) -> None:
 async def _handle_organization_member_removed(payload: dict[str, Any]) -> None:
     await _recheck_sessions([payload.get("user_id")],
                             reason=EventName.ORGANIZATION_MEMBER_REMOVED)
+    await _unshare_member_portfolios(payload)
     org = _org_name(payload)
     await _notify_organization(
         payload, EventName.ORGANIZATION_MEMBER_REMOVED,

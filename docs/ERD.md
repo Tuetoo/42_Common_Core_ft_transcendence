@@ -92,7 +92,9 @@ organization roles.
 **organization_invitations** — `id`, `organization_id` (FK), `email`, `role`,
 `invited_by` (FK → users), `expires_at`, `accepted_at`. There is no
 status column. An invitation can never carry the `owner` role (422 when
-it is created).
+it is created). Open invitations (`accepted_at` empty) that expired more
+than `ORGANIZATION_INVITATION_EXPIRE_DAYS` (7) days ago are deleted by the
+nightly purge-unverified job.
 
 **connections** — `id`, `requester_id` / `addressee_id` (FK → users),
 `pair_key` (deterministic, order-independent pair identifier — lets a unique
@@ -131,7 +133,8 @@ fills). **`adjustment`**: shares moved in
 **no cash effect** -- a transfer from another broker, a correction or an
 opening position. Shares in move the average cost like a buy; shares out
 leave it unchanged and cannot exceed the held quantity. Backtests and the
-history export treat it as an external flow, never as return.
+history export treat it as an external flow, never as return, valued at the
+ticker's session close (the stated `price` only when no close is known).
 `transaction_type` is a plain VARCHAR and `quantity`/`price` are
 unconstrained NUMERIC; the allowed values are checked by the application.
 
@@ -146,7 +149,7 @@ unconstrained NUMERIC; the allowed values are checked by the application.
 **documents** — `id`, `owner_id` (plain UUID), `organization_id` (plain UUID,
 nullable), `filename`, `document_type` (`pdf`/`txt`/`md` — file format),
 **`category`** (`filing`/`analyst_report`/`earnings_call`/`news`/
-`macro_research` — RAG-layer classification, a different axis from
+`macro_research`/`risk_analysis` — RAG-layer classification, a different axis from
 `document_type`; user-supplied at upload since there's no reliable way to
 infer document semantics from bytes alone), **`ticker`** (nullable — not
 every category is about one company), `storage_url` (an object *key* into
@@ -231,9 +234,9 @@ there is no separate cancelled status.
 
 ### Analysis pipeline
 
-**analyses** — `id`, `user_id` (plain UUID, **nullable** — a system-triggered
-batch analysis, e.g. core-service's scheduled market-open re-analysis job,
-has no owning user), `portfolio_id` (plain UUID, nullable), `ticker`, `status`
+**analyses** — `id`, `user_id` (plain UUID, **nullable** — a system
+analysis is started without a user, e.g. by `scripts/run_analysis.sh`;
+core-service's market-open job passes the portfolio owner), `portfolio_id` (plain UUID, nullable), `ticker`, `status`
 (`pending`→`running`→`completed`/`failed`), `failure_reason` (nullable
 text), `created_at`. Indexed on
 `(user_id, created_at)` and `(ticker, created_at)` (the latter backs the hot
@@ -269,7 +272,8 @@ no per-tier acceptance (see `recommendations.accepted_at`).
 
 **agents** — small catalog table, one row per `AgentRole`, upserted lazily
 (not seeded) since the set of roles is defined in code and rarely changes:
-`id`, `name` (unique), `description`, `version`, `active`.
+`id`, `name` (unique), `description`, `version`, `active` (only `name` is
+written; nothing reads the other three).
 
 **agent_runs** — `id`, `analysis_id` (FK), `agent_id` (FK → agents), `status`,
 `started_at`/`completed_at` (the agent's own start and end time; the
@@ -293,9 +297,10 @@ bookkeeping.
 
 **document_chunks** — `id`, `document_id` (plain UUID → `core.documents.id`),
 `chunk_index`, `token_count`, `qdrant_point_id` (unique — the actual
-addressable Qdrant point this row's text lives under). This table's entire
-purpose is letting a citation resolve back to "where the vector actually is"
-without querying Qdrant just to check existence.
+addressable Qdrant point this row's text lives under). Written by RAG
+ingestion and archival and removed with the document; no service code reads
+it. It is a diagnostic for operators' SQL and for the orphan sweep of
+`scripts/delete_analyses.py`.
 
 **embedding_jobs** — `id`, `document_id` (plain UUID), `embedding_model`,
 `status`, `created_at`. One row per ingestion run.
@@ -371,8 +376,9 @@ written only when both returns are known; a missing price
 series leaves the window unscored and the next review run tries again.
 
 **decision_reviews** — `id`, `decision_id` (FK), `review_text`,
-`lessons_learned`. Written by `POST /api/v1/decisions/{id}/review` (one
-row per call). Re-posting the decision deletes its reviews
+`lessons_learned`, `created_at`. Written by
+`POST /api/v1/decisions/{id}/review`: one row per decision; a new review
+replaces it. Re-posting the decision deletes its reviews
 together with its `decision_outcomes` rows.
 
 ### Backtesting
@@ -391,7 +397,9 @@ per-trade and per-position rows are not stored.
 
 **benchmarks** — `id`, `symbol` (unique), `name`, `asset_type`, `currency`
 (default `"USD"`), `description`, `created_at`. Upserted lazily per symbol
-encountered, same pattern as the `agents` catalog table.
+encountered, same pattern as the `agents` catalog table (`name` is the
+symbol and `asset_type` is always `index`; nothing reads `name`,
+`asset_type`, `currency` or `description`).
 
 **benchmark_results** — `id`, `backtest_id` (FK), `benchmark_id` (FK),
 `strategy_return`, `benchmark_return`, `alpha`, `beta`, `information_ratio`,

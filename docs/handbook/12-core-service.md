@@ -195,7 +195,23 @@ SQL (`PortfolioRepository.list_for_user`), ordered by `created_at` then
 
 Creating a portfolio *inside* an organization requires the creator to be a
 MEMBER, ADMIN or OWNER of it (`auth_client.ensure_organization_writer`;
-a non-member or a VIEWER gets 403).
+a non-member or a VIEWER gets 403). `visibility` `organization` without an
+`organization_id` is 422 (`PortfolioCreate`). A `PATCH` that changes the
+visibility to `organization` runs the same writer check against the
+portfolio's organization (403), and is 422 for a portfolio with no
+organization. The organization itself never changes after creation.
+
+**Sharing ends when the owner leaves.** On `organization.member.left` and
+`organization.member.removed`, `_unshare_member_portfolios` sets that
+member's `organization` portfolios of that organization to `private` (the
+`organization_id` stays, so the owner keeps the portfolio and can share
+it again after rejoining). Log `member_portfolios_unshared` (count), or
+`member_portfolios_unshare_failed` when the update fails (then the
+portfolio stays shared until the owner changes it). If the event is lost
+(Redis down when auth publishes), the portfolio also stays shared until
+the owner changes it; no sweep repairs it. A role change to
+VIEWER does not unshare: the writer check applies only when the
+visibility changes.
 
 Routes (`domains/portfolio/api.py`, prefix `/api/v1/portfolios`):
 
@@ -208,7 +224,7 @@ Routes (`domains/portfolio/api.py`, prefix `/api/v1/portfolios`):
 | `DELETE /{id}` | `portfolio:write` + owner | cascade delete + durable `portfolio.deleted` (3.15) |
 | `GET /{id}/snapshots` | readable | `start_date`, `end_date`; display conversion for EUR/GBP (3.5) |
 | `POST /{id}/holdings`, `PATCH /{id}/holdings/{hid}`, `DELETE /{id}/holdings/{hid}` | `portfolio:write` + owner | record ADJUSTMENT rows (3.4) |
-| `GET /{id}/holdings` | readable | each holding with `latest_recommendation` from ai-service (best effort) |
+| `GET /{id}/holdings` | readable | the holdings; `latest_recommendation` is null here (no ai-service call); the public API's list fills it (3.14) |
 | `POST /{id}/transactions` | `portfolio:write` + owner | the ledger write path (3.3) |
 | `GET /{id}/transactions` | readable | paginated |
 | `GET /{id}/history.csv` | readable | daily snapshots with a flow-adjusted daily return |
@@ -277,8 +293,9 @@ For a buy or withdrawal the service:
 
 1. locks the portfolio row (two outflows that each fit alone but not
    together would otherwise both pass);
-2. groups all existing cash effects by **UTC calendar day**, adds the new
-   outflow on its own day;
+2. groups all existing cash effects by **snapshot day**
+   (`ledger.snapshot_day`, the 17:30 New York cutoff that the daily
+   snapshots use), adds the new outflow on its own snapshot day;
 3. computes the running balance at the end of each day from the new day
    onwards and takes the lowest;
 4. refuses with 422 if that lowest balance is below zero ("Insufficient
@@ -288,9 +305,14 @@ Checking every later day, not just today, matters for back-dated
 outflows: a withdrawal dated last week could make last Tuesday negative
 even if today's balance is fine. Days *before* the new row are not
 examined, so old messy history cannot block an unrelated new trade. Day
-granularity (not exact time) is deliberate: the tier-execution path sends
-date-only fills (midnight UTC), which would otherwise sort before a
-deposit recorded later the same day.
+granularity (not exact time) is deliberate: a date-only entry is stored
+as midnight UTC (the evening before in New York, so it belongs to its own
+calendar date's snapshot), which would otherwise sort before a deposit
+recorded later the same day. Using the
+snapshot day, not the UTC day, keeps this check and the snapshots in
+step: a deposit made after 17:30 New York counts for the next day, so a
+buy earlier that day cannot rely on it and the day's snapshot never
+shows negative cash.
 
 **Replay** (`ledger.replay_positions`) and **same-timestamp ordering**
 (`ledger.ledger_order`, `_phase`). Rows are sorted by
@@ -324,9 +346,11 @@ Two columns exist only for one type each, so no field carries two
 meanings: `dividend_per_share` (a dividend's cash is `quantity *
 dividend_per_share`; reusing the stock's trade `price` there would
 overstate cash by orders of magnitude) and `split_ratio` (a multiplier,
-unlike `quantity`). The per-type checks run in the service
-(`_validate_required_fields`), not in the schema: a sell without a price
-would otherwise remove shares with no proceeds. Quantities and costs
+unlike `quantity`). The required fields of BUY/SELL, DEPOSIT/WITHDRAWAL,
+DIVIDEND and STOCK_SPLIT are checked in the service
+(`_validate_required_fields`; a sell without a price would otherwise
+remove shares with no proceeds); signs, the CASH ticker rule and the
+ADJUSTMENT rules are checked in the schema (`TransactionCreate`). Quantities and costs
 that differ by less than a tiny relative tolerance count as equal in the
 replay, because Decimal division in the weighted average can leave a
 last-digit difference.
@@ -450,6 +474,23 @@ the `/internal/.../cash-flows` route (field `snapshot_date` and its
 `start_date`/`end_date` window), the recompute script (through
 `service.positions_at_cutoff`) and the market-close job all use this
 rule, so they agree.
+
+**History export daily return** (`export_history`, `external_flow`):
+`(value_t - flows) / value_{t-1} - 1`, where the flows are the deposits,
+withdrawals and ADJUSTMENT rows whose snapshot day falls after the
+previous snapshot and at or before this one. An ADJUSTMENT is valued at
+the ticker's session close on or before its snapshot day (signed quantity
+times close, from `ai_client.get_daily_closes`), so deleting a holding or
+changing its average cost is not shown as a loss or gain. Only without a
+close is it valued at its stated `price` (shares out written by the
+holding routes have no price and then count as 0), with
+the warning `history_adjustment_valued_at_cost_basis`. This is the same
+rule as the portfolio backtest's time-weighted return (chapter 19), so the
+two returns agree. The export calls ai-service (and through it possibly
+the market provider) once per adjusted ticker; each call looks back only
+to that ticker's earliest ADJUSTMENT snapshot day in the export (plus a
+10-day pad, `_CLOSE_LOOKBACK_PAD_DAYS`), so a ticker listed later than
+the first snapshot does not fetch years of bars it does not need.
 
 **Recompute script** (`scripts/recompute_snapshots.py`, wrapper
 `scripts/snapshots.sh`, `make snapshots`):
@@ -758,7 +799,12 @@ object storage, so a duplicate leaves no orphan object and does not make
 ai-service re-index the old id with new content.
 
 Auto-ingestion's dedup list (`GET /internal/documents/filenames`,
-`DocumentRepository.list_filenames`) covers every owner and leaves out
+`DocumentRepository.list_filenames`) covers every owner by default; with
+`system_only=true` it covers only system documents (`SYSTEM_DOCUMENT_OWNER_ID`).
+ai-service's nightly filing, news and macro ingestion passes
+`system_only=true`, so a user's private upload with the same filename does
+not stop the system copy; the seed upload script (`--as-system`) uses the
+every-owner list. Both leave out
 `failed` documents first uploaded within the last
 `FAILED_DOCUMENT_RETRY_DAYS` (default 7) days, so a filing whose ingestion
 failed (for example on a transient embedding error) is fetched and
@@ -857,7 +903,8 @@ documents the nightly ingestion adds and the RAG assistant cites).
 Otherwise 404.
 
 **System documents** come in through `api/internal.py`:
-`GET /internal/documents/filenames` (dedup check for auto-ingestion),
+`GET /internal/documents/filenames` (dedup check for auto-ingestion;
+optional `system_only=true`),
 `POST /internal/documents` (raw text from ingestion), `POST
 /internal/documents/system` (multipart, used by ai-service's seed upload
 script). They use the same `ResearchService.upload`.
@@ -968,7 +1015,7 @@ scheduler reports success:
    DailyJobStale        backup|review-run|rag-ingest|logs-cleanup|
                         purge-unverified|notification-retention|
                         deleted-user-sweep-core|deleted-user-sweep-ai > 26 h  (for 10m)
-   TradingDayJobStale   market-open|market-close|tier-monitoring    > 100 h (for 10m)
+   TradingDayJobStale   market-open|market-close|tier-monitoring    > 26 h, 76 h after a Friday (for 10m)
    MarketCloseSkippedPortfolios   alphamind_market_close_portfolios_skipped > 0
 ```
 
@@ -977,9 +1024,11 @@ scheduler reports success:
 (auth-service), `notification-retention`, `deleted-user-sweep-core`,
 `deleted-user-sweep-ai` (ai-service). The trading-day
 jobs still report success on a closed-market weekday (a holiday): the
-route answers "skipped" and the script sends the heartbeat. So the
-longest normal gap is a weekend (Friday 17:30 to Monday 17:30, 72 hours),
-and the 100-hour limit leaves room.
+route answers "skipped" and the script sends the heartbeat. So a
+success is due every weekday: the limit is 26 hours after a Monday to
+Thursday success, 76 hours after a Friday (or Saturday) success, which
+covers the weekend (Friday 17:30 to Monday 17:30, 71-73 hours), and 50
+hours after a Sunday success.
 
 **A job that has never succeeded still alerts.** An alert rule compares
 `time()` with the gauge; a label that has no series compares with nothing
@@ -992,7 +1041,7 @@ without a success, kept in the Redis hash `core:job_tracked_since` with
 `HSETNX`, so a later restart keeps the first time and does not push the
 alert further away. The gauge holds that time until the first real
 heartbeat replaces it, so `DailyJobStale` fires 26 hours, and
-`TradingDayJobStale` 100 hours, after tracking started. The log line
+`TradingDayJobStale` 26, 76 or 50 hours (by the weekday tracking started on), after tracking started. The log line
 `scheduled_job_no_success_yet` (info, `job`, `since`) names each such
 job at start. If Redis cannot be read at start, the gauge of every job
 is set to the process start time (nothing is written), so the series
@@ -1100,7 +1149,10 @@ exist because validating a key and writing `last_used_at` on every
 request would be a database round trip plus a contended `UPDATE` of the
 same row for a busy key. The holdings list of the public API is
 paginated in memory with the same `PaginationParams` arithmetic, because
-the service returns the small per-portfolio list unpaginated.
+the service returns the small per-portfolio list unpaginated. It is the
+only holdings list that asks ai-service for each holding's
+`latest_recommendation` (only for the rows of the page); the web app's
+list leaves it null because the page does not show it.
 Revoking a key overwrites its cached entry with a revoked marker
 (`mark_revoked_in_cache`); changing a key deletes its cache entry
 (`forget_cached_key`). Each write happens twice: once in the request,
@@ -1168,7 +1220,9 @@ Before the notification work, the handlers of
 affected users' open Yjs sockets on every replica (no claim; a failure is
 logged and never stops the notification; see 3.9). auth-service drops the
 membership cache and writes the live state before it publishes, so the
-re-check sees the new rights. An analysis or tier event whose `user_id`
+re-check sees the new rights. The `member.left` and `member.removed`
+handlers then make the member's shared portfolios of that organization
+private (3.2; also on every replica, the update is idempotent). An analysis or tier event whose `user_id`
 is empty (`""`, a system analysis) never creates a notification for an
 empty id; tier events then notify the portfolio owner.
 
@@ -1189,10 +1243,13 @@ connection with <name> changed.") notifies only the actor, so the other
 user never learns about an unblock or a declined request.
 
 **Deleted users** (`delete_private_user_data`). Policy: a deleted
-user's personal data is removed completely, in every service. Data that
+user's personal data is removed in every service. Data that
 belongs to that user alone is deleted; content other people use
 (organization documents and notes, comments on organization notes) stays
-and shows the anonymized username. System data not keyed to a user
+and shows the anonymized username. A portfolio the user shared with an
+organization also stays, readable by that organization's members, until
+the organization is deleted (then it is deleted with the organization's
+other data). System data not keyed to a user
 stays. core's part runs on `user.deleted`; each step runs in its own
 session and commits:
 
@@ -1320,6 +1377,11 @@ others still run. Log `deleted_organization_sweep_completed`.
   sequential S3 deletes. While one runs, the other cross-service events
   (socket re-checks, notifications) wait. This is acceptable at the
   current scale.
+- Both cleanups run before any claim (`_claim_event`). The stack runs one
+  core replica; with more than one, every replica would run them: the
+  data still ends correct (each step deletes only what is still there),
+  but S3 deletes are repeated and `document.deleted` / `portfolio.deleted`
+  can be queued twice.
 
 **Replica de-duplication** (`_claim_event`). With several core replicas,
 each one receives every pub/sub event. Pushes must happen on every
@@ -1327,8 +1389,9 @@ replica (each has its own sockets), but a notification row must be
 created once. The first replica to `SET core:event_claim:<event>:<id> NX
 EX 300` (db 2) creates it. `<id>` is the publisher's `event_id` (a fresh
 one per publish), so two real events with identical content (deactivate,
-reactivate, deactivate within five minutes) are not merged. A payload
-without `event_id` falls back to a hash of its content. If Redis is
+reactivate, deactivate within five minutes) are not merged. Every
+publisher adds `event_id` (`shared/events.py`); a payload without one is
+not claimed, so each replica would act on it. If Redis is
 down the claim fails open: a duplicate notification is better than a lost
 one.
 
@@ -1432,7 +1495,7 @@ minutes or less); REST reads answer 404 at once.
 | `auth_client.set_user_presence` | auth `/internal/users/{id}/presence` | logged, never raises |
 | `ai_client.get_latest_recommendation` | ai `/internal/recommendations/latest` (ticker + portfolio) | cached 10 s; a Redis error on the cache read or write is logged (`latest_recommendation_cache_read_failed` / `_write_failed`) and treated as a cache miss; holdings still returned without it |
 | `ai_client.get_analysis_ref` | ai `/internal/analyses/{id}` | raises (WebSocket check then denies) |
-| `ai_client.get_daily_closes` | ai `/internal/market/instruments/{ticker}/prices?interval=1d` | None; 15 s timeout; closes keyed by New York session date |
+| `ai_client.get_daily_closes` | ai `/internal/market/instruments/{ticker}/prices?interval=1d` (market-close job, history export, recompute script) | None; 15 s timeout; `lookback_days` capped at 3650 (ai's limit); closes keyed by New York session date |
 | `ai_client.get_fx_rate` | ai `/internal/fx-rate` (ai-service treats a Redis error on its own rate cache as a cache miss, not a 5xx) | None (USD to USD is 1 without a call) |
 | `ai_client.request_analysis` | ai `POST /internal/analyses` | None; 15 s timeout |
 | `ai_client.analyze_sentiment` | ai `POST /internal/sentiment` | None |
@@ -1734,7 +1797,7 @@ print(r.json())"
 ```
 
 Expected: one holding AAPL, quantity 10, average_cost 200
-(`latest_recommendation` null unless an analysis exists); two ledger rows
+(`latest_recommendation` null); two ledger rows
 (deposit with ticker `CASH`, buy); cash balance 8000.0. Say: "There is no
 cash column anywhere. 10000 minus 10 times 200 is computed from the
 ledger every time."

@@ -96,8 +96,8 @@ def decision_event_payload(
 
 def decision_outcome_event_payload(
         *, decision_id: Any, analysis_id: Any, user_id: Any, ticker: str,
-        evaluation_days: int, alpha: float | None,
-        outperformed: bool | None) -> dict[str, Any]:
+        evaluation_days: int, alpha: float,
+        outperformed: bool) -> dict[str, Any]:
     return {
         "decision_id": str(decision_id),
         "analysis_id": _id_or_empty(analysis_id),
@@ -116,7 +116,6 @@ def backtest_event_payload(
         "backtest_id": str(backtest_id),
         "user_id": _id_or_empty(user_id),
         "kind": backtest_kind(strategy_name),
-        "status": "completed" if completed else "failed",
         "error": None if completed else (error or "backtest_failed")
     }
 

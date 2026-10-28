@@ -2,6 +2,8 @@
 
 import { useActionState } from "react";
 import { updateUserByAdmin, type EditUserState, type EditUserValues } from "@/app/lib/actions/admin";
+import { FormMessage } from "@/app/form-message";
+import { EMAIL_MAX, TIMEZONE_PATTERN, TIMEZONE_TITLE, USERNAME_PATTERN, USERNAME_TITLE } from "@/app/(public)/field-rules";
 
 const initialState: EditUserState = {};
 
@@ -33,14 +35,14 @@ export function EditUserForm({
           required
           minLength={3}
           maxLength={32}
-          pattern="[A-Za-z0-9_.\-]{3,32}"
-          title="3-32 characters: letters, digits, underscore, dot or hyphen"
+          pattern={USERNAME_PATTERN}
+          title={USERNAME_TITLE}
           defaultValue={v.username}
         />
       </div>
       <div className="field">
         <label htmlFor="admin-email">Email</label>
-        <input id="admin-email" name="email" autoComplete="off" type="email" required maxLength={254} defaultValue={v.email} />
+        <input id="admin-email" name="email" autoComplete="off" type="email" required maxLength={EMAIL_MAX} defaultValue={v.email} />
       </div>
       <label className="flex items-center gap-2 text-[13px] text-[var(--text-secondary)]">
         <input type="checkbox" name="is_verified" autoComplete="off" defaultChecked={v.is_verified} />
@@ -66,8 +68,8 @@ export function EditUserForm({
           autoComplete="off"
           type="text"
           maxLength={64}
-          pattern="[A-Za-z0-9_+\-\/]+"
-          title="An IANA timezone name such as Europe/Paris"
+          pattern={TIMEZONE_PATTERN}
+          title={TIMEZONE_TITLE}
           placeholder="Europe/Paris"
           defaultValue={v.timezone}
         />
@@ -76,16 +78,8 @@ export function EditUserForm({
         <label htmlFor="admin-country">Country</label>
         <input id="admin-country" name="country" autoComplete="off" type="text" maxLength={100} defaultValue={v.country} />
       </div>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.success && (
-        <p aria-live="polite" className="form-message success">
-          Saved.
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.success ? "Saved." : null} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Saving…" : "Save changes"}
       </button>

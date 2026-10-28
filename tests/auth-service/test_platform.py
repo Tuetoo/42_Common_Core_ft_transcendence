@@ -1,3 +1,4 @@
+import asyncio
 from uuid import uuid4
 import pytest
 from helpers import (PASSWORD, enable_2fa, login_response, make_user,
@@ -26,6 +27,7 @@ def small_limits(monkeypatch):
                         "RATE_LIMIT_PASSWORD_RESET_PER_EMAIL": 2,
                         "RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL": 2,
                         "RATE_LIMIT_INVITATIONS_PER_ORG": 2,
+                        "RATE_LIMIT_INVITATIONS_PER_USER": 3,
                         "RATE_LIMIT_2FA_FAILURES": 3}.items():
         monkeypatch.setattr(settings, name, value)
 
@@ -137,6 +139,18 @@ class TestRateLimits:
                               "000000", "000000")]
         assert codes == [401, 401, 200, 401, 401]
 
+        import security
+
+        await reset_rate_limits()
+        burst_user = str(uuid4())
+        burst = await asyncio.gather(
+            *(security.two_factor_attempt(burst_user) for _ in range(6)),
+            return_exceptions=True)
+        assert [isinstance(result, security.RateLimitedError)
+                for result in burst].count(True) == 3
+        await security.two_factor_succeeded(burst_user)
+        await security.two_factor_attempt(burst_user)
+
         await reset_rate_limits()
         for i in range(2):
             r = await client.post(
@@ -178,6 +192,12 @@ class TestRateLimits:
                 json={"email": f"inv{i}@example.com"}, headers=headers)
             codes.append(r.status_code)
         assert codes == [201, 201, 429]
+        second = (await client.post(
+            ORGS, json={"name": "RL2"}, headers=headers)).json()["data"]
+        r = await client.post(
+            f"{ORGS}/{second['id']}/invitations",
+            json={"email": "inv9@example.com"}, headers=headers)
+        assert r.status_code == 429
 
         await reset_rate_limits()
         from config import settings

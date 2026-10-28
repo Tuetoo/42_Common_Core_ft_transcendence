@@ -245,6 +245,19 @@ class AdminService:
             retention_days=settings.UNVERIFIED_ACCOUNT_RETENTION_DAYS)
         return result
 
+    async def purge_expired_invitations(self) -> int | None:
+        cutoff = datetime.now(UTC) - timedelta(
+            days=settings.ORGANIZATION_INVITATION_EXPIRE_DAYS)
+        try:
+            deleted = await self.orgs.delete_expired_invitations(cutoff)
+            await self._db.commit()
+        except Exception as exc:
+            await self._db.rollback()
+            logger.error("expired_invitations_purge_failed", error=str(exc))
+            return None
+        logger.info("expired_invitations_purged", deleted=deleted)
+        return deleted
+
     async def _delete(self, user: User, actor_id: UUID) -> None:
         await self._ensure_not_last_admin(user)
         previous_state = state_of(user)

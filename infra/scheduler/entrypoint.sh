@@ -62,7 +62,12 @@ fi
 # it exit, so the container restart-looped. It runs as a child instead,
 # and this script forwards SIGTERM/SIGINT so `docker compose stop` still
 # stops it cleanly instead of waiting for the kill timeout.
-crond -f -l 2 &
+#
+# -l 5 (notice): dcron logs to stderr with -f, so its "time disparity"
+# notice reaches `docker compose logs scheduler`. dcron runs missed jobs
+# late after a clock jump of up to 60 minutes (the host slept) and skips
+# them, logging only that notice, after a longer jump.
+crond -f -l 5 &
 CROND_PID=$!
 trap 'kill -TERM "$CROND_PID" 2>/dev/null; wait "$CROND_PID"; exit 0' TERM INT
 wait "$CROND_PID"

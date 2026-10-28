@@ -178,9 +178,9 @@ async def add_holding(
     result = await service.add_holding(
         portfolio_id, current_user.user_id, data)
     notify_holding_adjustment(
-        background_tasks, current_user.user_id, await
-        service.portfolio_name(portfolio_id), result.ticker, [data.quantity])
-    return APIResponse(data=result)
+        background_tasks, current_user.user_id, result.portfolio_name,
+        result.read.ticker, result.quantities)
+    return APIResponse(data=result.read)
 
 
 @router.get(
@@ -207,10 +207,9 @@ async def update_holding(
     result = await service.update_holding(
         portfolio_id, current_user.user_id, holding_id, data)
     notify_holding_adjustment(
-        background_tasks, current_user.user_id, await
-        service.portfolio_name(portfolio_id), result.ticker, await
-        service.transaction_quantities(result.transaction_ids))
-    return APIResponse(data=result)
+        background_tasks, current_user.user_id, result.portfolio_name,
+        result.read.ticker, result.quantities)
+    return APIResponse(data=result.read)
 
 
 @router.delete(
@@ -225,10 +224,9 @@ async def delete_holding(
     result = await service.delete_holding(
         portfolio_id, current_user.user_id, holding_id)
     notify_holding_adjustment(
-        background_tasks, current_user.user_id, await
-        service.portfolio_name(portfolio_id), result.ticker, await
-        service.transaction_quantities(result.transaction_ids))
-    return APIResponse(data=result)
+        background_tasks, current_user.user_id, result.portfolio_name,
+        result.read.ticker, result.quantities)
+    return APIResponse(data=result.read)
 
 
 @router.post(

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import security
 from config import settings
@@ -75,17 +75,6 @@ class TokenPair(BaseModel):
 
 
 class OAuthTwoFactorChallenge(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "description": (
-                "Returned by the OAuth callback instead of a token pair when "
-                "the "
-                "account has 2FA enabled. Exchange `challenge_token` plus a "
-                "TOTP "
-                "code at POST /api/v1/auth/oauth/2fa.")
-        })
-
-    two_factor_required: Literal[True] = True
     challenge_token: str
     expires_in: int
 

@@ -40,14 +40,21 @@ SQL
     [ "$#" -ge 1 ] || die "usage: bash scripts/tiers.sh decline <analysis-uuid> [...]"
     require_owner_id
     token=$(make_token "$OWNER_USER_ID" user 1)
+    rc=0
     for analysis_id in "$@"; do
       [[ "$analysis_id" =~ $UUID_RE ]] || die "not a UUID: $analysis_id"
       echo "== $analysis_id"
-      curl -sk -X POST "$GATEWAY_URL/api/v1/analyses/$analysis_id/decisions" \
-        -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
-        -d "{\"action_taken\": \"declined\", \"portfolio_id\": \"$PORTFOLIO_ID\"}"
+      # The header comes from a file descriptor, so the token is not on
+      # the curl command line (visible in `ps`).
+      curl -sk --fail-with-body -X POST \
+        "$GATEWAY_URL/api/v1/analyses/$analysis_id/decisions" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+        -H "Content-Type: application/json" \
+        -d "{\"action_taken\": \"declined\", \"portfolio_id\": \"$PORTFOLIO_ID\"}" \
+        || rc=1
       echo
     done
+    exit "$rc"
     ;;
   *) die "usage: bash scripts/tiers.sh [open|all|decline <analysis-uuid> ...]" ;;
 esac

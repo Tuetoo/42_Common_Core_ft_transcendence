@@ -3,6 +3,7 @@
 import { useActionState, useState } from "react";
 import { recordDecision, type RecordDecisionState } from "@/app/lib/actions/analyses";
 import { DECISION_NOTES_MAX_LENGTH } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: RecordDecisionState = {};
 
@@ -56,16 +57,8 @@ export function DecisionForm({
           className="w-full"
         />
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state?.success && (
-        <p aria-live="polite" className="form-message success">
-          Decision recorded.
-        </p>
-      )}
+      <FormMessage text={state?.error} />
+      <FormMessage kind="success" text={state?.success ? "Decision recorded." : null} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Saving…" : "Record decision"}
       </button>

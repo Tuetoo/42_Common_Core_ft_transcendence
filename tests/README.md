@@ -22,13 +22,11 @@ tests/
   auth_tokens.py        access_token(), auth_headers(), bearer_headers()
 ```
 
-The unit suites hold 54 (auth), 102 (core) and 426 (ai) collected tests,
-582 in total, from 570 test functions in 21 files: 3 (auth), 4 (core) and
+The unit suites hold 55 (auth), 107 (core) and 443 (ai) collected tests,
+605 in total, from 593 test functions in 21 files: 3 (auth), 4 (core) and
 14 (ai), plus the 4 alembic_contract.py checks, which every suite
-collects. With the one integration test, the repository has 575 test
-functions. Coverage of the service code is about 75% (auth), 66% (core)
-and 90% (ai); coverage of `shared/` is 78%, 80% and 77% in the three
-runs. Tests
+collects. With the one integration test, the repository has 598 test
+functions. Tests
 are grouped by topic into `Test*` classes; one test covers one feature or
 flow, with several steps where they share setup. Each
 test file passes on its own, and so does each service's whole suite.
@@ -137,7 +135,9 @@ turn it on for one test with
 - No test file imports another test file. Shared code lives in
   `helpers.py` or `conftest.py` of the same service, or in the two modules
   at the top of `tests/`.
-- Parametrize cases get readable ids (`pytest.param(..., id="sell-not-held")`).
+- No test is parametrized. Several inputs for one behaviour run as a loop
+  over named cases inside one test, and each assert names its case (for
+  example `sell-not-held`).
 - A test that needs the database requests `db_session`, `client` or
   `real_client`, or `_schema_ready` when it opens its own sessions.
 - No network: LLM routers, market data, SEC, FRED and other services are
@@ -194,12 +194,16 @@ deletion itself, so `cleanup` does not try to remove it again.
 It needs an access token of your admin account (2 hours):
 
 ```bash
-TOKEN=$(docker compose --env-file .env.docker exec -T auth-service python -c \
+export E2E_ADMIN_TOKEN=$(docker compose --env-file .env.docker exec -T auth-service python -c \
   "from datetime import timedelta; from security import _create_token; print(_create_token('<ADMIN_USER_ID>', timedelta(hours=2), 'access', {'role': 'admin'}))")
-docker compose --env-file .env.docker exec -T -e E2E_ADMIN_TOKEN="$TOKEN" \
+docker compose --env-file .env.docker exec -T -e E2E_ADMIN_TOKEN \
   core-service python -m scripts.e2e_check [--with-analysis] [--keep] \
   [--only SECTION[,SECTION]] [--verbose]
 ```
+
+`-e E2E_ADMIN_TOKEN` without a value copies the variable from your shell,
+so the token is not on the command line (visible in `ps`). `make e2e`
+(`scripts/e2e.sh`) does all of this for you.
 
 Output is one line per check (`OK` / `FAIL` / `SKIP`) and a `SUMMARY`
 line; the exit code is 1 when a check failed. `--only` adds the
@@ -239,7 +243,7 @@ socket's first message must be the `analysis.status` snapshot). The
 cleanup deletes the synthetic analysis rows; `--keep` keeps them.
 
 ```bash
-docker compose --env-file .env.docker exec -T -e E2E_ADMIN_TOKEN="$TOKEN" \
+docker compose --env-file .env.docker exec -T -e E2E_ADMIN_TOKEN \
   ai-service python -m scripts.e2e_tier_check [--keep] [--verbose]
 ```
 

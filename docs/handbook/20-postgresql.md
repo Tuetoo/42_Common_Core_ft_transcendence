@@ -42,7 +42,7 @@ of tables inside a database. Each backend service owns exactly one schema:
                           ^                ^                 ^
                           |                |                 |
          postgres-exporter (metrics)   scheduler (pg_dump   Adminer / psql
-         -> Prometheus                 at 02:30 New York)   (browsing, demos)
+         -> Prometheus                 at 00:50 New York)   (browsing, demos)
 ```
 
 Three rules hold everything together:
@@ -255,9 +255,9 @@ async def get_db():
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()
 ```
+
+(`async with` closes the session.)
 
 So one request = one session = one transaction. Repositories only
 `flush()`; the commit happens once, after the handler returns. The
@@ -659,7 +659,7 @@ reachable.
 ### 3.10 Backups
 
 `infra/scheduler/backup.sh` runs from the scheduler's crontab every day at
-02:30 New York time (07:30 in London most of the year):
+00:50 New York time (05:50 in London most of the year):
 
 1. `pg_dump -Fc` of the whole `alphamind` database (all three schemas)
    into `postgres.dump`. `-Fc` is PostgreSQL's custom archive format:

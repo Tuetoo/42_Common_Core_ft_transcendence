@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 import structlog
 from ai.llm.base import LLMError, LLMMessage, LLMTier
-from ai.llm.mistral_provider import mistral_key_count
 from ai.llm.router import LLMRouter
 from ai.rag.embedding import cosine_similarity, embed_texts
 from ai.rag.retriever import BaseRetriever
+from ai.rag.visibility import SYSTEM_ONLY_SCOPE
 from config import settings
 from pydantic import BaseModel
 from qdrant import get_qdrant_client
@@ -23,12 +23,8 @@ _SYSTEM_PROMPT = (
     "in the passage -- not a generic question that could apply to any "
     "similar document. Return only the question, no preamble, no quotes.")
 
-_INTER_CHUNK_DELAY_SECONDS_PER_KEY = 1.5
+_INTER_CHUNK_DELAY_SECONDS = 1.5
 _RETRIES_PER_CHUNK = 5
-
-
-def _inter_chunk_delay_seconds() -> float:
-    return _INTER_CHUNK_DELAY_SECONDS_PER_KEY / max(1, mistral_key_count())
 
 
 class GoldenQAPair(BaseModel):
@@ -49,7 +45,8 @@ class GoldenSetGenerationResult(BaseModel):
 async def _sample_indexed_chunks(sample_size: int) -> list[dict[str, Any]]:
     client = get_qdrant_client()
     points, _ = await client.scroll(
-        collection_name=settings.QDRANT_COLLECTION_RESEARCH, limit=sample_size,
+        collection_name=settings.QDRANT_COLLECTION_RESEARCH,
+        scroll_filter=SYSTEM_ONLY_SCOPE.qdrant_condition(), limit=sample_size,
         with_payload=True, with_vectors=True)
     return [{
         "chunk_id": str(p.id),
@@ -123,11 +120,6 @@ async def _drop_near_duplicate_chunks(
     return [c for i, c in enumerate(chunks) if i not in dropped]
 
 
-async def _select_chunks_for_golden_set(
-        chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return await _drop_near_duplicate_chunks(chunks)
-
-
 def _normalize_question(question: str) -> str:
     return re.sub(r"\s+", " ", question.strip().lower()).rstrip("?.! ")
 
@@ -154,13 +146,11 @@ async def _real_indexed_chunk_count() -> int:
     return result.count
 
 
-async def generate_golden_set(
-    *, sample_size: int | None = None, llm_router: LLMRouter | None = None,
-    llm_tier: LLMTier = LLMTier.CHEAP,
+async def select_golden_set_chunks(
+    *, sample_size: int | None = None,
     categories: frozenset[str] | None = None,
     skip_chunk_ids: frozenset[str] = frozenset()
-) -> GoldenSetGenerationResult:
-    router = llm_router or LLMRouter()
+) -> tuple[list[dict[str, Any]], int]:
     if sample_size is None:
         sample_size = await _real_indexed_chunk_count()
     chunks = await _sample_indexed_chunks(sample_size)
@@ -168,26 +158,24 @@ async def generate_golden_set(
         chunks = [c for c in chunks if c["category"] in categories]
     if skip_chunk_ids:
         chunks = [c for c in chunks if c["chunk_id"] not in skip_chunk_ids]
-    if not chunks:
-        raise ValueError(
-            "No indexed chunks to generate questions for (none in Qdrant, "
-            "or none left after the category / already-covered filters) -- "
-            "run some documents through "
-            "ai/workflows/rag_ingestion_workflow.py "
-            "first")
-    raw_sample_count = len(chunks)
-    chunks = await _select_chunks_for_golden_set(chunks)
-    if len(chunks) < raw_sample_count:
+    kept = await _drop_near_duplicate_chunks(chunks)
+    if len(kept) < len(chunks):
         logger.info(
             "golden_set.chunks_filtered_before_generation",
-            sampled_count=raw_sample_count, kept_count=len(chunks),
-            filtered_count=raw_sample_count - len(chunks))
+            sampled_count=len(chunks), kept_count=len(kept),
+            filtered_count=len(chunks) - len(kept))
+    return kept, len(chunks)
 
+
+async def generate_golden_set(
+        chunks: list[dict[str, Any]], *, llm_router: LLMRouter | None = None,
+        llm_tier: LLMTier = LLMTier.CHEAP) -> GoldenSetGenerationResult:
+    router = llm_router or LLMRouter()
     pairs: list[GoldenQAPair] = []
     failed_chunk_ids: list[str] = []
     for i, chunk in enumerate(chunks):
         if i > 0:
-            await asyncio.sleep(_inter_chunk_delay_seconds())
+            await asyncio.sleep(_INTER_CHUNK_DELAY_SECONDS)
         try:
             response = await router.complete(
                 llm_tier, [
@@ -321,7 +309,7 @@ async def compute_recall_at_k(
         category_filter: DocumentCategory | None = None) -> RecallResult:
     retriever = BaseRetriever(
         top_k=top_k, use_query_expansion=False,
-        category_filter=category_filter)
+        category_filter=category_filter, visibility=None)
 
     query_vectors: list[list[float] | None]
     if sources is None or "vector" in sources:

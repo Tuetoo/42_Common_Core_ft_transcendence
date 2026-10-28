@@ -50,6 +50,18 @@ scrape_configs:
         labels:
           service: redis
 
+  # Qdrant's own /metrics (no API key is set; see docker-compose.yaml).
+  # Scraped mainly so ServiceDown (up == 0) covers Qdrant: ai-service's
+  # /metrics keeps answering while Qdrant is down. The gateway, frontend,
+  # object storage, scheduler, vector and Grafana are not scraped, so no
+  # alert covers them.
+  - job_name: "qdrant"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["qdrant:6333"]
+        labels:
+          service: qdrant
+
   - job_name: "alertmanager"
     static_configs:
       - targets: ["alertmanager:9093"]

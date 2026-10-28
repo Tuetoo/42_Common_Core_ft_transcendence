@@ -3,12 +3,8 @@ import asyncio
 import os
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
-_AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
-if str(_AI_SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_SERVICE_DIR))
 
 THRESHOLDS_SECONDS = (30.0, 60.0, 90.0)
 _SLOTS = ["GOOGLE_API_KEY"] + [f"GOOGLE_API_KEY_{i}" for i in range(2, 11)]

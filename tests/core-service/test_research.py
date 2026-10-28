@@ -1296,6 +1296,34 @@ class TestDocumentIngestion:
         assert document.status == "uploaded"
         assert document.ticker == "AMD"
 
+    async def test_filenames_route_system_only(self, client, db_session):
+        from domains.research.repository import DocumentRepository
+        from shared.schemas import SYSTEM_DOCUMENT_OWNER_ID
+
+        ticker = f"ZZ{uuid4().hex[:6].upper()}"
+        repo = DocumentRepository(db_session)
+        for owner_id, day in ((SYSTEM_DOCUMENT_OWNER_ID, "01"), (uuid4(),
+                                                                 "02")):
+            await repo.create(
+                owner_id=owner_id, organization_id=None,
+                filename=f"{ticker}_10-Q_2026-01-{day}.txt",
+                document_type="txt", category="filing", ticker=ticker,
+                storage_url=f"documents/x/{day}.txt")
+        await db_session.commit()
+
+        params = {"ticker": ticker, "category": "filing"}
+        every_owner = await client.get(
+            "/internal/documents/filenames", params=params)
+        assert every_owner.status_code == 200
+        assert sorted(every_owner.json()) == [
+            f"{ticker}_10-Q_2026-01-01.txt", f"{ticker}_10-Q_2026-01-02.txt"
+        ]
+        system = await client.get(
+            "/internal/documents/filenames",
+            params={**params, "system_only": "true"})
+        assert system.status_code == 200
+        assert system.json() == [f"{ticker}_10-Q_2026-01-01.txt"]
+
     async def test_delete_documents_script(self, db_session):
         from scripts.delete_documents import parse_ids
 
