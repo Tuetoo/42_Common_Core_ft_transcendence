@@ -2,10 +2,9 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { call, getAccessToken, jsonInit } from "@/app/lib/session";
-import { backendFetch, extractErrorMessage } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import { SYSTEM_ROLES, UUID_RE } from "@/app/lib/format";
-import { EMAIL_RE, USERNAME_RE, isTimezone } from "@/app/(public)/field-rules";
+import { EMAIL_MAX, EMAIL_RE, USERNAME_RE, isTimezone } from "@/app/(public)/field-rules";
 
 // Result of a one-click action (a button or a small select form).
 // Only types may be shared from a "use server" file; every exported
@@ -134,7 +133,7 @@ export async function updateUserByAdmin(
   if (!USERNAME_RE.test(values.username)) {
     return { values, error: "Username: 3-32 characters, letters, digits, _ . - only" };
   }
-  if (values.email.length > 254 || !EMAIL_RE.test(values.email)) {
+  if (values.email.length > EMAIL_MAX || !EMAIL_RE.test(values.email)) {
     return { values, error: "Enter a valid email address" };
   }
   if (values.first_name.length > 100 || values.last_name.length > 100) {
@@ -178,24 +177,9 @@ async function moderate(kind: Kind, id: string, intent: Intent): Promise<ActionR
   if (!UUID_RE.test(id)) {
     return { error: `Enter a ${kind} id (a UUID)` };
   }
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
   const path = `/moderation/${kind}s/${id}${intent === "delete" ? "" : `/${intent}`}`;
-  let res: Response;
-  try {
-    res = await backendFetch(path, accessToken, { method: intent === "delete" ? "DELETE" : "POST" });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-  if (res.status === 401) {
-    return { error: "Your session expired. Please log in again." };
-  }
-  if (!res.ok) {
-    return { error: await extractErrorMessage(res, `Could not ${intent} the ${kind}`) };
-  }
+  const result = await call(path, { method: intent === "delete" ? "DELETE" : "POST" }, `Could not ${intent} the ${kind}`);
+  if (!result.ok) return { error: result.error };
 
   revalidatePath("/admin/moderation");
   revalidatePath("/research", "layout");

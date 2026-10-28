@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -39,7 +39,7 @@ from shared.exceptions import (ConflictError, NotFoundError,
                                PermissionDeniedError, ValidationAppError)
 from shared.http_client import gather_bounded
 from shared.market_calendar import market_today
-from shared.schemas import PaginationParams
+from shared.schemas import PaginationParams, RecommendationRef
 from shared.user_state import get_user_state
 
 logger = structlog.get_logger(__name__)
@@ -64,6 +64,13 @@ async def delete_portfolio_row(session: AsyncSession,
 class MarketCloseResult:
     written: int
     skipped: int
+
+
+@dataclass(frozen=True)
+class HoldingAdjustment:
+    read: HoldingAdjustmentRead
+    portfolio_name: str
+    quantities: list[Decimal]
 
 
 @dataclass(frozen=True)
@@ -114,18 +121,12 @@ def missing_session_closes(
     })
 
 
-def _ledger_day(moment: datetime) -> date:
-    if moment.tzinfo is None:
-        return moment.date()
-    return moment.astimezone(UTC).date()
-
-
 def lowest_cash_from(
         transactions: list[Transaction], *, new_day: date,
         new_delta: Decimal) -> tuple[Decimal, date]:
     per_day: dict[date, Decimal] = {}
     for txn in transactions:
-        day = _ledger_day(txn.transaction_date)
+        day = snapshot_day(txn.transaction_date)
         per_day[day] = per_day.get(day, Decimal(0)) + cash_delta(txn)
     per_day[new_day] = per_day.get(new_day, Decimal(0)) + new_delta
 
@@ -147,14 +148,39 @@ class HistoryRow:
     daily_return: Decimal | None
 
 
-def _external_flow(txn: Transaction) -> Decimal:
+_CLOSE_LOOKBACK_PAD_DAYS = 10
+
+
+def close_on_or_before(closes: Mapping[date, Decimal],
+                       day: date) -> Decimal | None:
+    earlier = [d for d in closes if d <= day]
+    return closes[max(earlier)] if earlier else None
+
+
+def external_flow(txn: LedgerRow, day: date,
+                  closes: Mapping[date, Decimal]) -> Decimal:
     if txn.transaction_type in (TransactionType.DEPOSIT,
                                 TransactionType.WITHDRAWAL):
         return cash_delta(txn)
-    if (txn.transaction_type == TransactionType.ADJUSTMENT and txn.quantity
-            and txn.price is not None):
-        return txn.quantity * txn.price
-    return Decimal(0)
+    if txn.transaction_type != TransactionType.ADJUSTMENT or not txn.quantity:
+        return Decimal(0)
+    close = close_on_or_before(closes, day)
+    if close is None:
+        logger.warning(
+            "history_adjustment_valued_at_cost_basis", ticker=txn.ticker,
+            day=day.isoformat())
+        return txn.quantity * (txn.price or Decimal(0))
+    return txn.quantity * close
+
+
+def _holding_read(
+        holding: Holding,
+        recommendation: RecommendationRef | None = None) -> HoldingRead:
+    return HoldingRead(
+        id=holding.id, portfolio_id=holding.portfolio_id,
+        ticker=holding.ticker, quantity=holding.quantity,
+        average_cost=holding.average_cost,
+        latest_recommendation=recommendation)
 
 
 class PortfolioService:
@@ -199,7 +225,14 @@ class PortfolioService:
         portfolio = await self._require_owner(portfolio_id, requester_id)
         if data.name is not None:
             portfolio.name = data.name
-        if data.visibility is not None:
+        if (data.visibility is not None
+                and data.visibility != portfolio.visibility):
+            if data.visibility == "organization":
+                if portfolio.organization_id is None:
+                    raise ValidationAppError(
+                        "This portfolio has no organization to share with.")
+                await auth_client.ensure_organization_writer(
+                    requester_id, portfolio.organization_id)
             portfolio.visibility = data.visibility
         if data.auto_analyze_at_open is not None:
             portfolio.auto_analyze_at_open = data.auto_analyze_at_open
@@ -215,17 +248,21 @@ class PortfolioService:
 
     async def list_holdings(
             self, portfolio_id: UUID, requester_id: UUID,
-            window: slice = slice(None)) -> tuple[list[HoldingRead], int]:
+            window: slice = slice(None), *,
+            with_recommendations: bool = False
+    ) -> tuple[list[HoldingRead], int]:
         await self._require_readable(portfolio_id, requester_id)
         holdings = await self.holdings.list_for_portfolio(portfolio_id)
+        if not with_recommendations:
+            return [_holding_read(h) for h in holdings[window]], len(holdings)
         return await gather_bounded(
             (self._holding_to_read(h) for h in holdings[window]),
             limit=20), len(holdings)
 
     async def add_holding(
             self, portfolio_id: UUID, requester_id: UUID,
-            data: HoldingCreate) -> HoldingAdjustmentRead:
-        await self._require_owner(portfolio_id, requester_id)
+            data: HoldingCreate) -> HoldingAdjustment:
+        portfolio = await self._require_owner(portfolio_id, requester_id)
         await self._lock_portfolio_row(portfolio_id)
         existing = await self.holdings.get_by_ticker(
             portfolio_id, data.ticker, for_update=True)
@@ -234,12 +271,12 @@ class PortfolioService:
                 f"A holding for {data.ticker.upper()} already exists -- use "
                 "a transaction to change its quantity instead.")
         return await self._adjust_holding_to(
-            portfolio_id, data.ticker, None, data.quantity, data.average_cost)
+            portfolio, data.ticker, None, data.quantity, data.average_cost)
 
     async def update_holding(
             self, portfolio_id: UUID, requester_id: UUID, holding_id: UUID,
-            data: HoldingUpdate) -> HoldingAdjustmentRead:
-        await self._require_owner(portfolio_id, requester_id)
+            data: HoldingUpdate) -> HoldingAdjustment:
+        portfolio = await self._require_owner(portfolio_id, requester_id)
         await self._lock_portfolio_row(portfolio_id)
         holding = await self._require_holding(portfolio_id, holding_id)
         target_quantity = (
@@ -248,17 +285,16 @@ class PortfolioService:
             data.average_cost
             if data.average_cost is not None else holding.average_cost)
         return await self._adjust_holding_to(
-            portfolio_id, holding.ticker, holding, target_quantity,
-            target_cost)
+            portfolio, holding.ticker, holding, target_quantity, target_cost)
 
     async def delete_holding(
             self, portfolio_id: UUID, requester_id: UUID,
-            holding_id: UUID) -> HoldingAdjustmentRead:
-        await self._require_owner(portfolio_id, requester_id)
+            holding_id: UUID) -> HoldingAdjustment:
+        portfolio = await self._require_owner(portfolio_id, requester_id)
         await self._lock_portfolio_row(portfolio_id)
         holding = await self._require_holding(portfolio_id, holding_id)
         return await self._adjust_holding_to(
-            portfolio_id, holding.ticker, holding, Decimal(0),
+            portfolio, holding.ticker, holding, Decimal(0),
             holding.average_cost)
 
     async def _require_holding(
@@ -273,9 +309,10 @@ class PortfolioService:
         return locked
 
     async def _adjust_holding_to(
-            self, portfolio_id: UUID, ticker: str, holding: Holding | None,
+            self, portfolio: Portfolio, ticker: str, holding: Holding | None,
             target_quantity: Decimal,
-            target_cost: Decimal) -> HoldingAdjustmentRead:
+            target_cost: Decimal) -> HoldingAdjustment:
+        portfolio_id = portfolio.id
         quantity = holding.quantity if holding is not None else Decimal(0)
         cost = holding.average_cost if holding is not None else Decimal(0)
         plan = plan_adjustments(quantity, cost, target_quantity, target_cost)
@@ -321,10 +358,13 @@ class PortfolioService:
             logger.info(
                 "holding_adjusted", portfolio_id=str(portfolio_id),
                 ticker=ticker, transactions=len(txn_ids))
-        return HoldingAdjustmentRead(
-            **read.model_dump(),
-            transaction_id=txn_ids[-1] if txn_ids else None,
-            transaction_ids=txn_ids)
+        return HoldingAdjustment(
+            read=HoldingAdjustmentRead(
+                **read.model_dump(),
+                transaction_id=txn_ids[-1] if txn_ids else None,
+                transaction_ids=txn_ids),
+            portfolio_name=portfolio.name,
+            quantities=[signed_quantity for signed_quantity, _ in plan])
 
     async def record_transaction(
             self, portfolio_id: UUID, requester_id: UUID,
@@ -425,7 +465,7 @@ class PortfolioService:
         after = replay_positions(rows)
         before = replay_positions([t for t in rows if t.id != new_row.id])
         if total_shortfall(after, ticker) > total_shortfall(before, ticker):
-            when = _ledger_day(new_row.transaction_date).isoformat()
+            when = snapshot_day(new_row.transaction_date).isoformat()
             raise ValidationAppError(
                 f"Cannot record this {new_row.transaction_type} of {ticker} "
                 f"dated "
@@ -481,19 +521,6 @@ class PortfolioService:
             if not data.split_ratio:
                 raise ValidationAppError(
                     "A stock split requires a split_ratio.")
-            if data.split_ratio <= 0:
-                raise ValidationAppError(
-                    "A stock split/dividend requires a positive split_ratio "
-                    "(e.g. 2.0 for a 2-for-1 split, 0.5 for a 1-for-2 reverse "
-                    "split, 1.05 for a 5% stock dividend).")
-        elif kind == TransactionType.ADJUSTMENT:
-            if not data.quantity:
-                raise ValidationAppError(
-                    "An adjustment requires a non-zero quantity.")
-            if data.quantity > 0 and (data.price is None or data.price < 0):
-                raise ValidationAppError(
-                    "An adjustment that moves shares in requires a price >= 0."
-                )
 
     async def _lock_portfolio_row(self, portfolio_id: UUID) -> None:
         await self._db.execute(
@@ -507,7 +534,7 @@ class PortfolioService:
         amount = quantity * (data.price or Decimal(0)) if is_buy else quantity
         await self._lock_portfolio_row(portfolio_id)
         txns = await self.transactions.list_all_for_portfolio(portfolio_id)
-        new_day = _ledger_day(data.transaction_date)
+        new_day = snapshot_day(data.transaction_date)
         lowest, lowest_day = lowest_cash_from(
             txns, new_day=new_day, new_delta=-amount)
         if lowest >= 0:
@@ -557,7 +584,7 @@ class PortfolioService:
         watchlist = await self._require_watchlist_owner(watchlist_id, owner_id)
         watchlist.name = data.name
         await self._db.flush()
-        items = await self.watchlists.list_items(watchlist.id)
+        items = await self.watchlists.list_items([watchlist.id])
         return WatchlistRead(
             id=watchlist.id, name=watchlist.name,
             items=[WatchlistItemRead.model_validate(i) for i in items])
@@ -574,15 +601,15 @@ class PortfolioService:
 
     async def list_my_watchlists(self, owner_id: UUID) -> list[WatchlistRead]:
         watchlists = await self.watchlists.list_for_user(owner_id)
-        results = []
-        for wl in watchlists:
-            items = await self.watchlists.list_items(wl.id)
-            results.append(
-                WatchlistRead(
-                    id=wl.id, name=wl.name,
-                    items=[WatchlistItemRead.model_validate(i)
-                           for i in items]))
-        return results
+        items: dict[UUID, list[WatchlistItemRead]] = {}
+        for item in await self.watchlists.list_items(
+                [wl.id for wl in watchlists]):
+            items.setdefault(item.watchlist_id, []).append(
+                WatchlistItemRead.model_validate(item))
+        return [
+            WatchlistRead(id=wl.id, name=wl.name, items=items.get(wl.id, []))
+            for wl in watchlists
+        ]
 
     async def add_watchlist_item(
             self, watchlist_id: UUID, owner_id: UUID,
@@ -718,13 +745,7 @@ class PortfolioService:
         await self._require_readable(portfolio_id, requester_id)
         snapshots = await self.snapshots.list_for_portfolio(
             portfolio_id, end_date=end_date)
-        flows: dict[date, Decimal] = {}
-        for txn in await self.transactions.list_all_for_portfolio(portfolio_id
-                                                                  ):
-            flow = _external_flow(txn)
-            if flow:
-                day = snapshot_day(txn.transaction_date)
-                flows[day] = flows.get(day, Decimal(0)) + flow
+        flows = await self._history_flows(portfolio_id, snapshots, start_date)
         rows: list[HistoryRow] = []
         previous: PortfolioSnapshot | None = None
         for snap in snapshots:
@@ -746,6 +767,40 @@ class PortfolioService:
                         daily_return=daily_return))
             previous = snap
         return rows
+
+    async def _history_flows(
+            self, portfolio_id: UUID, snapshots: Sequence[PortfolioSnapshot],
+            start_date: date | None) -> dict[date, Decimal]:
+        if len(snapshots) < 2:
+            return {}
+        days = [s.snapshot_date for s in snapshots]
+        before_start = [d for d in days if start_date and d < start_date]
+        after = before_start[-1] if before_start else days[0]
+        rows = [(txn, day) for txn in
+                await self.transactions.list_all_for_portfolio(portfolio_id)
+                if after < (day := snapshot_day(txn.transaction_date))
+                <= days[-1]]
+        first_day: dict[str, date] = {}
+        for txn, day in rows:
+            if txn.transaction_type == TransactionType.ADJUSTMENT:
+                first_day[txn.ticker] = min(
+                    day, first_day.get(txn.ticker, day))
+        tickers = sorted(first_day)
+        today = market_today()
+        fetched = await gather_bounded(
+            (ai_client.get_daily_closes(
+                t, lookback_days=(today - first_day[t]).days
+                + _CLOSE_LOOKBACK_PAD_DAYS) for t in tickers), limit=20)
+        closes = {
+            ticker: bars or {}
+            for ticker, bars in zip(tickers, fetched, strict=True)
+        }
+        flows: dict[date, Decimal] = {}
+        for txn, day in rows:
+            flow = external_flow(txn, day, closes.get(txn.ticker, {}))
+            if flow:
+                flows[day] = flows.get(day, Decimal(0)) + flow
+        return flows
 
     async def export_transactions(
             self, portfolio_id: UUID, requester_id: UUID, *,
@@ -828,16 +883,6 @@ class PortfolioService:
             raise NotFoundError("Watchlist not found.")
         return watchlist
 
-    async def transaction_quantities(
-            self, transaction_ids: list[UUID]) -> list[Decimal]:
-        if not transaction_ids:
-            return []
-        result = await self._db.execute(
-            select(Transaction.id, Transaction.quantity).where(
-                Transaction.id.in_(transaction_ids)))
-        by_id = {row.id: row.quantity for row in result}
-        return [by_id.get(i) or Decimal(0) for i in transaction_ids]
-
     async def portfolio_name(self, portfolio_id: UUID) -> str:
         portfolio = await self.portfolios.get_by_id(portfolio_id)
         return portfolio.name if portfolio is not None else ""
@@ -859,8 +904,4 @@ class PortfolioService:
                 holding.ticker, holding.portfolio_id)
         except Exception:
             recommendation = None
-        return HoldingRead(
-            id=holding.id, portfolio_id=holding.portfolio_id,
-            ticker=holding.ticker, quantity=holding.quantity,
-            average_cost=holding.average_cost,
-            latest_recommendation=recommendation)
+        return _holding_read(holding, recommendation)

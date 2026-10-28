@@ -2,6 +2,8 @@ from collections.abc import Callable, Sequence
 from datetime import date, timedelta
 from typing import Any
 import structlog
+from ai.agents.debate_common import (PRIOR_YEAR_UNUSUAL_KEY,
+                                     YEAR_TO_DATE_UNUSUAL_KEY)
 from ai.agents.finish_checks import (OWN_EVIDENCE_CHECK,
                                      InternalTokenValidator,
                                      own_evidence_figure_check)
@@ -348,16 +350,15 @@ class FilingAgent(BaseAgent):
             raw_output={
                 "injected_context": combine_context(
                     state.fresh_filing_context, kg_context),
-                "final_answer": result.final_answer,
                 "one_off_items": await
                 one_off_items_for(state.ticker, records, role=self.role.value),
                 "key_records": await
                 key_records_for(state.ticker, records, role=self.role.value),
-                "year_to_date_unusual_items": await _lines_for(
+                YEAR_TO_DATE_UNUSUAL_KEY: await _lines_for(
                     year_to_date_unusual_item_lines, state.ticker, records,
                     role=self.role.value,
                     event="filing.ytd_unusual_items_failed"),
-                "prior_year_unusual_items": await _lines_for(
+                PRIOR_YEAR_UNUSUAL_KEY: await _lines_for(
                     prior_year_unusual_item_lines, state.ticker, records,
                     role=self.role.value,
                     event="filing.prior_year_unusual_items_failed")

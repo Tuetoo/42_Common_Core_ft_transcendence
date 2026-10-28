@@ -111,7 +111,7 @@ async def _ingest_news(ticker: str) -> str:
         try:
             existing = set(
                 await get_existing_document_filenames(
-                    ticker, DocumentCategory.NEWS.value))
+                    ticker, DocumentCategory.NEWS.value, system_only=True))
             digest = await generate_news_digest(
                 ticker, already_ingested_filenames=existing)
             if digest is not None:
@@ -142,7 +142,8 @@ async def run_macro_auto_ingestion_workflow() -> dict[str, Any]:
     try:
         existing_filenames = set(
             await get_existing_document_filenames(
-                None, DocumentCategory.MACRO_RESEARCH.value))
+                None, DocumentCategory.MACRO_RESEARCH.value,
+                system_only=True))
         with track_source_failures() as source_failures:
             report = await generate_macro_report(
                 already_ingested_filenames=existing_filenames)

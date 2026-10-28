@@ -46,6 +46,8 @@ Browser --HTTPS/WSS :8443--> nginx gateway (TLS, path routing, WebSocket
    SeaweedFS (S3 object storage:  Qdrant (vectors, ai-service only)
    documents)
 
+   frontend (Next.js pages; served by the gateway at /, it calls the API
+   through the gateway's internal listener)
    scheduler (cron -> internal routes, backups)   mailhog (dev email)
    Prometheus + Alertmanager + Grafana, postgres/redis exporters,
    vector (log shipping)
@@ -97,13 +99,17 @@ hops and contracts without a scaling need at this size.
 
 **Internal REST.** A service calls another's `/internal/*` routes through
 a typed client (`clients/*.py`): `httpx` with a timeout, the shared
-`X-Internal-Token`, the response parsed into a `shared.schemas`
-model, a short Redis cache where the data allows it, and any failure
-turned into `UpstreamServiceError` (502) so a raw `httpx` error never
-reaches domain code. The gateway never proxies `/internal`.
+`X-Internal-Token`, the response parsed into a `shared.schemas` model
+or read as a plain dict, and a short Redis cache where the data allows
+it. A lookup the caller needs turns any failure into
+`UpstreamServiceError` (502), so a raw `httpx` error never reaches domain
+code; a best-effort call (for example an FX rate, a sentiment label, the
+friend list or a presence update) logs the failure and returns an
+empty value (`None`, `False` or `[]`) instead. The gateway never proxies `/internal`.
 
 **Events.** "Something happened" signals go through Redis
-(`shared/events.py`, names and payloads in `shared/events.py`):
+(names in `shared/events.py`; each payload is built by its publishing
+service and listed in `API_SPEC.md` section 6):
 - pub/sub for notifications and live updates (a missed one loses only a
   message a user can still find by refreshing);
 - durable streams with consumer groups for the events that must not be
@@ -184,8 +190,9 @@ load off the database the other services use.
   (`shared/redis.py::fixed_window_hits`) that lets requests through when
   Redis is down.
 - **Transport and secrets.** TLS at the gateway; plain HTTP only inside
-  the Docker network; `/internal` needs the shared internal token and is
-  never exposed; secrets come from `.env.docker` (never committed;
+  the Docker networks (the frontend is on its own `edge` network with the
+  gateway only, so it cannot reach the data stores or `/internal`);
+  `/internal` needs the shared internal token and is never exposed; secrets come from `.env.docker` (never committed;
   `.env.example` is the template).
 - **Uploads.** Type, size and content checks; PDFs parsed in the ingestion
   worker, not in the request.
@@ -238,9 +245,11 @@ load off the database the other services use.
   check, build), and a stack smoke workflow that starts the whole stack
   and checks the gateway and the alert rules. A deploy workflow then
   deploys that exact commit to the cloud host once every other workflow
-  run of that commit has succeeded (`DEPLOYMENT.md`). The per-service
-  workflows run only for the services a commit touches, so the gate does
-  not re-check an earlier commit whose own checks failed.
+  run of that commit, and the newest push run on `main` of every other
+  workflow, has succeeded or was skipped (`DEPLOYMENT.md`). The
+  per-service workflows run only for the services a commit touches; the
+  "newest run on `main`" rule is what keeps a check that failed on an
+  earlier commit blocking later deploys until it passes again.
 
 ## 8. Testing
 

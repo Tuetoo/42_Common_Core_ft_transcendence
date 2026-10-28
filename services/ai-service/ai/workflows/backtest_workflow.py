@@ -186,7 +186,8 @@ def compute_backtest_metrics(
 
 async def persist_backtest_result(
         backtest_uuid: UUID, *, benchmark_symbol: str,
-        result: BacktestMetricsResult) -> None:
+        result: BacktestMetricsResult,
+        initial_capital: float | None = None) -> None:
     async with SessionLocal() as session:
         persist = BacktestPersistenceRepository(session)
         await persist.save_metrics(
@@ -202,10 +203,14 @@ async def persist_backtest_result(
             beta=result.beta, information_ratio=result.information_ratio,
             tracking_error=result.tracking_error,
             outperformed=result.outperformed)
-        await BacktestRepository(session).finalize(
+        backtests = BacktestRepository(session)
+        await backtests.finalize(
             backtest_uuid, ending_capital=result.ending_capital,
             strategy_return=result.strategy_return,
             benchmark_return=result.benchmark_return)
+        if initial_capital is not None:
+            backtest = await backtests.get_by_id(backtest_uuid)
+            backtest.initial_capital = initial_capital
         await session.commit()
 
 
@@ -413,14 +418,12 @@ def _is_adjustment(flow: Mapping[str, Any]) -> bool:
 
 
 def _adjustment_ticker(flow: Mapping[str, Any]) -> str | None:
-    ticker = flow.get("ticker") or flow.get("symbol")
+    ticker = flow.get("ticker")
     return str(ticker).strip().upper() if ticker else None
 
 
 def _flow_date(flow: Mapping[str, Any]) -> date:
-    if flow.get("snapshot_date"):
-        return date.fromisoformat(str(flow["snapshot_date"]))
-    return datetime.fromisoformat(str(flow["transaction_date"])).date()
+    return date.fromisoformat(str(flow["snapshot_date"]))
 
 
 def _close_on_or_before(closes: dict[date, float], day: date) -> float | None:
@@ -593,7 +596,8 @@ async def run_portfolio_backtest_workflow(
         result = compute_backtest_metrics(
             twr_curve, benchmark_closes, strategy_returns=strategy_returns)
         await persist_backtest_result(
-            backtest_uuid, benchmark_symbol=benchmark_symbol, result=result)
+            backtest_uuid, benchmark_symbol=benchmark_symbol, result=result,
+            initial_capital=strategy_values[0])
 
         logger.info(
             "portfolio_backtest_complete", backtest_id=backtest_id,

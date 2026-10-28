@@ -8,6 +8,7 @@ from ai.agents.debate_common import (find_ungrounded_figures,
 from ai.agents.loop import (MAX_FINISH_VALIDATION_RETRIES,
                             NUMBER_MATCH_REL_TOLERANCE, ScratchpadEntry,
                             evidence_reference_text)
+from ai.knowledge.filing_records import RECORD_ID_PATTERN
 from ai.knowledge.recycled_content import note_and_source_passages
 from ai.tools.news_tool import tool_labels_in_text
 
@@ -16,11 +17,13 @@ logger = structlog.get_logger(__name__)
 FinishCheck = Callable[[str, dict[str, Any] | None, list[ScratchpadEntry]],
                        str | None]
 
-RECORD_ID_IN_TEXT_RE = re.compile(r"\bF\d+\.[A-Z]\d+\b")
+RECORD_ID_IN_TEXT_RE = re.compile(rf"\b{RECORD_ID_PATTERN}\b")
 
 
 def record_ids_in_text(text: str) -> list[str]:
-    return sorted(set(RECORD_ID_IN_TEXT_RE.findall(text or "")))
+    return sorted({
+        match.group(0) for match in RECORD_ID_IN_TEXT_RE.finditer(text or "")
+    })
 
 
 def internal_tokens_in_text(text: str) -> list[str]:

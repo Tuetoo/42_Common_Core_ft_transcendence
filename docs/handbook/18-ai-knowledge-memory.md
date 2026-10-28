@@ -140,7 +140,7 @@ give `(None, None)`.
 
 ### 3.3 L2 episodic memory: outcomes and reading
 
-**Outcomes.** The daily review job (02:00 New York, chapter 19) scores
+**Outcomes.** The daily review job (00:20 New York, chapter 19) scores
 every recommendation that is at least `AI_ACCURACY_EVALUATION_DAYS` (30)
 days old and not yet scored, as long as its window ended at most
 `REVIEW_GIVE_UP_AFTER_DAYS` (30) days ago; after that an unscorable
@@ -314,9 +314,11 @@ is deleted while its graph facts are extracted, the failure is logged as
 **Near-duplicate superseding.** For all four archived categories,
 before archiving:
 
-1. Load the 3 most recent reports of the same category and ticker
-   (`_NEAR_DUPLICATE_DEDUP_LOOKBACK`, `list_recent_by_category`), then keep
-   only those of the same owner.
+1. Load the 3 most recent reports of the same category, ticker and owner
+   (`_NEAR_DUPLICATE_DEDUP_LOOKBACK`, `_recent_reports_of_owner`: the owner
+   is the analysis's user, or no user for a system analysis), so other
+   users' newer notes on the same ticker do not push a user's own notes
+   out of the window.
 2. Embed the new report and those reports in one batch (one embedding
    request for up to 4 texts) and compute the cosine similarity. The
    reports are embedded whole: the vectors in Qdrant belong to single
@@ -624,7 +626,8 @@ What the listing does:
 - Per form it fixes a window of the newest filings first (`_MAX_PER_FORM`:
   one 10-K, four 10-Qs, i.e. the current annual report and a full
   trailing year of quarters) and only then skips the ones already stored as
-  FILING documents in core-service. The window never slides back to older
+  system FILING documents in core-service (`system_only=true`; a user's
+  upload with the same filename does not count). The window never slides back to older
   filings when the newest is already stored.
 - The form must match exactly: `get_filings(form="10-K")` also returns
   `10-K/A` amendments, which would replace the real annual report.
@@ -637,7 +640,11 @@ What the listing does:
   10-K's input (`_merged_amendment_text`); the prompt then says that the
   amendment wins on the topics it covers and the original stays valid for
   everything else (an amendment often re-files one item only, e.g. a
-  corrected MD&A). The amendment lookup fails open.
+  corrected MD&A). The amendment lookup fails open, and a 10-K without a
+  period of report gets no amendment. Only a 10-K/A that
+  exists when the 10-K is first ingested is merged (amendments filed
+  before the 10-K's filing date are skipped); a 10-K/A filed later is not
+  merged, because the stored 10-K is not ingested again.
 - A text under 100 words is skipped (`sec_edgar_filings.filing_text_too_short`).
 
 **Per filing, oldest first, 3 s apart** (the pause lowers HIGHEST-tier
@@ -689,7 +696,9 @@ plus amendment) before the summary call: up to 1.2 million characters keep
 all; up to 1.6M keep 80%; 1.8M 70%; 2.1M 60%; 2.5M 50%; above 2.5M the
 filing is skipped (`FilingTooLargeError`, log
 `sec_edgar_filings.filing_too_large_skipped`; losing one document is
-better than stalling the batch). A cut is logged
+better than stalling the batch). The skip is reported as an `sec_edgar`
+source failure, so the ticker counts as failed in the run and the next
+run downloads the filing again. A cut is logged
 (`filing_summary.staircase_truncated`) and is a blind character cut (it can
 land mid-table; an amendment appended at the end is the first text lost).
 The tiers were sized for the model's 262k-token context from a single
@@ -1257,7 +1266,7 @@ not ok.
 | `ARCHIVAL_NEAR_DUPLICATE_THRESHOLD` | 0.85 | same | cosine bar for superseding (calibrated for `gemini-embedding-2`; use 0.90 with `mistral-embed`) |
 | `ARCHIVAL_RECYCLED_SHARE_MAX` | 0.5 | same | recycled share that blocks archival |
 | `KG_EXTRACTION_LLM_TIER` | `cheap` | same | tier of the triple extraction call |
-| `SEC_EDGAR_USER_AGENT` | empty | same | "Company Name contact@domain.com"; required by SEC for every request (filings, XBRL, official company names) |
+| `SEC_EDGAR_USER_AGENT` | empty | same | a real name and contact email ("Your Name your.email@example.com"); required by SEC for every request (filings, XBRL, official company names); empty turns SEC EDGAR off |
 | `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` | 8.0 | same | spacing of the SEC requests sent by `ai/providers/sec_edgar.py` in one process (SEC allows 10/s); 0 = no spacing; `edgartools` requests have their own limiter (`EDGAR_RATE_LIMIT_PER_SEC`, library default 9, `.env.example` sets 2) |
 | `FILING_RECORDS_MAX_FILINGS` | 5 | same | newest filings whose records agents load and `search_filings` shows |
 | `FILING_RECORDS_BACKFILL_LLM_TIER` | `cheap` | same | default tier of the backfill's records-only call (`--tier` overrides; ingestion uses `FILING_LLM_TIER`) |
@@ -1367,7 +1376,7 @@ in retrieval. The archive exists for audits and the backfill.
 | a known material item is not in the records | omitted by the model (often a fallback model) or dropped by a check | `filing_records.dropped` (title and reason) for that file; `filing_summary.records_served_by`; check the SEC XBRL line, which carries the material below-operating numbers |
 | records call refused on input size | free-tier limit of 250,000 input tokens per minute per key | `filing_summary.records_input_truncated`, `filing_summary.records_call_input` (`sent_chars`); large filings need the 65 s pause |
 | a stored summary ends mid-sentence | output limit even after the retry | `filing_summary.output_truncated`; `scripts.regenerate_filing_summaries` (3.13) |
-| a new filing was never stored | larger than 2.5M characters, or the summary failed | `sec_edgar_filings.filing_too_large_skipped`; `sec_filings.fallback_not_persisted` (retried on the next run) |
+| a new filing was never stored | larger than 2.5M characters (the ticker is reported failed; retried on the next run), or the summary failed | `sec_edgar_filings.filing_too_large_skipped`; `sec_filings.fallback_not_persisted` (retried on the next run) |
 | filing passages say "period: not available from SEC EDGAR" | EDGAR has no `reportDate` for that filing (XOM's filings before its CIK change) | `sec_edgar.filing_period_unavailable` |
 | no "Latest quarter" line in Fundamental or the Judge | no usable us-gaap quarter (IFRS filer) or the lookup failed | `sec_edgar.latest_quarter_unavailable`, `sec_edgar.quarter_results_failed` |
 | no year-to-date line | first fiscal quarter, a 10-K, or no fiscal-year start found | `sec_edgar.year_to_date_unavailable` (`metrics` gives the reason per metric) |

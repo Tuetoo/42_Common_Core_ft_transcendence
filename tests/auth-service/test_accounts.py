@@ -1025,7 +1025,7 @@ class TestRecentLogin:
         assert _claims(ok.json()["data"]["access_token"])["auth_time"]
 
 
-async def _unverified_user(client, mock_email, db_session, *, days_old):
+async def _unverified_user(client, db_session, *, days_old):
     from sqlalchemy import update
     from domains.auth.model import User
 
@@ -1057,7 +1057,7 @@ class TestUnverifiedPurge:
         from domains.admin.repository import AdminRepository
 
         old_id, _ = await _unverified_user(
-            client, mock_email, db_session, days_old=8)
+            client, db_session, days_old=8)
 
         async def _broken(self):
             raise RuntimeError("database hiccup")
@@ -1074,22 +1074,36 @@ class TestUnverifiedPurge:
             for name, payload in captured_events if name == "user.deleted"
         }
 
+    async def test_failed_invitation_cleanup_fails_its_step(
+            self, client, monkeypatch):
+        from domains.organization.repository import OrganizationRepository
+
+        async def _broken(self, cutoff):
+            raise RuntimeError("database hiccup")
+
+        monkeypatch.setattr(
+            OrganizationRepository, "delete_expired_invitations", _broken)
+        r = await client.post(PURGE)
+        assert r.status_code == 500, r.text
+        assert r.json()["all_units_failed"] == ["expired_invitations"]
+        assert r.json()["expired_invitations_deleted"] == 0
+
     async def test_only_old_never_verified_accounts_are_deleted(
             self, client, mock_email, db_session, captured_events,
             monkeypatch):
         from domains.auth.model import OAuthAccount
 
         old_id, old_email = await _unverified_user(
-            client, mock_email, db_session, days_old=8)
+            client, db_session, days_old=8)
         young_id, _ = await _unverified_user(
-            client, mock_email, db_session, days_old=6)
+            client, db_session, days_old=6)
         linked_id, _ = await _unverified_user(
-            client, mock_email, db_session, days_old=30)
+            client, db_session, days_old=30)
         db_session.add(
             OAuthAccount(
                 user_id=linked_id, provider="github", provider_user_id="77"))
         seen_id, _ = await _unverified_user(
-            client, mock_email, db_session, days_old=30)
+            client, db_session, days_old=30)
         users = _users(db_session)
         seen = await users.get_by_id(seen_id)
         seen.last_seen_at = datetime.now(UTC) - timedelta(days=20)
@@ -1104,6 +1118,15 @@ class TestUnverifiedPurge:
             role="member", invited_by=UUID(verified["id"]),
             expires_at=datetime.now(UTC) + timedelta(days=2))
         db_session.add(live_invitation)
+        stale_invitations = [
+            OrganizationInvitation(
+                organization_id=UUID(org.json()["data"]["id"]),
+                email=f"stale{days}@example.com", role="member",
+                invited_by=UUID(verified["id"]),
+                expires_at=datetime.now(UTC) - timedelta(days=days))
+            for days in (2, 10)
+        ]
+        db_session.add_all(stale_invitations)
         await db_session.flush()
 
         r = await client.post(PURGE)
@@ -1124,6 +1147,12 @@ class TestUnverifiedPurge:
         assert gone.deleted_at is not None and gone.email != old_email
         assert await db_session.get(
             OrganizationInvitation, live_invitation.id) is not None
+        recent_stale, old_stale = stale_invitations
+        assert body["expired_invitations_deleted"] >= 1
+        assert await db_session.get(
+            OrganizationInvitation, recent_stale.id) is not None
+        assert await db_session.get(
+            OrganizationInvitation, old_stale.id) is None
         await reset_rate_limits()
         r = await client.post(
             "/api/v1/auth/register", json={
@@ -1145,7 +1174,7 @@ class TestUnverifiedPurge:
         from domains.admin.service import AdminService
 
         user_id, _ = await _unverified_user(
-            client, mock_email, db_session, days_old=3)
+            client, db_session, days_old=3)
         monkeypatch.setattr(settings, "UNVERIFIED_ACCOUNT_RETENTION_DAYS", 2)
 
         async def _broken(self, user, actor_id):

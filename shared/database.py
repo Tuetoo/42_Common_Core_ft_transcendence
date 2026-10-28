@@ -75,8 +75,6 @@ def make_get_db(
             except Exception:
                 await session.rollback()
                 raise
-            finally:
-                await session.close()
 
     return get_db
 

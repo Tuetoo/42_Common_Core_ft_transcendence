@@ -41,7 +41,7 @@ require_portfolio_id
 AI_CLI=("${COMPOSE[@]}" exec -T ai-service python -m scripts.analysis_cli)
 POLL_INTERVAL_SECONDS=5
 # Wide on purpose: a ticker whose newest filing is not summarized yet is
-# summarized inline first (up to 300 s x 5 attempts, see
+# summarized inline first (up to 300 s x 2 attempts, see
 # ai/knowledge/filing_summary.py _FILING_SUMMARY_TIMEOUT_SECONDS).
 MAX_WAIT_SECONDS=3600
 
@@ -63,6 +63,7 @@ SUMMARY_FILE="$OUTDIR/_summary.txt"
 echo "Output directory: $OUTDIR"
 
 for ticker in "${TICKERS[@]}"; do
+  ticker=$(printf '%s' "$ticker" | tr '[:lower:]' '[:upper:]')
   echo "=================================================="
   echo "=== Starting $ticker at $(date) ==="
   START_TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -83,17 +84,18 @@ except Exception:
   fi
   echo "  $ticker -> analysis_id=$ANALYSIS_ID"
 
+  SECONDS=0  # bash builtin: wall time, including each poll's exec
   ELAPSED=0
   STATUS="pending"
   while [ "$ELAPSED" -lt "$MAX_WAIT_SECONDS" ]; do
     sleep "$POLL_INTERVAL_SECONDS"
-    ELAPSED=$((ELAPSED + POLL_INTERVAL_SECONDS))
     STATUS=$("${AI_CLI[@]}" status "$ANALYSIS_ID" 2>/dev/null | python3 -c \
       "import sys, json
 try:
     print(json.load(sys.stdin)['data']['status'])
 except Exception:
     print('unknown')" 2>/dev/null)
+    ELAPSED=$SECONDS
     echo "  [$ticker] elapsed=${ELAPSED}s status=$STATUS"
     if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then
       break
@@ -105,12 +107,13 @@ except Exception:
 
   # The status turns completed/failed BEFORE the post-verdict
   # writes (archived notes, KG facts, procedural memory) finish; wait up
-  # to 2 minutes for the queue job, or the export misses the last note
-  # and the next ticker starts while they still run.
+  # to 2 minutes for the queue job's end event, or the export misses the
+  # last note and the next ticker starts while they still run.
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then
     for _ in $(seq 1 24); do
       if "${COMPOSE[@]}" logs ai-service --since "$START_TIME_UTC" 2>/dev/null \
-          | grep "analysis_queue_job_finished" | grep -q "$ANALYSIS_ID"; then
+          | grep -E "analysis_queue_job_(finished|errored|timed_out|cancelled|skipped_owner_inactive)" \
+          | grep -q "$ANALYSIS_ID"; then
         break
       fi
       sleep 5

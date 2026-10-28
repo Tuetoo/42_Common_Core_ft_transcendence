@@ -12,6 +12,7 @@ import ai.rag.indexing as indexing_module
 import ai.rag.retriever as retriever_module
 import ai.workflows.auto_ingestion_workflow as auto_workflow
 import ai.workflows.rag_ingestion_workflow as ingestion_module
+import domains.rag.qa as qa_module
 import numpy as np
 import pytest
 from ai.evaluation.rag_recall import (GoldenQAPair,
@@ -24,7 +25,7 @@ from ai.llm.base import (LLMMessage, LLMNonEnglishOutputError,
 from ai.rag.chunking import _CATEGORY_CONFIG, chunk_document
 from ai.rag.embedding import embed_texts
 from ai.rag.indexing import chunk_point_id, index_chunks
-from ai.rag.retriever import (BaseRetriever, expand_query,
+from ai.rag.retriever import (BaseRetriever, FilingRetriever, expand_query,
                               reciprocal_rank_fusion)
 from ai.rag.visibility import (SYSTEM_ONLY_SCOPE, ChunkVisibility,
                                LazyVisibilityScope, VisibilityScope,
@@ -404,7 +405,7 @@ async def test_variants_share_one_embedding_and_filing_tie_prefers_system(
     monkeypatch.setattr(retriever_module, "expand_query", _expand)
     monkeypatch.setattr(retriever_module, "get_qdrant_client", _Qdrant)
     monkeypatch.setattr(retriever_module, "get_bm25_index", _BM25)
-    await BaseRetriever().retrieve("revenue")
+    await BaseRetriever(visibility=None).retrieve("revenue")
     assert embed_calls == [(["revenue", "variant one",
                              "variant two"], "query")]
     assert searched == [[0.0], [1.0], [2.0]]
@@ -434,9 +435,9 @@ async def test_variants_share_one_embedding_and_filing_tie_prefers_system(
             return points, None
 
     monkeypatch.setattr(retriever_module, "get_qdrant_client", _ScrollQdrant)
-    newest = await retriever_module.FilingRetriever(use_query_expansion=False
-                                                    ).newest_filing_chunks(
-                                                        "revenue", "AMD")
+    newest = await retriever_module.FilingRetriever(
+        use_query_expansion=False,
+        visibility=None).newest_filing_chunks("revenue", "AMD")
     assert [c.document_id for c in newest] == ["1111-system-new"]
 
 
@@ -1105,6 +1106,7 @@ async def ask_qdrant(monkeypatch):
         "research_documents")
     monkeypatch.setattr(indexing_module, "_bm25_index", None)
     monkeypatch.setattr(retriever_module, "embed_query", _embed)
+    monkeypatch.setattr(qa_module, "embed_query", _embed)
     monkeypatch.setattr(auth_client, "list_user_organization_ids", _orgs)
     docs = {
         "own_note": (
@@ -1584,6 +1586,61 @@ class TestNewestFilingReserved:
             assert "most recently filed source" in prompt
             assert "NOT the end of the period" in prompt
 
+    @pytest.mark.asyncio
+    async def test_reservation_respects_visibility(self, filings):
+        from domains.rag.qa import retrieve_sources
+        from domains.rag.schema import RagAskRequest
+
+        scope = VisibilityScope.for_user(_ME)
+        newest = await FilingRetriever(
+            use_query_expansion=False, visibility=scope).newest_filing_chunks(
+                "AMD 10-Q quarterly report revenue", "AMD")
+        assert {c.document_id for c in newest} == {filings["newest"]}
+
+        request = RagAskRequest(
+            question="AMD 10-Q quarterly report revenue gross margin",
+            ticker="AMD", categories=[DocumentCategory.FILING], top_k=3)
+        ids = [c.document_id for c in await retrieve_sources(request, scope)]
+        assert filings["newest"] in ids
+        assert filings["foreign"] not in ids
+
+    @pytest.mark.asyncio
+    async def test_question_is_embedded_once_for_all_categories(
+            self, filings, monkeypatch):
+        from domains.rag.qa import retrieve_sources
+        from domains.rag.schema import RagAskRequest
+
+        calls: list[str] = []
+
+        async def _counting(text):
+            calls.append(text)
+            return _vector(text)
+
+        async def _failing(text):
+            calls.append(text)
+            raise RuntimeError("embedding down")
+
+        async def _never(text):
+            raise AssertionError("retrievers must not embed again")
+
+        monkeypatch.setattr(retriever_module, "embed_query", _never)
+        request = RagAskRequest(
+            question="AMD 10-Q quarterly report revenue gross margin",
+            ticker="AMD", categories=[
+                DocumentCategory.FILING, DocumentCategory.NEWS,
+                DocumentCategory.EARNINGS_CALL
+            ], top_k=3)
+        scope = VisibilityScope.for_user(_ME)
+        for case_id, embed in (("shared-vector", _counting),
+                               ("embedding-failed-bm25-only", _failing)):
+            calls.clear()
+            monkeypatch.setattr(qa_module, "embed_query", embed)
+            ids = [
+                c.document_id for c in await retrieve_sources(request, scope)
+            ]
+            assert calls == [request.question], case_id
+            assert filings["newest"] in ids, case_id
+
 
 class TestAutoIngestionContentDate:
 
@@ -1600,7 +1657,8 @@ class TestAutoIngestionContentDate:
         async def _tickers():
             return ["AMD"]
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         async def _no_filings(ticker, *, already_ingested_filenames):

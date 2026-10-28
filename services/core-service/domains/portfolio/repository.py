@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -270,10 +271,11 @@ class WatchlistRepository:
         await self._db.delete(watchlist)
         await self._db.flush()
 
-    async def list_items(self, watchlist_id: UUID) -> list[WatchlistItem]:
+    async def list_items(
+            self, watchlist_ids: Sequence[UUID]) -> list[WatchlistItem]:
         result = await self._db.execute(
             select(WatchlistItem).where(
-                WatchlistItem.watchlist_id == watchlist_id))
+                WatchlistItem.watchlist_id.in_(watchlist_ids)))
         return list(result.scalars().all())
 
     async def get_item(

@@ -108,14 +108,19 @@ class DocumentRepository:
         await self._db.flush()
 
     async def list_filenames(self, *, ticker: str | None, category: str,
-                             failed_retry_days: int) -> list[str]:
-        ticker_condition = (
+                             failed_retry_days: int,
+                             owner_id: UUID | None = None) -> list[str]:
+        conditions = [
             Document.ticker.is_(None)
-            if ticker is None else Document.ticker == ticker.upper())
+            if ticker is None else Document.ticker == ticker.upper(),
+            Document.category == category
+        ]
+        if owner_id is not None:
+            conditions.append(Document.owner_id == owner_id)
         now = datetime.now(UTC)
         result = await self._db.execute(
             select(Document.filename).where(
-                ticker_condition, Document.category == category,
+                *conditions,
                 or_(
                     Document.status == DocumentStatus.READY,
                     and_(

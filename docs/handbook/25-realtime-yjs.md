@@ -102,7 +102,7 @@ Step by step:
    |---|---|---|
    | `user:<id>` | `<id>` is the caller | string compare |
    | `presence:<id>` | `<id>` is the caller, or an accepted friend | `auth_client.are_users_connected` -> auth `GET /internal/connections/check` |
-   | `analysis:<id>` | the caller owns the analysis; for a system analysis (no user), the caller can read its portfolio | `ai_client.get_analysis_ref` (ai-service), then `PortfolioService.get` |
+   | `analysis:<id>` | the caller owns the analysis; for a system analysis (no user), the caller can read its portfolio | `ai_client.get_analysis_ref` (ai-service), then `PortfolioService._require_readable` |
    | `document:<id>` | the caller can read the document (same rule as `GET /research/documents/{id}`) | `ResearchService.get_document` |
 
    Any exception during the check means "deny" (logged as
@@ -365,8 +365,16 @@ updates and receives raw updates.
      replicas. The message is `<replica id>:<base64 of the update>`. Base64
      is needed because every Redis client is built with
      `decode_responses=True` and cannot carry raw bytes; the colon is a
-     safe separator because base64 never contains `:`;
+     safe separator because base64 never contains `:`. The publish is
+     best effort: a Redis error is logged (`yjs_cross_replica_publish_failed`,
+     warning) and the socket stays open, so other replicas miss that update
+     while Redis is down;
   5. if due: persist the snapshot (section 3.7).
+- There is no total size limit on this path: only each update is capped
+  (`YJS_MAX_UPDATE_BYTES`). The 200 000-character `content` limit is
+  checked on the REST routes only, so a note edited through Yjs can grow
+  past it (the editor's `maxLength` is a client-side check). A later REST
+  `PATCH` that sends such a body back gets 422.
 - An `InvalidYjsUpdate` is logged (`yjs_invalid_update` with size and
   error) and closes **only that socket** with **1008**. The room and the
   other participants continue.
@@ -673,7 +681,10 @@ Rooms live only in the process memory (`YjsRelay._rooms`). On a restart:
   or it stayed open for at least 10 seconds (`STABLE_OPEN_MS`). core-service
   accepts a socket before it checks the token or the socket cap, so an
   "open" alone proves nothing. Each client can act on every (re)open; the unread badge
-  uses this to read the unread count again.
+  uses this to read the unread count again. One socket does not retry:
+  the analysis page's `analysis:<id>` socket (`retry: false` in
+  `analyses/[id]/live-status.tsx`) ends on any close, and the page then
+  reloads its data every 15 seconds until the analysis finishes.
 - A clean stop normally closes the sockets first, and each socket's
   `finally` runs `relay.disconnect`, which saves a dirty room before
   evicting it. After the background tasks stop, the lifespan also calls

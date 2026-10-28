@@ -282,6 +282,89 @@ class TestPortfolioAccess:
                 "visibility": "organization"
             }, headers=headers)
         assert ok.status_code == 201, ok.text
+        no_org = await client.post(
+            "/api/v1/portfolios", json={
+                "name": "x",
+                "visibility": "organization"
+            }, headers=headers)
+        assert no_org.status_code == 422
+
+    async def test_sharing_needs_a_writer_and_ends_when_the_member_leaves(
+            self, client, db_session, monkeypatch):
+        import clients.auth_client as auth_client
+        import event_listener
+        from domains.portfolio.repository import PortfolioRepository
+
+        owner, headers = _make_token()
+        watched = uuid4()
+
+        async def _roles(user_id):
+            return {watched: "viewer"}
+
+        monkeypatch.setattr(
+            auth_client, "list_user_organization_roles", _roles)
+        repo = PortfolioRepository(db_session)
+        in_org = await repo.create(
+            owner_id=UUID(owner), name="p", currency="USD",
+            organization_id=watched, visibility="private")
+        alone = await create_portfolio(client, headers)
+        share = {"visibility": "organization"}
+        viewer = await client.patch(
+            f"/api/v1/portfolios/{in_org.id}", json=share, headers=headers)
+        assert viewer.status_code == 403
+        no_org = await client.patch(
+            f"/api/v1/portfolios/{alone}", json=share, headers=headers)
+        assert no_org.status_code == 422
+        same = await client.patch(
+            f"/api/v1/portfolios/{in_org.id}", json={
+                "name": "renamed",
+                "visibility": "private"
+            }, headers=headers)
+        assert same.status_code == 200, same.text
+
+        from database import SessionLocal
+        from domains.portfolio.model import Portfolio
+        from sqlalchemy import delete, select
+
+        other_org = uuid4()
+        rows = [
+            Portfolio(
+                owner_id=UUID(owner), name=name, currency="USD",
+                organization_id=org, visibility="organization")
+            for name, org in (("left", watched), ("other", other_org))
+        ]
+        async with SessionLocal() as session:
+            session.add_all(rows)
+            await session.commit()
+
+        async def _no_notification(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(
+            event_listener, "_notify_organization", _no_notification)
+        try:
+            await event_listener._handle_organization_member_left({
+                "organization_id": str(watched),
+                "user_id": owner,
+                "actor_id": owner,
+                "member_ids": []
+            })
+            async with SessionLocal() as session:
+                after = {
+                    p.name: (p.visibility, p.organization_id)
+                    for p in (await session.execute(
+                        select(Portfolio).where(
+                            Portfolio.owner_id == UUID(owner)))).scalars()
+                }
+            assert after == {
+                "left": ("private", watched),
+                "other": ("organization", other_org)
+            }
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(Portfolio).where(Portfolio.owner_id == UUID(owner)))
+                await session.commit()
 
 
 class TestTransactions:
@@ -1097,6 +1180,9 @@ class TestScheduledJobs:
         assert ("NVDA", UUID(pid), UUID(owner)) in calls
 
         await client.get(f"/api/v1/portfolios/{pid}/holdings", headers=headers)
+        assert rec_calls == []
+        await PortfolioService(db_session).list_holdings(
+            UUID(pid), UUID(owner), with_recommendations=True)
         assert rec_calls == [("NVDA", UUID(pid))]
 
         import domains.portfolio.service as service_module
@@ -1185,6 +1271,84 @@ class TestExports:
                 }, headers=headers))
         assert [r[0] for r in ranged[1:]] == ["2026-09-02"]
         assert Decimal(ranged[1][4]) == Decimal("0.05")
+
+    def test_cash_check_uses_the_snapshot_day(self):
+        from domains.portfolio.ledger import snapshot_day
+        from domains.portfolio.service import lowest_cash_from
+
+        evening = datetime(2026, 10, 27, 23, 30, tzinfo=UTC)
+        deposit = _LedgerRow("deposit", "CASH", Decimal(1000), evening)
+        buy_time = datetime(2026, 10, 27, 15, tzinfo=UTC)
+        assert lowest_cash_from(
+            [deposit], new_day=snapshot_day(buy_time),
+            new_delta=Decimal(-1000)) == (Decimal(-1000), date(2026, 10, 27))
+
+    def test_external_flow_rule(self):
+        from domains.portfolio.service import external_flow
+
+        day = date(2026, 9, 3)
+        closes = {date(2026, 9, 2): Decimal(100), date(2026, 9, 4): Decimal(1)}
+        out = _LedgerRow("adjustment", "AAPL", Decimal(-3), _at(3))
+        shares_in = _LedgerRow(
+            "adjustment", "AAPL", Decimal(3), _at(3), price=Decimal(40))
+        assert external_flow(LEDGER[0], day, {}) == 10000
+        assert external_flow(LEDGER[-1], day, {}) == -100
+        assert external_flow(LEDGER[1], day, closes) == 0
+        assert external_flow(out, day, closes) == -300
+        assert external_flow(shares_in, day, closes) == 300
+        assert external_flow(shares_in, day, {}) == 120
+        assert external_flow(out, day, {}) == 0
+
+    async def test_history_values_adjustments_at_session_close(
+            self, client, db_session, monkeypatch):
+        import clients.ai_client as ai_client
+        from domains.portfolio.repository import PortfolioSnapshotRepository
+
+        _, headers = _make_token()
+        pid = await create_portfolio(client, headers)
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 1, 14, tzinfo=UTC),
+            ticker="AAPL", transaction_type="adjustment", quantity="100",
+            price="50")
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 2, 14, tzinfo=UTC),
+            ticker="AAPL", transaction_type="adjustment", quantity="-100")
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 2, 14, 0, 1, tzinfo=UTC),
+            ticker="AAPL", transaction_type="adjustment", quantity="100",
+            price="60")
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 3, 14, tzinfo=UTC),
+            ticker="AAPL", transaction_type="adjustment", quantity="-100")
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 3, 14, 0, 1, tzinfo=UTC),
+            ticker="MSFT", transaction_type="adjustment", quantity="10",
+            price="10")
+        await _txn_at(
+            client, pid, headers, datetime(2026, 9, 3, 14, 0, 2, tzinfo=UTC),
+            ticker="MSFT", transaction_type="adjustment", quantity="-10")
+        snaps = PortfolioSnapshotRepository(db_session)
+        for day, total in [(1, "10000"), (2, "10000"), (3, "0")]:
+            await snaps.upsert(
+                portfolio_id=UUID(pid), snapshot_date=date(2026, 9, day),
+                total_value=Decimal(total), cash_balance=Decimal(0))
+        lookups: dict[str, int] = {}
+
+        async def _closes(ticker, *, lookback_days=5, timeout=15.0):
+            lookups[ticker] = lookback_days
+            return {date(2026, 9, d): Decimal(100) for d in (1, 2)}
+
+        import domains.portfolio.service as service_module
+
+        monkeypatch.setattr(ai_client, "get_daily_closes", _closes)
+        monkeypatch.setattr(
+            service_module, "market_today", lambda: date(2026, 10, 1))
+        rows = _csv_rows(await client.get(
+            f"/api/v1/portfolios/{pid}/history.csv", headers=headers))
+        # Each ticker looks back to its own first adjustment day in the
+        # export (AAPL 9-02, MSFT 9-03), plus the 10-day pad.
+        assert lookups == {"AAPL": 29 + 10, "MSFT": 28 + 10}
+        assert [Decimal(r[4]) for r in rows[2:]] == [0, 0]
 
     async def test_transactions_csv_content_and_filters(self, client):
         _, headers = _make_token()

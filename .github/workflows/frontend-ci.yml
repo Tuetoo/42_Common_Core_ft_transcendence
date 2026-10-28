@@ -14,6 +14,10 @@ on:
       - "frontend/**"
       - ".github/workflows/frontend-ci.yml"
 
+# Read-only token: no job writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   frontend:
     runs-on: ubuntu-latest

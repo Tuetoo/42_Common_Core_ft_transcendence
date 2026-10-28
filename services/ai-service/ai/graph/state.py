@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from ai.tools.base import is_evidence_record
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from shared.enums import (AgentRole, AgentStatus, AnalysisFailureReason,
                           AnalysisType, RecommendationAction)
 
@@ -437,8 +437,6 @@ PARTIAL_PARTICIPATION_RATIO_THRESHOLD = 0.8
 
 
 class AnalysisState(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     analysis_id: str
     user_id: str
     portfolio_id: str | None = None
@@ -522,7 +520,10 @@ class AnalysisState(BaseModel):
             return None
         return self.usable_agent_count() / len(self.agent_outputs)
 
-    def confidence_adjustment_note(self) -> str | None:
+    def confidence_adjustment_note(
+            self, *, converged: bool | None = None) -> str | None:
+        if converged is None:
+            converged = self.debate.converged
         notes: list[str] = []
 
         if self.skipped_agents:
@@ -579,7 +580,7 @@ class AnalysisState(BaseModel):
                 "that "
                 "leans on those specific agents' claims with extra caution.")
 
-        if not self.debate.converged:
+        if not converged:
             notes.append(
                 "Bull/Bear debate did not converge within the round cap; "
                 "confidence reflects that.")

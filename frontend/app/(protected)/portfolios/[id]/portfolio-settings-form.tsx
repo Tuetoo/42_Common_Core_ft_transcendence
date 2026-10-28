@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { updatePortfolio, type UpdatePortfolioState } from "@/app/lib/actions/portfolios";
 import { NAME_MAX_LENGTH } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: UpdatePortfolioState = {};
 
@@ -46,16 +47,8 @@ export function PortfolioSettingsForm({
           </select>
         </div>
       )}
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.success && (
-        <p aria-live="polite" className="form-message success">
-          Saved.
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.success ? "Saved." : null} />
       <button type="submit" disabled={pending} className="btn btn-ghost">
         {pending ? "Saving…" : "Save settings"}
       </button>

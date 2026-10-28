@@ -428,7 +428,7 @@ class TestNewsAndWebSearchProviders:
                 lambda: TavilyProvider().search("anything"),
                 lambda: httpx.Response(500, json={"error": "boom"}))
         }
-        for case_id, (module, key_setting, search, reply) in searches.items():
+        for module, key_setting, search, reply in searches.values():
             monkeypatch.setattr(module.settings, key_setting, "")
             with pytest.raises(ProviderUnavailableError):
                 await search()
@@ -479,14 +479,12 @@ class _FakeMarketService:
     def __init__(self, cached_bars, *, refresh_raises=None):
         self._cached_bars = cached_bars
         self._refresh_raises = refresh_raises
-        self.get_recent_prices_calls = 0
         self.refresh_calls = 0
 
     def __call__(self, session):
         return self
 
     async def get_recent_prices(self, ticker, interval):
-        self.get_recent_prices_calls += 1
         if self._cached_bars is None:
             raise NotFoundError("no instrument")
         return self._cached_bars

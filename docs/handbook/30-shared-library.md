@@ -695,7 +695,7 @@ What the values mean, where the code does not say it by name:
   500. Every `page` query parameter should use `le=MAX_PAGE` too.
   How the envelopes are used: single objects are wrapped as
   `{"data": ..., "request_id": "<id>"}` (`APIResponse`; the field defaults
-  to `request_id.current_request_id()`, so it equals the `X-Request-ID`
+  to `shared.logging.current_request_id()`, so it equals the `X-Request-ID`
   header and the error body's id; a route never sets it). Paginated
   lists are returned unwrapped as `{"items", "total", "page",
   "page_size"}` (`PaginatedResponse`), with one exception: auth-service's

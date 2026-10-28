@@ -58,7 +58,8 @@ async def list_holdings(
     pagination = PaginationParams(page=page, page_size=page_size)
     page_items, total = await PortfolioService(db).list_holdings(
         portfolio_id, owner_id,
-        slice(pagination.offset, pagination.offset + pagination.limit))
+        slice(pagination.offset, pagination.offset + pagination.limit),
+        with_recommendations=True)
     return PaginatedResponse(
         items=page_items, total=total, page=pagination.page,
         page_size=pagination.page_size)
@@ -94,11 +95,9 @@ async def update_holding(
     result = await service.update_holding(
         portfolio_id, owner_id, holding_id, data)
     notify_holding_adjustment(
-        background_tasks, owner_id, await service.portfolio_name(portfolio_id),
-        result.ticker, await
-        service.transaction_quantities(result.transaction_ids),
-        source=" (API key)")
-    return APIResponse(data=result)
+        background_tasks, owner_id, result.portfolio_name, result.read.ticker,
+        result.quantities, source=" (API key)")
+    return APIResponse(data=result.read)
 
 
 @router.delete(

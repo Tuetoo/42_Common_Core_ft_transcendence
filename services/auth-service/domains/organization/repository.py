@@ -198,6 +198,14 @@ class OrganizationRepository:
                     <= now)).execution_options(synchronize_session="fetch"))
         return int(getattr(result, "rowcount", 0) or 0)
 
+    async def delete_expired_invitations(self, cutoff: datetime) -> int:
+        result = await self._db.execute(
+            delete(OrganizationInvitation).where(
+                OrganizationInvitation.accepted_at.is_(None),
+                OrganizationInvitation.expires_at
+                < cutoff).execution_options(synchronize_session="fetch"))
+        return int(getattr(result, "rowcount", 0) or 0)
+
     async def delete_invitation(
             self, invitation: OrganizationInvitation) -> None:
         await self._db.delete(invitation)

@@ -71,7 +71,7 @@ async def _can_read_analysis(requester_id: str, analysis_id: UUID) -> bool:
     if ref.portfolio_id is None:
         return False
     async with SessionLocal() as session:
-        await PortfolioService(session).get(
+        await PortfolioService(session)._require_readable(
             ref.portfolio_id, UUID(requester_id))
     return True
 

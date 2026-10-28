@@ -6,10 +6,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-_AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
-if str(_AI_SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_SERVICE_DIR))
-
 
 def merge_pairs(existing: list[Any], new: list[Any]) -> list[Any]:
     seen = {p.chunk_id for p in existing}
@@ -26,7 +22,8 @@ def category_counts(pairs: list[Any]) -> dict[str, int]:
 
 
 DESCRIPTION = (
-    "Generates RAG golden-set questions (one per indexed chunk) with the")
+    "Generates RAG golden-set questions (one per indexed chunk) with the "
+    "CHEAP LLM tier.")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -54,11 +51,9 @@ def _parser() -> argparse.ArgumentParser:
 async def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
-    from ai.evaluation.rag_recall import (GoldenQAPair,
-                                          _drop_near_duplicate_chunks,
-                                          _real_indexed_chunk_count,
-                                          _sample_indexed_chunks,
-                                          generate_golden_set, save_golden_set)
+    from ai.evaluation.rag_recall import (GoldenQAPair, generate_golden_set,
+                                          save_golden_set,
+                                          select_golden_set_chunks)
     from shared.enums import DocumentCategory
 
     categories: frozenset[str] | None = None
@@ -80,16 +75,12 @@ async def main(argv: list[str] | None = None) -> int:
             f"{category_counts(existing)}")
     skip = frozenset(p.chunk_id for p in existing)
 
-    sample_size = args.limit or await _real_indexed_chunk_count()
-    chunks = await _sample_indexed_chunks(sample_size)
-    if categories is not None:
-        chunks = [c for c in chunks if c["category"] in categories]
-    chunks = [c for c in chunks if c["chunk_id"] not in skip]
-    kept = await _drop_near_duplicate_chunks(chunks)
+    kept, candidate_count = await select_golden_set_chunks(
+        sample_size=args.limit, categories=categories, skip_chunk_ids=skip)
     planned = dict(sorted(Counter(c["category"] for c in kept).items()))
     print(
         f"Chunks to generate questions for: {len(kept)} {planned} "
-        f"({len(chunks) - len(kept)} near-duplicate chunk(s) left out); "
+        f"({candidate_count - len(kept)} near-duplicate chunk(s) left out); "
         f"one CHEAP-tier call each.")
     if args.dry_run or not kept:
         print(
@@ -97,8 +88,7 @@ async def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    result = await generate_golden_set(
-        sample_size=sample_size, categories=categories, skip_chunk_ids=skip)
+    result = await generate_golden_set(kept)
     print(
         f"Generated {len(result.pairs)} question(s) from "
         f"{result.sampled_count} chunk(s) {category_counts(result.pairs)}.")

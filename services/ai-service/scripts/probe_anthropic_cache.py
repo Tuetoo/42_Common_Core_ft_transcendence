@@ -1,14 +1,10 @@
 import argparse
 import asyncio
 import sys
-from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
 from uuid import uuid4
 
-_AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
-if str(_AI_SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_SERVICE_DIR))
 
 DESCRIPTION = (
     "Owner-run probe: does Anthropic prompt caching reuse the ReAct "

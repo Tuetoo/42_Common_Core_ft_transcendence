@@ -119,15 +119,15 @@ field on the wire (section 3.4).
 | `tier.executed` | ai (`tier_monitoring_workflow.py`) | pub/sub | core `_handle_tier_executed` | `tier_id, analysis_id, user_id, portfolio_id, ticker, action, quantity, price, reason` | push, notification |
 | `tier.execution_failed` | ai (`tier_monitoring_workflow.py`) | pub/sub | core `_handle_tier_execution_failed` | same | push, notification |
 | `tier.cancelled` | ai (decision route: `declined` / `superseded`; analysis workflow: `superseded`; portfolio delete: `portfolio_deleted`) | pub/sub | core `_handle_tier_cancelled` | same, `reason` set | push, notification |
-| `backtest.completed` | ai (`backtest_workflow.py::publish_backtest_finished`) | pub/sub | core `_handle_backtest_completed` | `backtest_id, user_id, kind, status, error` | notification |
+| `backtest.completed` | ai (`backtest_workflow.py::publish_backtest_finished`) | pub/sub | core `_handle_backtest_completed` | `backtest_id, user_id, kind, error` | notification |
 | `backtest.failed` | ai (same) | pub/sub | core `_handle_backtest_failed` | same | notification |
 | `backtest.deleted` | ai (`domains/backtest/api.py::delete_backtest`, after the commit as a background task) | pub/sub | core `_handle_backtest_deleted` | `backtest_id, user_id, kind` | notification to the owner |
 | `organization.created` | auth (`domains/organization/service.py`) | pub/sub | core `_handle_organization_created` | `organization_id, organization_name, actor_id, user_id` (the affected member, or `None`), `role` (or `None`), `member_ids` (members to notify, sorted, unique) | notification to members |
 | `organization.updated` | auth | pub/sub | core | same | notification to members |
 | `organization.deleted` | auth (owner `DELETE /organizations/{id}`; also `AdminService._delete` when the deleted user was the owner and no other member is left, and the nightly purge-unverified job's `clean_deleted_account_leftovers` for such an organization of an account deleted earlier) | pub/sub | core | same | open sockets (Yjs and channels) of every former member are re-checked (section 3.8); notification to former members. core deletes the organization's documents (`document.deleted`) and notes, deletes the shared portfolios of deleted owners (`portfolio.deleted`) and makes the others private again (`delete_organization_content`, chapter 12) |
 | `organization.member.joined` | auth (invitation accept) | pub/sub | core | same | welcome to the new member, notice to others |
-| `organization.member.left` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
-| `organization.member.removed` | auth | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
+| `organization.member.left` | auth | pub/sub | core | same | open sockets of the member re-checked; the member's shared portfolios of that organization made private; affected member + others notified |
+| `organization.member.removed` | auth | pub/sub | core | same | open sockets of the member re-checked; the member's shared portfolios of that organization made private; affected member + others notified |
 | `organization.role.changed` | auth (also when a deleted owner's organization passes to a successor) | pub/sub | core | same | open sockets of the member re-checked; affected member + others notified |
 | `organization.invitation.created` | auth | pub/sub | core | same (`user_id` = the invitee when the email has an account, else `None`) | notification to the actor and to the invited user (when the email has an account) |
 | `organization.invitation.revoked` | auth (`revoke_invitation`; also `AdminService._delete` and `clean_deleted_account_leftovers`, one per open invitation the deleted user sent, with that user as `actor_id`) | pub/sub | core | same (`user_id` as above, `role` = the invitation role) | notification to the actor and to the invited user (when the email has an account); a deleted sender (the `AdminService._delete` path) gets no notification, because core skips deleted users |
@@ -399,9 +399,10 @@ own sockets), but only ONE replica may create the notification row.
 
 ```python
 event_id = payload.get("event_id")
-digest = str(event_id) if event_id else sha256(json.dumps(payload, sort_keys=True))
+if not event_id:
+    return True
 claimed = await get_events_client(settings).set(
-    f"core:event_claim:{event}:{digest}", "1", nx=True, ex=_EVENT_CLAIM_TTL_SECONDS)
+    f"core:event_claim:{event}:{event_id}", "1", nx=True, ex=_EVENT_CLAIM_TTL_SECONDS)
 ```
 
 - `SET ... NX EX 300`: set the key only if it does not exist, with a 300
@@ -411,8 +412,8 @@ claimed = await get_events_client(settings).set(
   payload content would make two real, identical events within 5 minutes
   (deactivate, reactivate, deactivate the same user) look like one, and the
   second notification would be lost. A payload without `event_id` (for
-  example one published by hand) falls back to a SHA-256 hash of the
-  payload (`json.dumps(..., sort_keys=True, default=str)`).
+  example one published by hand) is not claimed: the function returns
+  `True`, so every replica writes the notification.
 - If Redis is down the function logs `event_claim_failed` and returns
   `True` ("fails open"): a duplicate notification is better than a lost
   one.
@@ -743,12 +744,12 @@ core-service's handlers in `event_listener.py` do up to three things:
    check itself fails the socket stays open (`websocket_session_recheck_failed`).
    Details in [25-realtime-yjs.md](25-realtime-yjs.md).
 
-Handlers that need a recipient and find none log a warning and stop:
+Handlers that need a recipient and find none log and stop:
 the notify handlers for one recipient (analysis, recommendation,
-decision and backtest events) log `event_missing_user_id` (fields
-`event_name`, `analysis_id`; for example a system analysis), the
+decision and backtest events) log `event_missing_user_id` at info level
+(fields `event_name`, `analysis_id`; expected for a system analysis), the
 actor-only ones (`connection.blocked`, `friend.removed` other than
-`removed`, `user.deleted`) log `event_missing_actor_id`, and the handlers
+`removed`, `user.deleted`) log `event_missing_actor_id` as a warning, and the handlers
 that notify the user and the actor (`_notify_pair`: friend, user and
 invitation events) log `event_missing_recipient` when both are missing;
 `organization_member_joined_missing_user_id`,

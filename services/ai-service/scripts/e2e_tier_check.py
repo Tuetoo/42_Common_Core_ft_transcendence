@@ -82,12 +82,10 @@ class TierCheck:
         self.tier_ids: dict[str, UUID] = {}
         self.ws_events: list[dict[str, Any]] = []
         self.ws_error: str | None = None
-        base = args.base_url.rstrip("/")
-        self.ws_base = (
-            "wss" + base[5:] if base.startswith("https") else "ws" + base[4:])
-        headers = {"Host": args.host_header} if args.host_header else {}
+        self.ws_base = "wss" + DEFAULT_BASE_URL.removeprefix("https")
         self.api = httpx.AsyncClient(
-            base_url=base, verify=False, headers=headers, timeout=30.0,
+            base_url=DEFAULT_BASE_URL, verify=False,
+            headers={"Host": DEFAULT_HOST_HEADER}, timeout=30.0,
             follow_redirects=False)
 
     def record(self, name: str, status: str, detail: str) -> None:
@@ -603,8 +601,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--break-lock", action="store_true",
         help="remove the lock of an earlier end-to-end run that was killed")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--host-header", default=DEFAULT_HOST_HEADER)
     return parser.parse_args(argv)
 
 

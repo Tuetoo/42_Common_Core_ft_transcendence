@@ -3,6 +3,7 @@
 import { useActionState, useState } from "react";
 import { uploadAvatar, type UploadAvatarState } from "@/app/lib/actions/profile";
 import { AVATAR_TYPES, avatarFileError } from "@/app/(public)/field-rules";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: UploadAvatarState = {};
 
@@ -50,16 +51,8 @@ export function AvatarForm() {
         )}
       </div>
       <p style={{ fontSize: 12, color: "var(--text-faint)", margin: 0 }}>PNG, JPEG, WebP or GIF, up to 5MB.</p>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state?.success && (
-        <p aria-live="polite" className="form-message success">
-          Picture updated.
-        </p>
-      )}
+      <FormMessage text={state?.error} />
+      <FormMessage kind="success" text={state?.success ? "Picture updated." : null} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Uploading…" : "Upload picture"}
       </button>

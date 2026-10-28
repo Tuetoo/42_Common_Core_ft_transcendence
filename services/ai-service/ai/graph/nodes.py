@@ -304,17 +304,19 @@ async def _portfolio_kg_context(
 
     holdings = await get_portfolio_holdings(portfolio_id)
     provider = get_market_data_provider()
-    valued: list[tuple[float, str]] = []
-    for h in holdings:
-        ticker = h.get("ticker")
-        quantity = h.get("quantity")
-        if not ticker or not quantity:
-            continue
+
+    async def _value(ticker: str, quantity: Any) -> tuple[float, str] | None:
         try:
             quote = await provider.get_current_price(ticker)
-            valued.append((float(quantity) * float(quote.price), ticker))
+            return float(quantity) * float(quote.price), ticker
         except Exception:
-            continue
+            return None
+
+    results = await asyncio.gather(
+        *(
+            _value(h["ticker"], h["quantity"]) for h in holdings
+            if h.get("ticker") and h.get("quantity")))
+    valued = [v for v in results if v is not None]
     top_tickers = [
         t for _, t in sorted(valued, key=lambda v: v[0], reverse=True)[:20]
     ]
@@ -571,7 +573,7 @@ async def judge_node(state: AnalysisState) -> dict[str, Any]:
             try:
                 verdict = await JudgeAgent().assess_round(judge_state)
                 break
-            except LLMRateLimitError as exc:
+            except (LLMRateLimitError, LLMProviderTimeoutError) as exc:
                 wait = await _judge_retry_wait(retry_attempts, retry_seconds)
                 if wait is None:
                     raise

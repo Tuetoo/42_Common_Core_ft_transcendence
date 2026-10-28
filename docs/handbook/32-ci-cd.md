@@ -187,15 +187,15 @@ itself, and any repository file a test inspects.
 
 | Workflow | Runs when a PR or a push to `main` touches | Steps |
 |---|---|---|
-| `auth-service-ci.yml` | `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, `tests/alembic_contract.py`, `tests/auth_tokens.py`, `Makefile`, `pyproject.toml`, `uv.lock`, the workflow | checkout; install uv 0.8.17; `uv sync --frozen`; flake8 of the service, `shared/` and its tests; `make mypy-shared mypy-auth`; `make test-auth`; `docker build ... --target production` |
-| `core-service-ci.yml` | the same for core, plus `infra/scheduler/**`, `infra/gateway/nginx.conf` and `infra/prometheus/alert_rules.yml` (its tests read them) | the same with `mypy-core`, `test-core` |
+| `auth-service-ci.yml` | `services/auth-service/**`, `shared/**`, `tests/auth-service/**`, `tests/alembic_contract.py`, `tests/auth_tokens.py`, `Makefile`, `pyproject.toml`, `uv.lock`, `.dockerignore`, the workflow | checkout; install uv 0.8.17 (its download cache is kept between runs, keyed on `uv.lock`); `uv sync --locked`; flake8 of the service, `shared/` and its tests; `make mypy-shared mypy-auth`; `make test-auth`; `docker build ... --target production` |
+| `core-service-ci.yml` | the same for core, plus `infra/scheduler/**`, `infra/gateway/nginx.conf` and `infra/prometheus/alert_rules.yml` (its tests read them) and `.dockerignore` | the same with `mypy-core`, `test-core` |
 | `ai-service-ci.yml` | the same for ai, plus `infra/scheduler/**`, `infra/vector/**`, `scripts/**`, `.env.example`, `.gitignore`, `.dockerignore` and the auth and core Dockerfiles | the same with `mypy-ai`, `test-ai` |
 | `frontend-ci.yml` ("frontend CI") | `frontend/**`, the workflow (and pushes to `main` that touch them) | in `frontend/` with Node 24: `npm ci`; `npm run lint`; `npx next typegen && npx tsc --noEmit` (route types, then the type check); `npm run build` |
 | `integration-ci.yml` ("stack smoke CI"), job `config-checks` | `infra/**`, `scripts/**`, both compose files, `.dockerignore`, `frontend/Dockerfile`, `Makefile`, `.env.example`, the workflow (and every push to `main`) | flake8 of `infra/`; the status page's CSP hashes (`csp_hashes.py --check`); `docker compose config -q` for the stack and the restore-drill project; `bash -n` / `sh -n` of every shell script; `make promtool-test` (alert rules and their unit tests) |
 
 What each step protects against:
 
-- **`uv sync --frozen`** installs exactly the versions in `uv.lock` and
+- **`uv sync --locked`** installs exactly the versions in `uv.lock` and
   fails if `pyproject.toml` and the lock disagree, so CI never tests
   with different library versions than the images use.
 - **flake8** catches style errors, unused imports and undefined names
@@ -212,14 +212,20 @@ What each step protects against:
 A workflow that does not run for a PR (its paths were not touched) shows
 no check at all; that is expected, not a failure.
 
+Every CI workflow sets `permissions: contents: read`: its token can read
+the repository and nothing else (only `deploy.yml` sets its own
+permissions).
+
 ### 3.3 After the merge: stack smoke on `main`
 
 `integration-ci.yml` also runs on every push to `main`, which is what a
 merge is. Its `stack-smoke` job runs only for pushes
 (`if: github.event_name == 'push'`):
 
-1. Make a throwaway `.env.docker` from `.env.example` and add random
-   `GRAFANA_ADMIN_PASSWORD`, `INTERNAL_API_TOKEN` and `JWT_SECRET`.
+1. Make a throwaway `.env.docker` from `.env.example`, set
+   `APP_ENV=production` (as on the cloud host, so the production start-up
+   checks run) and add random `GRAFANA_ADMIN_PASSWORD`,
+   `INTERNAL_API_TOKEN`, `JWT_SECRET` and `TOTP_ENCRYPTION_KEY`.
 2. `make certs`: a self-signed certificate for the gateway.
 3. `docker compose --env-file .env.docker -f docker-compose.yaml up -d
    --build`: the whole stack, production image stages, no development
@@ -396,7 +402,8 @@ replace its `authorized_keys` line and the `DEPLOY_SSH_KEY` secret.
 - The certificate names only `alphamind-research.duckdns.org`. The
   frontend's server side therefore does not call `https://gateway`; it
   uses the gateway's internal plain-HTTP listener
-  (`BACKEND_API_URL=http://gateway:8080/api/v1`, Docker network only), so
+  (`BACKEND_API_URL=http://gateway:8080/api/v1`, on the `edge` Docker
+  network, not published), so
   no certificate has to name `gateway`
   ([10](10-gateway.md) section 3.3).
 - certbot's systemd timer checks twice a day and renews 30 days before

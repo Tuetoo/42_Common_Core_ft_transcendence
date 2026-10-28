@@ -8,7 +8,13 @@
 # Host ports: only the gateway is published on all
 # interfaces (https://localhost:8443, http://localhost:8000 redirects to
 # https). Developer UIs are bound to 127.0.0.1 only; everything else is
-# reachable only on the internal Docker network.
+# reachable only on the internal Docker networks.
+#
+# Two networks: `edge` holds only the frontend and the gateway; `default`
+# holds the gateway and every backend container. The frontend therefore
+# reaches nothing but the gateway (its only target, BACKEND_API_URL), so a
+# compromised frontend cannot talk to Redis, Qdrant, Postgres, the object
+# storage or the services' /internal/* routes directly.
 
 # Every container's Docker log is capped (5 x 20 MB) so the json-file logs
 # cannot fill the disk shared with Postgres and the backups. `vector` still
@@ -34,6 +40,9 @@ services:
       # (infra/gateway/nginx.conf, port 8080, not published). The browser
       # itself only ever talks to the HTTPS listener.
       BACKEND_API_URL: http://gateway:8080/api/v1
+    # Only the gateway shares this network (see the top of this file).
+    networks:
+      - edge
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/login"]
       interval: 15s
@@ -60,6 +69,11 @@ services:
       - "8443:443"
       # Plain HTTP: only redirects to https://<host>:8443.
       - "8000:80"
+    # `edge` to reach the frontend, `default` to reach the services and
+    # Grafana.
+    networks:
+      - edge
+      - default
     depends_on:
       auth-service:
         condition: service_healthy
@@ -495,6 +509,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./logs:/logs
     restart: unless-stopped
+
+networks:
+  # Frontend <-> gateway only. `default` (every other container) is created
+  # by compose as usual.
+  edge: {}
 
 volumes:
   postgres_data:

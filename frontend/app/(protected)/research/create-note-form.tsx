@@ -4,6 +4,7 @@ import { useActionState, useState } from "react";
 import { createNote, type CreateNoteState } from "@/app/lib/actions/research";
 import { MAX_TAGS, NOTE_CONTENT_MAX, NOTE_TITLE_MAX, TAG_MAX_CHARS, parseTags } from "./limits";
 import type { Organization } from "./types";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: CreateNoteState = {};
 
@@ -80,11 +81,7 @@ export function CreateNoteForm({ organizations }: { organizations: Organization[
             : "Members of the organization can read the note; owners, admins and members can also edit it live. This cannot be changed later."}
         </span>
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Creating…" : "Create note"}
       </button>

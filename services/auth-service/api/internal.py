@@ -168,6 +168,7 @@ async def purge_unverified_accounts(
     service = AdminService(db)
     result = await service.purge_unverified_accounts()
     leftovers = await service.clean_deleted_account_leftovers()
+    expired_invitations = await service.purge_expired_invitations()
     schedule_events(background_tasks, service.pending_events)
     return job_response(
         "purge-unverified", {
@@ -176,11 +177,13 @@ async def purge_unverified_accounts(
             "deleted": result.deleted,
             "skipped": result.skipped,
             "failed": result.failed,
-            "deleted_account_leftovers": asdict(leftovers)
+            "deleted_account_leftovers": asdict(leftovers),
+            "expired_invitations_deleted": expired_invitations or 0
         }, steps={
             "accounts": (result.attempted, result.failed),
             "deleted_account_leftovers": (leftovers.candidates,
                                           leftovers.failed),
             "deleted_account_leftovers_lookup": (
-                1, int(leftovers.lookup_failed))
+                1, int(leftovers.lookup_failed)),
+            "expired_invitations": (1, int(expired_invitations is None))
         })

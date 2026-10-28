@@ -40,6 +40,13 @@ class PortfolioCreate(BaseModel):
     organization_id: UUID | None = None
     visibility: PortfolioVisibility = "private"
 
+    @model_validator(mode="after")
+    def _shared_needs_organization(self) -> "PortfolioCreate":
+        if self.visibility == "organization" and self.organization_id is None:
+            raise ValueError(
+                "visibility 'organization' requires an organization_id.")
+        return self
+
 
 class PortfolioUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)

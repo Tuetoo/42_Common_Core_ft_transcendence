@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useActionState } from "react";
 import { runPortfolioBacktest, type RunBacktestState } from "@/app/lib/actions/backtests";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: RunBacktestState = {};
 
@@ -39,11 +40,7 @@ export function BacktestForm({ portfolioId }: { portfolioId: string }) {
           Your past backtests
         </Link>
       </p>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Starting…" : "Run backtest"}
       </button>

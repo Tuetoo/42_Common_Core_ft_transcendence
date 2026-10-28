@@ -82,7 +82,7 @@ one model; only when it gives up does the router move to another model.
 |---|---|---|
 | `GoogleAdapter` | `ai/llm/google_provider.py` | **Default provider.** `LLM_DEFAULT_PROVIDER = "google"` (`config.py`). Key pool, pacing, 429/503/timeout handling, thinking config. Its key pool is also used for Gemini embeddings (section 3.14). |
 | `MistralAdapter` | `ai/llm/mistral_provider.py` | Complete and selectable (`LLM_DEFAULT_PROVIDER=mistral`). Own pool of up to 7 keys (`MISTRAL_API_KEY`, `_2` .. `_7`) with round-robin and paced by the router. The owner keeps this file unchanged; it is the one file `make lint` excludes from flake8. |
-| `OpenAIAdapter` | `ai/llm/openai_provider.py` | Simple single-key adapter (Chat Completions). Maps errors like the Anthropic adapter: 429 with code `insufficient_quota` -> `LLMCreditExhaustedError` (never retried), other 429 -> `LLMRateLimitError`, 5xx -> `LLMServerOverloadedError`, timeout -> `LLMProviderTimeoutError`, other 4xx -> `LLMInvalidRequestError` (never retried), anything else -> `LLMRequestError`. Not used by default. |
+| `OpenAIAdapter` | `ai/llm/openai_provider.py` | Simple single-key adapter (Chat Completions). The client is built with `max_retries=0`, so the router alone decides retries; without a caller timeout the SDK default timeout (600 s) applies. Error mapping is similar to the Anthropic adapter, with two differences: 401/403 and 408/409 become `LLMInvalidRequestError` (never retried). The mapping: 429 with code `insufficient_quota` -> `LLMCreditExhaustedError` (never retried), other 429 -> `LLMRateLimitError`, 5xx -> `LLMServerOverloadedError`, timeout -> `LLMProviderTimeoutError`, other 4xx -> `LLMInvalidRequestError` (never retried), anything else -> `LLMRequestError`. Not used by default. |
 | `AnthropicAdapter` | `ai/llm/anthropic_provider.py` | Complete and selectable (`LLM_DEFAULT_PROVIDER=anthropic`). One key (`ANTHROPIC_API_KEY`), structured outputs, error mapping, usage logs (section 3.16). |
 
 All adapters implement `LLMProviderAdapter` (`ai/llm/base.py`): a list of
@@ -280,13 +280,14 @@ with a timeout, and classifies the result:
 
 If every key was tried or the pacer failed fast, the adapter logs
 `google.pool_exhausted_for_model` and raises `LLMServerOverloadedError`
-(when the last failure was a 503) or `LLMRateLimitError`. Every
-`LLMRateLimitError` the adapter raises, from `complete` and from `stream`,
+(when the last failure was a 503) or `LLMRateLimitError`. Every quota or
+pool error the adapter raises, from `complete` and from `stream`,
 carries `requests_sent`: the number of requests this call really sent to
 Google. 0 means "nothing was even sent, every key was cooling down". A
 skip error that the router builds itself (a model skipped as exhausted,
 overloaded or timed out, section 3.10) sent nothing either, but carries
-`requests_sent=None` because no adapter call was made.
+`requests_sent=None` because no adapter call was made. A Flash request
+timeout (`LLMRequestTimeoutError`) also carries `requests_sent=None`.
 
 The exception family matters, because the router branches on it
 (`ai/llm/base.py`):
@@ -297,6 +298,8 @@ LLMError
  +-- LLMNonEnglishOutputError       answer not in English (never retried by the router)
  +-- LLMRequestError                generic request failure
       +-- LLMInvalidRequestError    400/404
+      |    +-- LLMCreditExhaustedError     Anthropic or OpenAI credit used up (never retried)
+      +-- LLMOutputExhaustedError   Anthropic: thinking used all of max_tokens
       +-- LLMProviderTimeoutError   Lite or caller-supplied timeout
       +-- LLMRateLimitError         429 (quota)  -> triggers the fallback model
            +-- LLMServerOverloadedError    503 give-up, or a skipped overloaded model
@@ -426,7 +429,7 @@ retry, but every agent and debate call passes
 | `LLMInvalidRequestError` (400/404), including `LLMCreditExhaustedError` | 0 |
 | `LLMOutputExhaustedError` (Anthropic: thinking used all of `max_tokens`, no text) | at most 1 (`_OUTPUT_EXHAUSTED_RETRIES`) |
 | Google Lite `LLMRateLimitError` (a 429, or a 503 give-up, because `LLMServerOverloadedError` is a subclass of it) | 0 (the fallback model and the cooldown retry take over) |
-| `LLMProviderTimeoutError` from Google (Lite, or a caller-supplied timeout on Flash) , Anthropic (after `LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS`) or OpenAI; the Mistral adapter raises a plain `LLMRequestError` on a timeout, so it falls under the last row | at most 1 (`_TIMEOUT_RETRIES`) |
+| `LLMProviderTimeoutError` from Google (Lite, or a caller-supplied timeout on Flash), Anthropic (after `LLM_ANTHROPIC_REQUEST_TIMEOUT_SECONDS`) or OpenAI, and `LLMRequestTimeoutError` (Flash timeout on the default limit; with a fallback model the early break below moves to the fallback first); the Mistral adapter raises a plain `LLMRequestError` on a timeout, so it falls under the last row | at most 1 (`_TIMEOUT_RETRIES`) |
 | Everything else | the caller's `retries` |
 
 The wait before a retry is `rate_limit_backoff_seconds(attempt)` for
@@ -1018,8 +1021,8 @@ ids with `--log logs/ai-service/<date>.log`, or `--log -` for stdin)
 and prints, per analysis and per group, the calls by model, prompt,
 uncached, cache-write, cache-read, output and thinking tokens, the
 number of evidence-first calls, the wall time (from
-`analysis_queue_job_started` to `analysis_queue_job_finished` or
-`analysis_queue_job_errored`; without them, from the first to the last
+`analysis_queue_job_started` to `analysis_queue_job_finished`,
+`_errored`, `_timed_out` or `_cancelled`; without them, from the first to the last
 log line, marked "(first-last line)"), a note
 when a new filing was ingested inside the analysis, and the
 cost at the list prices of `docs/MODEL_COMPARISON.md` (cache read 0.1x,

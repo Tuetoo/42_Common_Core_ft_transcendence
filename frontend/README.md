@@ -24,7 +24,7 @@ Docker): copy `.env.example` to `.env.local`, then `npm ci` and
 `npm run dev`. `npm run dev` trusts the gateway's self-signed certificate
 through `NODE_EXTRA_CA_CERTS` (see `package.json`). Google and GitHub
 sign-in work only when the page runs on the origin set in the backend's
-`FRONTEND_BASE_URL` (`https://localhost:8443` by default), because the
+`FRONTEND_BASE_URL` (`https://localhost:8443` in `.env.example`), because the
 sign-in finishes there and its marker is kept per origin. To sign
 in with OAuth from `npm run dev`, point `FRONTEND_BASE_URL` at
 `http://localhost:3000`, or use the password login.
@@ -45,7 +45,7 @@ of the backend's secrets (`.env.docker` is not passed to it).
 | Path | Content |
 |---|---|
 | `app/(public)/` | Pages without a session: login, register, OAuth callback, password reset, email verification, invitations |
-| `app/(protected)/` | Pages that need a session: analyses, backtests, portfolios, watchlists, research, analytics, organizations, friends, notifications, profile, admin |
+| `app/(protected)/` | Pages that need a session: analyses, backtests, portfolios, watchlists, research, analytics, organizations, friends, notifications, profile, admin. `loading.tsx` shows "Loading..." while a page's data loads, so these pages stream: `notFound()` or `redirect()` inside a page gives HTTP status 200 (the not-found page, or a redirect in the browser) instead of 404 / 307; what the user sees is the same |
 | `app/(legal)/` | Privacy Policy and Terms of Service |
 | `app/lib/` | Backend calls, session cookies, Server Actions (`actions/`), formatting helpers, the shared WebSocket hook (`use-channel.ts`) |
 | `app/healthz/` | Health route: 200 only when the server reaches the API through the gateway |

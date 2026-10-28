@@ -4,6 +4,7 @@ import { useActionState, useState } from "react";
 import Link from "next/link";
 import { login, type LoginState } from "@/app/lib/actions/auth";
 import { EMAIL_MAX, PASSWORD_MAX_BYTES, TOTP_CODE_PATTERN, TOTP_CODE_TITLE } from "../field-rules";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: LoginState = {};
 
@@ -62,10 +63,7 @@ export function LoginForm({ next }: { next: string }) {
           />
         </div>
       )}
-      {/* Always mounted so screen readers announce the error when it appears. */}
-      <p aria-live="polite" className="form-message error">
-        {state?.error}
-      </p>
+      <FormMessage text={state?.error} />
       {/* The backend refuses an unverified email with this code; offer a
           way to get a fresh verification link. */}
       {state?.code === "email_not_verified" && (

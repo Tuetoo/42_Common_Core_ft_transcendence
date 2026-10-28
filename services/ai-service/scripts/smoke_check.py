@@ -303,7 +303,7 @@ async def check_retrieval(ctx: SmokeContext) -> str:
 
     await _ensure_bm25(ctx)
     ticker = await _filing_ticker(ctx)
-    retriever = FilingRetriever(use_query_expansion=False)
+    retriever = FilingRetriever(use_query_expansion=False, visibility=None)
     chunks = await retriever.retrieve(
         "revenue and risk factors", ticker=ticker, sources=frozenset({"bm25"}))
     if not chunks:
@@ -769,7 +769,8 @@ async def check_llm(ctx: SmokeContext) -> str:
     except SkipCheck:
         vector_detail = "; no filing ticker for a vector search"
     else:
-        chunks = await FilingRetriever(use_query_expansion=False).retrieve(
+        chunks = await FilingRetriever(
+            use_query_expansion=False, visibility=None).retrieve(
             "ping", ticker=ticker, sources=frozenset({"vector"}),
             query_vector=vectors[0])
         if not chunks:

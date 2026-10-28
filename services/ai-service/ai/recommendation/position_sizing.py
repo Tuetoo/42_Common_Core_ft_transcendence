@@ -402,6 +402,14 @@ async def generate_position_sizing(
     return result, note
 
 
+def _whole_number(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
 def _validated_sizing(
     raw: str, *, action: RecommendationAction, ticker: str, budget: Decimal,
     cash: Decimal | None, committed_buy_cash: Decimal, capped_by_weight: bool,
@@ -414,9 +422,9 @@ def _validated_sizing(
             "No entry/exit tiers were generated for this recommendation -- "
             "the position-sizing model's response could not be parsed.")
 
-    window_days_raw = parsed.get("window_days")
+    window_days_raw = _whole_number(parsed.get("window_days"))
     tiers_raw = parsed.get("tiers")
-    if not isinstance(window_days_raw, int) or not isinstance(tiers_raw, list):
+    if window_days_raw is None or not isinstance(tiers_raw, list):
         logger.warning("position_sizing.malformed_response", parsed=parsed)
         return None, (
             "No entry/exit tiers were generated for this recommendation -- "

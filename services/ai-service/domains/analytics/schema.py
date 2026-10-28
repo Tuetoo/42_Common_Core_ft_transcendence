@@ -6,6 +6,7 @@ from shared.schemas import BaseSchema
 
 class AgentPerformanceRead(BaseSchema):
     agent_id: UUID
+    agent: str
     avg_score: float | None
     success_rate: float | None
 

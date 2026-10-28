@@ -2,8 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, readApiError } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import { ANALYSIS_TYPES, DECISION_ACTIONS, DECISION_NOTES_MAX_LENGTH, UUID_RE, normalizeTicker } from "@/app/lib/format";
 
 export type StartAnalysisState = {
@@ -37,28 +36,14 @@ export async function startAnalysis(
     return { error: "Please choose one of your portfolios", values };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in", values };
-  }
+  const result = await call(
+    "/analyses",
+    jsonInit("POST", { ticker, analysis_type: analysisType, portfolio_id: portfolioId }),
+    "Could not start the analysis"
+  );
+  if (!result.ok) return { error: result.error, values };
 
-  let res: Response;
-  try {
-    res = await backendFetch("/analyses", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticker, analysis_type: analysisType, portfolio_id: portfolioId }),
-    });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?", values };
-  }
-
-  if (!res.ok) {
-    const err = await readApiError(res, "Could not start the analysis");
-    return { error: err.message, values };
-  }
-
-  const { data } = await res.json();
+  const { data } = await result.res.json();
   // The analysis now runs in the background; its page follows it live.
   redirect(`/analyses/${data.id}`);
 }
@@ -86,29 +71,17 @@ export async function recordDecision(
     return { error: `Notes can be at most ${DECISION_NOTES_MAX_LENGTH} characters`, notes };
   }
 
-  const accessToken = await getAccessToken();
-  const keptNotes = typeof notes === "string" ? notes : undefined;
-  if (!accessToken) {
-    return { error: "You're not logged in", notes: keptNotes };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch(`/analyses/${encodeURIComponent(analysisId)}/decisions`, accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action_taken: actionTaken,
-        portfolio_id: portfolioId,
-        notes: typeof notes === "string" && notes.trim() ? notes.trim() : null,
-      }),
-    });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?", notes: keptNotes };
-  }
-
-  if (!res.ok) {
-    return { error: (await readApiError(res, "Could not record your decision")).message, notes: keptNotes };
+  const result = await call(
+    `/analyses/${encodeURIComponent(analysisId)}/decisions`,
+    jsonInit("POST", {
+      action_taken: actionTaken,
+      portfolio_id: portfolioId,
+      notes: typeof notes === "string" && notes.trim() ? notes.trim() : null,
+    }),
+    "Could not record your decision"
+  );
+  if (!result.ok) {
+    return { error: result.error, notes: typeof notes === "string" ? notes : undefined };
   }
 
   // "followed" may change tier statuses shown on the analysis page.

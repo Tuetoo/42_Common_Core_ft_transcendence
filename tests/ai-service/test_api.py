@@ -448,6 +448,40 @@ class TestAnalysisRepository:
         assert len(session_row.arguments) == 2
 
     @pytest.mark.asyncio
+    async def test_decision_pages_are_stable_for_equal_timestamps(
+            self, db_session):
+        from domains.analysis.repository import (AnalysisPersistenceRepository,
+                                                 AnalysisRepository)
+        from domains.decision.repository import InvestmentDecisionRepository
+
+        user_id = uuid4()
+        repo = InvestmentDecisionRepository(db_session)
+        decisions = []
+        for _ in range(3):
+            analysis = await AnalysisRepository(db_session).create(
+                user_id=user_id, portfolio_id=None, ticker="AAPL")
+            rec = await AnalysisPersistenceRepository(
+                db_session).save_recommendation(
+                    analysis_id=analysis.id, recommendation="buy",
+                    confidence=0.7, reasoning="r",
+                    confidence_adjustment_note=None, debate_converged=True)
+            decisions.append(await repo.create(
+                user_id=user_id, portfolio_id=None, recommendation_id=rec.id,
+                ticker="AAPL", action_taken="buy", notes=None))
+        same_instant = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)
+        for decision in decisions:
+            decision.created_at = same_instant
+        await db_session.flush()
+
+        first, total = await repo.list_for_user(
+            user_id, PaginationParams(page=1, page_size=2))
+        second, _ = await repo.list_for_user(
+            user_id, PaginationParams(page=2, page_size=2))
+        assert total == 3
+        assert [d.id for d in first + second] == sorted(
+            (d.id for d in decisions), reverse=True)
+
+    @pytest.mark.asyncio
     async def test_get_latest_recommendation_for_ticker(self, _schema_ready):
         from database import SessionLocal
         from domains.analysis.repository import (AnalysisPersistenceRepository,
@@ -541,11 +575,17 @@ class TestAnalysisService:
 class TestRunAnalysisWorkflow:
 
     @pytest.mark.asyncio
-    async def test_full_workflow_persists_and_completes(
-            self, _schema_ready, mock_cross_service):
+    async def test_full_workflow_without_llm_fails_cleanly(
+            self, _schema_ready, mock_cross_service, monkeypatch):
+        from ai.llm.router import LLMRouter
         from ai.workflows.analysis_workflow import run_analysis_workflow
         from database import SessionLocal
         from domains.analysis.repository import AnalysisRepository
+
+        async def _no_llm(self, *args, **kwargs):
+            raise LLMConfigError("no key configured")
+
+        monkeypatch.setattr(LLMRouter, "complete", _no_llm)
 
         async with SessionLocal() as setup_session:
             analysis = await AnalysisRepository(setup_session).create(
@@ -560,14 +600,9 @@ class TestRunAnalysisWorkflow:
         async with SessionLocal() as verify_session:
             repo = AnalysisRepository(verify_session)
             persisted = await repo.get_by_id(analysis_id, with_details=True)
-            completed = persisted.status == "completed"
-            if completed:
-                assert persisted.failure_reason is None
-                assert len(persisted.recommendations) == 1
-            else:
-                assert (persisted.status,
-                        persisted.failure_reason) == ("failed", "no_evidence")
-                assert persisted.recommendations == []
+            assert (persisted.status,
+                    persisted.failure_reason) == ("failed", "no_evidence")
+            assert persisted.recommendations == []
             assert {r.agent.name
                     for r in persisted.agent_runs
                     } == {AgentRole.MARKET.value, AgentRole.TECHNICAL.value}
@@ -582,17 +617,9 @@ class TestRunAnalysisWorkflow:
             await verify_session.commit()
 
         event_names = [name for name, _ in mock_cross_service]
-        if not completed:
-            assert event_names == ["analysis.started", "analysis.failed"]
-            assert mock_cross_service[1][1]["failure_reason"] == "no_evidence"
-            return
-        assert event_names == [
-            "analysis.started", "analysis.completed", "recommendation.ready"
-        ]
-
-        payloads_by_event = dict(mock_cross_service)
-        assert payloads_by_event["analysis.completed"]["user_id"] == ""
-        assert payloads_by_event["recommendation.ready"]["user_id"] is None
+        assert event_names == ["analysis.started", "analysis.failed"]
+        assert mock_cross_service[1][1]["failure_reason"] == "no_evidence"
+        assert mock_cross_service[1][1]["user_id"] == ""
 
     @pytest.mark.asyncio
     async def test_workflow_error_is_recorded_and_failed_row_not_rerun(
@@ -1496,6 +1523,50 @@ class TestBacktestRoutes:
         assert order == ["commit", "start"]
 
     @pytest.mark.asyncio
+    async def test_recommendation_replay_needs_a_triggered_tier(
+            self, client, db_session, monkeypatch):
+        import domains.backtest.api as backtest_api
+        from domains.analysis.repository import RecommendationTierRepository
+
+        triggered: list[Any] = []
+        started: list[str] = []
+
+        async def _tiers(self, *args, **kwargs):
+            return triggered
+
+        def _start(coro):
+            started.append("start")
+            coro.close()
+
+        monkeypatch.setattr(
+            RecommendationTierRepository, "list_triggered_tiers", _tiers)
+        monkeypatch.setattr(backtest_api, "_start_background", _start)
+        user = uuid4()
+
+        empty = await client.post(
+            "/api/v1/backtests/recommendation-replay", headers=_headers(user),
+            json={})
+        assert empty.status_code == 422
+        assert started == []
+
+        triggered.extend([
+            SimpleNamespace(
+                triggered_at=datetime(2026, 2, 3, 15, 0, tzinfo=UTC)),
+            SimpleNamespace(triggered_at=None),
+            SimpleNamespace(
+                triggered_at=datetime(2026, 1, 5, 15, 0, tzinfo=UTC))
+        ])
+        response = await client.post(
+            "/api/v1/backtests/recommendation-replay", headers=_headers(user),
+            json={"initial_capital": 5000})
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["strategy_name"] == "ai_recommendation_replay"
+        assert data["start_date"] == "2026-01-05"
+        assert data["initial_capital"] == 5000
+        assert started == ["start"]
+
+    @pytest.mark.asyncio
     async def test_create_refused_above_active_cap(
             self, client, db_session, monkeypatch):
         import domains.backtest.api as backtest_api
@@ -1622,6 +1693,32 @@ class TestTriggeredTiers:
                     now - timedelta(days=5)).date(), end_date=now.date())
         }
         assert found == {window_ids["inside"]}
+
+
+class TestAgentAnalytics:
+
+    @pytest.mark.asyncio
+    async def test_rows_carry_the_agent_name(self, client, db_session):
+        from domains.analysis.repository import AgentCatalogRepository
+        from domains.analytics.repository import AnalyticsRepository
+
+        name = f"agent_{uuid4().hex[:8]}"
+        agent = await AgentCatalogRepository(db_session).get_or_create(name)
+        await AnalyticsRepository(db_session).upsert_agent_metric(
+            agent_id=agent.id, avg_score=0.6, success_rate=0.5)
+
+        response = await client.get(
+            "/api/v1/analytics/agents", headers=_headers(uuid4()))
+        assert response.status_code == 200
+        row = next(
+            r for r in response.json()["data"]
+            if r["agent_id"] == str(agent.id))
+        assert row == {
+            "agent_id": str(agent.id),
+            "agent": name,
+            "avg_score": 0.6,
+            "success_rate": 0.5
+        }
 
 
 class TestAnalyticsOverview:
@@ -1793,6 +1890,26 @@ class TestAnalyticsExport:
         assert rows[0]["action_taken"] == "followed"
         assert rows[0]["recommended_action"] == "buy"
         assert rows[0]["notes"] == "'=HYPERLINK(evil)"
+
+
+class TestRagAskEmptyAnswer:
+
+    @pytest.mark.asyncio
+    async def test_empty_llm_answer_is_unavailable_not_grounded(self):
+        from ai.rag.retriever import RetrievedChunk
+        from domains.rag.qa import RagAnswerUnavailableError, answer_question
+        from domains.rag.schema import RagAskRequest
+        from helpers import _Router
+        from shared.enums import DocumentCategory
+
+        chunk = RetrievedChunk(
+            chunk_id="c1", text="Revenue grew.", score=0.9,
+            category=DocumentCategory.FILING, ticker="AMD")
+        with pytest.raises(RagAnswerUnavailableError) as raised:
+            await answer_question(
+                RagAskRequest(question="How did revenue change?"), [chunk],
+                started=0.0, llm_router=_Router(["  "]))
+        assert raised.value.code == "empty_answer"
 
 
 class TestSentiment:

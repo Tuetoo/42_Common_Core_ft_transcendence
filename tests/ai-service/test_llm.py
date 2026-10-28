@@ -2563,8 +2563,9 @@ def test_router_retry_limit():
                  "google-overloaded", LLMServerOverloadedError("503"),
                  "google", "gemini-3.8-flash", 4, 4),
              (
-                 "google-request-timeout", LLMRequestTimeoutError("t"),
-                 "google", "gemini-3.8-flash", 4, 4),
+                 "google-request-timeout-one-retry",
+                 LLMRequestTimeoutError("t"), "google", "gemini-3.8-flash", 4,
+                 1),
              (
                  "mistral-rate-limit", LLMRateLimitError("429"), "mistral",
                  "mistral-small-lite", 4, 4),
@@ -3183,12 +3184,12 @@ class TestRetrieverBm25Fallback:
     async def test_default_sources_degrade_and_pinned_ones_raise(
             self, failing_embedding_backends):
         chunk_id, qdrant = failing_embedding_backends
-        results = await retriever_module.BaseRetriever().retrieve(
-            "AMD revenue")
+        retriever = retriever_module.BaseRetriever(visibility=None)
+        results = await retriever.retrieve("AMD revenue")
         assert [r.chunk_id for r in results] == [chunk_id]
         assert qdrant.query_points_calls == 0
         with pytest.raises(embedding_module.EmbeddingError):
-            await retriever_module.BaseRetriever().retrieve(
+            await retriever.retrieve(
                 "AMD revenue", sources=frozenset({"bm25", "vector"}))
 
 
@@ -3354,10 +3355,11 @@ class TestReembedCollection:
         }
         for case_id, (existing_target, target) in cases.items():
             fake.collections.update(existing_target)
-            written = await module.run(
-                source="research_documents", target=target,
-                model="gemini-embedding-001", dims=8, confirm=True)
-            assert written == 0 and embedded == [], case_id
+            with pytest.raises(SystemExit, match="ABORT"):
+                await module.run(
+                    source="research_documents", target=target,
+                    model="gemini-embedding-001", dims=8, confirm=True)
+            assert embedded == [], case_id
 
 
 class TestIngestionStatusEvent:

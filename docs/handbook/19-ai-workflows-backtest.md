@@ -22,8 +22,8 @@
  09:30 Mon-Fri     market-open -> core-service       ----> analyses (queue)    ch. 16
  17:00 Mon-Fri     tier-monitoring                   ----> run_tier_monitoring_workflow
  17:30 Mon-Fri     market-close -> core-service            (portfolio NAV snapshots)
- 02:00 daily       review-run                        ----> run_review_workflow
- 02:30 daily       backup.sh                               (backups, chapter 2)
+ 00:20 daily       review-run                        ----> run_review_workflow
+ 00:50 daily       backup.sh                               (backups, chapter 2)
  03:05 daily       rag-ingest                        ----> auto-ingestion      ch. 17
  04:00 daily       logs-cleanup.sh
  04:10 daily       purge-unverified -> auth-service        (unverified accounts)
@@ -41,7 +41,7 @@
 ```
 
 London is 5 hours ahead of New York most of the year, so 17:00 New York is
-22:00 in London, 02:00 is 07:00, and 03:05 is 08:05. The scheduler runs in
+22:00 in London, 00:20 is 05:20, and 03:05 is 08:05. The scheduler runs in
 `America/New_York` (the container's `TZ`), so the jobs follow daylight
 saving time automatically.
 
@@ -50,7 +50,7 @@ The life of a recommendation tier across workflows:
 ```
  analysis workflow           user                 tier monitoring (17:00)       core-service
  -----------------           ----                 -----------------------       ------------
- BUY 3 @ 150  -------------> "followed" -------> today's bar low <= 150? -----> POST /internal/
+ BUY 3 @ 150  -------------> "followed" -------> a bar low <= 150? ---------> POST /internal/
  pending_acceptance          accepted_awaiting     yes: fill = min(open, 150)     portfolios/{id}/
                              _trigger               idempotency_key tier:<id>     transactions
                                                     |                              |
@@ -59,7 +59,7 @@ The life of a recommendation tier across workflows:
                                                     +-- 4xx: execution_failed,
                                                     |   event tier.execution_failed
                                                     +-- 5xx/timeout: stays accepted,
-                                                        tried again next trading day
+                                                        tried again on the next run
                  window passed (any open status) --> expired
                  system analysis pending > SYSTEM_TIER_ACCEPTANCE_HOURS --> expired
 ```
@@ -202,22 +202,42 @@ recorded as a success, however many tiers are still pending.
    `pending_acceptance` tier inside its window (or a tier whose
    recommendation has no window yet) is left alone (`pending`).
 3. **Price data.** `get_bars_cache_first(ticker, interval="1d",
-   lookback_days=1)` (`ai/tools/market_data_cache.py`, the same cache the
-   agents use, so every check leaves a `price_bars` row behind for
+   lookback_days=...)` covering every day from the New York date of
+   `accepted_at` to today (`ai/tools/market_data_cache.py`, the same cache
+   the agents use, so every check leaves a `price_bars` row behind for
    auditing). A provider error with no cached bars to serve instead gives
    `price_lookup_failed` (log `tier_monitoring.price_lookup_failed`,
-   warning); the tier stays open. No bar for today's New
-   York date (`_today_bar_matches`) gives `no_fresh_data`.
-4. **Accepted during today's session?** If `accepted_at` is after 09:30
-   New York on the bar's date, today's bar is skipped (`still_open`, log
+   warning); the tier stays open.
+4. **Every daily bar since acceptance.** The bars from the acceptance day
+   to today are checked oldest first, and the first one that crosses the
+   target fills the tier. So a trading day without a successful run (host
+   asleep, price feed down, job error) is checked on the next successful
+   run. Nothing extra is stored for this: an earlier bar that crossed
+   would already have filled the tier, so re-reading it is harmless, and
+   a resent order uses the same idempotency key (3.4). The order is
+   recorded with the run's time, at the fill price of the bar that
+   crossed. A day on which the window has already ended is not checked:
+   the expiry in step 1 comes first. This is a known limit: a session
+   missed on the window's last day (no successful run that evening) is
+   not checked, because the next run expires the tier before it reads
+   that day's bar.
+5. **Accepted during a session?** A bar whose 09:30 New York open is
+   before `accepted_at` is skipped (for today's bar the log is
    `tier_monitoring.accepted_after_bar_open`): a daily bar cannot tell
    whether the low happened before or after the acceptance. The next
-   session's bar is checked on the next run.
-5. **Bad data.** A non-finite open, high or low (NaN) gives
-   `no_fresh_data` (`tier_monitoring.bar_has_non_finite_price`). Without
-   this, a NaN compared with `<=` is always false and a real trigger would
-   be missed silently.
-6. **Trigger rule.**
+   session's bar is checked on the next run. So a tier whose window ends
+   before any full session after its acceptance has been checked can
+   never trigger: for example `window_days` 1 on a tier accepted during
+   the session (the next 17:00 run finds the window already ended), or a
+   short window that ends over a weekend. Such a tier still reserves cash
+   and replaces earlier tiers until it expires.
+6. **Bad data.** A bar with a non-finite open, high or low (NaN) is
+   skipped (`tier_monitoring.bar_has_non_finite_price`). Without this, a
+   NaN compared with `<=` is always false and a real trigger would be
+   missed silently. When no usable bar for today's New York date exists
+   and no earlier bar crossed, the outcome is `no_fresh_data`; otherwise
+   it is `still_open`.
+7. **Trigger rule.**
    - BUY triggers when `bar.low <= target_price`; fill price
      `min(bar.open, target_price)`.
    - SELL triggers when `bar.high >= target_price`; fill price
@@ -248,15 +268,18 @@ The outcome decides the tier's status:
 |---|---|---|---|
 | success | `triggered`, with `triggered_at` and `triggered_price` | `tier.executed` (price = fill price) | no |
 | 4xx business refusal (not 408/429): insufficient cash, not enough shares, conflict, unknown portfolio | `execution_failed`; a line "Tier ... was not executed: core-service refused the order (status: detail)." is appended to the recommendation's `tier_generation_note` | `tier.execution_failed` (reason = that line) | no |
-| 5xx, timeout, network error | unchanged (`accepted_awaiting_trigger`), whole tier rolled back | none | yes, next trading day |
+| 5xx, timeout, network error | unchanged (`accepted_awaiting_trigger`), whole tier rolled back | none | yes, on the next run, from the same crossing bar (3.3 step 4) |
 
 Why the idempotency key: if core-service committed the trade but the
-answer timed out, the next day's retry with the same `tier:<id>` key gets
-the existing transaction back instead of buying twice. Known limit: in
-that case ai stores the retry day's fill price and time as
-`triggered_price` / `triggered_at`, while the ledger keeps the first day's
-trade, because core's internal transaction answer carries only `id` and
-`ticker` (no price or date) for ai to copy. Why
+answer timed out, the next run's retry with the same `tier:<id>` key gets
+the existing transaction back instead of buying twice. The retry reads
+the same crossing bar again, so it sends the same fill price. Known
+limits: ai stores the retry run's time as `triggered_at`, while the
+ledger keeps the first run's trade, because core's internal transaction
+answer carries only `id` and `ticker` (no price or date) for ai to copy;
+and when the window ends before the next successful run, the tier
+becomes `expired` although the ledger holds the trade (no
+`tier.executed` event, and the backtests leave the trade out). Why
 `execution_failed` is terminal: a refusal for insufficient cash will be
 refused again every day until the window ends.
 
@@ -276,8 +299,8 @@ portfolio with status `expired`).
 
 ### 3.5 The review workflow
 
-- **When:** 02:00 New York (07:00 London), every day:
-  `0 2 * * * /scripts/call-job.sh review-run` -> `POST /internal/review/run`
+- **When:** 00:20 New York (05:20 London), every day:
+  `20 0 * * * /scripts/call-job.sh review-run` -> `POST /internal/review/run`
   (curl limit 1800 s).
 - **Why every day:** recommendations and decisions keep aging on weekends.
 
@@ -397,8 +420,8 @@ Cost and failure rules (`ai/workflows/auto_ingestion_workflow.py`):
   unavailable, nothing is stored for that ticker
   (`auto_ingestion.news_unverified_skipped`).
 - A provider outage counts as a failure even though the ingestion
-  helpers catch it: a failed SEC listing or download, a fallback filing
-  summary, a failed NewsAPI search, an unavailable relevance classifier
+  helpers catch it: a failed SEC listing or download, a filing too large
+  to summarise, a fallback filing summary, a failed NewsAPI search, an unavailable relevance classifier
   or an unloadable SEC ticker map marks the ticker as failed
   (`auto_ingestion.ticker_source_failed`). "Nothing new" is a success.
   The macro step fails when no FRED indicator could be fetched, its LLM
@@ -516,7 +539,8 @@ ai_recommendation_replay`). The route stores that window on the backtest
 row; the workflow (`_load_replay_trade_events`) then passes `start_date` and
 `end_date` to `RecommendationTierRepository.list_triggered_tiers`, so the
 replay counts only fills whose `triggered_at` is inside the window (UTC
-days, both ends inclusive). A fill that lands after the
+days, both ends inclusive). A tier filled from an earlier session's bar
+is dated at the run that filled it, not at that session. A fill that lands after the
 window, while the replay waits to run, is left out instead of being
 replayed past `end_date`. Open positions are marked to market at each
 day's close; the win rate counts closed round trips only (FIFO). A SELL
@@ -538,7 +562,11 @@ backtest starts on that first funded day, and `initial_capital` is that
 day's total value (`strategy_name = portfolio_snapshot_backtest`). The
 workflow also drops leading aligned days with a value of 0 or less before
 the TWR (log `portfolio_backtest.skipped_unfunded_leading_days`) and fails
-with a clear error if fewer than 2 days remain.
+with a clear error if fewer than 2 days remain. On completion it stores
+the first value of the curve it actually used as `initial_capital` (it
+differs from the route's value when the first funded day has no usable
+benchmark close), so `ending_capital / initial_capital` always equals
+`1 + strategy_return`.
 
 - Snapshot days are aligned with benchmark days by date; a day without a
   usable benchmark close is dropped from both (and named in the error if
@@ -548,8 +576,12 @@ with a clear error if fewer than 2 days remain.
   <BENCH> close for the newest snapshot day D; ... run the backtest again
   later", so the stored `end_date` always has a value.
 - Returns are **time-weighted** (TWR): for each day, external cash flows
-  (deposits minus withdrawals, and share adjustments valued at that day's
-  close) are removed: `r = (v_curr - flow - v_prev) / v_prev`. The daily
+  (deposits minus withdrawals, and share adjustments valued at the session
+  close on or before that day, at cost basis only when no close exists:
+  the same rule as the `daily_return` of core's history export, chapter
+  12) are removed: `r = (v_curr - flow - v_prev) / v_prev`. Each flow is
+  dated by the `snapshot_date` core sends with it (the 17:30 New York
+  cut). The daily
   returns are compounded into a synthetic curve that every metric uses.
   So a deposit in the middle of the window does not count as profit, and
   `ending_capital` answers "how did the investing perform", not "how much
@@ -678,7 +710,7 @@ AI's advice).
 **Where to read the numbers.** `GET /api/v1/analytics/overview` reports
 the accuracy of the evaluated recommendations (overall and per ticker)
 and per-agent run counts, average score and duration;
-`GET /api/v1/analytics/agents` returns the `ai.agent_metrics` rows; a
+`GET /api/v1/analytics/agents` returns the `ai.agent_metrics` rows with the agent name; a
 backtest's metrics come from `GET /api/v1/backtests/{id}`; RAG recall
 comes from `scripts/measure_rag_recall.py` (chapter 17, section 3.15).
 The script and the integration-test floor
@@ -715,7 +747,7 @@ layers on synthetic price series from a fake market-data provider.
 | Setting / constant | Default | File | Meaning |
 |---|---|---|---|
 | crontab: tier monitoring | `0 17 * * 1-5` | `infra/scheduler/crontab` | 17:00 New York, weekdays |
-| crontab: review | `0 2 * * *` | same | 02:00 New York, daily |
+| crontab: review | `20 0 * * *` | same | 00:20 New York, daily |
 | crontab: rag-ingest | `5 3 * * *` | same | 03:05 New York, daily (five minutes after Google's daily quota reset at midnight Pacific) |
 | crontab: market-close | `30 17 * * 1-5` | same | snapshots after tier monitoring |
 | curl limit tier monitoring | 900 s | `infra/scheduler/call-job.sh` | |
@@ -750,9 +782,14 @@ provider; one settled bar per day is reliable and cheap.
 high (SELL). Reason: that assumes the best price of the day and makes
 every result look better than reality.
 
-**Skip today's bar for tiers accepted after the open.** Reason: a daily
+**Skip the bar of a session that opened before the acceptance.** Reason: a daily
 bar cannot prove the price crossed *after* acceptance. Missing a fill by
 one day is better than inventing one.
+
+**Re-read every bar since acceptance on each run.** Alternative: store a
+"last checked" date per tier. Reason: an earlier crossing bar would
+already have filled the tier, so re-reading the bars needs no new column,
+and a day without a successful run is still checked later.
 
 **Commit per tier.** Alternative: one commit at the end. Reason: one bad
 tier must not undo the correct changes of every other tier in the run.
@@ -804,11 +841,11 @@ that impossible.
 
 | Symptom | Cause | Diagnose |
 |---|---|---|
-| an accepted tier never triggers | price did not cross, accepted after the open, no fresh bar, price lookup failed | log `tier_monitoring.accepted_after_bar_open`, `tier_monitoring.price_lookup_failed`; the run's `no_fresh_data` and `price_lookup_failed` counts; `make tiers` |
+| an accepted tier never triggers | price did not cross, accepted after the open, no fresh bar, price lookup failed, or the window ended before a full session after acceptance was checked (3.3 step 5) | log `tier_monitoring.accepted_after_bar_open`, `tier_monitoring.price_lookup_failed`; the run's `no_fresh_data` and `price_lookup_failed` counts; `make tiers` |
 | tier in `execution_failed` | core-service refused the order | the tier's recommendation `tier_generation_note`; log `tier_monitoring.execution_rejected` |
 | `execution_failed` count > 0 in the run summary | technical error while processing; tier stays open | `tier_monitoring.tier_processing_failed` with a traceback |
 | tier monitoring did nothing on a weekday | market holiday | the job answer `{"skipped": true, ...}` in the scheduler log |
-| alert `TradingDayJobStale` (tier-monitoring) | job has not succeeded for over 100 hours | `bash scripts/logs.sh scheduler grep tier-monitoring`; `make health` |
+| alert `TradingDayJobStale` (tier-monitoring) | job missed a trading day (no success for over 26 hours, or 76 hours after a Friday) | `bash scripts/logs.sh scheduler grep tier-monitoring`; `make health` |
 | alert `DailyJobStale` (review-run, rag-ingest) | daily job has not succeeded for over 26 hours | scheduler log; was the machine awake at the scheduled time? |
 | decision has no outcome | younger than 7 days, or no price data for the ticker or the benchmark (retried on each run for up to 30 days after its window ends, `REVIEW_GIVE_UP_AFTER_DAYS`) | `GET /api/v1/decisions/{id}/outcome` (404 with "hasn't been evaluated yet"); log `review.decision_no_price_data` (`ticker_missing`, `benchmark_missing`) |
 | tier-monitoring, review-run or rag-ingest answers 500 | every attempted unit failed (all accepted tiers without fresh data, with a failed price lookup or failed; all pending recommendations or decisions without price data or failed; every attempted ticker of the filings or the news step failed, including by a provider outage; or the macro step failed; a missing key or a used-up NewsAPI quota is not a failure) | `bash scripts/logs.sh ai-service grep scheduled_job_all_units_failed`; the body's `all_units_failed` names the step |

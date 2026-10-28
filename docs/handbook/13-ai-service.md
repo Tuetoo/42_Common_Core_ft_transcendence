@@ -103,7 +103,7 @@ All paths are relative to `services/ai-service/`.
 | `ai/agents/` | The nine data agents, Bull, Bear, Judge, Reflection, the ReAct loop and the evidence checks (chapter 15). |
 | `ai/graph/` | The LangGraph graph: `builder.py` (wiring and routing decisions), `nodes.py` (node functions, the agent registry and the Supervisor's agent selection), `state.py` (the shared `AnalysisState`, node names per role, the debate and reflection caps). Chapter 16. |
 | `ai/llm/` | LLM adapters (Google, Mistral, OpenAI, Anthropic), the router with tiers and one fallback model per tier, request pacing, the helpers that parse JSON out of LLM replies (`base.py`). Chapter 14. |
-| `ai/providers/` | Clients for external data: Yahoo Finance, FRED, NewsAPI (with its source catalog), SEC EDGAR (fundamentals, filing periods, the XBRL latest-quarter line), Tavily; a small retry helper; `news_relevance.py` (query building, company aliases, structural pre-drops, consent-link relinking, and the LLM relevance classifier with its subject/kind enums). |
+| `ai/providers/` | Clients for external data: Yahoo Finance, FRED, NewsAPI (with its source catalog), SEC EDGAR (fundamentals, filing periods, the XBRL latest-quarter line), Tavily; a small retry helper; `news_relevance.py` (query building, company search names, structural pre-drops, consent-link relinking, and the LLM relevance classifier with its subject/kind enums). |
 | `ai/tools/` | Agent tools that wrap providers, the RAG retriever, core-service and the knowledge graph; the cache-first price store (`market_data_cache.py`); indicator math and the backtest metrics (returns, drawdown, Sharpe, ...) shared by the backtests (`indicators.py`). |
 | `ai/rag/` | Chunking, embeddings, Qdrant + BM25 indexing, hybrid retrieval with Reciprocal Rank Fusion, visibility rules. Chapter 17. |
 | `ai/knowledge/` | Archival of agent reports into RAG, knowledge-graph extraction and KG context, filing summaries and structured filing records (`filing_records.py`, table `ai.filing_records`), recycled-content and prior-note-claim detection, ticker names. Chapter 18. |
@@ -127,7 +127,8 @@ All paths are relative to `services/ai-service/`.
 
 `main.py` mounts six domain routers on `api_router` and adds it under
 `settings.API_V1_PREFIX` (`/api/v1`, from `shared/config.py`). The
-gateway forwards these prefixes to ai-service (`infra/gateway/nginx.conf`:
+gateway forwards these prefixes to ai-service (`infra/gateway/api_locations.conf`,
+included by `nginx.conf`:
 `location /api/v1/analyses`, `/api/v1/market`, `/api/v1/analytics`,
 `/api/v1/decisions`, `/api/v1/backtests`, `/api/v1/rag`). ai-service
 mounts the market router at `/api/v1/market/instruments`; the gateway
@@ -139,7 +140,7 @@ forwards everything under `/api/v1/market`, which includes that path.
 | `/api/v1/decisions` | `domains/decision/api.py` | `GET ""`, `GET /{decision_id}/outcome`, `POST /{decision_id}/review` (201, LLM critique that replaces the stored review and publishes `decision.reviewed`, a notification to the user; 503 with `Retry-After: 60` and nothing stored or published when the LLM call fails; 429 with `Retry-After` over the per-user limit), `GET /{decision_id}/review` |
 | `/api/v1/backtests` | `domains/backtest/api.py` | `POST ""` (a `strategy_name` reserved for the other two kinds is a 422), `POST /recommendation-replay`, `POST /portfolio`, `GET ""` (the caller's own backtests, newest first, `limit`/`offset`), `GET /{backtest_id}`, `GET /{backtest_id}/metrics`, `DELETE /{backtest_id}` (204; publishes `backtest.deleted`, a notification to the owner). The three create routes answer 429 when the caller already has `BACKTEST_MAX_ACTIVE_PER_USER` (2, a module constant) backtests pending or running (log `backtest_rejected_limit`; counted under a per-user advisory lock in the creating transaction, so two parallel creates cannot both pass). |
 | `/api/v1/market/instruments` | `domains/market/api.py` | `GET /{ticker}/prices` (JWT required; `interval` `1d`, `1wk` or `1mo`, default `1d`; `lookback_days` default 5, 1..3650 (`MAX_PRICE_LOOKBACK_DAYS` in `domains/market/repository.py`); newest bar first). There is no instrument-metadata route. |
-| `/api/v1/analytics` | `domains/analytics/api.py` | `GET /agents`, `GET /overview`, `GET /timeseries`, `GET /export.csv` |
+| `/api/v1/analytics` | `domains/analytics/api.py` | `GET /agents` (nightly per-agent rollup with the agent name), `GET /overview`, `GET /timeseries`, `GET /export.csv`. With `scope=mine`, each request asks core-service for the owner of every portfolio that has a system analysis in the range (all users, one call per portfolio, 8 in parallel); any core error makes the request 503 |
 | `/api/v1/rag` | `domains/rag/api.py` | `POST /ask`, `POST /ask/stream` (Server-Sent Events) |
 
 The public route and its internal twin
@@ -187,21 +188,21 @@ exactly `/internal/*`.
 
 | Route | Caller | What it does |
 |---|---|---|
-| `POST /internal/analyses` | core-service market-open job; `scripts/analysis_cli.py` | Creates an analysis like the public route, but without a JWT. `user_id` is optional (none = a "system analysis"). If a user is given, that user must be active and allowed to create analyses (checked when `USER_STATE_CHECK_ENABLED` is on and the user's state can be read); with a user and a portfolio, the user must own the portfolio. Respects the global queue cap, not the per-user cap. |
+| `POST /internal/analyses` | core-service market-open job; `scripts/analysis_cli.py` | Creates an analysis like the public route, but without a JWT. `user_id` is optional (none = a "system analysis"). If a user is given, that user must be active and allowed to create analyses (checked when `USER_STATE_CHECK_ENABLED` is on and the user's state can be read); with a user and a portfolio, the user must own the portfolio. Respects the global queue cap, not the per-user cap. Rows it creates with a user still count toward that user's per-user cap on the public route, so a market-open batch can make the owner's own `POST /api/v1/analyses` answer 429 until the batch drains. |
 | `GET /internal/analyses/{id}` | core-service (WebSocket channel authorisation); `analysis_cli.py status` | Short reference: id, ticker, status, created_at, user_id, portfolio_id. |
 | `GET /internal/analyses/{id}/detail` | `analysis_cli.py get` | Same body as the public detail route. |
 | `GET /internal/recommendations/latest?ticker=&portfolio_id=` | core-service | Newest recommendation of an analysis on that portfolio; 404 when none. |
 | `GET /internal/market/instruments/{ticker}/prices` | core-service (`get_daily_closes`) | Twin of the public prices route. |
 | `GET /internal/fx-rate?from_currency=&to_currency=` | core-service | Current FX rate via Yahoo (`USDGBP=X` style ticker), cached in Redis for 3600 s. A Redis error on the cache read or write is logged (`fx_rate_cache_read_failed` / `fx_rate_cache_write_failed`) and treated as a cache miss, not a 5xx. |
-| `POST /internal/review/run` | scheduler, daily 02:00 New York | Scores past recommendations and decision outcomes and rolls up agent metrics (`ai/workflows/review_workflow.py`); returns done, attempted and failed counts per step. Answers 500 with the same counts when every attempted recommendation or every attempted decision outcome failed. |
-| `POST /internal/scheduler/tier-monitoring` | scheduler, 17:00 New York on weekdays | Checks open tiers against the day's bar; skipped with 200 and `{"skipped": true, "reason": "non_trading_day"}` on a weekend or NYSE holiday (the only ai-service job tied to the trading session). Answers 500 with the same counts when every attempted tier (checked minus `closed_meanwhile` and `pending`) failed to execute, had no fresh price or had a failed price lookup. |
+| `POST /internal/review/run` | scheduler, daily 00:20 New York | Scores past recommendations and decision outcomes and rolls up agent metrics (`ai/workflows/review_workflow.py`); returns done, attempted and failed counts per step. Answers 500 with the same counts when every attempted recommendation or every attempted decision outcome failed. |
+| `POST /internal/scheduler/tier-monitoring` | scheduler, 17:00 New York on weekdays | Checks open tiers against every daily bar since acceptance; skipped with 200 and `{"skipped": true, "reason": "non_trading_day"}` on a weekend or NYSE holiday (the only ai-service job tied to the trading session). Answers 500 with the same counts when every attempted tier (checked minus `closed_meanwhile` and `pending`) failed to execute, had no fresh price or had a failed price lookup. |
 | `POST /internal/scheduler/rag-ingest` | scheduler, daily 03:05 New York | Per-ticker filing and news ingestion plus the macro ingestion, as three steps (`filings`, `news`, `macro`). Answers 500 with the same body when every ticker a step attempted failed (an error, or a provider outage reported by the ingestion helpers), or the macro step failed. A source without its key or user agent is disabled (0 units, logged once) and a NewsAPI quota refusal defers that ticker's news; neither is a failure (chapter 26, section 3.5). |
 | `GET /internal/stats` | auth-service admin page | Counts of analyses (total/completed/failed), recommendations, backtests. |
 | `POST /internal/scheduler/deleted-user-sweep` | scheduler, daily 04:40 New York | Runs `delete_user_data` for every deleted account that still owns ai rows (section 3.8). Answers `{candidates, deleted, cleaned, failed, lookup_failed, refused}`; 500 when every deleted user failed or auth could not be asked (step `users_lookup`; nothing is deleted then). |
 | `POST /internal/sentiment` | core-service, after a note or comment is saved | Lite-tier sentiment label; 503 with `Retry-After: 60` when the LLM is unavailable. |
 
 The scheduler times come from `infra/scheduler/crontab` (New York time;
-02:00 New York is usually 07:00 London, 03:05 is 08:05, 17:00 is 22:00).
+00:20 New York is usually 05:20 London, 03:05 is 08:05, 17:00 is 22:00).
 The 500 rule is `shared/scheduled_jobs.py::job_response`: a step that
 attempted at least one unit and failed every one answers 500 (log
 `scheduled_job_all_units_failed`, body plus `"all_units_failed": [steps]`),
@@ -225,7 +226,7 @@ one worker task named `analysis-queue-worker`.
           |       pending >= ANALYSIS_QUEUE_MAX_PENDING (50)?  -> 503, Retry-After: 60
           |       public only: user's pending+running >= ANALYSIS_MAX_ACTIVE_PER_USER (3)? -> 429
           |  2. INSERT ai.analyses (status "pending"), COMMIT
-          |  3. analysis_queue.enqueue(AnalysisJob(id, analysis_type, requested_agents))
+          |  3. analysis_queue.enqueue(AnalysisJob(id, analysis_type, requested_agents, user_id))
           v
    asyncio.Queue  [job][job][job] ...      (in memory, FIFO)
           |
@@ -414,7 +415,9 @@ technical indicator and volatility tools. The rules:
   close is still more useful to an agent than nothing.
 
 Other caches: the FX rate (Redis, 1 h); SEC's ticker-to-CIK map and
-company names (process memory, re-downloaded once per UTC day); SEC
+company names (process memory, re-downloaded once per UTC day; when that
+download fails the previous day's map is kept, log
+`sec_edgar.ticker_map_refresh_failed_using_previous`); SEC
 submissions and the XBRL latest-quarter result per ticker per day (process
 memory; a cached quarter is re-checked for a newer 10-Q/10-K, and both are
 dropped when ingestion stores a new filing); NewsAPI's source catalog
@@ -441,12 +444,12 @@ folder call some of them for you.
 | `llm_usage_report.py` | Reads the ai-service log lines of given analyses (a run folder or a daily log) and prints calls, tokens, cache use, wall time and cost per analysis and per group (chapter 14, section 3.16). Standard library only, so it also runs with the host's `python3`. | No |
 | `smoke_check.py` | One line per non-analysis feature check (RAG, KG, filing records, market, FX, FRED, core reads, auth, backtests). Its top also holds the `flatten`/`one_line` output helpers that `e2e_tier_check.py` and `delete_analyses.py` import. The `filing_records` check fails and lists the filing documents without an `ai.filing_records` row (a records call that failed at ingestion), with the backfill command. Used by `scripts/smoke.sh`. | Small, deliberate writes only: refreshes AAPL price bars and creates then deletes one scratch backtest (see its header) |
 | `e2e_tier_check.py` | Deterministic real-environment test of the tier chain with a synthetic recommendation. Used by `scripts/e2e.sh`. | Yes (test data, cleaned up unless `--keep`) |
-| `delete_analyses.py` | Deletes whole analyses and everything they wrote, then sweeps orphans (including knowledge-graph entities left without relations). Walks the live foreign-key tree first. | **Yes, destructive** |
-| `reembed_collection.py` | Copies the RAG collection into a new Qdrant collection with vectors from another embedding model. Preview by default; `--confirm` writes. | Yes with `--confirm` |
+| `delete_analyses.py` | Deletes whole analyses and everything they wrote, then sweeps orphans (including knowledge-graph entities left without relations). Walks the live foreign-key tree first; an unhandled foreign key stops any apply and the exit code is 1. | **Yes, destructive** |
+| `reembed_collection.py` | Copies the RAG collection into a new Qdrant collection with vectors from another embedding model. Preview by default; `--confirm` writes. Refuses (exit code 1, `ABORT: ...`) when source and target are the same, the source does not exist, or the target exists with another vector size. | Yes with `--confirm` |
 | `generate_rag_golden_set.py`, `measure_rag_recall.py` | RAG evaluation: build questions, measure Recall@K per category; `measure_rag_recall.py --sweep` tunes the BM25/vector weights. | `--sweep --apply` writes `ai/rag/category_weights.json`; everything else is read-only |
 | `backfill_filing_records.py` | Extracts (or with `--redo` re-extracts) `ai.filing_records` for filing documents already stored, oldest first, one records-only call each. Flags `--ticker` (repeatable; default every ticker with FILING documents), `--latest N`, `--filename NAME` (repeatable; tickers taken from the names when no `--ticker`), `--tier` (default `FILING_RECORDS_BACKFILL_LLM_TIER`), `--apply` (default dry run: no LLM, SEC or database writes). Waits 65 s before a filing above 500,000 characters; a failed filing stores nothing and the exit code is 1. Chapter 18, 3.13. | Yes with `--apply` |
 | `regenerate_filing_summaries.py` | Two steps for a stored summary that is bad (for example cut off): `--filename F` (repeatable) makes one HIGHEST summary call from the archived raw text and saves it to `/app/_regenerated/` (no database writes; prints the current core document id); after the owner deletes the old document with core-service `scripts.delete_documents`, `--filename F --apply` stores the new document (normal RAG ingestion). Summary only; records are redone with the backfill. Chapter 18, 3.13. | Yes with `--apply` |
-| `upload_seed_documents.py` | Uploads the RAG seed corpus from the repo-root `rag_seed_documents/` folder. | Writes documents |
+| `upload_seed_documents.py` | Uploads the RAG seed corpus from the repo-root `rag_seed_documents/` folder. Exit code 1 when any upload failed. | Writes documents |
 | `verify_portfolio_backtest.py` | Recomputes a portfolio backtest independently and compares. | Only with `--run`: it runs the production backtest, which creates a backtest row; the row is deleted unless `--keep` |
 
 ### 3.8 Deleted users
@@ -533,7 +536,7 @@ sends no effort.
 | Memory and review | `EPISODIC_CONTEXT_LIMIT` (3), `AI_ACCURACY_EVALUATION_DAYS` (30), `REVIEW_GIVE_UP_AFTER_DAYS` (30), `DECISION_REVIEW_RATE_LIMIT_PER_MINUTE` (3), `DECISION_REVIEW_RATE_LIMIT_PER_DAY` (20), `ANALYSIS_EXPERIMENT_ISOLATION` (False; experiment switch, chapter 16 section 3.2) | Chapters 16, 18 and 19. |
 | Data providers | `SEC_EDGAR_USER_AGENT`, `FRED_API_KEY`, `NEWSAPI_API_KEY`, `TAVILY_API_KEY` (empty), `NEWSAPI_SEARCH_IN` (`title,description`), `NEWSAPI_SORT_BY` (`relevancy`), `NEWSAPI_RECENT_EXTRA_LIMIT` (10), `NEWSAPI_RATE_LIMIT_COOLDOWN_SECONDS` (3600.0) | Section 3.6. |
 | RAG assistant | `RAG_TOP_K_RESULTS` (5), `RAG_ASK_RATE_LIMIT_PER_MINUTE` (10), `RAG_ASK_RATE_LIMIT_PER_DAY` (200), `RAG_ASK_LLM_TIER` (`cheap`), `RAG_ASK_MAX_OUTPUT_TOKENS` (1024), `RAG_ASK_SNIPPET_CHARS` (300), `RAG_ASK_STREAM_TIMEOUT_SECONDS` (120.0) | Chapter 17. |
-| User sentiment | `SENTIMENT_MAX_INPUT_CHARS` (6000), `SENTIMENT_TIMEOUT_SECONDS` (240) | `POST /internal/sentiment`. |
+| User sentiment | `SENTIMENT_MAX_INPUT_CHARS` (6000), `SENTIMENT_TIMEOUT_SECONDS` (240) | `POST /internal/sentiment`. Keep `SENTIMENT_TIMEOUT_SECONDS` below core-service's 270 s `_SENTIMENT_TIMEOUT` (chapter 12), or core gives up first. |
 | Shared (from `shared/config.py`) | `LOG_LEVEL` (`INFO`), `LOG_JSON` (True), `INTERNAL_API_TOKEN` (empty), `USER_STATE_CHECK_ENABLED` (True), database/Redis/storage URLs | Chapter 30. |
 
 ## 5. Design decisions and why

@@ -13,8 +13,6 @@ import edgar
 import httpx
 import pytest
 from ai.agents import debate_common
-from ai.agents import filing as filing_module
-from ai.agents import risk as risk_module
 from ai.agents.filing import (prior_year_unusual_item_lines,
                               year_to_date_unusual_item_lines)
 from ai.graph import nodes as nodes_module
@@ -366,6 +364,79 @@ class TestListNewFilings:
             "a real 10-K/A for a genuinely different real "
             "period_of_report must never be merged in")
 
+    async def test_amendment_search_skips_older_amendments_and_no_period(
+            self, monkeypatch):
+
+        class _PeriodMustNotBeRead(_FakeFiling):
+
+            @property
+            def period_of_report(self):
+                raise AssertionError("period read")
+
+            @period_of_report.setter
+            def period_of_report(self, value):
+                pass
+
+        cases = {
+            "amendment-filed-before-the-10-k": (
+                "2025-12-27",
+                _PeriodMustNotBeRead(date(2025, 6, 1), "<p>old</p>")),
+            "original-without-period": (
+                None,
+                _PeriodMustNotBeRead(date(2026, 3, 1), "<p>later</p>"))
+        }
+        for case_id, (period, amendment) in cases.items():
+            original = _FakeFiling(
+                date(2026, 2, 4), f"<p>{_REAL_PROSE}</p>",
+                period_of_report=period)
+            _patch_company(
+                monkeypatch, {
+                    "10-K": [original],
+                    "10-K/A": [amendment]
+                })
+            with capture_logs() as logs:
+                result = await sec_edgar_filings.list_new_filings(
+                    "AMD", already_ingested_filenames=set())
+            assert len(result) == 1, case_id
+            assert "+amendment" not in result[0].text, case_id
+            assert not any(
+                e["event"] == "sec_edgar_filings.amendment_check_failed"
+                for e in logs), case_id
+
+    async def test_a_failing_period_lookup_keeps_the_filing(self, monkeypatch):
+
+        class _PeriodRaises(_FakeFiling):
+
+            @property
+            def period_of_report(self):
+                raise RuntimeError("SEC homepage 429")
+
+            @period_of_report.setter
+            def period_of_report(self, value):
+                pass
+
+        filing = _PeriodRaises(date(2026, 5, 6), f"<p>{_REAL_PROSE}</p>")
+        _patch_company(monkeypatch, {"10-Q": [filing]})
+        result = await sec_edgar_filings.list_new_filings(
+            "AMD", already_ingested_filenames=set())
+        assert [r.filename for r in result] == ["AMD_10-Q_2026-05-06.txt"]
+        assert result[0].report_date is None
+
+    async def test_a_too_large_filing_is_a_source_failure(self, monkeypatch):
+        from ai.ingestion.digests import track_source_failures
+
+        async def _too_large(raw_text, **kwargs):
+            raise filing_summary.FilingTooLargeError("too large")
+
+        monkeypatch.setattr(sec_edgar_filings, "summarize_filing", _too_large)
+        _patch_company(
+            monkeypatch,
+            {"10-Q": [_FakeFiling(date(2026, 5, 6), f"<p>{_REAL_PROSE}</p>")]})
+        with track_source_failures() as failures:
+            result = await sec_edgar_filings.list_new_filings(
+                "AMD", already_ingested_filenames=set())
+        assert result == [] and failures == ["sec_edgar"]
+
 
 class _TextFiling:
 
@@ -436,7 +507,8 @@ class TestFilingIngestion:
             self, monkeypatch):
         stored: list[dict[str, Any]] = []
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         async def _list(ticker, *, already_ingested_filenames):
@@ -487,7 +559,8 @@ class TestFilingIngestion:
         created: list[str] = []
         release = asyncio.Event()
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         async def _list(ticker, *, already_ingested_filenames):
@@ -1314,6 +1387,50 @@ class TestSecEdgarLookups:
         await sec_edgar._load_ticker_to_cik()
         assert len(downloads) == 2
 
+    async def test_failed_ticker_map_refresh_keeps_previous_map(
+            self, monkeypatch):
+        downloads: list[str] = []
+        fail = [False]
+
+        async def _get(url, *, op_name, what):
+            downloads.append(url)
+            if fail[0]:
+                raise sec_edgar.ProviderRequestError(f"{what} failed")
+            return {"0": {"cik_str": 21344, "ticker": "KO", "title": "COCA"}}
+
+        today = [date(2026, 10, 4)]
+        monkeypatch.setattr(sec_edgar, "_sec_get_json", _get)
+        monkeypatch.setattr(sec_edgar, "_today", lambda: today[0])
+        monkeypatch.setattr(sec_edgar, "_ticker_to_cik_cache", None)
+        monkeypatch.setattr(sec_edgar, "_ticker_to_title_cache", None)
+        monkeypatch.setattr(sec_edgar, "_ticker_map_day", None)
+        assert (await sec_edgar._load_ticker_to_cik())["KO"] == 21344
+        fail[0] = True
+        today[0] = date(2026, 10, 5)
+        with capture_logs() as logs:
+            assert (await sec_edgar._load_ticker_to_cik())["KO"] == 21344
+        assert (await sec_edgar.load_ticker_to_title())["KO"] == "COCA"
+        assert any(
+            e["event"] == "sec_edgar.ticker_map_refresh_failed_using_previous"
+            for e in logs)
+        assert len(downloads) == 3
+        fail[0] = False
+        await sec_edgar._load_ticker_to_cik()
+        assert len(downloads) == 4
+        await sec_edgar._load_ticker_to_cik()
+        assert len(downloads) == 4
+
+    async def test_failed_first_ticker_map_fetch_raises(self, monkeypatch):
+
+        async def _get(url, *, op_name, what):
+            raise sec_edgar.ProviderRequestError(f"{what} failed")
+
+        monkeypatch.setattr(sec_edgar, "_sec_get_json", _get)
+        monkeypatch.setattr(sec_edgar, "_ticker_to_cik_cache", None)
+        monkeypatch.setattr(sec_edgar, "_ticker_map_day", None)
+        with pytest.raises(sec_edgar.ProviderRequestError):
+            await sec_edgar._load_ticker_to_cik()
+
 
 _INTC_Q2_RAW = (
     "Net revenue $ 16,130 million. In the second quarter we recorded an "
@@ -1561,12 +1678,6 @@ class TestFilingRecords:
         assert (
             prompt.index('"one_off_items"') < prompt.index('"guidance"') <
             prompt.index('"transactions"') < prompt.index('"legal_matters"'))
-        for gone in ('"commitments"', '"results"', '"line"', '"part_of"',
-                     '"id"', '"next_event"', "prior_id", "PREVIOUS FILING",
-                     "RECORDS FROM THE PREVIOUS FILING",
-                     "every one the filing names",
-                     "fair-value changes that appear every period"):
-            assert gone not in prompt
         for words in ("the most material first",
                       "notes on other income (expense)",
                       "IS an unusual item even when such a line appears every",
@@ -1596,9 +1707,6 @@ class TestFilingRecords:
         assert (
             filing_summary._RECORDS_MAX_TOKENS
             < filing_summary._RETRY_MAX_TOKENS)
-        assert "commitments" not in filing_module._SYSTEM_PROMPT
-        assert "reported-result" not in filing_module._SYSTEM_PROMPT
-        assert "next:" not in risk_module._SYSTEM_PROMPT
         assert "below operating income" in debate_common.UNUSUAL_ITEMS_RULE
         assert [key for key, _ in debate_common._FILING_PERIOD_TITLES] == [
             debate_common.YEAR_TO_DATE_UNUSUAL_KEY,
@@ -1938,7 +2046,6 @@ class TestFilingSummaries:
             llm_router=router  # type: ignore[arg-type]
         )
         assert (out.text, out.truncated) == ("Full summary.", False)
-        assert not hasattr(out, "records")
         assert {c["tier"] for c in router.calls} == {LLMTier.HIGHEST_ACCURACY}
         assert [c["max_tokens"] for c in router.calls] == [12288, 16384]
         assert frec.RECORDS_MARKER not in (
@@ -2642,12 +2749,30 @@ def _load_golden_set_script():
 
 class TestRagGoldenSet:
 
-    async def test_delay_and_requested_uncovered_categories(self, monkeypatch):
+    async def test_sampling_reads_system_chunks_only(self, monkeypatch):
         import ai.evaluation.rag_recall as gs
+        from ai.rag.visibility import SYSTEM_ONLY_SCOPE
 
-        monkeypatch.setattr(gs, "mistral_key_count", lambda: 0)
-        assert gs._inter_chunk_delay_seconds() == (
-            gs._INTER_CHUNK_DELAY_SECONDS_PER_KEY)
+        seen: list[dict[str, Any]] = []
+
+        class _Qdrant:
+
+            async def scroll(self, **kwargs):
+                seen.append(kwargs)
+                return [
+                    SimpleNamespace(
+                        id="c1", payload={"text": "t", "category": "news"},
+                        vector=[0.1])
+                ], None
+
+        monkeypatch.setattr(gs, "get_qdrant_client", _Qdrant)
+        chunks = await gs._sample_indexed_chunks(3)
+        assert [c["chunk_id"] for c in chunks] == ["c1"]
+        assert seen[0]["scroll_filter"] == SYSTEM_ONLY_SCOPE.qdrant_condition()
+        assert seen[0]["limit"] == 3
+
+    async def test_requested_uncovered_categories(self, monkeypatch):
+        import ai.evaluation.rag_recall as gs
 
         chunks = [
             _golden_chunk("n1", "news"),
@@ -2663,24 +2788,20 @@ class TestRagGoldenSet:
             return items
 
         monkeypatch.setattr(gs, "_sample_indexed_chunks", _sample)
-        monkeypatch.setattr(gs, "_select_chunks_for_golden_set", _keep_all)
-        monkeypatch.setattr(gs, "_inter_chunk_delay_seconds", lambda: 0.0)
-        router = _QuestionRouter()
-        result = await gs.generate_golden_set(
-            sample_size=10, llm_router=router,
-            categories=frozenset({"news", "risk_analysis"}),
+        monkeypatch.setattr(gs, "_drop_near_duplicate_chunks", _keep_all)
+        monkeypatch.setattr(gs, "_INTER_CHUNK_DELAY_SECONDS", 0.0)
+        kept, candidate_count = await gs.select_golden_set_chunks(
+            sample_size=10, categories=frozenset({"news", "risk_analysis"}),
             skip_chunk_ids=frozenset({"n2"}))
+        assert candidate_count == 2
+        router = _QuestionRouter()
+        result = await gs.generate_golden_set(kept, llm_router=router)
         assert sorted(p.chunk_id for p in result.pairs) == ["n1", "r1"]
         assert len(router.calls) == 2
 
-        async def _sample(size):
-            return [_golden_chunk("e1", "earnings_call")]
-
-        monkeypatch.setattr(gs, "_sample_indexed_chunks", _sample)
-        with pytest.raises(ValueError, match="filters"):
-            await gs.generate_golden_set(
-                sample_size=1, llm_router=_QuestionRouter(),
-                categories=frozenset({"news"}))
+        kept, candidate_count = await gs.select_golden_set_chunks(
+            sample_size=10, categories=frozenset({"macro_research"}))
+        assert (kept, candidate_count) == ([], 0)
 
     async def test_script_merges_new_chunks_and_rejects_unknown_category(self):
         from ai.evaluation.rag_recall import GoldenQAPair
@@ -2706,3 +2827,26 @@ class TestRagGoldenSet:
             await
             script.main(["--category", "gossip", "--output",
                          "/tmp/x.json"]) == 2)
+
+
+async def test_existing_filenames_system_only_param(monkeypatch):
+    from clients import core_client
+
+    calls: list[dict[str, str] | None] = []
+
+    async def _get_json(path, what, *, params=None, not_found_none=False):
+        calls.append(params)
+        return ["AMD_10-Q_2026-08-05.txt"]
+
+    monkeypatch.setattr(core_client, "_get_json", _get_json)
+    assert await core_client.get_existing_document_filenames(
+        "AMD", "filing", system_only=True) == ["AMD_10-Q_2026-08-05.txt"]
+    await core_client.get_existing_document_filenames("AMD", "filing")
+    assert calls == [{
+        "category": "filing",
+        "ticker": "AMD",
+        "system_only": "true"
+    }, {
+        "category": "filing",
+        "ticker": "AMD"
+    }]

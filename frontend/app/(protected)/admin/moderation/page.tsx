@@ -5,9 +5,9 @@ import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
 import { moderateContent } from "@/app/lib/actions/admin";
-import { UUID_RE } from "@/app/lib/format";
+import { UUID_RE, firstParam } from "@/app/lib/format";
 import type { Paginated } from "@/app/(protected)/research/types";
-import { Pager, firstParam, pageParam } from "../../pager";
+import { Pager, pageParam } from "../../pager";
 import { ActionButton } from "../inline-actions";
 import { ModerateByIdForm } from "./moderate-by-id-form";
 

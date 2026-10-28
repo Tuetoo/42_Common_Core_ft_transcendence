@@ -130,9 +130,8 @@ tests:
               summary: "Analysis queue is backed up"
               description: "3 analyses are waiting in ai-service's serial queue and the queue is not draining."
 
-  # Daily jobs that stopped reporting (backup and one of the sweeps), a
-  # trading-day job within its window, and a market-close that skipped
-  # portfolios. The series carry
+  # Daily jobs that stopped reporting (backup and one of the sweeps) and a
+  # market-close that skipped portfolios. The series carry
   # the labels a real scrape stores (job="core-service" from the scrape
   # job, the job name in scheduled_job).
   - interval: 1m
@@ -140,8 +139,6 @@ tests:
       - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="backup", job="core-service", instance="core-service:8000", service="core-service"}'
         values: "0x1900"
       - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="deleted-user-sweep-ai", job="core-service", instance="core-service:8000", service="core-service"}'
-        values: "0x1900"
-      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="market-close", job="core-service", instance="core-service:8000", service="core-service"}'
         values: "0x1900"
       - series: 'alphamind_market_close_portfolios_skipped{job="core-service", instance="core-service:8000", service="core-service"}'
         values: "0x60 2x60"
@@ -170,9 +167,6 @@ tests:
             exp_annotations:
               summary: "Scheduled job deleted-user-sweep-ai has not succeeded for over 26 hours"
               description: "The daily job deleted-user-sweep-ai last succeeded 1d 6h 0m 0s ago. Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time)."
-      - eval_time: 30h
-        alertname: TradingDayJobStale
-        exp_alerts: []
       - eval_time: 100m
         alertname: MarketCloseSkippedPortfolios
         exp_alerts:
@@ -183,7 +177,110 @@ tests:
               instance: core-service:8000
             exp_annotations:
               summary: "The last market-close skipped 2 portfolio(s)"
-              description: "A holding had no close for the session, so no snapshot was written for 2 portfolio(s) (see the market_close_snapshot_skipped log lines). Fill the day later with bash scripts/snapshots.sh --all --to <date> (then --confirm)."
+              description: "A holding had no close for the session, so no snapshot was written for 2 portfolio(s) (see the market_close_snapshot_skipped log lines). Fill the day later with bash scripts/snapshots.sh --all --to <date> (then --confirm). The alert stays until the next market-close that skips no portfolio; silence it in Alertmanager once the day is filled."
+
+  # Trading-day jobs. Test time 0 is Thursday 1970-01-01 00:00 UTC.
+  # market-close last succeeded on Friday 1970-01-02 22:30 UTC (167400,
+  # 17:30 New York in winter) and then missed Monday: silent over the
+  # weekend and on Monday (limit 76 hours after a Friday), fires early on
+  # Tuesday. tier-monitoring last succeeded on Tuesday 1970-01-06 22:30 UTC
+  # (513000) and then missed Wednesday: silent on Wednesday evening, fires
+  # early on Thursday (limit 26 hours).
+  - interval: 2m
+    input_series:
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="market-close", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "167400x5100"
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="tier-monitoring", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "513000x5100"
+    alert_rule_test:
+      # Sunday 20:00 UTC, 45.5 hours after Friday.
+      - eval_time: 3d20h
+        alertname: TradingDayJobStale
+        exp_alerts: []
+      # Monday 23:30 UTC, 73 hours after Friday (Monday's run would have
+      # finished by now).
+      - eval_time: 4d23h30m
+        alertname: TradingDayJobStale
+        exp_alerts: []
+      # Tuesday 03:00 UTC: over 76 hours since Friday.
+      - eval_time: 5d3h
+        alertname: TradingDayJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: market-close
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job market-close missed a trading day"
+              description: "The trading-day job market-close last succeeded 3d 4h 30m 0s ago (limit: 26 hours, 76 hours after a Friday or Saturday success, 50 hours after a Sunday success). Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time); fill a missed market-close day with bash scripts/snapshots.sh."
+      # Wednesday 23:00 UTC: tier-monitoring is 24.5 hours after Tuesday (silent).
+      - eval_time: 6d23h
+        alertname: TradingDayJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: market-close
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job market-close missed a trading day"
+              description: "The trading-day job market-close last succeeded 5d 0h 30m 0s ago (limit: 26 hours, 76 hours after a Friday or Saturday success, 50 hours after a Sunday success). Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time); fill a missed market-close day with bash scripts/snapshots.sh."
+      # Thursday 01:00 UTC: over 26 hours since Tuesday.
+      - eval_time: 7d1h
+        alertname: TradingDayJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: market-close
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job market-close missed a trading day"
+              description: "The trading-day job market-close last succeeded 5d 2h 30m 0s ago (limit: 26 hours, 76 hours after a Friday or Saturday success, 50 hours after a Sunday success). Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time); fill a missed market-close day with bash scripts/snapshots.sh."
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: tier-monitoring
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job tier-monitoring missed a trading day"
+              description: "The trading-day job tier-monitoring last succeeded 1d 2h 30m 0s ago (limit: 26 hours, 76 hours after a Friday or Saturday success, 50 hours after a Sunday success). Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time); fill a missed market-close day with bash scripts/snapshots.sh."
+
+  # Trading-day jobs after a manual Sunday run. market-close last
+  # succeeded on Sunday 1970-01-04 15:00 UTC (313200) and then missed
+  # Monday: silent on Monday evening, fires on Tuesday once 50 hours have
+  # passed (Tuesday 17:00 UTC plus the 10 minutes of `for`).
+  - interval: 2m
+    input_series:
+      - series: 'alphamind_job_last_success_timestamp_seconds{scheduled_job="market-close", job="core-service", instance="core-service:8000", service="core-service"}'
+        values: "313200x5100"
+    alert_rule_test:
+      # Monday 23:30 UTC, 32.5 hours after Sunday.
+      - eval_time: 4d23h30m
+        alertname: TradingDayJobStale
+        exp_alerts: []
+      # Tuesday 16:00 UTC, 49 hours after Sunday.
+      - eval_time: 5d16h
+        alertname: TradingDayJobStale
+        exp_alerts: []
+      # Tuesday 18:00 UTC: over 50 hours since Sunday.
+      - eval_time: 5d18h
+        alertname: TradingDayJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: scheduler
+              scheduled_job: market-close
+              job: core-service
+              instance: core-service:8000
+            exp_annotations:
+              summary: "Scheduled job market-close missed a trading day"
+              description: "The trading-day job market-close last succeeded 2d 3h 0m 0s ago (limit: 26 hours, 76 hours after a Friday or Saturday success, 50 hours after a Sunday success). Check `docker compose logs scheduler` (and that the Mac was awake at the scheduled time); fill a missed market-close day with bash scripts/snapshots.sh."
 
   # Outbox backlog: fires only when unpublished events stay for 15 minutes.
   - interval: 1m

@@ -56,7 +56,7 @@ from shared.storage import download_bytes
 content = asyncio.run(
     download_bytes(settings, bucket=settings.S3_BUCKET_DOCUMENTS, key=os.environ["KEY"])
 )
-sys.stdout.write(content.decode("utf-8"))
+sys.stdout.buffer.write(content)
 PY
     ;;
   *) die "usage: bash scripts/objectstore.sh [buckets|ls [prefix]|cat <key>]" ;;

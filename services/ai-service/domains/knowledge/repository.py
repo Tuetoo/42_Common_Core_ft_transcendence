@@ -33,16 +33,6 @@ class AgentReportRepository:
         await self.session.flush()
         return report
 
-    async def list_recent_by_category(
-            self, category: str, *, ticker: str | None = None,
-            limit: int = 5) -> list[AgentReport]:
-        query = select(AgentReport).where(AgentReport.category == category)
-        if ticker is not None:
-            query = query.where(AgentReport.ticker == ticker)
-        query = query.order_by(AgentReport.created_at.desc()).limit(limit)
-        result = await self.session.execute(query)
-        return list(result.scalars().all())
-
     async def delete(self, report_id: UUID) -> None:
         await self.session.execute(
             delete(AgentReport).where(AgentReport.id == report_id))

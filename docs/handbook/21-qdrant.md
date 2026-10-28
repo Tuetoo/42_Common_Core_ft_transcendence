@@ -33,7 +33,7 @@
 
  delete document --document.deleted-->  delete_document_chunks() -- delete by filter -->
 
- scheduler 02:30 New York: backup.sh -- POST /collections/<c>/snapshots, download, DELETE -->
+ scheduler 00:50 New York: backup.sh -- POST /collections/<c>/snapshots, download, DELETE -->
 ```
 
 Key facts:
@@ -146,8 +146,8 @@ How texts are embedded (`ai/rag/embedding.py`):
 - Batches are capped at 20 inputs and about 15,000 estimated tokens
   (`_GOOGLE_BATCH_MAX_INPUTS`, `_GOOGLE_BATCH_TOKEN_BUDGET`). The free
   tier counts every input against per-project limits (100 requests and
-  30K tokens per minute, 1K requests per day); a 50-chunk batch uses
-  about 28K tokens, almost a whole minute's budget.
+  30K tokens per minute, 1K requests per day); a 50-chunk document
+  (3 batches) uses about 28K tokens, almost a whole minute's budget.
 - Requests rotate across the pooled Google projects; on 429 or 5xx the
   code waits 5, 10, 20, 40 seconds between rounds
   (`_GOOGLE_RETRY_WAITS_SECONDS`). A request with no answer after
@@ -192,7 +192,7 @@ before any write happens.
 | `text` | the chunk text | returned to agents; BM25 rebuild; re-embedding |
 | `ticker` | e.g. `AMD`, or null for macro research | filter |
 | `category` | `filing`, `analyst_report`, `earnings_call`, `news`, `macro_research`, `risk_analysis` | filter |
-| `created_at` | ISO time of indexing (defaults to now) | stored so recency could be used later; retrieval scoring has no recency term today |
+| `created_at` | ISO time of indexing (defaults to now) | breaks ties between filings with the same date in the newest-filing lookup (`_newest_document_rank`); the date of an agent note that has no `content_date` (`_payload_content_date`); retrieval scoring has no recency term |
 | `source` | file name without extension (e.g. `AMD_10-Q_2026-08-05`) or `agent:<role>` for agent notes | shown in search results |
 | `content_date` | the date the content is about (filing date, report date), when known | shown in results; stale flags |
 | `owner_id` | uploading user (or the analysis user for an agent note) | visibility |
@@ -276,8 +276,11 @@ category and `top_k`):
 
 If the query embedding fails (provider overloaded), a default search
 continues with BM25 alone and logs
-`retriever.vector_search_skipped_embedding_failed`. Details of steps 3-6
-are in [17-ai-rag.md](17-ai-rag.md).
+`retriever.vector_search_skipped_embedding_failed`. The research
+assistant (`domains/rag/qa.py`) embeds the question once and passes the
+vector to all its retrievers; if that embedding fails, it searches with
+BM25 alone and logs `rag_ask.vector_search_skipped_embedding_failed`.
+Details of steps 3-6 are in [17-ai-rag.md](17-ai-rag.md).
 
 ### 3.5 Visibility filtering (`ai/rag/visibility.py`)
 
@@ -403,7 +406,7 @@ MRR@10 0.762, against 0.552 / 0.907 / 0.702 for `mistral-embed` and
 
 ### 3.8 Snapshots in backups
 
-`infra/scheduler/backup.sh` (daily 02:30 New York, 07:30 London) for each
+`infra/scheduler/backup.sh` (daily 00:50 New York, 05:50 London) for each
 collection listed by `GET /collections`:
 
 1. `POST /collections/<c>/snapshots?wait=true` (Qdrant writes a snapshot
@@ -537,7 +540,7 @@ API and dashboard.
 | ai-service fails at startup: "holds N-dim vectors but the configured embedding model produces M" | collection built for another model | `ensure_collection` raises | `bash scripts/qdrant.sh info research_documents_gemini`; check `QDRANT_COLLECTION_RESEARCH` and `QDRANT_VECTOR_SIZE` |
 | ai-service fails at startup: "QDRANT_VECTOR_SIZE=... does not match EMBEDDING_PROVIDER" | settings changed only partly | `check_embedding_configuration` raises | set the provider, dimensions and vector size together |
 | `/health` of ai-service shows `"qdrant": false` | Qdrant down or not ready | 503 from `/health`; compose marks ai-service unhealthy | `docker compose --env-file .env.docker ps qdrant`; `bash scripts/qdrant.sh` |
-| Searches return only keyword-style results | embedding provider failing | vector search skipped, BM25 only | log `retriever.vector_search_skipped_embedding_failed` |
+| Searches return only keyword-style results | embedding provider failing | vector search skipped, BM25 only | log `retriever.vector_search_skipped_embedding_failed` (analyses) or `rag_ask.vector_search_skipped_embedding_failed` (research assistant) |
 | A document stays in `embedding` or ends `failed` | embedding errors during ingestion | transient errors (429/5xx/timeouts, including `EmbeddingRateLimitedError` when every pooled Gemini project keeps answering 429) mark it failed and leave the event for redelivery (up to 5 deliveries); permanent errors just mark it failed. A failed run that already touched the index deletes the document's points again, so a `failed` document is not searchable (log `rag_ingestion_failure_chunk_cleanup_failed` if that delete fails) | `bash scripts/psql.sh -c "SELECT document_id, embedding_model, status, created_at FROM ai.embedding_jobs ORDER BY created_at DESC LIMIT 10;"`; ai-service logs |
 | A deleted document still appears in results | `document.deleted` not processed | the durable event is retried | count its points (demo step 5); `bash scripts/redis-cli.sh -n 3 XINFO GROUPS stream:document.deleted` |
 | Keyword search empty right after a Qdrant restore | BM25 still holds the old corpus | none | restart ai-service; look for `bm25_index_rebuilt` with the expected `chunk_count` |

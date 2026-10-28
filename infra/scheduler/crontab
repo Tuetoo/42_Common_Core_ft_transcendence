@@ -1,5 +1,8 @@
 # AlphaMind scheduler -- times are in America/New_York (see Dockerfile's TZ),
-# so these stay correct across DST changes automatically.
+# so they follow New York daylight saving time. No job is scheduled
+# between 01:00 and 02:59: on the March change 02:00-02:59 does not exist
+# (cron would skip a job there), and on the November change 01:00-01:59
+# happens twice (cron could run a job there twice).
 #
 # Holidays: cron only knows weekdays (`1-5`); the NYSE
 # calendar (weekends, market holidays such as Thanksgiving, Christmas,
@@ -48,11 +51,12 @@
 # metrics rollup (ai-service). Runs once daily rather than tied to market
 # hours -- unlike market-open/close, nothing here is time-sensitive to
 # the trading session itself (it scores recommendations once they are 30
-# days old and user decisions at 7, 30 and 90 days). 2:00 AM ET: after the prior day's
+# days old and user decisions at 7, 30 and 90 days). 00:20 ET: after the prior day's
 # market-close processing, well before the next market-open job, on
 # every day of the week (not just weekdays) since decision/recommendation
-# aging doesn't pause on weekends the way market data does.
-0 2 * * * /scripts/call-job.sh review-run >/proc/1/fd/1 2>/proc/1/fd/2
+# aging doesn't pause on weekends the way market data does. call-job.sh
+# gives up after 1800 s (00:50), when the backup starts.
+20 0 * * * /scripts/call-job.sh review-run >/proc/1/fd/1 2>/proc/1/fd/2
 
 # RAG auto-ingestion: checks every tracked ticker (portfolio holdings +
 # watchlists) for new SEC filings AND recent news, adding both to the RAG
@@ -79,11 +83,11 @@
 # Backups: Postgres dump + Qdrant snapshots + a copy of every object in
 # the object storage (SeaweedFS, through its S3 API) + avatars into
 # /backups/<YYYY-MM-DD_HHMM>/ (host ./backups), then prunes backups older
-# than BACKUP_RETENTION_DAYS (default 7). 2:30 AM ET daily: between
-# review-run (2:00) and rag-ingest (3:05), the quietest window -- no
-# market job and no ingestion writes documents at that time. See
-# docs/DISASTER_RECOVERY.md.
-30 2 * * * /scripts/backup.sh >/proc/1/fd/1 2>/proc/1/fd/2
+# than BACKUP_RETENTION_DAYS (default 7). 00:50 ET daily: after
+# review-run (00:20, at most 30 minutes) and before rag-ingest (3:05), the
+# quietest window -- no market job and no ingestion writes documents at
+# that time. See docs/DISASTER_RECOVERY.md.
+50 0 * * * /scripts/backup.sh >/proc/1/fd/1 2>/proc/1/fd/2
 
 # Unverified account purge (auth-service): deletes, through the same path
 # as an admin deletion (anonymized row, user.deleted event), every account
@@ -91,7 +95,9 @@
 # days ago, never verified its email, never signed in and has no OAuth
 # link. Then it cleans the auth leftovers (sessions, open sent
 # invitations, memberships, owned organizations) of accounts deleted
-# before the full deletion existed. 04:10 AM ET daily: after the backup,
+# before the full deletion existed, and deletes open organization
+# invitations that expired more than ORGANIZATION_INVITATION_EXPIRE_DAYS
+# (default 7) days ago. 04:10 AM ET daily: after the backup,
 # so a purged account is still in the previous night's backup.
 10 4 * * * /scripts/call-job.sh purge-unverified >/proc/1/fd/1 2>/proc/1/fd/2
 

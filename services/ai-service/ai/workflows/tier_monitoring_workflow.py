@@ -23,10 +23,10 @@ def _session_open_utc(day: date) -> datetime:
     return datetime.combine(day, time(9, 30), tzinfo=MARKET_TZ).astimezone(UTC)
 
 
-def _today_bar_matches(bar_timestamp: datetime, today: date) -> bool:
+def _market_day(bar_timestamp: datetime) -> date:
     if bar_timestamp.tzinfo is None:
         bar_timestamp = bar_timestamp.replace(tzinfo=UTC)
-    return bar_timestamp.astimezone(MARKET_TZ).date() == today
+    return bar_timestamp.astimezone(MARKET_TZ).date()
 
 
 async def _check_one_tier(tier: RecommendationTier, *, today: date) -> str:
@@ -46,43 +46,51 @@ async def _check_one_tier(tier: RecommendationTier, *, today: date) -> str:
         return "pending"
 
     ticker = recommendation.analysis.ticker
+    accepted_at = recommendation.accepted_at
+    first_day = (
+        accepted_at.astimezone(MARKET_TZ).date()
+        if accepted_at is not None else today)
     try:
         bars = await get_bars_cache_first(
-            ticker, interval="1d", lookback_days=1)
+            ticker, interval="1d",
+            lookback_days=max(1, (today - first_day).days + 1))
     except ProviderError as exc:
         logger.warning(
             "tier_monitoring.price_lookup_failed", ticker=ticker,
             tier_id=str(tier.id), error=str(exc))
         return "price_lookup_failed"
 
-    if not bars or not _today_bar_matches(bars[-1].timestamp, today):
-        return "no_fresh_data"
-
-    bar = bars[-1]
-    accepted_at = recommendation.accepted_at
-    if accepted_at is not None and accepted_at > _session_open_utc(
-            bar.timestamp.date()):
-        logger.info(
-            "tier_monitoring.accepted_after_bar_open", ticker=ticker,
-            tier_id=str(tier.id), accepted_at=accepted_at.isoformat())
-        return "still_open"
-    if not (math.isfinite(bar.low) and math.isfinite(bar.high)
-            and math.isfinite(bar.open)):
-        logger.warning(
-            "tier_monitoring.bar_has_non_finite_price", ticker=ticker,
-            tier_id=str(tier.id), low=bar.low, high=bar.high, open=bar.open)
-        return "no_fresh_data"
-    if tier.side == TierSide.BUY.value and bar.low <= tier.target_price:
-        fill_price = min(bar.open, tier.target_price)
-        fill_price = Decimal(str(fill_price))
-        return await _execute_and_mark_triggered(
-            tier, ticker=ticker, price=fill_price, transaction_type="buy")
-    if tier.side == TierSide.SELL.value and bar.high >= tier.target_price:
-        fill_price = max(bar.open, tier.target_price)
-        fill_price = Decimal(str(fill_price))
-        return await _execute_and_mark_triggered(
-            tier, ticker=ticker, price=fill_price, transaction_type="sell")
-    return "still_open"
+    has_today = False
+    days = sorted(((_market_day(bar.timestamp), bar) for bar in bars),
+                  key=lambda item: item[0])
+    for day, bar in days:
+        if not first_day <= day <= today:
+            continue
+        if not (math.isfinite(bar.low) and math.isfinite(bar.high)
+                and math.isfinite(bar.open)):
+            logger.warning(
+                "tier_monitoring.bar_has_non_finite_price", ticker=ticker,
+                tier_id=str(tier.id), low=bar.low, high=bar.high,
+                open=bar.open)
+            continue
+        has_today = has_today or day == today
+        if accepted_at is not None and accepted_at > _session_open_utc(day):
+            if day == today:
+                logger.info(
+                    "tier_monitoring.accepted_after_bar_open", ticker=ticker,
+                    tier_id=str(tier.id), accepted_at=accepted_at.isoformat())
+            continue
+        if tier.side == TierSide.BUY.value and bar.low <= tier.target_price:
+            return await _execute_and_mark_triggered(
+                tier, ticker=ticker,
+                price=Decimal(str(min(bar.open, tier.target_price))),
+                transaction_type="buy")
+        if tier.side == TierSide.SELL.value and bar.high >= tier.target_price:
+            return await _execute_and_mark_triggered(
+                tier, ticker=ticker,
+                price=Decimal(str(max(bar.open, tier.target_price))),
+                transaction_type="sell")
+    return "still_open" if has_today else "no_fresh_data"
 
 
 async def _execute_and_mark_triggered(

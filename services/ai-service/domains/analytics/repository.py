@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
-from sqlalchemy import select
+from sqlalchemy import Row, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from domains.analysis.model import Agent, AgentResult, AgentRun, Recommendation
@@ -13,9 +14,13 @@ class AnalyticsRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def list_agent_metrics(self) -> list[AgentMetric]:
-        result = await self.session.execute(select(AgentMetric))
-        return list(result.scalars().all())
+    async def list_agent_metrics(self) -> list[Row[Any]]:
+        result = await self.session.execute(
+            select(AgentMetric.agent_id, Agent.name.label("agent"),
+                   AgentMetric.avg_score, AgentMetric.success_rate).join(
+                       Agent, Agent.id == AgentMetric.agent_id).order_by(
+                           Agent.name))
+        return list(result.all())
 
     async def list_agent_ids(self) -> list[UUID]:
         result = await self.session.execute(select(Agent.id))

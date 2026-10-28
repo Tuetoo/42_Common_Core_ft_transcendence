@@ -2,6 +2,8 @@
 
 import { useActionState } from "react";
 import { updateProfile, type ProfileValues, type UpdateProfileState } from "@/app/lib/actions/profile";
+import { FormMessage } from "@/app/form-message";
+import { TIMEZONE_PATTERN, TIMEZONE_TITLE, USERNAME_PATTERN, USERNAME_TITLE } from "@/app/(public)/field-rules";
 
 const initialState: UpdateProfileState = {};
 
@@ -24,8 +26,8 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
           required
           minLength={3}
           maxLength={32}
-          pattern="[A-Za-z0-9_.\-]{3,32}"
-          title="3-32 characters: letters, digits, underscore, dot or hyphen"
+          pattern={USERNAME_PATTERN}
+          title={USERNAME_TITLE}
           defaultValue={v.username}
         />
       </div>
@@ -49,8 +51,8 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
           autoComplete="off"
           type="text"
           maxLength={64}
-          pattern="[A-Za-z0-9_+\-\/]+"
-          title="An IANA timezone name such as Europe/Paris"
+          pattern={TIMEZONE_PATTERN}
+          title={TIMEZONE_TITLE}
           placeholder="Europe/Paris"
           defaultValue={v.timezone}
         />
@@ -59,16 +61,8 @@ export function EditProfileForm({ defaults }: { defaults: ProfileValues }) {
         <label htmlFor="country">Country</label>
         <input id="country" name="country" autoComplete="country-name" type="text" maxLength={100} defaultValue={v.country} />
       </div>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.success && (
-        <p aria-live="polite" className="form-message success">
-          Saved.
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.success ? "Saved." : null} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Saving…" : "Save changes"}
       </button>

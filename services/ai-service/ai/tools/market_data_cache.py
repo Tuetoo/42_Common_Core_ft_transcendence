@@ -12,6 +12,9 @@ from shared.market_calendar import (MARKET_TZ, is_trading_day,
 
 logger = structlog.get_logger(__name__)
 
+MAX_LOOKBACK_DAYS = 730
+INDICATOR_LOOKBACK_DAYS = 90
+
 _FRESHNESS_BY_INTERVAL: dict[str, timedelta] = {
     "1wk": timedelta(days=6),
     "1mo": timedelta(days=27)

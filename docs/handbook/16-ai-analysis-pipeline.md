@@ -136,7 +136,9 @@ Reflection's citation review and position sizing use HIGHEST_ACCURACY.
 
 **Availability failure.** The provider did not answer: HTTP 429 (rate
 limit or quota) or HTTP 503 (server overloaded), or a timeout. In the code
-this is `LLMRateLimitError` and its subclass `LLMServerOverloadedError`
+this is `LLMRateLimitError` with its subclasses `LLMServerOverloadedError`
+and `LLMRequestTimeoutError`, plus `LLMProviderTimeoutError` (any other
+provider timeout, for example Anthropic after its request timeout)
 (`ai/llm/base.py`). The pipeline treats these very differently from a
 *content* failure (the model answered, but badly): an availability failure
 is usually not retried at once, because retrying into the same overload
@@ -299,6 +301,7 @@ Each agent node goes through `_run_agent_safely` (`ai/graph/nodes.py`):
   Portfolio about 5.2 s), so nine first LLM calls do not hit the rate
   limiter in the same instant. This is the only start stagger.
 - An exception becomes a `FAILED` `AgentOutput` with a `failure_kind`:
+  `credit_exhausted` (Anthropic or OpenAI credit used up),
   `server_overload` (503 or timeout), `rate_limit` (429/quota),
   `non_english`, or `other` (`_failure_kind_of`).
 - A successful but non-English summary is rejected and replaced by a
@@ -544,13 +547,14 @@ checked with `find_ungrounded_figures` against the grounding reference
 plus the code-built lines of the user message (never the Bull and Bear
 texts). With an ungrounded figure the Judge is asked ONCE, in the same
 conversation, to restate each listed figure exactly as the evidence gives
-it or remove it; the second answer is accepted whatever it says, and a
-remaining problem is only logged. A failed or unusable rewrite keeps the
+it or remove it; a usable second answer (an English rationale, a
+leaning and a confidence) is accepted whatever it says, and a remaining
+problem is only logged. A failed or unusable rewrite keeps the
 first answer (chapter 15, section 3.18).
 
 Parsing rules: confidence is clamped to 0..1 (a non-number, `NaN` or
 `Infinity` becomes 0.0, never 1.0), an unknown leaning becomes
-HOLD, and `converged` counts only a real `true` or the string `"true"`
+HOLD (logged `judge.unknown_leaning`), and `converged` counts only a real `true` or the string `"true"`
 (`_parse_converged`; a plain truthiness test would count the string
 `"false"` as true).
 
@@ -565,8 +569,8 @@ sentences also deletes investment text, so only the prompt rule asks
 the Judge to leave debate-process text out.
 
 **Delayed retry.** If the call fails for availability
-(`LLMRateLimitError`, which includes 429s, 503s and strong-model
-timeouts), `judge_node` asks `_judge_retry_wait` how long to wait. It
+(`LLMRateLimitError`, which includes 429s, 503s and Google strong-model
+timeouts, or `LLMProviderTimeoutError`), `judge_node` asks `_judge_retry_wait` how long to wait. It
 reads the cooldowns of the strong chain
 (`ai/llm/router.py::chain_capacity` over
 `tier_model_chain(HIGHEST_ACCURACY)`, chapter 14, 3.10):
@@ -575,13 +579,20 @@ reads the cooldowns of the strong chain
 - every model is in a cooldown: wait until the earliest cooldown ends;
 - every model is out of its daily quota: no retry.
 
+The cooldowns exist only for Google models. With another provider
+`chain_capacity` reports a free model, so the Judge retries without a
+wait, and the side repair and the review retry always wait in full
+(chapter 14, 3.10).
+
 `judge_node` logs `judge_node.delayed_retry` (fields `error`,
 `failure_kind`, `attempt` and `delay_seconds`), waits, runs the late side
 repair below and calls the Judge again. It repeats this after each
 availability failure, within a budget per analysis:
 `JUDGE_RETRY_MAX_ATTEMPTS` (4) retries and `JUDGE_RETRY_BUDGET_SECONDS`
 (240 s) of waiting in total. Each wait is capped by the rest of the
-budget. The state keeps the count and the seconds used
+budget. The budget counts only waits: for a provider timeout each retry
+costs the full call time, and only `JUDGE_RETRY_MAX_ATTEMPTS` bounds it.
+The state keeps the count and the seconds used
 (`judge_retry_attempts`, `judge_retry_seconds`). When the budget is used
 up or no retry is possible, the error is raised. Why: in
 run_20261011_130633 one fixed 120 s wait was too short for NVDA
@@ -679,9 +690,11 @@ The review is skipped, with a stated reason, when there are no outputs,
 when there is no verdict because the run is below the debate minimum,
 when the Judge failed for good
 (nothing can change), or when no agent has usable evidence. If the call
-fails for availability, it waits `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS`
-(60 s; skipped when a strong-chain model is free now) and tries once more
-(0 turns this off).
+fails for availability (the Judge's error set above, timeouts included),
+it waits `REFLECTION_REVIEW_DELAYED_RETRY_SECONDS` (60 s; skipped when a
+strong-chain model is free now) and tries once more (0 turns this off).
+A skipped review after a timeout gives the reason "the LLM provider timed
+out".
 
 **Capacity-aware waits, replayed.** Of the 8 fixed waits in the stored
 batches (side repair 4, citation-review retry 4), a strong-chain model
@@ -745,7 +758,7 @@ would only lead to another Judge call against the same unavailable model.
 
 | Reason | When |
 |---|---|
-| `llm_credit_exhausted` | any of the reasons below, when an agent, a debate side or the Judge failed because the Anthropic API credit is used up (chapter 14, section 3.16) |
+| `llm_credit_exhausted` | any of the reasons below, when an agent, a debate side or the Judge failed because the Anthropic or OpenAI API credit is used up (chapter 14, section 3.16) |
 | `no_evidence` | no verdict and no agent output, or every agent failed |
 | `insufficient_evidence` | no verdict and fewer usable agents than the minimum |
 | `debate_unavailable` | the Judge was skipped because both sides were unavailable |
@@ -774,17 +787,18 @@ the episodic memory and the portfolio's "latest recommendation".
 
 ### 3.12 The recommendation engine: penalties and caps
 
-`build_final_recommendation` starts from the Judge's leaning and
-confidence and applies, in this order:
+`build_final_recommendation` starts from the leaning and confidence of
+the verdict the node keeps (the newest valid one, 3.11) and applies, in
+this order:
 
 | Step | Rule | Constant |
 |---|---|---|
-| 1 | debate did not converge: subtract 0.15 | `_UNCONVERGED_DEBATE_PENALTY` |
+| 1 | the kept verdict did not converge: subtract 0.15 (a later failed Judge pass does not change this) | `_UNCONVERGED_DEBATE_PENALTY` |
 | 2 | last Reflection round not verified: no deduction; the note lists the open issues (below) | none |
 | 3a | usable-agent ratio below 0.5: cap at 0.3 | `_LOW_PARTICIPATION_CONFIDENCE_CAP` |
 | 3b | ratio from 0.5 to below 0.8: subtract 0.15 | `_PARTIAL_PARTICIPATION_PENALTY` |
 | 4 | BUY while the ticker is at or above `MAX_POSITION_WEIGHT_PCT` (50) of net value: action becomes HOLD | `engine.py` |
-| 5 | exactly one side's final argument unavailable: cap at 0.3, and `debate_converged` is reported as False | `_ONE_SIDE_UNAVAILABLE_CONFIDENCE_CAP` |
+| 5 | exactly one side's final argument unavailable, when the kept verdict is the last Judge pass: cap at 0.3, and `debate_converged` is reported as False (skipped when an earlier verdict is kept) | `_ONE_SIDE_UNAVAILABLE_CONFIDENCE_CAP` |
 | 6 | same action as the prior open recommendation, with fewer usable agents than the prior had: confidence may not exceed the prior's (final values on both sides: this cap is about what was issued) | reaffirmation cap |
 
 **Why an unverified Reflection costs no confidence.** Reflection's last
@@ -877,8 +891,8 @@ batch 15 of 19 Judges ran on the fallback model and nothing told the
 reader.
 
 **`debate_converged`** on the saved recommendation is true only when the
-Judge converged, the final verdict is not a failure, and no side was
-missing in the final round.
+kept verdict (3.11) converged and, when that verdict is from the last
+Judge pass, no side was missing in that round.
 
 ### 3.13 Position sizing: from verdict to tiers
 
@@ -968,7 +982,9 @@ and the fallback model:
   still meet the minimum tier size. Otherwise there are no tiers
   (a `BudgetBlockedNote`, unless the budget was cut by the position limit);
 - SELL total quantity above the held quantity: no tiers;
-- `window_days` is kept between 1 and `TIER_WINDOW_DAYS_MAX` (30); a
+- `window_days` must be a whole number (`14` or `14.0`; a boolean, a
+  string or `14.5` means the answer is missing a required field, so no
+  tiers); it is kept between 1 and `TIER_WINDOW_DAYS_MAX` (30); a
   larger answer is capped (log `position_sizing.window_days_clamped` with
   `proposed` and `used`), so one answer cannot keep cash reserved for
   months.

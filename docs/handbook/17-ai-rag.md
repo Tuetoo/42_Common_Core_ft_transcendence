@@ -417,7 +417,9 @@ a private document through its summary.
 ### 3.9 Retrieval: BaseRetriever
 
 `ai/rag/retriever.py::BaseRetriever(category_filter, top_k,
-use_query_expansion, visibility)`. `retrieve(query, ticker=...)`:
+use_query_expansion, visibility)`. `visibility` has no default: every
+caller passes a scope; only the recall evaluation and the smoke check pass `None` (no
+visibility filter) on purpose. `retrieve(query, ticker=...)`:
 
 1. Resolve the visibility scope.
 2. Pick sources: by default both BM25 and vector, but a category whose
@@ -727,9 +729,13 @@ Flow (`domains/rag/qa.py`):
    transaction (`INCR` plus `EXPIRE ... NX`), limits `RAG_ASK_RATE_LIMIT_PER_MINUTE` (10) and
    `RAG_ASK_RATE_LIMIT_PER_DAY` (200, UTC day). Over the limit: 429 with a
    `Retry-After` header. If Redis is down the request is let through.
-2. **Retrieval** (`retrieve_sources`): one `BaseRetriever` per requested
+2. **Retrieval** (`retrieve_sources`): the question is embedded once
+   and the vector is shared by one `BaseRetriever` per requested
    category (or one unfiltered), no query expansion, the caller's
-   visibility scope; results merged by score and cut to `top_k`; then the
+   visibility scope. If that one embedding call fails, every retriever
+   searches with BM25 only (warning
+   `rag_ask.vector_search_skipped_embedding_failed`). Results are merged
+   by score and cut to `top_k`; then the
    newest-filing reservation when a ticker is given and filings are in
    scope. A retrieval error is a plain 503 before any streaming starts.
 3. **No sources**: a fixed honest answer ("I could not find any relevant
@@ -744,6 +750,10 @@ Flow (`domains/rag/qa.py`):
    word paragraph for a research note instead of an answer.
 5. **Non-English output** is rejected. The plain endpoint retries once with
    an English-only instruction, then answers 503.
+6. **Empty answer**: an LLM reply that is empty after trimming is not
+   returned. The plain endpoint answers 503 (`Retry-After: 30`, log
+   `rag_ask.empty_answer`). A stream whose answer is empty (streamed, or
+   from the fallback below) ends with `error`/`empty_answer`.
 
 `RagAnswer`: `answer`, `citations` (index, document_id, title, category,
 ticker, content_date, snippet of `RAG_ASK_SNIPPET_CHARS` = 300
@@ -792,11 +802,17 @@ holdings and watchlists, `clients/core_client.py::get_tracked_tickers`):
   clean text with the `edgartools` library, and makes two calls on the
   strong model (HIGHEST tier):
   - the summary (`ai/knowledge/filing_summary.py::summarize_filing`,
-    separate prompts for 10-K and 10-Q, an amendment merged in when one
-    exists);
+    separate prompts for 10-K and 10-Q; a 10-K/A for the same period that
+    was filed before the 10-K is first ingested is merged in, a later
+    10-K/A is not);
   - a separate records-only call (`extract_filing_records`) that returns
     the structured filing records.
   The filename `{TICKER}_{FORM}_{date}.txt` is the duplicate key. The
+  check looks at system documents only
+  (`GET /internal/documents/filenames?system_only=true`), so a user's
+  private upload with the same name does not stop the system copy that
+  every user reads. The same system-only check is used for news digests
+  and the macro report. The
   stored text is the summary alone. A fallback summary (a raw excerpt,
   when the LLM failed) is never stored, so the next run tries again; its
   records call is not made. After the document is created, the records
@@ -814,6 +830,11 @@ holdings and watchlists, `clients/core_client.py::get_tracked_tickers`):
   that `stored_evidence_articles` confirms (3.11). A digest of fewer
   than 80 words is not stored. When the company name lookup fails, no
   NewsAPI request is sent at all, because nothing could be classified.
+  The name comes from SEC's ticker map, loaded once per UTC day; when
+  that day's refresh fails, the previous day's map is kept (warning
+  `sec_edgar.ticker_map_refresh_failed_using_previous`) and the next
+  lookup tries again, so the lookup fails only when no map was ever
+  loaded.
   Each digest costs one NewsAPI request per ticker.
 
 Only 10-K and 10-Q filings are ingested (`_WANTED_FORMS`). 8-K current
@@ -890,7 +911,7 @@ are uploaded without a ticker.
 
 | Tool | Purpose |
 |---|---|
-| `ai/evaluation/rag_recall.py` (`generate_golden_set`) | sample indexed chunks, ask an LLM for one question whose answer is in that chunk; drop near-duplicate chunks and duplicate questions |
+| `ai/evaluation/rag_recall.py` (`select_golden_set_chunks`, `generate_golden_set`) | sample indexed system chunks (system-only scope, so no private upload or private agent note is sampled), ask an LLM for one question whose answer is in that chunk; drop near-duplicate chunks and duplicate questions |
 | `scripts/generate_rag_golden_set.py` | runs the generator in the container (Lite model), writes the JSON |
 | `tests/fixtures/rag_golden_set.json` | the current golden set (909 questions: 706 earnings_call, 126 filing, 31 news, 25 analyst_report, 16 risk_analysis, 5 macro_research) |
 | `ai/evaluation/rag_recall.py` (scoring) | Recall@K, Recall@1/@3, MRR for BM25-only, vector-only and fused |
@@ -947,7 +968,7 @@ sets the embedding values explicitly.
 | `NEWS_RELEVANCE_BATCH_SIZE` | 8 | items per classifier call (calls run concurrently) |
 | `NEWS_CONSUMER_MAX_ITEMS` | 2 | consumer-product items kept per agent run (never evidence, never stored) |
 | `FILING_RECORDS_MAX_FILINGS` | 5 | newest filings whose records `search_filings` shows |
-| `SEC_EDGAR_USER_AGENT` | empty | required by SEC EDGAR ("Company Name email") |
+| `SEC_EDGAR_USER_AGENT` | empty | required by SEC EDGAR: a real name and contact email ("Your Name your.email@example.com"); empty turns SEC EDGAR off |
 | `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` | 8.0 | SEC request throttle (SEC's fair-access limit is 10) |
 | core: `ALLOWED_DOCUMENT_EXTENSIONS` | `.pdf .txt .md` | `services/core-service/config.py` |
 | core: `MAX_UPLOAD_SIZE_BYTES` | 20 MB | upload size limit |
@@ -1061,9 +1082,9 @@ for the named filing cannot.
 | ai-service refuses to start | vector size mismatch | startup error from `check_embedding_configuration` / `ensure_collection` |
 | search finds nothing after restart | BM25 not rebuilt | `rag.bm25_rebuilt_from_qdrant` with `chunk_count` at startup |
 | ingestion of a document takes a few seconds longer as the corpus grows | the full BM25 rebuild per write (off the event loop, so other requests are not held up) | `rag.indexed_document` timestamps against the document's `ready` status; corpus size from `make qdrant` |
-| search works but no vector results | embedding call failing | `retriever.vector_search_skipped_embedding_failed` |
+| search works but no vector results | embedding call failing | `retriever.vector_search_skipped_embedding_failed` (RAG ask: `rag_ask.vector_search_skipped_embedding_failed`) |
 | ask returns 429 | rate limit | `Retry-After` header; Redis keys `ai:rag_ask:rate:*` |
-| ask returns 503 | retrieval or LLM unavailable | `rag_ask.retrieval_failed`, `rag_ask.llm_failed` |
+| ask returns 503 | retrieval or LLM unavailable, or the LLM answered with empty text | `rag_ask.retrieval_failed`, `rag_ask.llm_failed`, `rag_ask.empty_answer` |
 | deleted document still found | deletion event not processed | compare Qdrant count with `ai.document_chunks` |
 | no news digest for a ticker today | classifier unavailable or company name lookup failed; or every item was left out | `bash scripts/logs.sh ai-service grep auto_ingestion.news_unverified_skipped`; `news_relevance.not_stored` lists the kinds left out |
 | many "[unverified]" news or web lines | the classifier answer was not valid JSON, even after the retry | `news_relevance.unparseable_after_retry` / `search_relevance.unparseable_after_retry` with the titles |

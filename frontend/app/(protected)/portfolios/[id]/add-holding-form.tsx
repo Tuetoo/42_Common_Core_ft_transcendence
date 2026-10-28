@@ -3,6 +3,7 @@
 import { useActionState, useId } from "react";
 import { addHolding, type AddHoldingState } from "@/app/lib/actions/portfolios";
 import { MIN_POSITIVE_AMOUNT, TICKER_PATTERN, TICKER_TITLE, upperCaseInput } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: AddHoldingState = {};
 
@@ -53,11 +54,7 @@ export function AddHoldingForm({ portfolioId }: { portfolioId: string }) {
           defaultValue={values.average_cost}
         />
       </div>
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Adding…" : "Add holding"}
       </button>

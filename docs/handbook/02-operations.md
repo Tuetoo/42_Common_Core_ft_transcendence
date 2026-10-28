@@ -32,7 +32,7 @@ work. Instead you use three layers of tools, from high to low:
 A normal day looks like this (times in New York, London in brackets):
 
 ```
-02:00 (07:00) review-run      02:30 (07:30) backup     03:05 (08:05) rag-ingest
+00:20 (05:20) review-run      00:50 (05:50) backup     03:05 (08:05) rag-ingest
 04:00 (09:00) logs-cleanup    04:10 (09:10) purge-unverified  04:20 (09:20) notification-retention
 04:30 (09:30) deleted-user-sweep-core   04:40 (09:40) deleted-user-sweep-ai
 09:00-10:30 (14:00-15:30)  BUSY WINDOW  09:30 (14:30) market-open (Mon-Fri)
@@ -491,6 +491,8 @@ analysis stops counting after that). SELL tiers are not listed; use
 `OWNER_USER_ID` (a decision must come from the portfolio owner) and calls
 the public `POST /api/v1/analyses/{id}/decisions` with
 `{"action_taken": "declined", "portfolio_id": ...}` through the gateway.
+It goes on with the next id when one call fails, and exits 1 at the end
+if any call failed.
 
 #### `scripts/snapshots.sh` - recompute portfolio NAV snapshots
 
@@ -519,9 +521,9 @@ writes the day's snapshot.
 bash scripts/backups.sh               # list ./backups/<stamp>/ with sizes
 bash scripts/backups.sh now           # make a backup now (same as make backup)
 bash scripts/backups.sh check         # restore DRY RUN of the newest backup
-bash scripts/backups.sh check 2026-10-01_0230
+bash scripts/backups.sh check 2026-10-01_0050
 bash scripts/backups.sh drill         # restore drill of the newest backup
-bash scripts/backups.sh drill 2026-10-01_0230   # (= make restore-drill BACKUP=...)
+bash scripts/backups.sh drill 2026-10-01_0050   # (= make restore-drill BACKUP=...)
 ```
 
 `check` runs `restore.sh` without `--yes` in the `restore` container, so
@@ -604,7 +606,8 @@ refresh the 30-second holdings cache in Redis, and `backtest_replay`
 creates one scratch system backtest (strategy name
 `smoke_check`) and deletes it with its metrics before the check
 returns. No analyses, tiers, recommendations, decisions, transactions or
-documents are written, and no events are published.
+documents are written. The replay publishes one `backtest.completed`
+event without a user (no notification).
 
 #### `scripts/e2e.sh` - real end-to-end checks
 
@@ -621,17 +624,23 @@ internal token and the database settings):
 docker compose --env-file .env.docker exec -T <service> python -m scripts.<name> [options]
 ```
 
-Common rules, followed by every script that writes: the default is a
+Common rules, followed by most scripts that write: the default is a
 preview or dry run, a flag (`--apply`, `--confirm`) is needed to change
 anything, and a re-run is safe (rows already handled are skipped or
-reported). Run them outside the busy windows (section 3.7); none of them
+reported). Exceptions: `set_system_role` and `upload_seed_documents`
+write unless `--dry-run` is given, and `analysis_cli create` writes at
+once. Two write modes write files under `/app`, so they need the
+development image stage (bind-mounted source): `measure_rag_recall
+--sweep --apply` and `regenerate_filing_summaries`. In the production
+image (the cloud host) `/app` belongs to root and the app user cannot
+write there, so they fail with a permission error. Run them outside the busy windows (section 3.7); none of them
 checks the clock.
 
 | Script | Service | Writes? | What it does | Chapter |
 |---|---|---|---|---|
 | `set_system_role --email E --role guest\|user\|moderator\|admin [--dry-run]` | auth | yes | Sets a user's system role in the database and in the live Redis mirror, so issued tokens get it at once. How the first admin is made. Refuses an unknown email, a deleted account and demoting the last active admin (exit 1). | 11 |
 | `delete_documents --id U [--id U ...] [--confirm]` | core | with `--confirm` | Deletes documents like the API does, but without the owner check (for documents owned by the ingestion user or the system): the row and a `document.deleted` outbox entry in one commit, the event published at once (or later by the outbox dispatcher), then the S3 object. Each document is committed on its own; ids already gone are reported as not found. | 12, 22 |
-| `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none, or whose label is older than the last edit (`sentiment_analyzed_at < updated_at`) (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run. | 12 |
+| `backfill_sentiment [--apply] [--kind note\|comment\|all] [--limit N] [--rate 30]` | core | with `--apply` | Fills `sentiment_label` for notes and comments that have none, or whose label is older than the last edit (`sentiment_analyzed_at < updated_at`) (oldest first, hidden rows included, empty notes skipped) through ai `POST /internal/sentiment`, at most `--rate` calls per minute so the Lite LLM tier is not flooded. A result is stored only if the text did not change meanwhile; `updated_at` is not touched; a failed call leaves the row empty for the next run, and the script then exits 1. | 12 |
 | `clean_organizations --id U [--id U ...] [--confirm]` | core | with `--confirm` | Cleans the core content of organizations that auth no longer has, like the nightly organization sweep, when the sweep's safety brake refuses. Asks auth first (`POST /internal/organizations/missing`) and skips any id auth still has. | 12, 26 |
 | `recompute_snapshots` (through `scripts/snapshots.sh`) | core | with `--confirm` | Rebuilds NAV snapshots from the ledger and official closes; see section 3.5. | 12 |
 | `e2e_check` (through `scripts/e2e.sh`) | core | test data only, cleaned up | Whole-stack end-to-end check; see section 3.11. | 31 |
@@ -639,9 +648,9 @@ checks the clock.
 | `upload_seed_documents --as-system [--dry-run] [--categories ...] [--seed-root DIR]` | ai | yes | Uploads the repository's `rag_seed_documents/` as system documents; see section 3.2 step 8. Without `--as-system` it uploads as a user (`--email`, `--password`) through the public API from the host. | 17 |
 | `measure_rag_recall [--limit N] [--top-k 10] < golden_set.json` | ai | no | Recall@1/5/10 and MRR@10 of the live index (BM25-only, vector-only, fused, and the production default) against the golden set read from stdin; questions whose chunk no longer exists are skipped and counted. One batched embedding pass, no chat model call. | 17 |
 | `measure_rag_recall --sweep [--apply]` | ai | only with `--apply` | Tunes the per-category BM25/vector weights in `ai/rag/category_weights.json` (categories with at least 10 questions; a win of 2 hits or fewer is flagged as noise). The file is inside the image: copy it out with `docker compose cp`, commit it, rebuild. | 17 |
-| `generate_rag_golden_set --output /tmp/x.json [--merge] [--category C] [--limit N] [--dry-run]` | ai | no (writes a file in the container) | Makes golden-set questions (one CHEAP call per chunk); with `--merge` it reads the existing set from stdin and only adds chunks without a question. Copy the result out with `docker compose cp`. | 17 |
-| `reembed_collection --source C [--target C] [--model M] [--dims N] [--all] [--confirm]` | ai | with `--confirm` | Copies a Qdrant collection into a new one with vectors from another embedding model (same point ids and payloads, so PostgreSQL and BM25 stay valid; the source stays as the rollback copy). | 21 |
-| `delete_analyses [--id U] [--failed] [--since D --until D] [--report U] [--confirm]` | ai | with `--confirm` | Deletes whole analyses and everything they wrote (archived notes with their vectors and KG relations, tiers, debate, memory), then sweeps orphans in the ai schema and the RAG store. Never deletes a `pending`/`running` analysis or one with a user decision. Afterwards restart ai-service (BM25 rebuild) and run the review job. | 13 |
+| `generate_rag_golden_set --output /tmp/x.json [--merge] [--category C] [--limit N] [--dry-run]` | ai | no (writes a file in the container) | Makes golden-set questions for system chunks only (one CHEAP call per chunk); with `--merge` it reads the existing set from stdin and only adds chunks without a question. Copy the result out with `docker compose cp`. | 17 |
+| `reembed_collection --source C [--target C] [--model M] [--dims N] [--all] [--confirm]` | ai | with `--confirm` | Copies a Qdrant collection into a new one with vectors from another embedding model (same point ids and payloads, so PostgreSQL and BM25 stay valid; the source stays as the rollback copy). Same source and target, a missing source or a target with other dimensions stop it with `ABORT: ...` and exit 1. | 21 |
+| `delete_analyses [--id U] [--failed] [--since D --until D] [--report U] [--confirm]` | ai | with `--confirm` | Deletes whole analyses and everything they wrote (archived notes with their vectors and KG relations, tiers, debate, memory), then sweeps orphans in the ai schema and the RAG store. Never deletes a `pending`/`running` analysis or one with a user decision. Afterwards restart ai-service (BM25 rebuild) and run the review job. Exits 1 when a foreign key to an analysis table is not handled by the script. | 13 |
 | `backfill_filing_records [--ticker T] [--filename F] [--latest N] [--redo] [--tier T] [--apply]` | ai | with `--apply` | Structured records (`ai.filing_records`) for stored filings, one records-only LLM call per filing, raw text from `raw_filings/` in object storage (else SEC EDGAR). Waits 65 s before a filing above 500,000 characters. | 18 |
 | `regenerate_filing_summaries --filename F [--apply]` | ai | with `--apply` | Two steps: write a new summary of a stored filing to `/app/_regenerated/` (no database write, prints the current document id); after the old document is deleted with core's `delete_documents`, `--apply` stores the new one. A filing whose old document still exists is skipped. | 18, 22 |
 | `smoke_check` (through `scripts/smoke.sh`) | ai | small, cleaned up | See section 3.5. | 31 |
@@ -722,15 +731,18 @@ bash scripts/psql.sh -c "SELECT id, ticker, status, created_at FROM ai.analyses 
 
 The `scheduler` container runs `dcron` with `TZ=America/New_York`
 (`infra/scheduler/Dockerfile`), so the times follow New York daylight
-saving automatically. The crontab is `infra/scheduler/crontab`:
+saving. No job runs between 01:00 and 02:59 New York: on the March change
+02:00-02:59 does not exist (cron would skip the job that day), and on the
+November change 01:00-01:59 happens twice. The crontab is
+`infra/scheduler/crontab`:
 
 | Job | Cron | New York | London (usual) | Calls | curl limit |
 |---|---|---|---|---|---|
-| `review-run` | `0 2 * * *` | 02:00 daily | 07:00 | ai `POST /internal/review/run` | 1800 s |
-| `backup` | `30 2 * * *` | 02:30 daily | 07:30 | `/scripts/backup.sh` (local) | - |
+| `review-run` | `20 0 * * *` | 00:20 daily | 05:20 | ai `POST /internal/review/run` | 1800 s |
+| `backup` | `50 0 * * *` | 00:50 daily | 05:50 | `/scripts/backup.sh` (local) | - |
 | `rag-ingest` | `5 3 * * *` | 03:05 daily | 08:05 | ai `POST /internal/scheduler/rag-ingest` | 3600 s |
 | `logs-cleanup` | `0 4 * * *` | 04:00 daily | 09:00 | `/scripts/logs-cleanup.sh` (local) | - |
-| `purge-unverified` | `10 4 * * *` | 04:10 daily | 09:10 | auth `POST /internal/scheduler/purge-unverified` (accounts never verified for 7 days) | 300 s |
+| `purge-unverified` | `10 4 * * *` | 04:10 daily | 09:10 | auth `POST /internal/scheduler/purge-unverified` (accounts never verified for 7 days; invitations expired for 7 days) | 300 s |
 | `notification-retention` | `20 4 * * *` | 04:20 daily | 09:20 | core `POST /internal/scheduler/notification-retention` (read notifications older than 90 days) | 300 s |
 | `deleted-user-sweep-core` | `30 4 * * *` | 04:30 daily | 09:30 | core `POST /internal/scheduler/deleted-user-sweep` (leftover data of deleted accounts) | 900 s |
 | `deleted-user-sweep-ai` | `40 4 * * *` | 04:40 daily | 09:40 | ai `POST /internal/scheduler/deleted-user-sweep` (leftover data of deleted accounts) | 900 s |
@@ -741,10 +753,11 @@ saving automatically. The crontab is `infra/scheduler/crontab`:
 Why these times: the review, backup, ingestion and log cleanup run every
 day, because nothing they do depends on the trading session (SEC posts
 filings on any day; on a day with nothing new ingestion is a no-op).
-The backup sits between review (02:00) and ingestion (03:05), the
-quietest moment. Tier monitoring waits one hour after the 16:00 close,
+The backup sits between review (00:20, curl limit 30 minutes) and
+ingestion (03:05), the quietest moment. Tier monitoring waits one hour after the 16:00 close,
 so the data provider's final daily bar is settled. Market close runs
-after tier monitoring (which ends within its 900 s limit), so trades the
+after tier monitoring (call-job.sh gives up on it after 900 s, at 17:15;
+the service may still finish that run on its own), so trades the
 tiers executed are in the day's snapshot. The curl limits match the
 work each route does inline: market-close recomputes every portfolio's
 snapshot, market-open makes one ai-service create call (up to 15 s) per
@@ -765,7 +778,7 @@ How a job runs:
   This is how the cloud host, where the scheduler stays stopped, runs
   purge-unverified, notification-retention and the two deleted-user
   sweeps by hand ([chapter 26](26-scheduler-jobs.md), section 3.11).
-  Without arguments it starts `crond -f -l 2` as a **child** and forwards `SIGTERM`
+  Without arguments it starts `crond -f -l 5` as a **child** and forwards `SIGTERM`
   and `SIGINT` to it, so `docker compose stop` stops it cleanly. crond is
   not made PID 1 because dcron calls `setpgid()` at start, which fails
   for PID 1 (a session leader); crond then exits and the container
@@ -811,7 +824,7 @@ How a job runs:
 |---|---|---|
 | 09:00-10:30 | 14:00-15:30 | market-open at 09:30 asks ai-service for an analysis of every held ticker of every portfolio with `auto_analyze_at_open`. They join the serial analysis queue. A restart of ai-service would fail them (`service_restart`); a restart of core-service during the request would break the job's HTTP call. |
 | 16:55-17:50 | 21:55-22:50 | tier monitoring (17:00, up to 900 s) executes tiers through core-service; market close (17:30, up to 600 s) writes the day's snapshots. A restart or an e2e run in between can break a job or disturb the e2e checks' counters. |
-| 01:55-04:55 (warning only) | 06:55-09:55 | the nightly jobs: review-run (02:00, up to 1800 s), backup (02:30), rag-ingest (03:05, up to 3600 s), logs-cleanup (04:00), purge-unverified (04:10), notification-retention (04:20), deleted-user sweeps (core 04:30, ai 04:40). A restart of ai-service aborts review-run or rag-ingest, which then sends no heartbeat until the next night (`DailyJobStale` after 26 hours). |
+| 00:15-04:55 (warning only) | 05:15-09:55 | the nightly jobs: review-run (00:20, up to 1800 s), backup (00:50), rag-ingest (03:05, up to 3600 s), logs-cleanup (04:00), purge-unverified (04:10), notification-retention (04:20), deleted-user sweeps (core 04:30, ai 04:40). A restart of ai-service aborts review-run or rag-ingest, which then sends no heartbeat until the next night (`DailyJobStale` after 26 hours). |
 
 `rebuild.sh`, `e2e.sh` and `snapshots.sh` (and their make targets) call
 `guard_busy_window` and stop with `refused: the scheduler is busy now
@@ -877,15 +890,17 @@ is first created. To change it later:
 
 Prometheus scrapes every 15 seconds (`infra/prometheus/prometheus.yml`):
 `auth-service`, `core-service`, `ai-service` (`/metrics`), `postgres`
-(postgres-exporter:9187), `redis` (redis-exporter:9121), `alertmanager`,
-and itself. Alert rules (`infra/prometheus/alert_rules.yml`):
+(postgres-exporter:9187), `redis` (redis-exporter:9121), `qdrant`
+(qdrant:6333, so `ServiceDown` covers Qdrant), `alertmanager`, and itself. Alert rules (`infra/prometheus/alert_rules.yml`):
 `ServiceDown`, `PostgresDown`, `RedisDown`, `High5xxRate`,
 `HighLatencyP95`, `AnalysisFailureRateHigh`, `AnalysisQueueBacklog`,
 `LLMProviderErrorsHigh`, `DailyJobStale` (no success for over 26 hours:
 backup, review-run, rag-ingest, logs-cleanup, purge-unverified,
 notification-retention, deleted-user-sweep-core, deleted-user-sweep-ai),
-`TradingDayJobStale` (over
-100 hours: market-open, market-close, tier-monitoring),
+`TradingDayJobStale` (market-open, market-close, tier-monitoring: over
+26 hours, over 76 hours when the last success was on a Friday or a
+Saturday, over 50 hours after a manual Sunday run, so one missed trading
+day fires),
 `MarketCloseSkippedPortfolios` and `OutboxBacklog` (durable events
 waiting in `core.event_outbox` for 15 minutes). The two stale-job alerts
 filter on the `scheduled_job` label (see `health.sh` above) and fire
@@ -910,7 +925,7 @@ What it does, per ticker, one after another (`scripts/run_analysis.sh`):
 1. **Create** a system analysis bound to `PORTFOLIO_ID` (required; the
    script stops at the start when it is not set) by running
    `python -m scripts.analysis_cli create <TICKER> --portfolio <id>`
-   inside ai-service. The CLI calls `POST /internal/analyses` on
+   inside ai-service (the ticker is upper-cased first). The CLI calls `POST /internal/analyses` on
    `http://localhost:8000` inside the container, with the
    `X-Internal-Token` from the container's environment (standard library
    only; the image has no curl). If creation fails (for example `503`
@@ -919,18 +934,21 @@ What it does, per ticker, one after another (`scripts/run_analysis.sh`):
 2. **Poll** `analysis_cli status <id>` every 5 seconds, for up to 3600
    seconds. The wide limit allows for a ticker whose newest filing is
    not summarised yet: it is summarised inline first (up to 300 s per
-   attempt, at most 2 attempts, `_FILING_SUMMARY_TIMEOUT_SECONDS` in
+   attempt, at most 2 attempts: a provider timeout gets one retry,
+   `_FILING_SUMMARY_TIMEOUT_SECONDS` in
    `ai/knowledge/filing_summary.py`). The analysis itself has a hard
    45-minute limit (`ANALYSIS_TIMEOUT_SECONDS=2700`) in ai-service. The
-   script's limit does not count time the analysis spent waiting in the
-   queue, so in a busy queue it can stop polling before the analysis
-   started (a known limit; the analysis still runs).
+   script's limit also counts time the analysis waited in the queue, so
+   in a busy queue it can stop polling before the analysis finished (a
+   known limit; the analysis still runs).
 3. **Wait for the queue job to finish** (up to 2 minutes, 24 x 5 s):
    the status turns `completed` or `failed` before the post-verdict
    writes (archived notes, knowledge-graph facts, procedural memory) are
    done. Without this wait the export would miss the last note and the
    next ticker would start while they still run. The script looks for
-   the log event `analysis_queue_job_finished` with the analysis id.
+   the queue's end event with the analysis id
+   (`analysis_queue_job_finished`, `_errored`, `_timed_out`,
+   `_cancelled` or `_skipped_owner_inactive`).
 4. **Export** the results and the log window. It waits 5 seconds before
    reading the log, because `docker compose logs --until` has one-second
    resolution and would drop lines written later in the same second.
@@ -1032,7 +1050,8 @@ make e2e PART=core ARGS="--verbose"
 ```
 
 `e2e.sh` makes a fresh 2-hour admin token and passes it as
-`E2E_ADMIN_TOKEN`. It is refused in a busy window unless `FORCE=1`.
+`E2E_ADMIN_TOKEN` through the environment (`exec -e E2E_ADMIN_TOKEN`
+without a value), so the token is not on a command line. It is refused in a busy window unless `FORCE=1`.
 
 - **`scripts.e2e_check`** (core-service container) drives the public API
   through the TLS gateway (`https://gateway`, Host `localhost`), the
@@ -1081,7 +1100,7 @@ backups/<YYYY-MM-DD_HHMM>/      (host folder ./backups, gitignored)
                                 bucket, the Alembic revision of each schema
 ```
 
-**When and how long:** every day at 02:30 New York (07:30 London), and
+**When and how long:** every day at 00:50 New York (05:50 London), and
 on demand with `make backup` (or `bash scripts/backups.sh now`, or
 `docker compose --env-file .env.docker exec scheduler /scripts/backup.sh
 --dry-run` to only print the plan). Backups older than
@@ -1133,7 +1152,7 @@ environment, never on a command line.
 ```sh
 make backups                         # list
 make backup-check                    # restore dry run of the newest
-make backup-check BACKUP=2026-10-01_0230
+make backup-check BACKUP=2026-10-01_0050
 make restore-drill                   # restore the newest into a throwaway
                                      # project and verify it (DR section 6)
 ```
@@ -1148,8 +1167,8 @@ restore the `objectstore/` folders).
 **Restoring (DESTRUCTIVE, replaces current data):**
 
 ```sh
-make restore BACKUP=2026-10-01_0230              # dry run: checksums, dump readable, plan
-make restore BACKUP=2026-10-01_0230 CONFIRM=yes  # DESTRUCTIVE real restore
+make restore BACKUP=2026-10-01_0050              # dry run: checksums, dump readable, plan
+make restore BACKUP=2026-10-01_0050 CONFIRM=yes  # DESTRUCTIVE real restore
 ```
 
 The real restore stops `auth-service core-service ai-service scheduler`,
@@ -1185,7 +1204,7 @@ scheduler`). What `restore.sh` does per part:
 
 Single parts: `--only postgres|qdrant|objectstore|avatars`, for example
 (DESTRUCTIVE)
-`docker compose --env-file .env.docker --profile tools run --rm --build restore /scripts/restore.sh --yes --only qdrant /backups/2026-10-01_0230`.
+`docker compose --env-file .env.docker --profile tools run --rm --build restore /scripts/restore.sh --yes --only qdrant /backups/2026-10-01_0050`.
 The full procedures, including a new machine and the monthly restore
 drill, are in [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md).
 
@@ -1268,9 +1287,12 @@ disappears on a server.
   you do this on your Mac (a terminal session, a scheduled wake in macOS
   power settings) is outside the repository.
 - **Signs the Mac slept:** a large job age in `make health`, late
-  `[date] market-open: ...` lines in `logs/scheduler/<date>.log`, or a
-  missing backup folder for a day. `DailyJobStale` (over 26 h) and
-  `TradingDayJobStale` (over 100 h) fire 10 minutes after the limit and
+  `[date] market-open: ...` lines in `logs/scheduler/<date>.log`, a
+  "time disparity" notice from crond in `docker compose logs scheduler`
+  (crond runs with `-l 5`; after a clock jump of up to 60 minutes dcron
+  runs the missed jobs late, after a longer jump it skips them and logs
+  only that notice), or a missing backup folder for a day. `DailyJobStale` (over 26 h) and
+  `TradingDayJobStale` (over 26 h, or 76 h after a Friday) fire 10 minutes after the limit and
   send an email to MailHog.
 
 ## 4. Configuration
@@ -1325,9 +1347,11 @@ backup end in the same state. Services refuse to guess when a schema is
 in an unknown state, instead of damaging it.
 
 **Restore is a dry run by default and runs in its own container.** The
-scheduler mounts the data volumes read-only, so a mistake in the nightly
-job can never overwrite data. The `restore` service has write access and
-only starts when asked. The PostgreSQL part runs in one transaction, so a
+scheduler mounts the avatars read-only, and `make restore` runs restores
+in the separate `restore` service, which only starts when asked. (The
+scheduler still holds the database password and the object storage keys,
+and `/scripts/restore.sh` is in its image, so this separates the normal
+paths; it is not a hard wall.) The PostgreSQL part runs in one transaction, so a
 failed restore leaves the database as it was.
 
 **Backups keep the newest three whatever their age.** Retention by age
@@ -1361,7 +1385,7 @@ a gateway failure). Every command in this chapter stands alone.
 | A code change has no effect | No auto-reload. | `RESTART_ONLY=1 bash scripts/rebuild.sh <svc>`; then confirm a log line from the new code. |
 | A `.env.docker` change has no effect | `restart` keeps the old environment. | `docker compose --env-file .env.docker up -d --force-recreate <services>`, then read the value back inside the container. |
 | `401 Missing or invalid internal token` in logs, or scheduler jobs fail with curl exit 22 | Containers disagree on `INTERNAL_API_TOKEN` (some not recreated after a change). | Recreate the services and the scheduler together. |
-| A script stops with `refused: the scheduler is busy now` | Inside 09:00-10:30 or 16:55-17:50 New York (01:55-04:55 only warns). | Wait, or `FORCE=1` if you accept the risk. |
+| A script stops with `refused: the scheduler is busy now` | Inside 09:00-10:30 or 16:55-17:50 New York (00:15-04:55 only warns). | Wait, or `FORCE=1` if you accept the risk. |
 | Analyses are `failed` with `service_restart` or `cancelled` | ai-service was restarted or stopped while they were queued or running. | Re-run them; restart only when the queue is empty. |
 | An analysis stays `pending` for a long time | The queue is serial; others are ahead (up to 45 minutes each). | `bash scripts/psql.sh -c "SELECT id, ticker, status, created_at FROM ai.analyses WHERE status IN ('pending', 'running') ORDER BY created_at;"` |
 | Create returns 503 (queue full) or 429 | Global cap of 50 pending analyses, or 3 pending/running per user on the public route. | Wait for the queue to drain. |
@@ -1370,8 +1394,8 @@ a gateway failure). Every command in this chapter stands alone.
 | `restore.sh` says `object storage at ... does not answer` | `objectstore` is not running, and the objects are restored through its S3 API. | `docker compose --env-file .env.docker up -d --wait objectstore`, then run the restore again. |
 | `restore.sh --verify` reports `FAIL: ...` | The running data differs from the backup (a part was not restored, a service wrote after the restore, or a copy is damaged). | Read the FAIL lines; restore that part again with `--only <part>` before starting the services. |
 | A `<stamp>-FAILED` folder in `./backups/` | A backup step failed; older backups were not pruned. | `bash scripts/logs.sh scheduler grep "backup: ERROR"`; fix, then `make backup`. |
-| A job's age in `make health` is above 26 hours (daily job) or 100 hours (trading-day job) | The Mac slept, the scheduler is down, or the job fails. `DailyJobStale` / `TradingDayJobStale` fire after 10 minutes above the limit. | `docker compose --env-file .env.docker logs scheduler`; `make health`; section 3.14. |
-| `MarketCloseSkippedPortfolios` alert | A holding had no close for the session, so no snapshot was written for some portfolios. | Later, `bash scripts/snapshots.sh --portfolio=<id> --to <date>` (preview), then the same with `--confirm` to add the missing day. |
+| A job's age in `make health` is above 26 hours (daily job; trading-day job: 26 hours, or 76 hours after a Friday) | The Mac slept, the scheduler is down, or the job fails. `DailyJobStale` / `TradingDayJobStale` fire after 10 minutes above the limit. | `docker compose --env-file .env.docker logs scheduler`; `make health`; section 3.14. |
+| `MarketCloseSkippedPortfolios` alert | A holding had no close for the session, so no snapshot was written for some portfolios. | Later, `bash scripts/snapshots.sh --portfolio=<id> --to <date>` (preview), then the same with `--confirm` to add the missing day. The alert stays until the next market-close without a skipped portfolio: silence it in Alertmanager (`http://127.0.0.1:9093`) once the day is filled. |
 | `OutboxBacklog` alert | core-service could not publish durable events (document indexing or removal, tier cancellation) to Redis for 15 minutes; they wait in `core.event_outbox`. | Check Redis (`bash scripts/redis-cli.sh PING`) and `bash scripts/logs.sh core-service grep outbox_publish_failed`; the dispatcher publishes them by itself once Redis works. |
 | e2e run says another run holds the lock | A previous run is still running, or was killed. | Check `docker compose --env-file .env.docker top core-service` / `top ai-service`; if nothing runs, `bash scripts/e2e.sh core --break-lock`. |
 | e2e auth checks hit 429 | auth-service's limits (10 registrations per hour, 30 logins per 15 minutes per address) or the gateway's 10 req/s on `/api/v1/auth`. | Wait for the window, then re-run. |
@@ -1464,7 +1488,7 @@ command on its own line, from the repository root.
 
 10. **Metrics and alerts.** Open `http://127.0.0.1:9090/targets`: every
     target (auth-service, core-service, ai-service, postgres, redis,
-    alertmanager, prometheus) is `UP`. Open `http://127.0.0.1:9090/alerts`:
+    qdrant, alertmanager, prometheus) is `UP`. Open `http://127.0.0.1:9090/alerts`:
     the rules are listed, none firing. Open `http://127.0.0.1:9093`: no
     active alerts.
 
@@ -1553,7 +1577,7 @@ one exporter for about two minutes; no data is touched):
 2. **You added a package to `pyproject.toml`. What do you run?** Lock it
    (`uv lock` on the host), then rebuild the images:
    `bash scripts/rebuild.sh auth-service core-service ai-service`. The
-   build uses `uv sync --frozen`, so a stale lock fails the build.
+   build uses `uv sync --locked`, so a stale lock fails the build.
 3. **You changed `INTERNAL_API_TOKEN`. Is `docker compose restart`
    enough?** No. Containers keep the environment they were created with.
    Recreate the services and the scheduler with
@@ -1568,7 +1592,7 @@ one exporter for about two minutes; no data is touched):
    ticker: `_result.json`, `_agent_reports.txt`, `_tiers.txt`,
    `_filings.txt`, `_ai-service.log` (and `_create_ERROR.txt` if the
    create failed).
-7. **`make restore BACKUP=2026-10-01_0230` - does it change data?** No,
+7. **`make restore BACKUP=2026-10-01_0050` - does it change data?** No,
    without `CONFIRM=yes` it is a dry run. With `CONFIRM=yes` it is
    destructive.
 8. **Where do you find yesterday's ai-service logs after the container

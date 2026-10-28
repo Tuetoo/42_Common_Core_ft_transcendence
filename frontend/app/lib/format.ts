@@ -20,14 +20,32 @@ export const TICKER_PATTERN = "[A-Za-z0-9.\\-]{1,10}";
 export const TICKER_TITLE = "1-10 characters: letters, digits, '.' or '-' (for example BRK.B)";
 export const TICKER_RE = /^[A-Z0-9.-]{1,10}$/;
 
-// Database ids (UUIDs) in paths and form fields.
-export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Reads one search param as trimmed text (the first value when repeated:
+// `?next=/a&next=/b` arrives as an array).
+export type SearchParam = string | string[] | undefined;
+
+export function firstParam(value: SearchParam): string {
+  return (Array.isArray(value) ? value[0] : value)?.trim() ?? "";
+}
+
+// Database ids (UUIDs) in paths and form fields; the pattern is for
+// HTML inputs.
+export const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+export const UUID_RE = new RegExp(`^${UUID_PATTERN}$`);
+
+// A calendar date as an HTML date input sends it.
+export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // shared/enums.py SystemRole.
 export const SYSTEM_ROLES = ["guest", "user", "moderator", "admin"] as const;
 
 // Portfolio and watchlist names (domains/portfolio/schema.py).
 export const NAME_MAX_LENGTH = 128;
+
+// Organization name and description (OrganizationCreate / OrganizationUpdate
+// in services/auth-service/domains/organization/schema.py).
+export const ORG_NAME_MAX = 128;
+export const ORG_DESCRIPTION_MAX = 1000;
 
 // shared/enums.py Currency.
 export const CURRENCIES = ["USD", "EUR", "GBP"] as const;

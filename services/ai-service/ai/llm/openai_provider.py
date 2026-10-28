@@ -19,7 +19,7 @@ def _get_client() -> AsyncOpenAI:
     if _client is None:
         if not settings.OPENAI_API_KEY:
             raise LLMConfigError("OPENAI_API_KEY is not configured")
-        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0)
     return _client
 
 

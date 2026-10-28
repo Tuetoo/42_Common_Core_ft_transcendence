@@ -154,7 +154,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             return 0
         result = await apply_plan(plan, rate_per_minute=args.rate)
         print_result(result)
-        return 0
+        return 1 if result.failed else 0
     finally:
         await close_http_clients()
         await close_redis_connections()

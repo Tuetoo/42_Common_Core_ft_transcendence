@@ -5,8 +5,8 @@ import { notFound } from "next/navigation";
 import { backendFetch, requireOk } from "@/app/lib/backend";
 import { can, getMe } from "@/app/lib/session";
 import { changeUserRole, deleteUser, setUserActive } from "@/app/lib/actions/admin";
-import { SYSTEM_ROLES } from "@/app/lib/format";
-import { Pager, firstParam, pageParam } from "../../pager";
+import { SYSTEM_ROLES, firstParam } from "@/app/lib/format";
+import { Pager, pageParam } from "../../pager";
 import { ActionButton, SelectActionForm } from "../inline-actions";
 import { AccountByIdForm } from "./account-by-id-form";
 
@@ -35,8 +35,6 @@ type Stats = {
   ai: Record<string, number> | null;
 };
 
-// Moderators may only deactivate/reactivate these roles (admin service).
-const MODERATABLE = new Set(["guest", "user"]);
 const PAGE_SIZE = 20;
 
 type SearchParams = Record<string, string | string[] | undefined>;
@@ -137,7 +135,7 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
                 </thead>
                 <tbody>
                   {users.items.map((u) => (
-                    <UserRow key={u.id} user={u} meId={me.id} canManage={canManage} />
+                    <UserRow key={u.id} user={u} meId={me.id} />
                   ))}
                 </tbody>
               </table>
@@ -165,28 +163,25 @@ export default async function AdminUsersPage({ searchParams }: { searchParams: P
   );
 }
 
-function UserRow({ user, meId, canManage }: { user: AdminUser; meId: string; canManage: boolean }) {
+// The user list is only loaded for admins (user:manage), so every row has
+// the admin actions. Moderators act by id with AccountByIdForm instead.
+function UserRow({ user, meId }: { user: AdminUser; meId: string }) {
   const isSelf = user.id === meId;
   const isDeleted = user.deleted_at !== null;
-  const mayToggle = !isSelf && !isDeleted && (canManage || MODERATABLE.has(user.system_role));
   const selfNote = isSelf ? "You cannot do this to your own account" : undefined;
 
   return (
     <tr>
       <td className="min-w-0">
         <div className="flex flex-col min-w-0">
-          {canManage ? (
-            <Link href={`/admin/users/${user.id}`} className="link-btn">
-              {user.username}
-            </Link>
-          ) : (
-            <span>{user.username}</span>
-          )}
+          <Link href={`/admin/users/${user.id}`} className="link-btn">
+            {user.username}
+          </Link>
           <span className="text-[12px] text-[var(--text-faint)] break-all">{user.email}</span>
         </div>
       </td>
       <td>
-        {canManage && !isDeleted ? (
+        {!isDeleted ? (
           <SelectActionForm
             key={`${user.id}-${user.system_role}`}
             action={changeUserRole.bind(null, user.id)}
@@ -224,19 +219,17 @@ function UserRow({ user, meId, canManage }: { user: AdminUser; meId: string; can
               action={setUserActive.bind(null, user.id, !user.is_active)}
               label={user.is_active ? "Deactivate" : "Reactivate"}
               confirmLabel={user.is_active ? "Confirm deactivate" : undefined}
-              disabled={!mayToggle}
+              disabled={isSelf}
               title={selfNote}
             />
-            {canManage && (
-              <ActionButton
-                action={deleteUser.bind(null, user.id, false)}
-                label="Delete"
-                confirmLabel="Confirm delete"
-                pendingLabel="Deleting…"
-                disabled={isSelf}
-                title={selfNote}
-              />
-            )}
+            <ActionButton
+              action={deleteUser.bind(null, user.id, false)}
+              label="Delete"
+              confirmLabel="Confirm delete"
+              pendingLabel="Deleting…"
+              disabled={isSelf}
+              title={selfNote}
+            />
           </div>
         )}
       </td>

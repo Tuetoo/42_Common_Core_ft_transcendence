@@ -39,8 +39,10 @@ CACHE_WRITE_MULTIPLIER = 1.25
 USAGE_EVENTS = frozenset(
     {"anthropic.completion_succeeded", "anthropic.stream_completed"})
 START_EVENT = "analysis_queue_job_started"
-END_EVENTS = frozenset(
-    {"analysis_queue_job_finished", "analysis_queue_job_errored"})
+END_EVENTS = frozenset({
+    "analysis_queue_job_finished", "analysis_queue_job_errored",
+    "analysis_queue_job_timed_out", "analysis_queue_job_cancelled"
+})
 NEW_FILING_EVENT = "fresh_filing_check.found_new_content"
 TOKEN_FIELDS = (
     "calls", "prompt", "uncached", "cache_write", "cache_read", "output",

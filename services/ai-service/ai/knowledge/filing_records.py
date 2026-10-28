@@ -705,12 +705,17 @@ def record_title(record: dict[str, Any]) -> str:
     return f"{CATEGORIES[category][1]}: {title}" if title else ""
 
 
-_RECORD_ID_RE = re.compile(r"^F(\d+)\.([A-Z])(\d+)$")
+RECORD_ID_PATTERN = r"F(\d+)\.([A-Z])(\d+)"
+_RECORD_ID_RE = re.compile(RECORD_ID_PATTERN)
+
+
+def is_record_id(text: str) -> bool:
+    return _RECORD_ID_RE.fullmatch(text.upper()) is not None
 
 
 def record_by_id(rows: Sequence[FilingRecordRow],
                  record_id: str) -> dict[str, Any] | None:
-    match = _RECORD_ID_RE.match(record_id.strip().upper())
+    match = _RECORD_ID_RE.fullmatch(record_id.strip().upper())
     if match is None:
         return None
     filing_index, letter, number = (

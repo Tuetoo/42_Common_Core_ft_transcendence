@@ -7,6 +7,7 @@ import { changeUserRole, deleteUser, resetUserTwoFactor, setUserActive } from "@
 import { Avatar } from "../../../avatar";
 import { ActionButton, SelectActionForm } from "../../inline-actions";
 import { EditUserForm } from "./edit-user-form";
+import { SYSTEM_ROLES } from "@/app/lib/format";
 
 type AdminUserDetail = {
   id: string;
@@ -33,8 +34,6 @@ type AdminUserDetail = {
   oauth_providers: string[];
   organizations_count: number;
 };
-
-const ROLES = ["guest", "user", "moderator", "admin"] as const;
 
 export default async function AdminUserDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { me, accessToken } = await getMe();
@@ -123,7 +122,7 @@ export default async function AdminUserDetailPage({ params }: { params: Promise<
                 action={changeUserRole.bind(null, user.id)}
                 name="role"
                 label="System role"
-                options={ROLES}
+                options={SYSTEM_ROLES}
                 current={user.system_role}
                 disabled={isSelf}
                 title={isSelf ? "You cannot change your own role" : undefined}

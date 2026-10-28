@@ -81,7 +81,3 @@ export async function readApiError(res: Response, fallback: string): Promise<Api
   }
   return result;
 }
-
-export async function extractErrorMessage(res: Response, fallback: string): Promise<string> {
-  return (await readApiError(res, fallback)).message;
-}

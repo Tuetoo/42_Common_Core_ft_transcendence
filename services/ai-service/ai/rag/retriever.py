@@ -169,7 +169,7 @@ class BaseRetriever:
     def __init__(
             self, *, category_filter: DocumentCategory | None = None,
             top_k: int | None = None, use_query_expansion: bool = True,
-            visibility: RetrievalVisibility | None = None) -> None:
+            visibility: RetrievalVisibility | None) -> None:
         self.category_filter = category_filter
         self.top_k = top_k or settings.RAG_TOP_K_RESULTS
         self.use_query_expansion = use_query_expansion
@@ -332,7 +332,7 @@ class FilingRetriever(BaseRetriever):
     def __init__(
             self, *, top_k: int | None = None,
             use_query_expansion: bool = True,
-            visibility: RetrievalVisibility | None = None) -> None:
+            visibility: RetrievalVisibility | None) -> None:
         super().__init__(
             category_filter=DocumentCategory.FILING, top_k=top_k
             or (settings.RAG_TOP_K_RESULTS + 3),

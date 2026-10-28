@@ -142,8 +142,8 @@ its own (`/ws`, `/grafana/`) loses the inherited ones, so those locations
 repeat all of them, including this replacement.
 
 The frontend's server side calls the API on the gateway's internal
-listener (`http://gateway:8080`, plain HTTP, not published, Docker network
-only). It copies the browser's address from `X-Real-IP` (always set by the
+listener (`http://gateway:8080`, plain HTTP, not published; the frontend
+reaches it on the `edge` network, section 3.17). It copies the browser's address from `X-Real-IP` (always set by the
 HTTPS listener) into `X-Forwarded-For`. The internal listener trusts that
 header only from private Docker addresses (`set_real_ip_from`
 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `real_ip_header
@@ -295,7 +295,7 @@ tab that still holds it cannot revoke any other session.
 
 Access tokens are not revocable one by one; they simply expire within 15
 minutes. Deactivation and role changes still apply immediately through
-the live state (3.7).
+the live state (3.8).
 
 **In the frontend.** The access and refresh tokens are stored in cookies
 set by the frontend's server (`frontend/app/lib/session-cookies.ts`):
@@ -366,13 +366,14 @@ step either side, comparing with `hmac.compare_digest`. The step that
 matched is stored (`two_factor_secrets.last_used_step`) and any step not
 newer than it is refused, so a code cannot be replayed.
 
-Brute force: `_check_totp` first checks a lock (`two_factor_guard`); each
-wrong code is counted (`two_factor_failed`) and each correct code clears
-the count (`two_factor_succeeded`); after
-`RATE_LIMIT_2FA_FAILURES` (5) failures within
-`RATE_LIMIT_2FA_WINDOW_SECONDS` (300) with no correct code in between,
-the user is locked for
-`RATE_LIMIT_2FA_LOCK_SECONDS` (900) and gets 429.
+Brute force: `_check_totp` first counts the attempt
+(`two_factor_attempt`, one atomic Redis transaction) and only then checks
+the code; a correct code clears the count (`two_factor_succeeded`). At
+most `RATE_LIMIT_2FA_FAILURES` (5) codes are checked within
+`RATE_LIMIT_2FA_WINDOW_SECONDS` (3600) with no correct code in between;
+every further attempt in that window gets 429. Because the count comes
+first, a burst of parallel requests cannot check more codes than the
+limit, and slow guessing stays at 5 codes per hour per user.
 
 Login with 2FA enabled and no code returns 401 with code
 `two_factor_required`; an unverified email returns 401
@@ -423,7 +424,9 @@ sign-in and stores them in Redis for 300 seconds under
   verifier, so an intercepted authorization code cannot be redeemed by
   anyone else. Google and GitHub both support PKCE with `S256`.
 
-The callback never answers JSON. It always answers **303 See Other** to
+The callback answers every success and every handled error (`AppError`)
+with **303 See Other**; an unexpected error (Redis or the database down)
+is a 500 JSON body. The redirect goes to
 `${FRONTEND_BASE_URL}/oauth/complete#<fragment>`, with the fragment built
 by `urlencode`:
 
@@ -552,6 +555,14 @@ portfolio".
     gets **403** "Only the portfolio owner can perform this action."
   - `_require_watchlist_owner`: watchlists are never shared, so anyone
     but the owner gets **404**.
+  - Sharing a portfolio (`visibility="organization"`) needs an
+    organization: a create without `organization_id` is a 422, and a
+    PATCH on a portfolio without one is refused ("This portfolio has no
+    organization to share with."). Switching to `organization` checks
+    again that the owner may write in that organization. When the owner
+    leaves or is removed from the organization, core makes their shared
+    portfolios of that organization private again
+    (`organization.member.left` / `.removed`, chapter 24).
   - Creating something inside an organization needs organization role
     `owner`, `admin` or `member`; a `viewer` or non-member gets 403
     (`clients/auth_client.py`, `ensure_organization_writer`,
@@ -624,8 +635,8 @@ answers 401 `Internal token not configured` (fail closed).
 | Registration | per address | 10 per hour | fail open | same |
 | Password reset request | per address / per email | 10 / 3 per hour | fail open | same |
 | Resend verification | per email | 3 per hour | fail open | same |
-| Invitations | per organization | 20 per hour | fail open | `domains/organization/service.py` |
-| 2FA failures | per user | 5 failures in 5 min -> 15 min lock | fail open | `security.two_factor_*` |
+| Invitations | per sender / per organization | 20 / 20 per hour | fail open | `domains/organization/service.py` |
+| 2FA codes | per user | 5 attempts per hour, counted before the code is checked; a correct code resets | fail open | `security.two_factor_attempt`, `two_factor_succeeded` |
 | Public API (`/api/v1/public`) | per key and per key owner | key: its `rate_limit_per_minute` (at most 60); owner: 60 per minute across all keys | fail open | `services/core-service/apikeys.py` |
 | RAG assistant (`/api/v1/rag/ask`, `/ask/stream`) | per user | 10 per clock minute, 200 per UTC day | fail open | `services/ai-service/domains/rag/qa.py`, `check_rate_limit` |
 | Decision review (`POST /api/v1/decisions/{id}/review`) | per user | 3 per clock minute, 20 per UTC day | fail open | `services/ai-service/rate_limit.py`, `check_user_rate_limit` |
@@ -644,12 +655,9 @@ Every Redis-based limit **fails open**: if Redis is down, requests are
 allowed and a warning is logged (`rate_limit_unavailable` for auth-service
 and the public API, `rag_ask.rate_limit_unavailable` for the RAG
 assistant, `decision_review.rate_limit_unavailable` for decision reviews). An outage of the limiter must not lock users out. The 2FA
-lockout is built from two keys: a failure counter
-(`auth:rl:2fa:fail:<hash>`, the shared fixed window, deleted by every
-correct code) and, after the fifth
-failure, a lock key with the lock time as its expiry (the counter is then
-deleted). `two_factor_guard` refuses while the lock key has a positive
-TTL, with `Retry-After` = that TTL. The RAG
+limit is one key, an attempt counter (`auth:rl:2fa:fail:<hash>`, the
+shared fixed window, deleted by every correct code); over the limit the
+answer is 429 with `Retry-After` = the rest of the window. The RAG
 and decision review limits use `check_user_rate_limit` in
 `services/ai-service/rate_limit.py`, which keeps per-minute and per-day
 keys (`ai:rag_ask:rate:...`, `ai:decision_review:rate:...`) in the
@@ -773,7 +781,8 @@ From `docker-compose.yaml`:
 | `127.0.0.1:9090` | Prometheus | only this machine |
 | `127.0.0.1:9093` | Alertmanager | only this machine |
 | `127.0.0.1:8080` | Adminer (only with `make adminer`) | only this machine |
-| none | auth/core/ai services, frontend and Grafana (both through the gateway), PostgreSQL, Redis, SeaweedFS, exporters, scheduler | only containers on the Docker network |
+| none | auth/core/ai services, Grafana (through the gateway), PostgreSQL, Redis, SeaweedFS, exporters, scheduler | only containers on the `default` Docker network |
+| none | frontend (through the gateway) | only containers on the `edge` Docker network (the gateway) |
 
 SeaweedFS: its master, volume server and filer have no authentication, so
 they listen on the container's own loopback (`-ip=127.0.0.1
@@ -781,14 +790,26 @@ they listen on the container's own loopback (`-ip=127.0.0.1
 network, and it requires signed requests with `S3_ACCESS_KEY` /
 `S3_SECRET_KEY`.
 
-**Qdrant and Redis have no password.** Any container on the Docker
+**Two Docker networks.** `docker-compose.yaml` puts the frontend on its
+own network, `edge`, which it shares only with the gateway. Every other
+container is on `default`, and the gateway is on both. The frontend's
+only target is the gateway (`BACKEND_API_URL=http://gateway:8080/api/v1`
+for pages, Server Actions, route handlers and `/healthz`; the browser
+itself only talks to the public HTTPS listener). So the internet-facing
+Node.js process cannot open a connection to Redis, Qdrant, PostgreSQL,
+the object storage or any service's `/internal/*` routes, even if an
+attacker runs code inside it.
+
+**Qdrant and Redis have no password.** Any container on the `default`
 network can read and write them, and any process on the host can use
-Qdrant on `127.0.0.1:6333`. The implication: the Docker network is a
-trust boundary. A compromised container could read the user-state mirror,
-rate counters, event streams and cached data from Redis, or change
-vectors in Qdrant. This is acceptable for a single-machine deployment
-where only the gateway is published; for a shared or cloud host you would
-add `requirepass` for Redis and an API key for Qdrant. The Qdrant key
+Qdrant on `127.0.0.1:6333`. The implication: the `default` network is a
+trust boundary. A compromised backend container could read or change the
+user-state mirror (which holds each user's live role), rate counters,
+event streams and cached data in Redis, or read and change vectors in
+Qdrant. This is acceptable for a single-machine deployment where only the
+gateway is published and the frontend is kept off that network; to
+harden it further you would add `requirepass` for Redis and an API key
+for Qdrant. The Qdrant key
 needs both sides: the client side exists already (ai-service
 `QDRANT_API_KEY`, also used by backup and restore), but the `qdrant`
 service in `docker-compose.yaml` sets no `QDRANT__SERVICE__API_KEY`, so
@@ -797,7 +818,7 @@ both.
 
 ### 3.18 Backups and secrets
 
-`infra/scheduler/backup.sh` (daily at 02:30 New York, 07:30 London) writes
+`infra/scheduler/backup.sh` (daily at 00:50 New York, 05:50 London) writes
 `postgres.dump`, Qdrant snapshots, the object-storage documents and the
 avatars into `./backups/<YYYY-MM-DD_HHMM>/`. It does **not** copy
 `.env.docker`, and the SeaweedFS S3 identity file is written to
@@ -834,11 +855,11 @@ off-machine copies encrypted. See `../DISASTER_RECOVERY.md`.
 | `OAUTH_REDIRECT_BASE_URL` | `https://localhost:8443` | Public base of the OAuth callback. | same |
 | `RATE_LIMIT_ENABLED` | `true` | auth-service limits on/off. | same |
 | `RATE_LIMIT_LOGIN_PER_EMAIL` / `_PER_IP` / `_WINDOW_SECONDS` | `10` / `30` / `900` | Login limits. | same |
-| `RATE_LIMIT_2FA_FAILURES` / `_WINDOW_SECONDS` / `_LOCK_SECONDS` | `5` / `300` / `900` | 2FA lockout. | same |
+| `RATE_LIMIT_2FA_FAILURES` / `_WINDOW_SECONDS` | `5` / `3600` | 2FA attempt limit. | same |
 | `RATE_LIMIT_PASSWORD_RESET_PER_EMAIL` / `_PER_IP` / `_WINDOW_SECONDS` | `3` / `10` / `3600` | Reset limits. | same |
 | `RATE_LIMIT_REGISTER_PER_IP` / `_WINDOW_SECONDS` | `10` / `3600` | Registration limit. | same |
 | `RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL` / `_WINDOW_SECONDS` | `3` / `3600` | Resend limit. | same |
-| `RATE_LIMIT_INVITATIONS_PER_ORG` / `_WINDOW_SECONDS` | `20` / `3600` | Invitation limit. | same |
+| `RATE_LIMIT_INVITATIONS_PER_ORG` / `_PER_USER` / `_WINDOW_SECONDS` | `20` / `20` / `3600` | Invitation limits (per organization and per sender). | same |
 | `INTERNAL_API_TOKEN` | `""` | Shared secret for `/internal/*`; required outside development/test. | `shared/config.py` |
 | `USER_STATE_CHECK_ENABLED` | `true` | Live role/active check on every request. | `shared/config.py` |
 | `USER_STATE_CACHE_TTL_SECONDS` | `300` | Cache time for a state fetched from auth-service after a Redis miss. | `shared/config.py` |
@@ -901,7 +922,8 @@ placeholder, an empty secret or one shorter than 32 characters.
 **Same answers for unknown accounts.** Login burns a dummy bcrypt check;
 reset and resend return the same message and send email in the
 background, so neither content nor timing reveals which emails have
-accounts.
+accounts. Register is the exception on purpose: it answers 409 for an
+email that already has an account.
 
 **bcrypt through passlib, pinned.** passlib is unmaintained but stable;
 pinning `bcrypt<4.1` keeps it working instead of rewriting hashing code.
@@ -922,7 +944,7 @@ pinning `bcrypt<4.1` keeps it working instead of rewriting hashing code.
 | A user is logged out in one browser unexpectedly | A rotated refresh token came back after the 30-second grace (`refresh_token_reuse_detected`), so that browser's session chain was revoked. Usually a browser that holds an old cookie (for example a second browser left idle for days). | Search auth-service logs; check the client does not reuse old refresh tokens. |
 | 503 "Portfolio ownership check is unavailable" | core-service or auth-service down. | `make health`. |
 | Public API always 401 `invalid_api_key` right after creating a key | Wrong header or a typo; the key is shown only once. | Header must be `X-API-Key`. |
-| OAuth sign-in ends at `/oauth/complete#error=oauth_failed&message=...` | The sign-in failed; the `message` says why (expired state, other browser, provider error, ...). | Log `oauth_callback_failed` in auth-service gives the error code. |
+| OAuth sign-in ends at `/oauth/complete#error=oauth_failed&message=...` | The sign-in failed (expired state, other browser, provider error, ...). The page shows one fixed text, never the `message`. | Log `oauth_callback_failed` in auth-service gives the error `code` and `message`. |
 | OAuth sign-in redirects to a page that does not exist | `FRONTEND_BASE_URL` is not the frontend origin. | Set it (for example `https://localhost:8443`) and recreate auth-service. |
 | Browser blocks API calls with a CORS error | Frontend origin not in `BACKEND_CORS_ORIGINS`. | Add it and recreate the services. |
 
@@ -1200,6 +1222,11 @@ or if any container could be compromised, you would add `requirepass`.
 - The scheduler and operator scripts can mint tokens (`scripts/token.sh`
   runs `_create_token` inside auth-service). Whoever can run
   `docker compose exec` on the host is effectively an administrator.
+- No container sets `cap_drop`, `no-new-privileges` or `read_only`
+  (the Python services and the frontend do run as non-root users), and
+  `vector` mounts the Docker socket, which gives it host-root power.
+  The Next.js pages get no Content Security Policy
+  ([10](10-gateway.md) section 3.6).
 
 ---
 
@@ -1219,7 +1246,7 @@ or if any container could be compromised, you would add `requirepass`.
 | `shared/http_client.py` | Internal-token request hook, `internal_headers`. |
 | `shared/config.py` | Security settings and the startup checks for weak secrets. |
 | `shared/schemas.py` | The ticker rule. |
-| `services/auth-service/security.py` | bcrypt, token creation, special tokens, TOTP, Fernet encryption of stored TOTP secrets; auth limits and 2FA lockout. |
+| `services/auth-service/security.py` | bcrypt, token creation, special tokens, TOTP, Fernet encryption of stored TOTP secrets; auth limits and the 2FA attempt limit. |
 | `services/auth-service/domains/auth/service.py` | Login, refresh rotation and reuse detection, 2FA, OAuth. |
 | `services/auth-service/domains/auth/repository.py` | `claim_session_for_rotation`, `revoke_rotation_successors`, `revoke_all_sessions`, `consume_totp_step`. |
 | `services/auth-service/user_state_sync.py` | Writer side of the live state. |
@@ -1227,7 +1254,7 @@ or if any container could be compromised, you would add `requirepass`.
 | `services/core-service/domains/portfolio/service.py` | `_require_readable`, `_require_owner`. |
 | `services/ai-service/deps.py` | `ensure_portfolio_access`, `ensure_portfolio_owner`, `ensure_analysis_access`. |
 | `services/ai-service/rate_limit.py`, `domains/rag/qa.py`, `domains/decision/api.py` | `check_user_rate_limit` (per-user minute and day counters) and its two callers, the RAG ask and decision review limits. |
-| `docker-compose.yaml` | Port bindings, SeaweedFS loopback flags. |
+| `docker-compose.yaml` | Port bindings, the `edge` and `default` networks, SeaweedFS loopback flags. |
 | `.gitignore`, `.dockerignore` | Keep `.env.docker`, backups and logs out of git and images. |
 
 ---

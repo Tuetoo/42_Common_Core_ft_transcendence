@@ -166,13 +166,6 @@ def _news_output(
         raw_output={"scratchpad": pad})
 
 
-class _NoCallRouter:
-
-    async def complete(self, *args, **kwargs):
-        raise AssertionError(
-            "label classification must not run for no-evidence output")
-
-
 @dataclass
 class _Row:
     filename: str

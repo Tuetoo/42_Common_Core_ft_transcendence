@@ -5,7 +5,8 @@ from typing import Any, ClassVar
 from ai.providers.base import MarketDataProvider, PriceBar, ProviderError
 from ai.providers.registry import get_market_data_provider
 from ai.tools.base import Tool, clamp_int
-from ai.tools.market_data_cache import (get_bars_cache_first,
+from ai.tools.market_data_cache import (MAX_LOOKBACK_DAYS,
+                                        get_bars_cache_first,
                                         missing_session_note)
 from domains.market.schema import PriceBarRead
 
@@ -51,7 +52,6 @@ def describe_high_volume_sessions(
 
 _DEFAULT_LOOKBACK_DAYS = 30
 PRICE_INTERVALS = ("1d", "1wk", "1mo")
-_MAX_LOOKBACK_DAYS = 730
 
 CLOSE_RE = re.compile(r"close=(-?\d+(?:\.\d+)?)")
 
@@ -143,7 +143,7 @@ class GetRecentPriceHistoryTool(Tool):
                 f"{', '.join(PRICE_INTERVALS)}).")
         lookback_days = clamp_int(
             lookback_days, default=_DEFAULT_LOOKBACK_DAYS, lo=1,
-            hi=_MAX_LOOKBACK_DAYS)
+            hi=MAX_LOOKBACK_DAYS)
         try:
             bars = await get_bars_cache_first(
                 ticker, interval=interval, lookback_days=lookback_days,

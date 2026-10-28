@@ -29,7 +29,7 @@
   |  domains/social        connections (friends), block              |
   |  domains/admin         user administration, site statistics      |
   |  api/internal.py       /internal/* for core-service, ai-service  |
-  |  security.py           tokens, TOTP, rate limits, 2FA lockout    |
+  |  security.py           tokens, TOTP, rate limits, 2FA limit      |
   |  events_out.py         events published after the commit         |
   |  user_state_sync.py    live role/active mirror in Redis          |
   +------------------------------------------------------------------+
@@ -176,7 +176,7 @@ From `domains/auth/model.py`, `domains/organization/model.py` and
 | `two_factor_secrets` | `user_id` (1:1), `secret`, `enabled`, `last_used_step` | `secret` is stored encrypted (`fernet:<token>`, `security.py`) |
 | `organizations` | `name`, `description`, `owner_id` | |
 | `organization_members` | `organization_id` (cascade), `user_id`, `role` (owner/admin/member/viewer), `joined_at` | unique (`organization_id`, `user_id`) |
-| `organization_invitations` | `organization_id`, `email`, `role`, `invited_by`, `expires_at`, `accepted_at` | an open row for the same email and expired open rows are deleted when the organization sends a new invitation (section 3.13); accepted rows stay as history |
+| `organization_invitations` | `organization_id`, `email`, `role`, `invited_by`, `expires_at`, `accepted_at` | an open row for the same email and expired open rows are deleted when the organization sends a new invitation (section 3.13); the nightly `purge-unverified` job deletes every open row that expired more than `ORGANIZATION_INVITATION_EXPIRE_DAYS` (7) days ago; accepted rows stay as history |
 | `connections` | `requester_id`, `addressee_id`, `pair_key` (generated), `status` (pending/accepted/blocked), `created_at`, `responded_at`, `blocked_by` | `pair_key` = `LEAST(a,b) || ':' || GREATEST(a,b)`, unique, so A->B and B->A cannot both exist |
 
 The models define no ORM relationships. With an async engine an implicit
@@ -294,7 +294,7 @@ Details worth knowing:
   (`send_verification_email_safely`, a failure is logged, never raised).
   Sending inside the request would turn an SMTP failure into a 500 for
   every registration, hold the database connection while a hanging SMTP
-  server waits (up to 60 s), and mail a link to an account a failed
+  server waits (up to the SMTP timeout), and mail a link to an account a failed
   commit never stored. A lost email is recovered with "resend".
 - The `email` claim inside the token stops an old link from verifying a
   newer address after the email was changed.
@@ -339,9 +339,9 @@ Details worth knowing:
    |                                | not verified -> 401 email_not_verified          |
    |                                | 2FA enabled?                       |           |
    |                                |   no code -> 401 two_factor_required            |
-   |                                |   locked? -> 429 ------------------------------>|
+   |                                |   count attempt; over limit? -> 429 ---------->|
    |                                |   code matches step s, s > last_used_step?      |
-   |                                |     no -> count failure, 401 ------------------->|
+   |                                |     no -> 401 (attempt stays counted) --------->|
    |                                | access JWT (15 min, role claim)    |           |
    |                                | refresh JWT (30 d)                 |           |
    |                                | INSERT user_sessions (sha256(refresh), ip, UA)  |
@@ -521,7 +521,7 @@ one rotation chain. There is no user-facing endpoint for it.
    |  (user scans the QR code into an authenticator app)                          |
    | POST /2fa/verify {code}             |                                        |
    |------------------------------------>| auth_time older than 10 min? -> 403    |
-   |                                     | _check_totp: lock? -> 429              |
+   |                                     | _check_totp: count attempt; over -> 429|
    |                                     | code matches step s in {now-1, now, now+1}?
    |                                     | UPDATE ... SET last_used_step=s        |
    |                                     |   WHERE last_used_step IS NULL OR < s  |
@@ -540,14 +540,16 @@ Code: `AuthService.setup_two_factor`, `verify_two_factor`,
 - **No replay:** the accepted step is stored in `last_used_step`, and the
   update only succeeds when the new step is larger. The same code (or an
   older one) cannot be used twice.
-- **Lockout:** each failure calls `security.two_factor_failed`; each
-  correct code calls `security.two_factor_succeeded`, which clears the
-  failure counter. After `RATE_LIMIT_2FA_FAILURES` = 5 failures within
-  `RATE_LIMIT_2FA_WINDOW_SECONDS` = 300 s with no correct code in
-  between, the user's 2FA is locked for
-  `RATE_LIMIT_2FA_LOCK_SECONDS` = 900 s; every check during the lock gets
-  429 "Too many invalid codes" with `Retry-After`. The lock is per user,
-  not per address.
+- **Lockout:** every check first counts an attempt
+  (`security.two_factor_attempt`, one atomic Redis `MULTI` on the
+  fixed-window key `2fa:fail`) and only then checks the code; a correct
+  code calls `security.two_factor_succeeded`, which deletes the counter.
+  So at most `RATE_LIMIT_2FA_FAILURES` = 5 codes are checked within
+  `RATE_LIMIT_2FA_WINDOW_SECONDS` = 3600 s (the window starts at the
+  first attempt) with no correct code in between, also when many
+  requests arrive in parallel. Every further check in that window gets
+  429 "Too many invalid codes" with `Retry-After` (seconds until the
+  window ends). The count is per user, not per address.
 - **Setup does not disable 2FA.** Calling setup on an enabled account
   would replace the secret and silently turn 2FA off, so it is a 409; you
   must disable with a valid code first. The database upsert (one atomic
@@ -587,8 +589,8 @@ Code: `AuthService.setup_two_factor`, `verify_two_factor`,
   raises `UnreadableTotpSecretError`; `_check_totp` logs
   `totp_secret_unreadable` and answers **409** "Your 2FA settings cannot
   be read. Ask an administrator to reset your 2FA, then set it up again."
-  (login, OAuth 2FA step, `/2fa/verify` and `/2fa/disable`; not counted
-  as a failed code). An admin then calls
+  (login, OAuth 2FA step, `/2fa/verify` and `/2fa/disable`; the attempt
+  is already counted, like every check). An admin then calls
   `DELETE /api/v1/admin/users/{id}/2fa` (section 3.19).
 
 ### 3.9 OAuth sign-in (Google, GitHub) and the OAuth 2FA challenge
@@ -662,11 +664,11 @@ and GitHub both accept PKCE with `S256` for web applications.
    |      fragment: challenge_token=..&expires_in=300 (2FA account)              |
    |             or access_token=..&refresh_token=..                             |
    |             or error=oauth_failed&message=.. (any failure above)            |
-   |      the nonce cookie is deleted in every case                              |
+   |      the nonce cookie is deleted for every success and AppError             |
    |                             |                                               |
    | POST /oauth/2fa {challenge_token, code}                                     |
    |---------------------------->| decode (type oauth_2fa), user still active    |
-   |                             | _check_totp (lockout, no replay)              |
+   |                             | _check_totp (attempt limit, no replay)        |
    |                             | SET oauth:2fa:used:<jti> NX (TTL = rest of    |
    |                             |   the challenge life) -- already set -> 401 ->|
    |<-- 200 {access_token, refresh_token}                                        |
@@ -713,8 +715,9 @@ Errors inside the sign-in: the provider says no or rejects the code ->
 `oauth_link_refused`; a deactivated account -> `invalid_credentials`; a
 concurrent callback for the same identity -> `conflict`.
 
-The callback route (`oauth_callback` in `domains/auth/api.py`) never
-answers JSON. It always answers **303 See Other** to
+The callback route (`oauth_callback` in `domains/auth/api.py`) answers
+every handled error (`AppError`) and every success with **303 See
+Other** to
 `${FRONTEND_BASE_URL}/oauth/complete#<fragment>`; `_oauth_complete_url`
 builds the fragment with `urllib.parse.urlencode`:
 
@@ -723,6 +726,11 @@ builds the fragment with `urllib.parse.urlencode`:
 | signed in | `access_token=...&refresh_token=...` |
 | the account has 2FA | `challenge_token=...&expires_in=300`; the frontend then calls `POST /api/v1/auth/oauth/2fa` |
 | any `AppError` listed above | `error=oauth_failed&message=<the error message>` |
+
+An unexpected error (Redis or the database down) is not an `AppError`:
+it reaches the global handler and the browser gets a 500 JSON body, and
+the nonce cookie is not cleared. `/authorize` behaves the same when Redis
+is down.
 
 The authorize route also takes two optional query parameters, which are
 stored with the state in Redis (`OAuthFlow`): `next`, the same-site path
@@ -751,14 +759,16 @@ GitHub sign-in (the login and register pages pass their `next` on).
 
 On an error the route rolls back the request's database work, logs
 `oauth_callback_failed` with `provider`, the error `code` and `message`,
-and publishes no events. The nonce cookie is deleted on every outcome.
+and publishes no events. The nonce cookie is deleted on every success and
+every handled error.
 The result travels in the fragment (the part after `#`) because browsers
 never send a fragment to any server and never put it in the `Referer`
 header, so the tokens do not reach the frontend's server, the gateway
 log or another site. The frontend page `/oauth/complete` reads
 `window.location.hash`, removes it from the address bar with
 `history.replaceState`, and then stores the tokens, asks for the 2FA
-code, or shows the message. `FRONTEND_BASE_URL` must therefore be the
+code, or shows a fixed error text (never the fragment's `message`: anyone
+can build a link with their own fragment). `FRONTEND_BASE_URL` must therefore be the
 frontend origin (for example `https://localhost:8443` locally, the cloud
 URL on the server). The OAuth 2FA challenge exists because otherwise
 "Sign in with Google" would have bypassed 2FA entirely.
@@ -957,7 +967,8 @@ Invitation flow:
 ```
  owner/admin          auth-service                              SMTP          invitee
    | POST /{org}/invitations {email, role}                        |              |
-   |------------------->| role checks; hit("invite:org", 20/3600 s)               |
+   |------------------->| role checks; hit("invite:user", 20/3600 s)              |
+   |                    |   and hit("invite:org", 20/3600 s)       |              |
    |                    | already a member? -> 409                 |              |
    |                    | open admin invitation for this email and |              |
    |                    |   requester is not the owner? -> 403     |              |
@@ -974,9 +985,10 @@ Invitation flow:
    |                    | POST /invitations/accept {token}  (invitee logged in) <--|
    |                    | decode; lock the invitation row (FOR UPDATE)           |
    |                    | invitation exists, not accepted, not expired           |
-   |                    | inviter still owner/admin of the org? else 404         |
    |                    | logged-in email == invitation email (case-insensitive)? |
    |                    |   else 403                                              |
+   |                    | already a member? -> 409                               |
+   |                    | inviter still owner/admin of the org? else 404         |
    |                    | INSERT member (savepoint; double submit -> 409),       |
    |                    |   accepted_at = now; event organization.member.joined   |
 ```
@@ -1010,13 +1022,16 @@ have an account yet. No invitation can grant `owner` (422 when sent).
   that organization are deleted (`delete_open_invitations_by`). Accepting
   also checks that the inviter is still an owner or admin member;
   otherwise it answers 404 "Invitation no longer exists." (this also
-  covers a deleted inviter account). The invitations of a deleted admin
-  still appear in `GET .../invitations` until they expire, but cannot be
-  accepted. It publishes
-  `organization.invitation.revoked`: core-service notifies the user who
-  revoked and, when the invited email has an account, the invitee.
+  covers a deleted inviter account).
 - Accepted rows are kept (the accept route uses them to answer "already
   accepted").
+- **Expired rows are deleted after a grace period.** The nightly
+  `purge-unverified` job (`AdminService.purge_expired_invitations`,
+  `OrganizationRepository.delete_expired_invitations`) deletes every open
+  invitation that expired more than `ORGANIZATION_INVITATION_EXPIRE_DAYS`
+  (7) days ago, so an invitee address that never joined is not kept
+  forever. Until then an expired link answers "This invitation has
+  expired."; after it, 404.
 
 **Membership cache invalidation.** core-service and ai-service cache "which
 organizations is this user in, with which role" in Redis
@@ -1122,12 +1137,13 @@ error **fails open** (logged as `rate_limit_unavailable`).
 | `reset:ip` | client IP | 10 | 3600 s | `POST /password-reset/request` |
 | `reset:email` | email | 3 | 3600 s | same |
 | `resend:email` | email | 3 | 3600 s | `POST /verify-email/resend` |
+| `invite:user` | requester user id | 20 | 3600 s | invitations (all organizations of the sender together) |
 | `invite:org` | organization id | 20 | 3600 s | invitations |
 | `friend:user` | requester user id | 30 | 3600 s | `POST /api/v1/connections` |
-| `2fa:fail` / `2fa:lock` | user id | 5 failures (a correct code resets the count) | 300 s window, 900 s lock | every TOTP check |
+| `2fa:fail` | user id | 5 attempts, counted before the code is checked (a correct code resets the count) | 3600 s | every TOTP check |
 
 Over the limit: 429 with body code `rate_limited`, the message "Too many
-attempts. Please try again later." (the 2FA lock says "Too many invalid
+attempts. Please try again later." (the 2FA limit says "Too many invalid
 codes. Please try again later.") and a `Retry-After` header (seconds
 until the window ends). `RATE_LIMIT_ENABLED=false` turns
 all of them off. The gateway adds its own coarse limit in front
@@ -1187,7 +1203,7 @@ admin page reads its counts from the database.
 | `GET /internal/users/{id}/notification-settings` | core notifications | `{email, deleted, notification_preferences}`; `email` is `null` when the account is deleted, deactivated or unverified (an anonymized, placeholder or unproven address), so core sends no email to it; `deleted` is true for a deleted account, and core then creates no notification at all |
 | `POST /internal/users/deleted` | the nightly deleted-user sweeps of core and ai (`shared/deleted_users.py::deleted_user_ids`, batches of 500) | body `{user_ids: [uuid, ...]}` (at most 500, else 422); answers `{deleted_ids: [...]}`, the subset whose account is deleted (`deleted_at` set). An unknown id is not in the answer, so a sweep never treats it as deleted |
 | `POST /internal/organizations/missing` | core's nightly sweep (`shared/deleted_users.py::missing_organization_ids`) | body `{organization_ids: [...]}` (at most 500); answers `{missing_ids: [...]}`, the ids with no organization row (deleted). core deletes content only after a successful answer |
-| `POST /internal/scheduler/purge-unverified` | the scheduler (`call-job.sh purge-unverified`, daily 04:10 New York) | `{retention_days, candidates, deleted, skipped, failed, deleted_account_leftovers: {candidates, cleaned, failed, lookup_failed}}`; 500 (`shared/scheduled_jobs.py`) with `all_units_failed` naming the step: `accounts` (every attempted account failed), `deleted_account_leftovers` (every leftover cleanup failed) or `deleted_account_leftovers_lookup` (the leftover query failed) (section 3.19) |
+| `POST /internal/scheduler/purge-unverified` | the scheduler (`call-job.sh purge-unverified`, daily 04:10 New York) | `{retention_days, candidates, deleted, skipped, failed, deleted_account_leftovers: {candidates, cleaned, failed, lookup_failed}, expired_invitations_deleted}`; 500 (`shared/scheduled_jobs.py`) with `all_units_failed` naming the step: `accounts` (every attempted account failed), `deleted_account_leftovers` (every leftover cleanup failed), `deleted_account_leftovers_lookup` (the leftover query failed) or `expired_invitations` (the delete of invitations that expired more than `ORGANIZATION_INVITATION_EXPIRE_DAYS` days ago failed; the count is then 0) (sections 3.13 and 3.19) |
 
 ### 3.19 Administration (`domains/admin/`) and the first admin
 
@@ -1363,11 +1379,11 @@ From `services/auth-service/config.py` unless noted. Set them in
 | `PRESENCE_ONLINE_THRESHOLD_MINUTES` | `5` | |
 | `RATE_LIMIT_ENABLED` | `true` | all auth rate limits |
 | `RATE_LIMIT_LOGIN_PER_EMAIL` / `_PER_IP` / `_WINDOW_SECONDS` | `10` / `30` / `900` | |
-| `RATE_LIMIT_2FA_FAILURES` / `_WINDOW_SECONDS` / `_LOCK_SECONDS` | `5` / `300` / `900` | |
+| `RATE_LIMIT_2FA_FAILURES` / `_WINDOW_SECONDS` | `5` / `3600` | |
 | `RATE_LIMIT_PASSWORD_RESET_PER_EMAIL` / `_PER_IP` / `_WINDOW_SECONDS` | `3` / `10` / `3600` | |
 | `RATE_LIMIT_REGISTER_PER_IP` / `_WINDOW_SECONDS` | `10` / `3600` | |
 | `RATE_LIMIT_RESEND_VERIFICATION_PER_EMAIL` / `_WINDOW_SECONDS` | `3` / `3600` | |
-| `RATE_LIMIT_INVITATIONS_PER_ORG` / `_WINDOW_SECONDS` | `20` / `3600` | |
+| `RATE_LIMIT_INVITATIONS_PER_ORG` / `_PER_USER` / `_WINDOW_SECONDS` | `20` / `20` / `3600` | per organization, and per sender across all their organizations |
 | `RATE_LIMIT_FRIEND_REQUESTS_PER_USER` / `_WINDOW_SECONDS` | `30` / `3600` | connection requests per sender |
 | `USER_STATE_CHECK_ENABLED` | `true` (`shared/config.py`) | live role/active check on every request |
 | `USER_STATE_CACHE_TTL_SECONDS` | `300` (`shared/config.py`) | cache of a state fetched after a Redis miss |
@@ -1433,9 +1449,11 @@ take over a local account.
 **OAuth sign-in returns a 2FA challenge for 2FA accounts.**
 *Reason:* social login must not bypass 2FA.
 
-**Per-user 2FA lockout and no-replay TOTP steps.**
-*Reason:* a six-digit code can be brute-forced without a lockout, and a
-shoulder-surfed code must not work twice.
+**Per-user 2FA attempt limit and no-replay TOTP steps.**
+*Reason:* a six-digit code can be brute-forced without a limit, and a
+shoulder-surfed code must not work twice. The attempt is counted before
+the code is checked, so parallel requests cannot try more codes than the
+limit, and the one-hour window keeps slow guessing at 5 codes per hour.
 
 **Soft delete instead of a real delete.**
 *Reason:* other services keep rows that reference user ids
@@ -1495,13 +1513,13 @@ a body is not.
 | `/2fa/setup` or `/2fa/verify` 403 `recent_login_required` | the session's login (`auth_time`) is more than 10 minutes old, or the token predates the claim; a refresh does not help | log in again (password or OAuth), then retry |
 | an account the user registered a week ago is gone ("Email/password combination is incorrect.") | it was never verified, so the nightly `purge-unverified` job deleted it; log `unverified_accounts_purged` | register again with the same email |
 | 429 `rate_limited` with `Retry-After` | auth-service limit | `bash scripts/redis-cli.sh -n 1 --scan --pattern 'auth:rl:*'` shows active counters (hashed identities) |
-| 429 "Too many invalid codes" | 2FA lock (5 failures in 5 minutes with no correct code between them, locked 15 minutes) | wait for `Retry-After` |
+| 429 "Too many invalid codes" | 2FA attempt limit (5 codes checked within one hour with no correct code between them) | wait for `Retry-After` |
 | refresh 401 and the user is logged out in one browser | reuse detection fired: a rotated refresh token came back after the 30 s grace, usually a browser holding an old cookie (for example a second browser left idle for days) | log event `refresh_token_reuse_detected` (`bash scripts/logs.sh auth-service grep refresh_token_reuse_detected`); the sessions of that chain show `revoked_reason = 'reuse'`; other logins of the user stay valid |
 | a demoted admin still has admin rights | the mirror was not written | `bash scripts/redis-cli.sh -n 2 GET auth:user_state:<id>`; logs `user_state.mirror_failed`, `user_state.startup_sync_failed`; core/ai logs `user_state.redis_read_failed`, `user_state.auth_lookup_failed` |
 | verification or reset email never arrives | SMTP problem; the request still succeeded | log events `verification_email_failed`, `password_reset_email_failed`, `invitation_email_failed`, `email_send_failed`; MailHog UI |
-| OAuth ends at `/oauth/complete#error=oauth_failed&message=...` | any sign-in error; the `message` says which one (rows below) | log `oauth_callback_failed` (`bash scripts/logs.sh auth-service grep oauth_callback_failed`) shows the error code |
-| OAuth message "Invalid or expired OAuth state." | the state is older than 300 s, was already used, or was for another provider | start again from `/oauth/<provider>/authorize` |
-| OAuth message "This sign-in was not started in this browser. Start the sign-in again." (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
+| OAuth ends at `/oauth/complete#error=oauth_failed&message=...`; the page shows only "Sign-in with the provider did not work. ..." | any sign-in error; the page never shows the `message` from the fragment | log `oauth_callback_failed` (`bash scripts/logs.sh auth-service grep oauth_callback_failed`) has the `code` and `message` (rows below) |
+| `oauth_callback_failed` message "Invalid or expired OAuth state." | the state is older than 300 s, was already used, or was for another provider | start again from `/oauth/<provider>/authorize` |
+| `oauth_callback_failed` message "This sign-in was not started in this browser. Start the sign-in again." (log `oauth_browser_binding_failed`) | the `alphamind_oauth_nonce` cookie is missing or belongs to another sign-in: the authorize step was called with `fetch` instead of a navigation, the callback was opened in another browser, cookies are blocked, or a second sign-in started in the same browser | open `/oauth/<provider>/authorize` as a top-level navigation and finish in the same browser within 5 minutes |
 | OAuth `oauth_callback_failed` code `oauth_link_refused` | a local account with that email exists but one side is unverified | log in with the password first |
 | OAuth `oauth_callback_failed` code `oauth_provider_error` | provider unreachable or odd answer | log events `oauth_provider_http_error`, `oauth_github_emails_unavailable` |
 | auth-service does not start, log says the schema was refused | tables without `alembic_version`, or a revision Alembic does not know (a backup whose revision is not in the current migration chains) | restore a backup made by the current code |
@@ -1598,7 +1616,7 @@ echo "$ACCESS" | cut -d. -f2 | python3 -c "import sys, base64, json; s = sys.std
 ```
 
 The audience sees `sub`, `type: "access"`, `iat`, `exp` (15 minutes
-later), `jti` and `role`.
+later), `jti`, `role` and `auth_time` (the login time).
 
 **Step 5: the live role mirror.**
 
@@ -1776,12 +1794,12 @@ in the database and in Redis.)
 |---|---|
 | `services/auth-service/main.py` | app, lifespan (schema, user-state sync, avatar dir), routers, `/health`, avatar static mount |
 | `services/auth-service/config.py` | all auth settings (token lifetimes, OAuth, avatars, presence, rate limits) |
-| `services/auth-service/security.py` | bcrypt, JWT creation and decoding, token types, TOTP helpers, encrypt/decrypt stored TOTP secrets (Fernet), refresh-token hashing; rate limits (`hit`), 2FA lockout, `client_ip`, 429 handler |
+| `services/auth-service/security.py` | bcrypt, JWT creation and decoding, token types, TOTP helpers, encrypt/decrypt stored TOTP secrets (Fernet), refresh-token hashing; rate limits (`hit`), 2FA attempt limit (`two_factor_attempt`), `client_ip`, 429 handler |
 | `services/auth-service/events_out.py` | after-commit event publishing, payload builders, membership cache invalidation |
 | `services/auth-service/user_state_sync.py` | writes the live role/active mirror (`commit_with_state`, startup sync) |
 | `services/auth-service/deps.py` | `get_current_user`, `require_recent_login` (2FA setup/verify) and permission-checked dependencies |
 | `services/auth-service/database.py` | engine, sessions, Alembic bootstrap |
-| `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai (including `users/deleted` and `organizations/missing` for the nightly sweeps), and the scheduler's `purge-unverified` with its leftover cleanup step |
+| `services/auth-service/api/internal.py` | `/internal/*` routes for core and ai (including `users/deleted` and `organizations/missing` for the nightly sweeps), and the scheduler's `purge-unverified` with its leftover cleanup and expired-invitation steps |
 | `services/auth-service/domains/auth/model.py` | users, profiles, settings, sessions (`SessionRevokeReason`), OAuth accounts, 2FA secrets |
 | `services/auth-service/domains/auth/schema.py` | request/response models, password and username rules |
 | `services/auth-service/domains/auth/repository.py` | data access, atomic rotation claim, rotation-chain revocation (`revoke_rotation_successors`), session purge, TOTP step consume |

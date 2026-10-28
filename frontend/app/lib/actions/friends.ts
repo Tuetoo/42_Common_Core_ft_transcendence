@@ -1,8 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { getAccessToken } from "@/app/lib/session";
-import { backendFetch, readApiError } from "@/app/lib/backend";
+import { call, jsonInit } from "@/app/lib/session";
 import { USERNAME_RE } from "@/app/(public)/field-rules";
 
 export type FriendActionState = {
@@ -23,25 +22,8 @@ export async function sendFriendRequest(
     };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { username, error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch("/connections", accessToken, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ addressee_username: username }),
-    });
-  } catch {
-    return { username, error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { username, error: (await readApiError(res, "Could not send the request")).message };
-  }
+  const result = await call("/connections", jsonInit("POST", { addressee_username: username }), "Could not send the request");
+  if (!result.ok) return { username, error: result.error };
 
   revalidatePath("/friends");
   return { success: true };
@@ -63,23 +45,12 @@ export async function respondToConnection(connectionId: string, kind: Connection
     return { error: "Unknown action" };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { error: "You're not logged in" };
-  }
-
-  let res: Response;
-  try {
-    res = await backendFetch(`/connections/${encodeURIComponent(connectionId)}${response.suffix}`, accessToken, {
-      method: response.method,
-    });
-  } catch {
-    return { error: "Could not reach the server. Is the backend running?" };
-  }
-
-  if (!res.ok) {
-    return { error: (await readApiError(res, "That didn't work")).message };
-  }
+  const result = await call(
+    `/connections/${encodeURIComponent(connectionId)}${response.suffix}`,
+    { method: response.method },
+    "That didn't work"
+  );
+  if (!result.ok) return { error: result.error };
 
   revalidatePath("/friends");
   return { success: true };

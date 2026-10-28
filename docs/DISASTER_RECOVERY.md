@@ -41,7 +41,7 @@ warning (or stops, with `--only objectstore`).
 The layout of one backup:
 
 ```
-backups/2026-10-05_0230/
+backups/2026-10-05_0050/
   postgres.dump
   qdrant/research_documents_gemini.snapshot
   objectstore/research-documents/documents/<user-id>/<hex>.pdf
@@ -56,8 +56,8 @@ backups/2026-10-05_0230/
 - **Location:** `./backups/<YYYY-MM-DD_HHMM>/` in the repository folder on
   the host (mounted at `/backups` in the scheduler). `./backups/` is
   gitignored.
-- **Schedule:** every day at **02:30 America/New_York** (scheduler
-  crontab), between the review job (02:00) and RAG ingestion (03:05).
+- **Schedule:** every day at **00:50 America/New_York** (scheduler
+  crontab), between the review job (00:20) and RAG ingestion (03:05).
   Backups run only while the scheduler runs. The cloud host keeps it
   stopped, so the cloud makes no backups; backups are made on the local
   stack (`docs/DEPLOYMENT.md` section 6).
@@ -103,7 +103,7 @@ deleted-user sweeps only clean accounts that are deleted in the restored
 Every backup can be checked without restoring it:
 
 ```sh
-cd backups/2026-09-29_0230
+cd backups/2026-09-29_0050
 sha256sum -c SHA256SUMS            # every file, every object: OK
 cat manifest.json                  # time, sizes, alembic revisions, buckets
 ```
@@ -114,8 +114,8 @@ anything:
 
 ```sh
 docker compose --env-file .env.docker exec scheduler \
-    /scripts/restore.sh 2026-09-29_0230
-make backup-check BACKUP=2026-09-29_0230   # the same through the restore image
+    /scripts/restore.sh 2026-09-29_0050
+make backup-check BACKUP=2026-09-29_0050   # the same through the restore image
 ```
 
 A backup is good when: the directory name has no `-FAILED` suffix, the
@@ -181,15 +181,15 @@ For example after a bad migration or deleted rows.
 docker compose --env-file .env.docker stop auth-service core-service ai-service scheduler
 # 2. check, then restore
 docker compose --env-file .env.docker --profile tools run --rm restore \
-    /scripts/restore.sh --only postgres /backups/2026-09-29_0230
+    /scripts/restore.sh --only postgres /backups/2026-09-29_0050
 docker compose --env-file .env.docker --profile tools run --rm restore \
-    /scripts/restore.sh --yes --only postgres /backups/2026-09-29_0230
+    /scripts/restore.sh --yes --only postgres /backups/2026-09-29_0050
 # 3. start everything again
 docker compose --env-file .env.docker up -d
 ```
 
 Check with `/scripts/restore.sh --verify --only postgres
-/backups/2026-09-29_0230` before step 3.
+/backups/2026-09-29_0050` before step 3.
 
 `restore.sh` drops the `auth`, `core` and `ai` schemas with CASCADE and
 recreates them from the dump, all in one transaction: if anything fails,
@@ -208,7 +208,7 @@ For example when the vector collection is broken or was deleted.
 
 ```sh
 docker compose --env-file .env.docker --profile tools run --rm restore \
-    /scripts/restore.sh --yes --only qdrant /backups/2026-09-29_0230
+    /scripts/restore.sh --yes --only qdrant /backups/2026-09-29_0050
 docker compose --env-file .env.docker restart ai-service   # rebuilds its BM25 index from Qdrant
 ```
 
@@ -225,9 +225,9 @@ Objects are restored through the S3 API, so `objectstore` must be
 docker compose --env-file .env.docker stop core-service ai-service scheduler
 docker compose --env-file .env.docker up -d --wait objectstore
 docker compose --env-file .env.docker --profile tools run --rm restore \
-    /scripts/restore.sh --yes --only objectstore /backups/2026-09-29_0230
+    /scripts/restore.sh --yes --only objectstore /backups/2026-09-29_0050
 docker compose --env-file .env.docker --profile tools run --rm restore \
-    /scripts/restore.sh --verify --only objectstore /backups/2026-09-29_0230
+    /scripts/restore.sh --verify --only objectstore /backups/2026-09-29_0050
 docker compose --env-file .env.docker up -d
 ```
 
@@ -288,7 +288,7 @@ Needed: a copy of `./backups/<stamp>/` and your saved `.env.docker`.
 ## 5. RPO and RTO
 
 - **RPO (how much data can be lost): up to 24 hours.** Backups are daily;
-  anything written after the last successful backup (02:30 ET) is lost
+  anything written after the last successful backup (00:50 ET) is lost
   in a full restore. Run `make backup` before risky work (migrations,
   bulk deletes, upgrades) to bring this close to zero for that event.
 - **RTO (how long a restore takes): about 30 minutes** for a full rebuild
@@ -309,7 +309,7 @@ to the backup scripts or to the storage layout):
 
 ```sh
 make restore-drill                          # the newest backup
-make restore-drill BACKUP=2026-09-29_0230   # a given one
+make restore-drill BACKUP=2026-09-29_0050   # a given one
 ```
 
 (= `bash scripts/backups.sh drill [<stamp>]`). The drill runs next to the

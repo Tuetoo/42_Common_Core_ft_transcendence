@@ -27,8 +27,8 @@
   |  09:30 Mon-Fri  call-job.sh market-open     --POST--> core /internal/scheduler/market-open
   |  17:00 Mon-Fri  call-job.sh tier-monitoring --POST--> ai /internal/scheduler/tier-monitoring
   |  17:30 Mon-Fri  call-job.sh market-close    --POST--> core /internal/scheduler/market-close
-  |  02:00 daily    call-job.sh review-run      --POST--> ai /internal/review/run
-  |  02:30 daily    backup.sh        (pg_dump, Qdrant snapshots, S3 object copy, avatars tar)
+  |  00:20 daily    call-job.sh review-run      --POST--> ai /internal/review/run
+  |  00:50 daily    backup.sh        (pg_dump, Qdrant snapshots, S3 object copy, avatars tar)
   |  03:05 daily    call-job.sh rag-ingest      --POST--> ai /internal/scheduler/rag-ingest
   |  04:00 daily    logs-cleanup.sh  (find ./logs -mtime +14 -delete)
   |  04:10 daily    call-job.sh purge-unverified --POST--> auth /internal/scheduler/purge-unverified
@@ -56,7 +56,7 @@ typed) and the scheduler trivial.
 | Term | Meaning here |
 |---|---|
 | cron | A Unix program that runs commands at times written in a `crontab` file. Each line: `minute hour day-of-month month day-of-week command`. `1-5` in the last time field means Monday to Friday. |
-| crond / dcron | The cron daemon. The image installs Alpine's `dcron` and runs `crond -f -l 2` (foreground, log level 2). |
+| crond / dcron | The cron daemon. The image installs Alpine's `dcron` and runs `crond -f -l 5` (foreground, log level 5 = notice, so its "time disparity" notice after a long clock jump is logged). |
 | TZ | The time zone environment variable. With `TZ=America/New_York`, cron reads the crontab in New York time, including daylight-saving changes. |
 | Internal endpoint | A route under `/internal/*`. It needs the `X-Internal-Token` header (`INTERNAL_API_TOKEN`), and the gateway returns 404 for it, so it is reachable only inside the Docker network. |
 | Heartbeat | A "I succeeded" signal sent after a job. Used to detect jobs that silently stopped running. |
@@ -124,7 +124,7 @@ host where the scheduler stays stopped (section 3.11):
 `docker compose --env-file .env.docker run --rm --no-deps scheduler
 /scripts/call-job.sh deleted-user-sweep-core`.
 
-Without arguments it starts `crond -f -l 2 &` as a **child** and waits for it. It does
+Without arguments it starts `crond -f -l 5 &` as a **child** and waits for it. It does
 not `exec` crond: dcron calls `setpgid()` at startup, which fails with
 "Operation not permitted" when it is PID 1 (a session leader), so crond
 would exit and the container would restart in a loop.
@@ -145,8 +145,8 @@ From `infra/scheduler/crontab`:
 | market-open | `30 9 * * 1-5` | 09:30 | 14:30 | Mon-Fri | `call-job.sh market-open` | core `POST /internal/scheduler/market-open` |
 | tier-monitoring | `0 17 * * 1-5` | 17:00 | 22:00 | Mon-Fri | `call-job.sh tier-monitoring` | ai `POST /internal/scheduler/tier-monitoring` |
 | market-close | `30 17 * * 1-5` | 17:30 | 22:30 | Mon-Fri | `call-job.sh market-close` | core `POST /internal/scheduler/market-close` |
-| review-run | `0 2 * * *` | 02:00 | 07:00 | every day | `call-job.sh review-run` | ai `POST /internal/review/run` |
-| backup | `30 2 * * *` | 02:30 | 07:30 | every day | `backup.sh` | local: pg_dump, Qdrant, S3 object copy, avatars tar |
+| review-run | `20 0 * * *` | 00:20 | 05:20 | every day | `call-job.sh review-run` | ai `POST /internal/review/run` |
+| backup | `50 0 * * *` | 00:50 | 05:50 | every day | `backup.sh` | local: pg_dump, Qdrant, S3 object copy, avatars tar |
 | rag-ingest | `5 3 * * *` | 03:05 | 08:05 | every day | `call-job.sh rag-ingest` | ai `POST /internal/scheduler/rag-ingest` |
 | logs-cleanup | `0 4 * * *` | 04:00 | 09:00 | every day | `logs-cleanup.sh` | local: `./logs` |
 | purge-unverified | `10 4 * * *` | 04:10 | 09:10 | every day | `call-job.sh purge-unverified` | auth `POST /internal/scheduler/purge-unverified` |
@@ -157,8 +157,9 @@ From `infra/scheduler/crontab`:
 `restore.sh` is copied into the image but has no cron line. It is run by
 hand only (see [../DISASTER_RECOVERY.md](../DISASTER_RECOVERY.md)).
 
-Order of the night: review (02:00) after the previous day's market jobs;
-backup (02:30) in the quietest window, between review and ingestion, when
+Order of the night: review (00:20) after the previous day's market jobs;
+backup (00:50, when review-run's 30-minute curl limit has passed) in the
+quietest window, between review and ingestion, when
 no job writes documents; rag-ingest (03:05, five minutes after Google's
 daily quota reset at midnight Pacific, so keys benched until then are
 free again); logs-cleanup (04:00), after
@@ -250,7 +251,7 @@ with
 | tier-monitoring | `tiers`: `checked - closed_meanwhile - pending` (a tier still awaiting acceptance is not checked, so it is not a unit); failed = `execution_failed + no_fresh_data + price_lookup_failed` (a price feed that fails or returns nothing for every accepted tier counts as a failure) |
 | review-run | `recommendations`: recommendations due for scoring; failed = no usable price history, or an error. `decisions`: (decision, window) pairs due for evaluation; failed = no ticker or benchmark price, or an error. The agent metrics rollup is not a step |
 | rag-ingest | `filings` and `news`: one unit per ticker the step attempted, failed when the ticker's step raised or one of its sources failed ("nothing new" is a success); a source that is not configured gives the step 0 units, and a ticker whose news hit the NewsAPI quota is deferred, not a unit; `macro`: 1 unit (0 when `FRED_API_KEY` is empty), failed when no FRED indicator could be fetched, the report's LLM call failed, or storing the report failed. So a failed macro step alone makes the run a 500; a month whose report already exists is a success |
-| purge-unverified | `accounts`: accounts the job tried to delete (deleted + failed); failed = the deletion raised (rolled back, logged `unverified_account_purge_failed`). An account that was verified or signed in meanwhile, and the last active admin, are skipped, not units. `deleted_account_leftovers`: deleted accounts that still had sessions, open sent invitations, memberships or owned organizations; failed = that account's cleanup raised (rolled back, logged `deleted_account_leftovers_failed`). `deleted_account_leftovers_lookup`: 1 unit, failed when the candidate query raised (`deleted_account_leftovers_lookup_failed`) |
+| purge-unverified | `accounts`: accounts the job tried to delete (deleted + failed); failed = the deletion raised (rolled back, logged `unverified_account_purge_failed`). An account that was verified or signed in meanwhile, and the last active admin, are skipped, not units. `deleted_account_leftovers`: deleted accounts that still had sessions, open sent invitations, memberships or owned organizations; failed = that account's cleanup raised (rolled back, logged `deleted_account_leftovers_failed`). `deleted_account_leftovers_lookup`: 1 unit, failed when the candidate query raised (`deleted_account_leftovers_lookup_failed`). `expired_invitations`: 1 unit, failed when deleting the expired invitations raised (`expired_invitations_purge_failed`) |
 | notification-retention | `batches`: delete batches attempted (one more than the full batches, the last one finds fewer rows than the batch size); failed = the batch raised (rolled back, logged `notification_retention_failed`; the run stops there). So only a run whose very first batch fails is a 500 |
 | deleted-user-sweep-core, deleted-user-sweep-ai | `users`: deleted accounts that still own data; failed = at least one cleanup step failed for that user (logged `deleted_user_sweep_item_failed`; the others still run). `users_lookup`: 1 unit, failed when auth could not be asked or the service's own candidate query failed (`deleted_user_sweep_candidates_failed`); nothing is deleted then. Core only: the same two for `organizations` (`organizations_lookup`: auth could not be asked or the organization candidate query failed, `deleted_organization_sweep_candidates_failed`), plus `organizations_safety_brake`, failed when too many organizations are missing and nothing was deleted. The organization part runs even if the user part failed |
 
@@ -293,7 +294,8 @@ queue checks the owner again before it starts and marks the job failed
 1. Not a trading day -> `200 {"skipped": true, "reason": "non_trading_day", "date": ...}`, log `tier_monitoring_skipped_non_trading_day`.
 2. Otherwise `run_tier_monitoring_workflow()`: for every open tier
    (pending acceptance or accepted awaiting trigger), re-read it under a row
-   lock, check today's high/low against the target price and the tier's
+   lock, check every daily high/low since acceptance against the target
+   price and the tier's
    window, and then trigger (execute the trade into the portfolio through
    core-service), expire, or leave it open. A tier expires when its window
    has passed, or when it is a pending tier of a system analysis that was
@@ -453,8 +455,9 @@ indicator with no observations in the window is left out and logged
 (`auto_ingestion.macro_indicator_empty`).
 
 Before it creates a document, it asks
-core which filenames already exist (`GET /internal/documents/filenames`),
-so a filing is not added twice. For each new filing a separate
+core which filenames already exist among the system documents
+(`GET /internal/documents/filenames?system_only=true`), so a filing is
+not added twice; a user's upload with the same name does not stop it. For each new filing a separate
 records-only LLM call (`extract_filing_records`) extracts structured
 records in four categories (one-off items, guidance, transactions, legal
 matters); they are stored in `ai.filing_records` (one row per filing, keyed
@@ -499,14 +502,22 @@ any deletion. Then it cleans the auth leftovers of accounts deleted
 before the full deletion existed
 (`AdminService.clean_deleted_account_leftovers`: sessions, open sent
 invitations, memberships, owned organizations; a second run finds
-nothing). Answer `{"retention_days", "candidates", "deleted",
+nothing). Last, it deletes expired invitations older than the retention:
+open organization invitations whose expiry is more than
+`ORGANIZATION_INVITATION_EXPIRE_DAYS` (default 7) days in the past
+(`AdminService.purge_expired_invitations`, one commit). So an expired
+invitation link answers "This invitation has expired." for 7 more days,
+then 404. Answer `{"retention_days", "candidates", "deleted",
 "skipped", "failed", "deleted_account_leftovers": {"candidates",
-"cleaned", "failed", "lookup_failed"}}`, 500 when every attempted account
-failed, every leftover cleanup failed, or the leftover candidate query
-failed (`job_response`, steps `accounts`, `deleted_account_leftovers`
-and `deleted_account_leftovers_lookup`). A failed leftover query is
-caught, so the purge's events are still published. Logs `unverified_accounts_purged` and
-`deleted_account_leftovers_cleaned`.
+"cleaned", "failed", "lookup_failed"}, "expired_invitations_deleted"}`,
+500 when every attempted account failed, every leftover cleanup failed,
+the leftover candidate query failed, or the invitation delete failed
+(`job_response`, steps `accounts`, `deleted_account_leftovers`,
+`deleted_account_leftovers_lookup` and `expired_invitations`; a failed
+invitation delete is rolled back and counted as 0). A failed leftover
+query is caught, so the purge's events are still published. Logs
+`unverified_accounts_purged`, `deleted_account_leftovers_cleaned` and
+`expired_invitations_purged` (or `expired_invitations_purge_failed`).
 Details: [11-auth-service.md](11-auth-service.md) sections 3.4 and 3.19.
 
 **notification-retention** (`services/core-service/api/internal.py::notification_retention`
@@ -574,7 +585,7 @@ core-service owns notifications).
 
 ### 3.6 The local jobs
 
-**backup.sh** (02:30): writes `/backups/<YYYY-MM-DD_HHMM>/` (host
+**backup.sh** (00:50): writes `/backups/<YYYY-MM-DD_HHMM>/` (host
 `./backups`) with `postgres.dump` (`pg_dump -Fc` of the whole database,
 which holds the auth, core and ai schemas), one Qdrant snapshot per
 collection, every object of every bucket under
@@ -613,8 +624,7 @@ How each part is made and checked:
   object, so the copy is consistent per object even if a document changes
   during the backup, and it does not depend on SeaweedFS's on-disk
   format.
-- Avatars: a `tar.gz` of the volume, mounted read-only, then `tar -tzf`
-  checks the archive.
+- Avatars: a `tar.gz` of the volume, mounted read-only.
 - A run killed outright (the container recreated mid-backup) skips the
   clean-up trap and leaves `.incomplete-<stamp>` behind; that is why such
   folders are removed after a day.
@@ -646,8 +656,8 @@ the script prints `... not found, success not reported` and exits 0.
 **restore.sh** (manual only): dry run by default (verifies checksums and
 the dump, prints what it would do); `--yes` really restores, which replaces
 current data, after a preflight that checks every chosen part's
-preconditions (databases answer, object storage running or stopped as the
-backup format needs, target volumes writable) so that nothing is replaced
+preconditions (databases answer, object storage running, target volumes
+writable) so that nothing is replaced
 when one part could not run; `--verify` changes nothing and exits 1 when the live data
 differs from the backup (Alembic revisions, table and Qdrant point
 counts, every object by size and MD5, avatars). Through the Makefile:
@@ -744,7 +754,9 @@ core-service (`api/internal.py::scheduler_heartbeat` and
   `HSETNX core:job_tracked_since <job> <now>` (so the first start is kept
   across restarts) and sets the gauge to that time, logging
   `scheduled_job_no_success_yet`. The stale-job alerts therefore fire 26 h
-  (`DailyJobStale`) or 100 h (`TradingDayJobStale`) after tracking began
+  (`DailyJobStale`) or 26 h / 76 h / 50 h (`TradingDayJobStale`, 76 h
+  when tracking began on a Friday or a Saturday, 50 h on a Sunday) after
+  tracking began
   for a job that never succeeds. `core:job_last_success` holds only real
   successes. If Redis cannot be read at start, every job gets the process
   start time (nothing is written).
@@ -772,7 +784,7 @@ Alert rules (`infra/prometheus/alert_rules.yml`, group `scheduled_jobs`):
 | Alert | Expression (simplified) | For | Meaning |
 |---|---|---|---|
 | `DailyJobStale` | `time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"backup\|review-run\|rag-ingest\|logs-cleanup\|purge-unverified\|notification-retention\|deleted-user-sweep-core\|deleted-user-sweep-ai"} > 26 * 3600` | 10m | a daily job has not succeeded for 26 h (one run plus 2 h slack) |
-| `TradingDayJobStale` | same for `market-open\|market-close\|tier-monitoring`, `> 100 * 3600` | 10m | a trading-day job has not succeeded for 100 h (the longest normal gap is a weekend, 72 h, because a closed-market weekday still reports success) |
+| `TradingDayJobStale` | same for `market-open\|market-close\|tier-monitoring`, `> 26 * 3600 + 50 * 3600 * (last success on Friday or Saturday) + 24 * 3600 * (last success on Sunday)`, weekday from `day_of_week()` (UTC) | 10m | a trading-day job missed a trading day: no success for 26 h after a Monday to Thursday success, 76 h after a Friday or Saturday success, or 50 h after a manual Sunday success (a closed-market weekday still reports success, so only the weekend is a normal gap: 71-73 h) |
 | `MarketCloseSkippedPortfolios` | `alphamind_market_close_portfolios_skipped > 0` | (none) | the last market-close skipped portfolios |
 
 `DailyJobStale` and `TradingDayJobStale` filter on
@@ -784,8 +796,12 @@ like a real scrape, so the tests would catch a rule that filtered on
 
 Alerts go to Alertmanager and are emailed to MailHog (see
 [27-observability.md](27-observability.md)). The `DailyJobStale` text also
-reminds you to check that the Mac was awake at the scheduled time: cron
-does not catch up on a run missed while the host slept.
+reminds you to check that the Mac was awake at the scheduled time. When
+the host wakes, dcron compares the clock with its last check: after a
+jump of up to 60 minutes it runs each job whose time fell in the gap once,
+late; after a longer jump it skips those jobs and only logs `time
+disparity of N minutes detected` (visible in `docker compose logs
+scheduler`, because crond runs with `-l 5`).
 
 Without heartbeats, a failed backup, ingestion or market-close would only
 print one log line, and nothing would alert.
@@ -799,8 +815,9 @@ until the next day's snapshot. So:
 
 - 16:00 the market closes.
 - 17:00 tier monitoring: one hour of buffer, because the data provider's
-  final end-of-day bar is not always available right at the close. Its time
-  limit is 900 s, so it has finished by 17:15.
+  final end-of-day bar is not always available right at the close.
+  call-job.sh gives up after 900 s (17:15); the service may still finish
+  that run on its own.
 - 17:30 market-close: all trades are in, and the final bar is settled.
 
 ### 3.10 Busy windows the operator scripts respect
@@ -815,8 +832,8 @@ until the next day's snapshot. So:
 `guard_busy_window` makes `scripts/rebuild.sh`, `scripts/e2e.sh` and
 `scripts/snapshots.sh` refuse to restart ai-service/core-service or run an
 end-to-end check in these windows, because that could break a job. Override
-with `FORCE=1`. The night jobs (02:00-04:40) are not guarded; inside
-01:55-04:55 the scripts only print a warning.
+with `FORCE=1`. The night jobs (00:20-04:40) are not guarded; inside
+00:15-04:55 the scripts only print a warning.
 
 ### 3.11 The compose service
 
@@ -825,7 +842,13 @@ with `FORCE=1`. The night jobs (02:00-04:40) are not guarded; inside
 - `env_file: .env.docker` (the token, backup settings and the `S3_*`
   object storage settings the backup uses) plus `CORE_SERVICE_URL`,
   `AI_SERVICE_URL`, `AUTH_SERVICE_URL`, `BACKUP_DIR=/backups`,
-  `AVATAR_DATA_DIR=/avatar-data`.
+  `AVATAR_DATA_DIR=/avatar-data`. The whole `.env.docker` is passed, so
+  the container also holds secrets it never uses (LLM keys, OAuth client
+  secrets, `JWT_SECRET`, `TOTP_ENCRYPTION_KEY`, the SMTP password);
+  `entrypoint.sh` copies only the about 20 values the jobs need into
+  `/scripts/env.sh`. The `restore` service and the three Python services
+  get the whole file too. A narrower `environment:` list per service
+  would limit what one compromised container leaks; it is not done.
 - Volumes: `./logs:/logs`, `./backups:/backups`,
   `avatar_data:/avatar-data:ro` (read-only: backups only read it; restores
   use the separate `restore` service). The object storage volume is not
@@ -844,8 +867,8 @@ with `FORCE=1`. The night jobs (02:00-04:40) are not guarded; inside
   it runs `backup.sh` inside the running scheduler container. Backups
   are made on the local stack (nightly, or by hand with `make backup`)
   and copied to the host when its data should be replaced. Because no
-  job succeeds on the host, its stale-job alerts fire after 26 h / 100 h
-  (section 3.8).
+  job succeeds on the host, its stale-job alerts fire after 26 h / 76 h /
+  50 h (section 3.8).
 - The quota-free jobs still matter on the host, because real users are
   deleted there: purge-unverified, notification-retention and the two
   deleted-user sweeps (the sweeps catch whatever a lost `user.deleted`
@@ -899,8 +922,10 @@ Python and no dependencies; a job can be run by hand with one curl. A
 service restart does not lose the schedule.
 
 **Times in New York, not UTC.** The jobs follow the US market. With
-`TZ=America/New_York` the crontab stays right across daylight-saving
-changes. A UTC crontab would drift by an hour twice a year.
+`TZ=America/New_York` the crontab follows daylight-saving changes. A UTC
+crontab would drift by an hour twice a year. The one cost: on the March
+change 02:00-02:59 does not exist, and on the November change 01:00-01:59
+happens twice, so no job is scheduled between 01:00 and 02:59.
 
 **Holidays checked in the services, not in cron.** cron cannot express the
 NYSE calendar. Checking in the service puts one calendar in shared code,
@@ -939,8 +964,8 @@ cannot also stop the nightly backup.
 | Token wrong or empty | curl exit code 22, the service answered 401 | check `INTERNAL_API_TOKEN` in `.env.docker` for the scheduler and the services (do not print it) |
 | Job too slow | curl exit code 28 (timeout) | look at the service log for the job's progress; the stale alert fires later |
 | Heartbeat failed | `<job>: could not report success to core-service` | core-service problem; the job itself succeeded |
-| Host asleep (laptop) | no job lines at all for that time | the job's age grows in `make health`; `DailyJobStale` / `TradingDayJobStale` fire after 26 h / 100 h |
-| purge-unverified answers 500 | `"all_units_failed": ["accounts"]` or `["deleted_account_leftovers"]` / `["deleted_account_leftovers_lookup"]` (`deleted_account_leftovers_failed` / `deleted_account_leftovers_lookup_failed`); `unverified_account_purge_failed` (error, with `user_id`) in the auth-service log | read the error; usually the database or Redis (the user-state mirror) was down; the next night retries |
+| Host asleep (laptop) | no job lines at all for that time | the job's age grows in `make health`; `DailyJobStale` / `TradingDayJobStale` fire after 26 h (trading-day jobs: 76 h after a Friday or Saturday success, 50 h after a Sunday one); dcron runs a job missed by up to 60 minutes once, late, and skips a longer gap (log `time disparity`) |
+| purge-unverified answers 500 | `"all_units_failed": ["accounts"]` or `["deleted_account_leftovers"]` / `["deleted_account_leftovers_lookup"]` / `["expired_invitations"]` (`deleted_account_leftovers_failed` / `deleted_account_leftovers_lookup_failed` / `expired_invitations_purge_failed`); `unverified_account_purge_failed` (error, with `user_id`) in the auth-service log | read the error; usually the database or Redis (the user-state mirror) was down; the next night retries |
 | notification-retention answers 500 | `"all_units_failed": ["batches"]`; `notification_retention_failed` in the core-service log | database problem; the next night retries |
 | A deleted-user sweep answers 500 or reports `failed` > 0 | `"all_units_failed"` names the step: `users`/`organizations` (cleanups failed), `users_lookup`/`organizations_lookup` (auth unreachable; `deleted_*_sweep_lookup_failed`), `organizations_safety_brake` (`deleted_organization_sweep_refused`: check that core talks to the right, intact auth; if the deletions are real, raise `ORGANIZATION_SWEEP_MAX_MISSING` for one run; when every organization with content is missing, no setting passes the brake, so clean them with `docker compose exec core-service python -m scripts.clean_organizations --id <org id> [--id ...]`, then again with `--confirm`: it asks auth first and skips any id auth still has); `deleted_user_sweep_item_failed` and `user_data_cleanup_failed` (core) or `ai_user_data_cleanup_failed` (ai) with the step name | read the step error (database, S3, Qdrant or auth down); the next night retries, because the rows are still there |
 | A user says their unverified account vanished | `unverified_accounts_purged` in auth-service; the account was older than 7 days, unverified and never signed in | expected; they register again |
@@ -950,13 +975,15 @@ cannot also stop the nightly backup.
 | Backup failed | `backup: ERROR: ...`, a `<stamp>-FAILED` folder, no heartbeat | read the error; `make backups`; `make backup-check` |
 | Stale-job alerts on the cloud host | `DailyJobStale` / `TradingDayJobStale` for the jobs, no backups in the host's `backups/` | expected: the host keeps the scheduler stopped (section 3.11); show jobs, backups and alerts on the local stack |
 | A new exchange closure not in the calendar | the jobs run as on a trading day, without a fresh price bar for that date (expect `no_fresh_data` tiers and skipped portfolios) | add the date to `EXTRA_CLOSED_DATES` |
-| Gauge shows nothing after a fresh install | no series until the first success | expected |
 | Your query for one job returns nothing | you filtered on `job="backup"` | filter on `scheduled_job="backup"` (section 3.8) |
 
 Note: `alphamind_market_close_portfolios_skipped` is also stored in Redis
 (`core:market_close_skipped`). After a core-service restart it is reloaded,
 so the `MarketCloseSkippedPortfolios` alert keeps firing until the next
-market-close run with no skipped portfolio.
+market-close run with no skipped portfolio. Filling the day with
+`scripts/snapshots.sh` does not reset it, so after filling the day add a
+silence for the alert in Alertmanager (`http://127.0.0.1:9093`, until the
+next market-close), or Alertmanager emails it again every 4 hours.
 
 ## 7. Demo walkthrough
 
@@ -970,7 +997,7 @@ stack: the cloud host keeps the scheduler stopped.
    docker compose --env-file .env.docker exec -T scheduler ps
    ```
    The audience sees the eleven lines, the New York time (`EDT`/`EST`), and
-   `crond -f -l 2` as a child of `/entrypoint.sh`. Say: "Times are New York
+   `crond -f -l 5` as a child of `/entrypoint.sh`. Say: "Times are New York
    time; in London add five hours."
 
 2. **Show recent job output.**
@@ -1065,7 +1092,7 @@ succeeding."
    and the script reports success.
 
 5. **Why 17:30 for market-close?**
-   After tier monitoring (17:00, at most 15 minutes) executed the day's
+   After tier monitoring (17:00; call-job.sh waits at most 15 minutes for it) executed the day's
    triggered tiers, and after the final end-of-day bar is available.
 
 6. **What does `DailyJobStale` measure?**
@@ -1115,7 +1142,7 @@ succeeding."
 | `infra/scheduler/heartbeat.sh` | success report to core-service |
 | `shared/scheduled_jobs.py` | `job_response`, `all_units_failed`: the 500 rule for a run where every unit failed |
 | `services/core-service/api/internal.py` | `market_open`, `market_close`, `notification_retention`, `deleted_user_sweep`, `scheduler_heartbeat`, `_skipped`, `get_tracked_tickers` |
-| `services/auth-service/api/internal.py`, `domains/admin/service.py` | `purge_unverified_accounts` (route and `AdminService` method, which reuses the admin deletion `_delete`) and `clean_deleted_account_leftovers` |
+| `services/auth-service/api/internal.py`, `domains/admin/service.py` | `purge_unverified_accounts` (route and `AdminService` method, which reuses the admin deletion `_delete`), `clean_deleted_account_leftovers` and `purge_expired_invitations` |
 | `services/core-service/domains/notification/service.py`, `repository.py` | `purge_old_read_notifications`, `delete_read_before` |
 | `services/core-service/job_health.py` | the two gauges, Redis persistence |
 | `services/core-service/domains/portfolio/service.py` | `run_market_open_job`, `run_market_close_job` |

@@ -23,6 +23,10 @@ on:
       - ".env.example"
       - ".github/workflows/integration-ci.yml"
 
+# Read-only token: no job writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   config-checks:
     runs-on: ubuntu-latest
@@ -31,7 +35,9 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           version: "0.8.17"
-      - run: uv sync --frozen
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
       - name: Flake8 of infra/
         run: uv run flake8 infra
       - name: Gateway status page CSP hashes up to date
@@ -62,13 +68,18 @@ jobs:
       # The template is .env.example; compose reads
       # .env.docker (env_file + --env-file interpolation). Values that
       # have no usable default are filled with throwaway random ones.
+      # APP_ENV=production, like the cloud host, so the production start-up
+      # checks (JWT secret strength, internal token, TOTP key) run here
+      # before a deploy. The later line of a repeated key wins.
       - name: Prepare .env.docker
         run: |
           cp .env.example .env.docker
           {
+            echo "APP_ENV=production"
             echo "GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)"
             echo "INTERNAL_API_TOKEN=$(openssl rand -hex 32)"
             echo "JWT_SECRET=$(openssl rand -hex 32)"
+            echo "TOTP_ENCRYPTION_KEY=$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
           } >> .env.docker
       - name: Generate TLS certificate
         run: make certs

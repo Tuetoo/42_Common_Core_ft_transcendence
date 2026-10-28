@@ -2,9 +2,10 @@
 
 import { useActionState, useState } from "react";
 import { moderateById, type ModerateByIdState } from "@/app/lib/actions/admin";
+import { FormMessage } from "@/app/form-message";
+import { UUID_PATTERN } from "@/app/lib/format";
 
 const initialState: ModerateByIdState = {};
-const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 
 // Kind and id are controlled so they survive the form reset React does
 // after each action. Delete needs a second click on "Confirm delete".
@@ -50,16 +51,8 @@ export function ModerateByIdForm() {
           />
         </div>
       </div>
-      {state.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
-      {state.message && (
-        <p aria-live="polite" className="form-message success">
-          {state.message}
-        </p>
-      )}
+      <FormMessage text={state.error} />
+      <FormMessage kind="success" text={state.message} />
       <div className="flex flex-wrap gap-2">
         <button type="submit" name="intent" value="hide" disabled={pending} className="btn btn-primary">
           Hide

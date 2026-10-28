@@ -6,13 +6,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from ai.evaluation.rag_recall import Score, embed_golden_questions, rank_of
 
 _AI_SERVICE_DIR = Path(__file__).resolve().parents[1]
-if str(_AI_SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_SERVICE_DIR))
-
-from ai.evaluation.rag_recall import (Score,  # noqa: E402
-                                      embed_golden_questions, rank_of)
 
 BASELINE_2026_08_27 = (
     "2026-08-27 baseline (mistral-embed, older corpus): BM25 R@5 ~91-94%, "
@@ -108,7 +104,7 @@ async def sweep_category_weights(
                 }
                 retriever = BaseRetriever(
                     top_k=5, use_query_expansion=False,
-                    category_filter=category)
+                    category_filter=category, visibility=None)
                 hits = 0
                 for pair, vector in items:
                     found = await retriever.retrieve(
@@ -179,7 +175,9 @@ def apply_sweep(
     return written
 
 
-DESCRIPTION = "Owner-run RAG measurement: Recall@1/@5/@10 and MRR@10 of"
+DESCRIPTION = (
+    "Owner-run RAG measurement: Recall@1/@5/@10 and MRR@10 of the live index "
+    "against a golden set read from stdin.")
 
 
 async def main() -> None:
@@ -250,7 +248,8 @@ async def main() -> None:
         for name, sources in CURVES.items():
             retriever = BaseRetriever(
                 top_k=args.top_k, use_query_expansion=False,
-                category_filter=pair.category if sources is None else None)
+                category_filter=pair.category if sources is None else None,
+                visibility=None)
             results = await retriever.retrieve(
                 pair.question, ticker=pair.ticker, sources=sources,
                 query_vector=vector)

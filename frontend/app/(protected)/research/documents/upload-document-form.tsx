@@ -14,6 +14,7 @@ import {
 } from "../limits";
 import { TICKER_PATTERN, TICKER_TITLE } from "@/app/lib/format";
 import type { Organization } from "../types";
+import { FormMessage } from "@/app/form-message";
 
 type Upload =
   | { state: "idle" }
@@ -204,11 +205,10 @@ export function UploadDocumentForm({ organizations }: { organizations: Organizat
         </div>
       )}
 
-      {(upload.state === "error" || upload.state === "done") && (
-        <p aria-live="polite" className={`form-message ${upload.state === "error" ? "error" : "success"}`}>
-          {upload.message}
-        </p>
-      )}
+      <FormMessage
+        kind={upload.state === "error" ? "error" : "success"}
+        text={upload.state === "error" || upload.state === "done" ? upload.message : null}
+      />
 
       <div className="flex flex-wrap gap-2">
         <button type="submit" disabled={busy} className="btn btn-primary">

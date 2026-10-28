@@ -42,7 +42,7 @@
                      +----------------------------------------------+
                                 ^                       ^
           get_object            |                       | S3 API (rclone copy)
-  ai-service rag_ingestion_workflow                scheduler backup.sh 02:30 New York
+  ai-service rag_ingestion_workflow                scheduler backup.sh 00:50 New York
   (after document.uploaded)                        -> objectstore/<bucket>/<key>
 ```
 
@@ -334,7 +334,7 @@ The event semantics (streams, consumer groups, retries) are explained in
 
 ### 3.7 Backups and restore
 
-**Backup** (`infra/scheduler/backup.sh`, daily at 02:30 New York, 07:30
+**Backup** (`infra/scheduler/backup.sh`, daily at 00:50 New York, 05:50
 London): the scheduler copies every object of every bucket through the
 S3 API with `rclone`, using the services' own endpoint and keys
 (`S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`). The
@@ -414,9 +414,9 @@ part, and `--only objectstore` refuses it. See
     documents bucket (size, time, key);
   - `bash scripts/objectstore.sh cat <key>` prints one object: it runs
     Python inside core-service that downloads the object from
-    `S3_BUCKET_DOCUMENTS` and writes it to stdout as UTF-8 text. Useful
-    to compare a stored summary with its raw filing. It decodes as text,
-    so it suits `.txt` and `.md` objects, not PDFs.
+    `S3_BUCKET_DOCUMENTS` and writes the object's raw bytes to stdout
+    (text objects print as text; redirect a PDF to a file). Useful to
+    compare a stored summary with its raw filing.
 - `services/core-service/scripts/delete_documents.py` is an operator
   cleanup tool that deletes documents by id the same way the API does,
   without the owner check: the row delete and the outbox entry come from

@@ -2,6 +2,7 @@
 
 import { useActionState, useState } from "react";
 import type { ActionResult } from "@/app/lib/actions/admin";
+import { FormMessage } from "@/app/form-message";
 
 type BoundAction = (prev: ActionResult, formData: FormData) => Promise<ActionResult>;
 
@@ -65,16 +66,8 @@ export function ActionButton({
           </button>
         )}
       </div>
-      {state.error && (
-        <span aria-live="polite" className="form-message error" style={{ fontSize: 12 }}>
-          {state.error}
-        </span>
-      )}
-      {state.message && (
-        <span aria-live="polite" className="form-message success" style={{ fontSize: 12 }}>
-          {state.message}
-        </span>
-      )}
+      <FormMessage text={state.error} style={{ fontSize: 12 }} />
+      <FormMessage kind="success" text={state.message} style={{ fontSize: 12 }} />
     </form>
   );
 }
@@ -128,11 +121,7 @@ export function SelectActionForm({
           {pending ? "Saving…" : "Save"}
         </button>
       </div>
-      {state.error && (
-        <span aria-live="polite" className="form-message error" style={{ fontSize: 12 }}>
-          {state.error}
-        </span>
-      )}
+      <FormMessage text={state.error} style={{ fontSize: 12 }} />
     </form>
   );
 }

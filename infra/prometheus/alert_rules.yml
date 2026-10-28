@@ -183,21 +183,45 @@ groups:
             scheduler` (and that the Mac was awake at the scheduled time).
 
       # Trading-day jobs: a closed market day still reports success (the
-      # job answers "skipped"), so the longest normal gap is a weekend
-      # (Friday 17:30 to Monday 17:30, 72 hours); 100 hours leaves room.
+      # job answers "skipped"), so a success is due on every weekday.
+      # The limit depends on the weekday of the last success
+      # (day_of_week() is in UTC; every scheduled run finishes on the same
+      # UTC weekday as its New York day, by about 23:40 UTC at the latest):
+      #   Monday-Thursday: 26 hours (the next run is the next day; same
+      #     margin as DailyJobStale);
+      #   Friday or Saturday (weekend runs are manual only):
+      #     26 + 50 = 76 hours (the next run is on Monday; Friday to
+      #     Monday is 71-73 hours across a daylight-saving change, plus up
+      #     to an hour of late start and the job's own run time);
+      #   Sunday (a manual run): 26 + 24 = 50 hours (from any time on
+      #     Sunday, Monday's run ends less than 48 hours later).
+      # So a single missed run fires a few hours after its scheduled time,
+      # on the same New York day, or early on the next UTC day (a missed
+      # Monday included, also after a manual Sunday run). The weekday
+      # terms need no job filter: `>` keeps only the series of the left
+      # side.
       - alert: TradingDayJobStale
         expr: |
           time() - alphamind_job_last_success_timestamp_seconds{scheduled_job=~"market-open|market-close|tier-monitoring"}
-            > 100 * 3600
+            > 26 * 3600
+              + 50 * 3600
+                * (day_of_week(alphamind_job_last_success_timestamp_seconds) >= bool 5)
+              + 24 * 3600
+                * (day_of_week(alphamind_job_last_success_timestamp_seconds) == bool 0)
         for: 10m
         labels:
           severity: warning
           service: scheduler
         annotations:
-          summary: "Scheduled job {{ $labels.scheduled_job }} has not succeeded for over 100 hours"
+          summary: "Scheduled job {{ $labels.scheduled_job }} missed a trading day"
           description: >-
             The trading-day job {{ $labels.scheduled_job }} last succeeded
-            {{ $value | humanizeDuration }} ago.
+            {{ $value | humanizeDuration }} ago (limit: 26 hours, 76 hours
+            after a Friday or Saturday success, 50 hours after a Sunday
+            success). Check
+            `docker compose logs scheduler` (and that the Mac was awake at
+            the scheduled time); fill a missed market-close day with
+            bash scripts/snapshots.sh.
 
       - alert: MarketCloseSkippedPortfolios
         expr: alphamind_market_close_portfolios_skipped > 0
@@ -211,6 +235,8 @@ groups:
             written for {{ $value }} portfolio(s) (see the
             market_close_snapshot_skipped log lines). Fill the day later
             with bash scripts/snapshots.sh --all --to <date> (then --confirm).
+            The alert stays until the next market-close that skips no
+            portfolio; silence it in Alertmanager once the day is filled.
 
   # Durable events (core-service outbox.py): an event written to
   # core.event_outbox that has not reached Redis. The dispatcher retries

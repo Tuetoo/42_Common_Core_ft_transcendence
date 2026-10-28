@@ -111,7 +111,7 @@ async def delete_document_chunks(document_id: str) -> int:
         points, next_offset = await client.scroll(
             collection_name=settings.QDRANT_COLLECTION_RESEARCH,
             scroll_filter=doc_filter, limit=256, offset=next_offset,
-            with_payload=True, with_vectors=False)
+            with_payload=["chunk_id"], with_vectors=False)
         chunk_ids.extend(
             p.payload["chunk_id"] for p in points
             if p.payload and p.payload.get("chunk_id"))

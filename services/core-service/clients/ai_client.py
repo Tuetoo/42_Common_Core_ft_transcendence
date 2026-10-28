@@ -18,6 +18,9 @@ logger = structlog.get_logger(__name__)
 _CACHE_TTL_SECONDS = 10
 _TIMEOUT = 3.0
 _CLOSES_TIMEOUT = 15.0
+# ai-service's MAX_PRICE_LOOKBACK_DAYS (domains/market/repository.py).
+_MAX_LOOKBACK_DAYS = 3650
+# Keep above ai-service's SENTIMENT_TIMEOUT_SECONDS (config.py, 240 s).
 _SENTIMENT_TIMEOUT = 270.0
 _LABELS = frozenset({"positive", "neutral", "negative"})
 
@@ -87,7 +90,7 @@ async def get_daily_closes(
         response = await get_http_client(timeout).get(
             url, params={
                 "interval": "1d",
-                "lookback_days": lookback_days
+                "lookback_days": min(lookback_days, _MAX_LOOKBACK_DAYS)
             })
         response.raise_for_status()
         bars = response.json().get("data") or []

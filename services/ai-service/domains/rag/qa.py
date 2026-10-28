@@ -11,6 +11,7 @@ import structlog
 from ai.agents.evidence_grounding import non_english_reason
 from ai.llm.base import LLMError, LLMMessage, LLMNonEnglishOutputError, LLMTier
 from ai.llm.router import LLMRouter
+from ai.rag.embedding import embed_query
 from ai.rag.retriever import (BaseRetriever, FilingRetriever, RetrievedChunk,
                               reserve_newest_filing_slots)
 from ai.rag.visibility import VisibilityScope
@@ -85,10 +86,20 @@ async def retrieve_sources(request: RagAskRequest,
             category_filter=category, top_k=top_k, use_query_expansion=False,
             visibility=scope) for category in categories
     ]
+    vector: list[float] | None = None
+    sources: frozenset[str] | None = None
+    try:
+        vector = await embed_query(request.question)
+    except Exception as exc:
+        sources = frozenset({"bm25"})
+        logger.warning(
+            "rag_ask.vector_search_skipped_embedding_failed",
+            error=f"{type(exc).__name__}: {str(exc)[:200]}")
     results = await asyncio.gather(
         *(
-            r.retrieve(request.question, ticker=request.ticker)
-            for r in retrievers))
+            r.retrieve(
+                request.question, ticker=request.ticker, sources=sources,
+                query_vector=vector) for r in retrievers))
     merged: dict[str, RetrievedChunk] = {}
     for chunk in (c for batch in results for c in batch):
         if (chunk.chunk_id not in merged
@@ -219,8 +230,13 @@ async def answer_question(
         except LLMError as exc:
             logger.warning("rag_ask.llm_failed", error_type=type(exc).__name__)
             raise RagAnswerUnavailableError(UNAVAILABLE_MESSAGE) from exc
+        answer = response.content.strip()
+        if not answer:
+            logger.warning("rag_ask.empty_answer")
+            raise RagAnswerUnavailableError(
+                UNAVAILABLE_MESSAGE, code="empty_answer")
         return RagAnswer(
-            answer=response.content.strip(), citations=citations,
+            answer=answer, citations=citations,
             model=response.model, latency_ms=int(
                 (time.monotonic() - started) * 1000), mode=request.mode,
             grounded=True)

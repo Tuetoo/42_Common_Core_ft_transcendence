@@ -509,6 +509,11 @@ class TestConnectionManager:
             await websocket_manager._publish_fanout(["user:x"], "text")
             is None)
 
+        import yjs_relay
+
+        monkeypatch.setattr(yjs_relay, "get_events_client", _broken)
+        assert await yjs_relay._publish_cross_replica("n", b"\x00") is None
+
     async def test_manager_cleanup_caps_and_presence(
             self, presence_calls, monkeypatch):
         from websocket_manager import (MAX_CONNECTIONS_PER_USER,
@@ -629,7 +634,8 @@ class TestWebSocketEndpoints:
 
         monkeypatch.setattr(ai_client, "get_analysis_ref", _get_ref)
         monkeypatch.setattr(auth_client, "are_users_connected", _connected)
-        monkeypatch.setattr(ws.PortfolioService, "get", _portfolio_get)
+        monkeypatch.setattr(
+            ws.PortfolioService, "_require_readable", _portfolio_get)
         monkeypatch.setattr(ws.ResearchService, "get_document", _get_document)
 
         cases = [(f"user:{me}", True, None), (f"user:{stranger}", False, 4403),
@@ -1514,7 +1520,8 @@ class TestNotificationEvents:
         payload = {
             "actor_id": str(uuid4()),
             "user_id": str(uuid4()),
-            "actor_username": "bob"
+            "actor_username": "bob",
+            "event_id": uuid4().hex
         }
         await event_listener._handle_friend_requested(dict(payload))
         await event_listener._handle_friend_requested(dict(payload))
@@ -1525,7 +1532,7 @@ class TestNotificationEvents:
             raise ConnectionError("redis down")
 
         monkeypatch.setattr(event_listener, "get_events_client", _broken)
-        assert await event_listener._claim_event("x", {"a": 1})
+        assert await event_listener._claim_event("x", {"event_id": "e1"})
 
     async def test_decision_outcome_evaluated_notifies_the_user(
             self, notified_user_calls, monkeypatch):
@@ -2548,7 +2555,8 @@ class TestCrossServiceEvents:
                 **body, "event_id": "e2"
             })
         assert await event_listener._claim_event("x", body)
-        assert not await event_listener._claim_event("x", dict(body))
+        assert await event_listener._claim_event("x", dict(body))
+        assert len(keys) == 2
 
         import json
 

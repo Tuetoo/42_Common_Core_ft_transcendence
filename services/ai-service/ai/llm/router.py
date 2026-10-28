@@ -44,7 +44,7 @@ def router_retry_limit(
         return 0
     if isinstance(exc, LLMOutputExhaustedError):
         return min(retries, _OUTPUT_EXHAUSTED_RETRIES)
-    if isinstance(exc, LLMProviderTimeoutError):
+    if isinstance(exc, (LLMProviderTimeoutError, LLMRequestTimeoutError)):
         return min(retries, _TIMEOUT_RETRIES)
     if provider_name != "google":
         return retries

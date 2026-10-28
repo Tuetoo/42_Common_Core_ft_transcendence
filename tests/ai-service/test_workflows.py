@@ -241,7 +241,7 @@ async def _no_cash_flows(portfolio_id, *, start_date, end_date) -> list[dict]:
 def _cash_flows(amounts_by_day: dict[int, float], *,
                 start: date) -> list[dict]:
     return [{
-        "transaction_date": (start + timedelta(days=offset)).isoformat(),
+        "snapshot_date": (start + timedelta(days=offset)).isoformat(),
         "amount": amount
     } for offset, amount in amounts_by_day.items()]
 
@@ -336,7 +336,9 @@ class TestAutoIngestionWorkflow:
         async def _fake_get_tracked_tickers():
             return ["BROKEN", "AMD"]
 
-        async def _fake_get_existing_filenames(ticker, category):
+        async def _fake_get_existing_filenames(
+                ticker, category, *, system_only):
+            assert system_only
             if ticker == "BROKEN":
                 raise RuntimeError("simulated SEC EDGAR failure")
             return []
@@ -383,7 +385,8 @@ class TestAutoIngestionWorkflow:
         assert result["failed_tickers"] == ["BROKEN"]
         assert created_documents == ["AMD_10-K_2026-01-01.txt"]
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         async def _filings(ticker, *, already_ingested_filenames):
@@ -465,7 +468,8 @@ class TestAutoIngestionWorkflow:
         async def _spy():
             return ["SPY"]
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         for module in (auto_ingestion_workflow, sec_filings_module):
@@ -582,7 +586,8 @@ class TestAutoIngestionWorkflow:
         import ai.ingestion.digests as digests
         from ai.ingestion.digests import MacroReport
 
-        async def _existing(ticker, category):
+        async def _existing(ticker, category, *, system_only):
+            assert system_only
             return []
 
         monkeypatch.setattr(
@@ -982,6 +987,38 @@ class TestPortfolioBacktestWorkflow:
                                               400)).startswith("ValueError: ")
 
     @pytest.mark.asyncio
+    async def test_initial_capital_is_the_curve_start(
+            self, monkeypatch, _schema_ready):
+        start = date(2026, 9, 28)
+        backtest_id = await _create_portfolio_backtest(
+            start_date=start, end_date=date(2026, 10, 1),
+            initial_capital=10_000.0)
+
+        async def _snap(portfolio_id, *, start_date=None, end_date=None):
+            return _snapshot_rows(
+                [10_000.0, 10_500.0, 10_600.0, 10_700.0], start=start)
+
+        provider = _FakeBenchmarkProvider(
+            [float("nan"), 766.0, 767.0, 768.0], start=start)
+        monkeypatch.setattr(
+            backtest_workflow, "get_portfolio_snapshots", _snap)
+        monkeypatch.setattr(
+            backtest_workflow, "get_market_data_provider", lambda: provider)
+        monkeypatch.setattr(
+            backtest_workflow, "get_portfolio_cash_flows", _no_cash_flows)
+        await backtest_workflow.run_portfolio_backtest_workflow(
+            str(backtest_id), portfolio_id=str(uuid4()))
+
+        async with SessionLocal() as session:
+            backtest = await BacktestRepository(session).get_by_id(backtest_id)
+            assert backtest.status == "completed"
+            assert float(backtest.initial_capital) == 10_500.0
+            assert float(backtest.ending_capital) / float(
+                backtest.initial_capital) == pytest.approx(
+                    1 + float(backtest.strategy_return))
+        await _delete_backtest(backtest_id)
+
+    @pytest.mark.asyncio
     async def test_deposits_and_adjustments_are_not_strategy_return(
             self, monkeypatch, _schema_ready):
         start = date(2026, 1, 1)
@@ -1024,13 +1061,13 @@ class TestPortfolioBacktestWorkflow:
         await _delete_backtest(backtest_id)
 
         flows = [{
-            "transaction_date": "2026-01-10",
+            "snapshot_date": "2026-01-10",
             "transaction_type": "adjustment",
             "ticker": "AMD",
             "quantity": 1,
             "price": 50.0
         }, {
-            "transaction_date": "2026-01-10",
+            "snapshot_date": "2026-01-10",
             "transaction_type": "ADJUSTMENT",
             "ticker": "NOPE",
             "quantity": 2,
@@ -1063,7 +1100,7 @@ class TestPortfolioBacktestWorkflow:
 
         async def _flows(portfolio_id, *, start_date, end_date):
             return [{
-                "transaction_date": days[2].isoformat(),
+                "snapshot_date": days[2].isoformat(),
                 "transaction_type": "adjustment",
                 "ticker": "AMD",
                 "quantity": 10.0,
@@ -1376,7 +1413,7 @@ class TestReviewDecisionOutcomes:
         monkeypatch.setattr(
             review_workflow, "DecisionOutcomeRepository", _Repo)
         written = await review_workflow._evaluate_one_decision(
-            uuid4(), "AMD", date(2026, 1, 1), "followed", 7, user_id=uuid4(),
+            uuid4(), "AMD", date(2026, 1, 1), "buy", 7, user_id=uuid4(),
             analysis_id=uuid4())
         assert written is None
 
@@ -1672,6 +1709,52 @@ class TestTierMonitoringGating:
             assert outcome == expected, case_id
             assert executed == ([Decimal("100")]
                                 if expected == "triggered" else []), case_id
+
+    @pytest.mark.asyncio
+    async def test_a_day_without_a_run_is_checked_later(self, monkeypatch):
+        lookbacks: list[int] = []
+        bars = [
+            _bar(
+                ts=datetime(2026, 8, 11, 4, tzinfo=UTC), open_=500.0,
+                high=505.0, low=498.0, close=502.0),
+            _bar(
+                ts=datetime(2026, 8, 12, 4, tzinfo=UTC), open_=497.0,
+                high=499.0, low=490.0, close=492.0),
+            _bar(
+                ts=TODAY_TS, open_=500.0, high=505.0, low=498.0, close=502.0)
+        ]
+
+        async def _bars(ticker, *, interval, lookback_days):
+            lookbacks.append(lookback_days)
+            return bars
+
+        executed: list = []
+
+        async def _execute(tier, **kwargs):
+            executed.append(kwargs["price"])
+            return "triggered"
+
+        monkeypatch.setattr(tier_workflow, "get_bars_cache_first", _bars)
+        monkeypatch.setattr(
+            tier_workflow, "_execute_and_mark_triggered", _execute)
+        tier = _StubTier(
+            target_price=Decimal("495"), recommendation=_StubRecommendation(
+                window_expires_at=datetime.now(UTC) + timedelta(days=5),
+                accepted_at=datetime(2026, 8, 11, 13, 0, tzinfo=UTC)))
+        assert await tier_workflow._check_one_tier(
+            tier, today=TODAY) == "triggered"
+        assert lookbacks == [3] and executed == [Decimal("495")]
+
+        bars[1] = _bar(
+            ts=datetime(2026, 8, 12, 4, tzinfo=UTC), open_=500.0, high=505.0,
+            low=498.0, close=502.0)
+        bars[2] = _bar(
+            ts=TODAY_TS, open_=float("nan"), high=505.0, low=490.0,
+            close=502.0)
+        executed.clear()
+        assert await tier_workflow._check_one_tier(
+            tier, today=TODAY) == "no_fresh_data"
+        assert executed == []
 
 
 class TestTierMonitoringRun:
@@ -1992,11 +2075,8 @@ class TestTierBudgetAndAcceptance:
 
     async def test_weekend_deadline_and_system_tiers_lapse_after_it(
             self, db_session, owners):
-        from config import AIServiceSettings
         from domains.analysis.repository import acceptance_lapsed
 
-        assert AIServiceSettings.model_fields[
-            "SYSTEM_TIER_ACCEPTANCE_HOURS"].default == 72
         friday_evening = datetime(2026, 10, 9, 22, 0, tzinfo=UTC)
         monday_open = datetime(2026, 10, 12, 13, 30, tzinfo=UTC)
         tuesday_evening = datetime(2026, 10, 13, 22, 0, tzinfo=UTC)
@@ -2200,19 +2280,14 @@ class TestKnowledgeGraphGuards:
 
         entries = [
             SimpleNamespace(
-                action="recompute_scenario", observation="   \n  ",
+                action="recompute_scenario", observation=observation,
+                is_tool_result=True, tool_error=False, peer_ticker=None,
                 action_input={
                     "ticker": "AMD",
-                    "additional_shares": 5
-                }),
-            SimpleNamespace(
-                action="recompute_scenario", observation="weight 12%\nmore",
-                action_input={
-                    "ticker": "AMD",
-                    "additional_shares": 7
-                })
+                    "additional_shares": shares
+                }) for observation, shares in (("   \n  ", 5),
+                                               ("weight 12%\nmore", 7))
         ]
-        monkeypatch.setattr(portfolio, "_successful", lambda entry: True)
         lines = portfolio._computed_scenarios(entries, "AMD")
         assert lines == ["additional_shares=7 -> weight 12%"]
 

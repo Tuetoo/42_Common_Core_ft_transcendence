@@ -124,7 +124,7 @@ async def fetch_closes(tickers: Iterable[str],
     out: dict[str, dict[date, Decimal]] = {}
     for ticker in sorted(set(tickers)):
         closes = await ai_client.get_daily_closes(
-            ticker, lookback_days=min(lookback, 3650), timeout=60.0)
+            ticker, lookback_days=lookback, timeout=60.0)
         out[ticker] = closes or {}
     return out
 

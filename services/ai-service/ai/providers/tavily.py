@@ -12,10 +12,6 @@ _SOURCE = "tavily"
 _SEARCH_URL = "https://api.tavily.com/search"
 
 
-class TavilyResult(WebSearchResult):
-    score: float | None = None
-
-
 class TavilyProvider(WebSearchProvider):
 
     async def search(
@@ -58,23 +54,26 @@ class TavilyProvider(WebSearchProvider):
             raise ProviderRequestError(
                 f"Tavily returned an unexpected response shape for query "
                 f"{query!r}")
-        results: list[TavilyResult] = []
-        for item in (payload.get("results") or [])[:max(limit, 0)]:
-            if not isinstance(item, dict):
-                continue
-            published_at = _parse_published_date(item.get("published_date"))
-            raw_score = item.get("score")
-            score = (
-                None if isinstance(raw_score, bool) or
-                not isinstance(raw_score, int | float) else float(raw_score))
-            results.append(
-                TavilyResult(
-                    title=item.get("title") or "(untitled)",
-                    url=item.get("url", ""), snippet=item.get("content", ""),
-                    published_at=published_at, source=_SOURCE, score=score))
-        results.sort(key=lambda r: -(r.score if r.score is not None else -1.0))
-        ordered: list[WebSearchResult] = [*results]
-        return ordered
+        items = [
+            item for item in (payload.get("results") or [])[:max(limit, 0)]
+            if isinstance(item, dict)
+        ]
+        items.sort(key=lambda item: -_score(item))
+        return [
+            WebSearchResult(
+                title=item.get("title") or "(untitled)",
+                url=item.get("url", ""), snippet=item.get("content", ""),
+                published_at=_parse_published_date(
+                    item.get("published_date")), source=_SOURCE)
+            for item in items
+        ]
+
+
+def _score(item: dict[str, object]) -> float:
+    raw_score = item.get("score")
+    if isinstance(raw_score, bool) or not isinstance(raw_score, int | float):
+        return -1.0
+    return float(raw_score)
 
 
 def _parse_published_date(raw_date: object) -> datetime | None:

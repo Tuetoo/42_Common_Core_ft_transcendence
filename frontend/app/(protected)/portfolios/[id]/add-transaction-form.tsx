@@ -3,6 +3,7 @@
 import { useActionState, useId, useState, type FormEvent } from "react";
 import { addTransaction, type AddTransactionState } from "@/app/lib/actions/portfolios";
 import { MIN_POSITIVE_AMOUNT, TICKER_PATTERN, TICKER_TITLE, upperCaseInput } from "@/app/lib/format";
+import { FormMessage } from "@/app/form-message";
 
 const initialState: AddTransactionState = {};
 
@@ -113,11 +114,7 @@ export function AddTransactionForm({ portfolioId }: { portfolioId: string }) {
           Buying needs enough cash in the portfolio — deposit first if needed.
         </p>
       )}
-      {state?.error && (
-        <p aria-live="polite" className="form-message error">
-          {state.error}
-        </p>
-      )}
+      <FormMessage text={state?.error} />
       <button type="submit" disabled={pending} className="btn btn-primary">
         {pending ? "Recording…" : "Record transaction"}
       </button>
